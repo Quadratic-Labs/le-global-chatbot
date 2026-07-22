@@ -1,0 +1,27 @@
+[Unit]
+Description=L&E Global Chatbot Docker Compose stack
+Documentation=https://github.com/Quadratic-Labs/le-global-chatbot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/le-global-chatbot/infra
+
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+ExecStartPre=/usr/bin/test -f /opt/le-global-chatbot/infra/compose.yml
+ExecStartPre=/usr/bin/test -f /opt/le-global-chatbot/infra/.env
+
+ExecStart=/usr/bin/docker compose --env-file .env -f compose.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file .env -f compose.yml down
+ExecReload=/usr/bin/docker compose --env-file .env -f compose.yml up -d --remove-orphans
+
+[Install]
+WantedBy=multi-user.target
