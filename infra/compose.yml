@@ -1,0 +1,180 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
+    container_name: le-global-opensearch
+    restart: unless-stopped
+
+    environment:
+      cluster.name: le-global-cluster
+      node.name: le-global-node-1
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms4g -Xmx4g"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    deploy:
+      resources:
+        limits:
+          memory: 7g
+
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+
+    ports:
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"
+
+    networks:
+      - le-global-network
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sk -u \"admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}\" https://localhost:9200/_cluster/health || exit 1"
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION}
+    container_name: le-global-opensearch-dashboards
+    restart: unless-stopped
+
+    environment:
+      OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
+      OPENSEARCH_USERNAME: kibanaserver
+      OPENSEARCH_PASSWORD: kibanaserver
+      OPENSEARCH_SSL_VERIFICATIONMODE: none
+
+    deploy:
+      resources:
+        limits:
+          memory: 1500m
+
+    ports:
+      - "127.0.0.1:5601:5601"
+
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+    networks:
+      - le-global-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: le-global-redis
+    restart: unless-stopped
+
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+    command:
+      [
+        "redis-server",
+        "--requirepass",
+        "${REDIS_PASSWORD}",
+        "--maxmemory",
+        "512mb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--appendonly",
+        "yes"
+      ]
+
+    deploy:
+      resources:
+        limits:
+          memory: 700m
+
+    volumes:
+      - redis-data:/data
+
+    ports:
+      - "127.0.0.1:6379:6379"
+
+    networks:
+      - le-global-network
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+
+    container_name: le-global-backend
+    restart: unless-stopped
+    init: true
+
+    environment:
+      APP_ENV: development
+
+      OPENSEARCH_URL: https://opensearch:9200
+      OPENSEARCH_USERNAME: admin
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      OPENSEARCH_VERIFY_CERTS: "false"
+
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    networks:
+      - le-global-network
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  opensearch-data:
+    name: le-global-opensearch-data
+
+  redis-data:
+    name: le-global-redis-data
+
+networks:
+  le-global-network:
+    name: le-global-network
+    driver: bridge
