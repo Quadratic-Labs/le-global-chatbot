@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from functools import lru_cache
 
 
@@ -31,6 +32,8 @@ class Settings:
     opensearch_password: str
     opensearch_verify_certs: bool
     redis_url: str
+    document_source_dir: Path
+    document_processed_dir: Path
 
 
 @lru_cache
@@ -50,4 +53,10 @@ def get_settings() -> Settings:
             False,
         ),
         redis_url=required_env("REDIS_URL"),
+        document_source_dir=Path(
+            required_env("DOCUMENT_SOURCE_DIR")
+        ),
+        document_processed_dir=Path(
+            required_env("DOCUMENT_PROCESSED_DIR")
+        ),
     )
