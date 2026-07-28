@@ -13,7 +13,12 @@ from app.models.chat import (
     LegalChatRequest,
     LegalChatResponse,
 )
+from app.services.country_detection import (
+    CountryDetectionError,
+    prepare_legal_chat_request,
+)
 from app.services.rag_answer import (
+    InvalidLegalChatRequestError,
     RagAnswerError,
     answer_legal_question,
 )
@@ -36,9 +41,25 @@ def legal_chat(
     """Generate an answer grounded in validated documents."""
 
     try:
-        return answer_legal_question(
-            request
+        prepared_request = (
+            prepare_legal_chat_request(
+                request
+            )
         )
+
+        return answer_legal_question(
+            prepared_request
+        )
+
+    except InvalidLegalChatRequestError as error:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(
+                error
+            ),
+        ) from error
 
     except OpenAIConfigurationError as error:
         raise HTTPException(
@@ -48,6 +69,15 @@ def legal_chat(
             detail=(
                 "The answer generation service "
                 "is not configured."
+            ),
+        ) from error
+
+    except CountryDetectionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "The country detection service "
+                "is temporarily unavailable."
             ),
         ) from error
 
