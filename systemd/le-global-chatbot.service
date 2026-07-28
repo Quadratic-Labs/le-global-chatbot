@@ -17,11 +17,11 @@ TimeoutStartSec=0
 TimeoutStopSec=120
 
 ExecStartPre=/usr/bin/test -f /opt/le-global-chatbot/infra/compose.yml
-ExecStartPre=/usr/bin/test -f /opt/le-global-chatbot/infra/.env
+ExecStartPre=/usr/bin/test -f /etc/le-global-chatbot/le-global-chatbot.env
 
-ExecStart=/usr/bin/docker compose --env-file .env -f compose.yml up -d --remove-orphans
-ExecStop=/usr/bin/docker compose --env-file .env -f compose.yml down
-ExecReload=/usr/bin/docker compose --env-file .env -f compose.yml up -d --remove-orphans
+ExecStart=/usr/bin/docker compose --env-file /etc/le-global-chatbot/le-global-chatbot.env -f compose.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /etc/le-global-chatbot/le-global-chatbot.env -f compose.yml down
+ExecReload=/usr/bin/docker compose --env-file /etc/le-global-chatbot/le-global-chatbot.env -f compose.yml up -d --remove-orphans
 
 [Install]
 WantedBy=multi-user.target

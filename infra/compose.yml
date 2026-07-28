@@ -137,6 +137,13 @@ services:
 
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
 
+      DOCUMENT_SOURCE_DIR: /data/documents/source
+      DOCUMENT_PROCESSED_DIR: /data/documents/processed
+
+    volumes:
+      - /var/lib/le-global-chatbot/documents/source:/data/documents/source:ro
+      - /var/lib/le-global-chatbot/documents/processed:/data/documents/processed
+
     deploy:
       resources:
         limits:
