@@ -4,3 +4,4 @@ opensearch-py==3.2.0
 redis==8.0.0
 
 python-docx==1.2.0
+python-multipart==0.0.32

@@ -139,18 +139,21 @@ services:
 
       DOCUMENT_SOURCE_DIR: /data/documents/source
       DOCUMENT_PROCESSED_DIR: /data/documents/processed
+      DOCUMENT_UPLOAD_MAX_BYTES: "${DOCUMENT_UPLOAD_MAX_BYTES:-26214400}"
 
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
       OPENAI_TIMEOUT_SECONDS: "${OPENAI_TIMEOUT_SECONDS:-60}"
-      
+
       API_ACCESS_KEY: "${API_ACCESS_KEY}"
+      ADMIN_API_KEY: "${ADMIN_API_KEY}"
+
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
       RATE_LIMIT_REQUESTS: "${RATE_LIMIT_REQUESTS:-60}"
       RATE_LIMIT_WINDOW_SECONDS: "${RATE_LIMIT_WINDOW_SECONDS:-60}"
 
     volumes:
-      - /var/lib/le-global-chatbot/documents/source:/data/documents/source:ro
+      - /var/lib/le-global-chatbot/documents/source:/data/documents/source
       - /var/lib/le-global-chatbot/documents/processed:/data/documents/processed
 
     deploy:

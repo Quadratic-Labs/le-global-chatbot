@@ -17,6 +17,9 @@ from app.services.country_detection import (
     CountryDetectionError,
     prepare_legal_chat_request,
 )
+from app.services.legal_topic_detection import (
+    prepare_legal_chat_topics,
+)
 from app.services.rag_answer import (
     InvalidLegalChatRequestError,
     RagAnswerError,
@@ -41,9 +44,15 @@ def legal_chat(
     """Generate an answer grounded in validated documents."""
 
     try:
-        prepared_request = (
+        country_prepared_request = (
             prepare_legal_chat_request(
                 request
+            )
+        )
+
+        prepared_request = (
+            prepare_legal_chat_topics(
+                country_prepared_request
             )
         )
 
