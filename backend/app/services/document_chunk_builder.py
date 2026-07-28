@@ -5,7 +5,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
-
+from app.services.section_splitter import (
+    split_parsed_sections,
+)
+from app.core.country_registry import (
+    resolve_country,
+)
 from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
     is_overview_section,
@@ -17,23 +22,38 @@ from app.services.docx_parser import (
 )
 
 
-_SOURCE_FILENAME_PATTERN: Final[re.Pattern[str]] = re.compile(
-    (
-        r"^Labour and Employment Law in "
-        r"(?P<country>.+?) "
-        r"(?P<year>(?:19|20)\d{2})"
-        r"\.docx$"
+_FILENAME_PATTERNS: Final[
+    tuple[re.Pattern[str], ...]
+] = (
+    re.compile(
+        r"^Labour and Employment Law in\s+"
+        r"(?P<country>.+?)"
+        r"(?:\s+(?P<year>(?:19|20)\d{2}))?$",
+        re.IGNORECASE,
     ),
-    re.IGNORECASE,
+    re.compile(
+        r"^Employment Law Overview"
+        r"(?:\s*-\s*|\s+)"
+        r"(?P<country>.+?)"
+        r"(?:\s+(?P<year>(?:19|20)\d{2}))?$",
+        re.IGNORECASE,
+    ),
+)
+
+
+_COPY_SUFFIX_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\s*\(\d+\)$"
 )
 
 
 class UnknownLegalTopicError(ValueError):
-    """Raised when a Heading 1 is outside the approved taxonomy."""
+    """Raised when a section is outside the approved taxonomy."""
 
 
 class InvalidSourceFilenameError(ValueError):
-    """Raised when a DOCX filename does not follow the expected format."""
+    """Raised when a DOCX filename has an unsupported format."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +68,9 @@ class DocumentMetadata:
     source_format: str = "docx"
 
 
-def _sha256(value: str) -> str:
+def _sha256(
+    value: str,
+) -> str:
     """Return a deterministic SHA-256 hexadecimal digest."""
 
     return hashlib.sha256(
@@ -56,10 +78,82 @@ def _sha256(value: str) -> str:
     ).hexdigest()
 
 
+def _normalize_filename_stem(
+    file_path: Path,
+) -> str:
+    """
+    Normalize supported filename variations.
+
+    Supported variations include:
+
+    - spaces;
+    - underscores;
+    - final copy suffixes such as "(1)".
+    """
+
+    stem_without_copy_suffix = (
+        _COPY_SUFFIX_PATTERN.sub(
+            "",
+            file_path.stem.strip(),
+        )
+    )
+
+    return " ".join(
+        stem_without_copy_suffix
+        .replace("_", " ")
+        .split()
+    )
+
+
+def _extract_filename_metadata(
+    file_path: Path,
+) -> tuple[str, int | None]:
+    """Return the raw country token and optional year."""
+
+    normalized_stem = _normalize_filename_stem(
+        file_path
+    )
+
+    for pattern in _FILENAME_PATTERNS:
+        match = pattern.fullmatch(
+            normalized_stem
+        )
+
+        if match is None:
+            continue
+
+        year_value = match.group(
+            "year"
+        )
+
+        return (
+            match.group(
+                "country"
+            ).strip(),
+            (
+                int(year_value)
+                if year_value is not None
+                else None
+            ),
+        )
+
+    raise InvalidSourceFilenameError(
+        "Unexpected DOCX filename. "
+        "Supported formats are: "
+        "'Labour and Employment Law in "
+        "<Country> [Year].docx' and "
+        "'Employment Law Overview [-] "
+        "<Country> [Year].docx'. "
+        "Spaces, underscores, and a final copy suffix "
+        "such as '(1)' are accepted. "
+        f"Received: {file_path.name}"
+    )
+
+
 def _validate_metadata(
     metadata: DocumentMetadata,
 ) -> None:
-    """Validate metadata before creating any chunk."""
+    """Validate metadata before creating chunks."""
 
     if not metadata.country.strip():
         raise ValueError(
@@ -67,7 +161,8 @@ def _validate_metadata(
         )
 
     country_code = (
-        metadata.country_code.strip()
+        metadata.country_code
+        .strip()
     )
 
     if (
@@ -109,7 +204,7 @@ def _validate_metadata(
 def _build_document_id(
     metadata: DocumentMetadata,
 ) -> str:
-    """Build a stable ID for one logical source document."""
+    """Build a stable identifier for one source document."""
 
     identity = "\x1f".join(
         (
@@ -138,7 +233,7 @@ def _build_chunk_id(
     subsection: str | None,
     occurrence: int,
 ) -> str:
-    """Build a stable chunk ID from its structural position."""
+    """Build a stable chunk identifier from its structural path."""
 
     identity = "\x1f".join(
         (
@@ -162,59 +257,51 @@ def _build_chunk_id(
 
 def metadata_from_filename(
     file_path: Path,
-    country_code: str,
+    country_code: str | None = None,
     language: str = "en",
 ) -> DocumentMetadata:
     """
-    Extract country and year from a standard L&E filename.
+    Extract canonical metadata from a supported filename.
 
-    This function remains a fallback. Future upload endpoints will
-    accept explicit metadata for non-standard filenames.
+    The country token is resolved through the central country
+    registry.
+
+    An explicit country code is optional. When supplied, it must
+    correspond to the country found in the filename.
     """
 
-    filename = file_path.name
-
-    match = (
-        _SOURCE_FILENAME_PATTERN.fullmatch(
-            filename
+    raw_country, reference_year = (
+        _extract_filename_metadata(
+            file_path
         )
     )
 
-    if match is None:
-        raise InvalidSourceFilenameError(
-            "Unexpected DOCX filename. "
-            "Expected format: "
-            "'Labour and Employment Law in "
-            "<Country> <Year>.docx'. "
-            f"Received: {filename}"
+    country, resolved_country_code = (
+        resolve_country(
+            raw_country=raw_country,
+            country_code=country_code,
         )
+    )
+
+    source_format = (
+        file_path.suffix
+        .lstrip(".")
+        .lower()
+    )
 
     return DocumentMetadata(
-        country=(
-            match.group(
-                "country"
-            ).strip()
-        ),
-        country_code=(
-            country_code
-            .strip()
-            .upper()
-        ),
-        reference_year=int(
-            match.group(
-                "year"
-            )
-        ),
+        country=country,
+        country_code=resolved_country_code,
+        reference_year=reference_year,
         language=(
             language
             .strip()
             .lower()
         ),
-        source_filename=filename,
+        source_filename=file_path.name,
         source_format=(
-            file_path.suffix
-            .lstrip(".")
-            .lower()
+            source_format
+            or "docx"
         ),
     )
 
@@ -232,7 +319,8 @@ def build_document_chunks(
     )
 
     country = (
-        metadata.country.strip()
+        metadata.country
+        .strip()
     )
 
     country_code = (
@@ -248,7 +336,8 @@ def build_document_chunks(
     )
 
     source_filename = (
-        metadata.source_filename.strip()
+        metadata.source_filename
+        .strip()
     )
 
     source_format = (
@@ -274,7 +363,8 @@ def build_document_chunks(
 
     for parsed_section in parsed_sections:
         section = (
-            parsed_section.section.strip()
+            parsed_section.section
+            .strip()
         )
 
         subsection = (
@@ -284,7 +374,8 @@ def build_document_chunks(
         )
 
         content = (
-            parsed_section.content.strip()
+            parsed_section.content
+            .strip()
         )
 
         if not content:
@@ -311,9 +402,8 @@ def build_document_chunks(
                 raise UnknownLegalTopicError(
                     "Unknown legal topic detected. "
                     f"Section: {section!r}. "
-                    "The document was not indexed "
-                    "because the topic is outside "
-                    "the approved taxonomy."
+                    "The document was not indexed because "
+                    "the topic is outside the approved taxonomy."
                 )
 
         path_key = (
@@ -373,10 +463,10 @@ def build_document_chunks(
 
 def build_document_chunks_from_docx(
     file_path: Path,
-    country_code: str,
+    country_code: str | None = None,
     language: str = "en",
 ) -> list[DocumentChunk]:
-    """Parse and enrich one standard-name L&E DOCX document."""
+    """Parse and enrich one L&E DOCX document."""
 
     metadata = metadata_from_filename(
         file_path=file_path,
@@ -384,9 +474,12 @@ def build_document_chunks_from_docx(
         language=language,
     )
 
-    parsed_sections = parse_docx_sections(
-        file_path=file_path,
-        country=metadata.country,
+    parsed_sections = split_parsed_sections(
+        parsed_sections=parse_docx_sections(
+            file_path=file_path,
+            country=metadata.country,
+        ),
+        max_chars=6000,
     )
 
     return build_document_chunks(

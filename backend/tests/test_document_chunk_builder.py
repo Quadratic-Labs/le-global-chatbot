@@ -1,6 +1,9 @@
 import unittest
 from pathlib import Path
 
+from app.core.country_registry import (
+    CountryMetadataMismatchError,
+)
 from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
     normalize_topic,
@@ -98,6 +101,7 @@ class DocumentChunkBuilderTests(unittest.TestCase):
             overview_chunk.document_type,
             "overview",
         )
+
         self.assertIsNone(
             overview_chunk.legal_topic
         )
@@ -108,18 +112,22 @@ class DocumentChunkBuilderTests(unittest.TestCase):
             comparator_chunk.document_type,
             "comparator",
         )
+
         self.assertEqual(
             comparator_chunk.legal_topic,
             "Hiring Practices",
         )
+
         self.assertEqual(
             comparator_chunk.country,
             "Spain",
         )
+
         self.assertEqual(
             comparator_chunk.country_code,
             "ES",
         )
+
         self.assertEqual(
             comparator_chunk.reference_year,
             2026,
@@ -209,14 +217,17 @@ class DocumentChunkBuilderTests(unittest.TestCase):
             metadata.country,
             "Spain",
         )
+
         self.assertEqual(
             metadata.country_code,
             "ES",
         )
+
         self.assertEqual(
             metadata.reference_year,
             2026,
         )
+
         self.assertEqual(
             metadata.language,
             "en",
@@ -231,6 +242,117 @@ class DocumentChunkBuilderTests(unittest.TestCase):
                     "Spain employment law.docx"
                 ),
                 country_code="ES",
+            )
+
+    def test_uk_filename_uses_canonical_country_name(
+        self,
+    ) -> None:
+        metadata = metadata_from_filename(
+            file_path=Path(
+                "Labour and Employment Law "
+                "in UK 2026.docx"
+            ),
+            country_code="GB",
+        )
+
+        self.assertEqual(
+            metadata.country,
+            "United Kingdom",
+        )
+
+        self.assertEqual(
+            metadata.country_code,
+            "GB",
+        )
+
+        self.assertEqual(
+            metadata.reference_year,
+            2026,
+        )
+
+    def test_infers_country_code_from_filename(
+        self,
+    ) -> None:
+        metadata = metadata_from_filename(
+            file_path=Path(
+                "Labour_and_Employment_Law_"
+                "in_Sweden_2026.docx"
+            )
+        )
+
+        self.assertEqual(
+            metadata.country,
+            "Sweden",
+        )
+
+        self.assertEqual(
+            metadata.country_code,
+            "SE",
+        )
+
+        self.assertEqual(
+            metadata.reference_year,
+            2026,
+        )
+
+    def test_accepts_overview_filename_without_year(
+        self,
+    ) -> None:
+        metadata = metadata_from_filename(
+            file_path=Path(
+                "Employment Law Overview Australia.docx"
+            )
+        )
+
+        self.assertEqual(
+            metadata.country,
+            "Australia",
+        )
+
+        self.assertEqual(
+            metadata.country_code,
+            "AU",
+        )
+
+        self.assertIsNone(
+            metadata.reference_year
+        )
+
+    def test_accepts_copy_suffix(self) -> None:
+        metadata = metadata_from_filename(
+            file_path=Path(
+                "Labour and Employment Law "
+                "in Spain 2026(1).docx"
+            )
+        )
+
+        self.assertEqual(
+            metadata.country,
+            "Spain",
+        )
+
+        self.assertEqual(
+            metadata.country_code,
+            "ES",
+        )
+
+        self.assertEqual(
+            metadata.reference_year,
+            2026,
+        )
+
+    def test_rejects_country_code_mismatch(
+        self,
+    ) -> None:
+        with self.assertRaises(
+            CountryMetadataMismatchError
+        ):
+            metadata_from_filename(
+                file_path=Path(
+                    "Labour and Employment Law "
+                    "in Spain 2026.docx"
+                ),
+                country_code="GB",
             )
 
 
