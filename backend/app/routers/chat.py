@@ -14,6 +14,7 @@ from app.models.chat import (
     LegalChatResponse,
 )
 from app.services.rag_answer import (
+    InvalidLegalChatRequestError,
     RagAnswerError,
     answer_legal_question,
 )
@@ -39,6 +40,16 @@ def legal_chat(
         return answer_legal_question(
             request
         )
+
+    except InvalidLegalChatRequestError as error:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(
+                error
+            ),
+        ) from error
 
     except OpenAIConfigurationError as error:
         raise HTTPException(

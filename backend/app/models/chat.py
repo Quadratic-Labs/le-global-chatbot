@@ -16,17 +16,24 @@ class LegalChatRequest(BaseModel):
 
     country_codes: list[str] = Field(
         default_factory=list,
-        description="Optional ISO alpha-2 country filters.",
+        description=(
+            "Optional ISO alpha-2 country filters. "
+            "Several countries may be supplied for comparisons."
+        ),
     )
 
     legal_topics: list[str] = Field(
         default_factory=list,
-        description="Optional canonical legal topic filters.",
+        description=(
+            "Optional canonical legal topic filters."
+        ),
     )
 
     subsections: list[str] = Field(
         default_factory=list,
-        description="Optional canonical subsection filters.",
+        description=(
+            "Optional canonical subsection filters."
+        ),
     )
 
     language: str = Field(
@@ -45,7 +52,10 @@ class LegalChatRequest(BaseModel):
         default=6,
         ge=1,
         le=10,
-        description="Maximum retrieved chunks used as context.",
+        description=(
+            "Maximum number of retrieved chunks "
+            "used to generate the answer."
+        ),
     )
 
     class Config:
@@ -53,7 +63,7 @@ class LegalChatRequest(BaseModel):
 
 
 class LegalAnswerSource(BaseModel):
-    """Source supporting the generated legal answer."""
+    """Source actually cited by the generated answer."""
 
     citation: int
 
@@ -77,7 +87,7 @@ class LegalAnswerSource(BaseModel):
 
 
 class LegalChatResponse(BaseModel):
-    """Grounded legal answer and its supporting sources."""
+    """Grounded legal answer and its cited sources."""
 
     question: str
     answer: str
