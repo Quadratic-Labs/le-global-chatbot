@@ -10,6 +10,9 @@ from app.middleware.api_protection import (
 from app.routers.chat import (
     router as chat_router,
 )
+from app.routers.frontend_config import (
+    router as frontend_config_router,
+)
 from app.routers.health import (
     router as health_router,
 )
@@ -23,14 +26,14 @@ from app.routers.legal_search import (
 
 app = FastAPI(
     title="L&E Global Chatbot API",
-    version="0.4.0",
+    version="0.5.0",
     description=(
         "Backend API for the L&E Global legal chatbot."
     ),
 )
 
-# Add API protection first so CORS remains the outer middleware
-# and also decorates authentication and rate-limit errors.
+# API protection is added first so CORS remains the outer
+# middleware and decorates authentication/rate-limit errors.
 app.add_middleware(
     ApiProtectionMiddleware
 )
@@ -59,6 +62,10 @@ app.include_router(
 )
 
 app.include_router(
+    frontend_config_router
+)
+
+app.include_router(
     legal_search_router
 )
 
@@ -75,6 +82,6 @@ app.include_router(
 def root() -> dict[str, str]:
     return {
         "service": "le-global-backend",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "documentation": "/docs",
     }
