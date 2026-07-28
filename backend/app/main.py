@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 
+from app.routers.chat import (
+    router as chat_router,
+)
 from app.routers.health import (
     router as health_router,
 )
@@ -10,7 +13,7 @@ from app.routers.legal_search import (
 
 app = FastAPI(
     title="L&E Global Chatbot API",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Backend API for the L&E Global legal chatbot."
     ),
@@ -24,11 +27,15 @@ app.include_router(
     legal_search_router
 )
 
+app.include_router(
+    chat_router
+)
+
 
 @app.get("/")
 def root() -> dict[str, str]:
     return {
         "service": "le-global-backend",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "documentation": "/docs",
     }
