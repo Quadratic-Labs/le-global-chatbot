@@ -1,0 +1,1 @@
+"""Security dependencies for protected administration routes."""

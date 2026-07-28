@@ -7,6 +7,9 @@ from app.core.config import env_csv
 from app.middleware.api_protection import (
     ApiProtectionMiddleware,
 )
+from app.routers.admin_documents import (
+    router as admin_documents_router,
+)
 from app.routers.chat import (
     router as chat_router,
 )
@@ -26,14 +29,12 @@ from app.routers.legal_search import (
 
 app = FastAPI(
     title="L&E Global Chatbot API",
-    version="0.5.0",
+    version="0.6.0",
     description=(
         "Backend API for the L&E Global legal chatbot."
     ),
 )
 
-# API protection is added first so CORS remains the outer
-# middleware and decorates authentication/rate-limit errors.
 app.add_middleware(
     ApiProtectionMiddleware
 )
@@ -54,6 +55,7 @@ app.add_middleware(
     allow_headers=[
         "Content-Type",
         "X-API-Key",
+        "X-Admin-Key",
     ],
 )
 
@@ -77,11 +79,15 @@ app.include_router(
     chat_router
 )
 
+app.include_router(
+    admin_documents_router
+)
+
 
 @app.get("/")
 def root() -> dict[str, str]:
     return {
         "service": "le-global-backend",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "documentation": "/docs",
     }

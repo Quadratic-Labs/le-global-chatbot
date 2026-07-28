@@ -42,7 +42,7 @@ def env_float(
         return default
 
     try:
-        parsed_value = float(
+        return float(
             value
         )
 
@@ -51,8 +51,6 @@ def env_float(
             "Invalid floating-point environment "
             f"variable: {name}"
         ) from error
-
-    return parsed_value
 
 
 def env_int(
@@ -87,8 +85,6 @@ def env_int(
 def env_csv(
     name: str,
 ) -> tuple[str, ...]:
-    """Read a comma-separated environment variable."""
-
     raw_value = os.getenv(
         name,
         "",
@@ -119,6 +115,21 @@ def env_csv(
     )
 
 
+def optional_secret(
+    name: str,
+) -> str | None:
+    """Read an optional secret without retaining whitespace."""
+
+    value = os.getenv(
+        name
+    )
+
+    if value is None:
+        return None
+
+    return value.strip() or None
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str
@@ -132,12 +143,15 @@ class Settings:
 
     document_source_dir: Path
     document_processed_dir: Path
+    document_upload_max_bytes: int
 
     openai_api_key: str | None
     openai_model: str
     openai_timeout_seconds: float
 
     api_access_key: str | None
+    admin_api_key: str | None
+
     cors_allowed_origins: tuple[str, ...]
     rate_limit_requests: int
     rate_limit_window_seconds: int
@@ -145,16 +159,6 @@ class Settings:
 
 @lru_cache
 def get_settings() -> Settings:
-    api_access_key = os.getenv(
-        "API_ACCESS_KEY"
-    )
-
-    if api_access_key is not None:
-        api_access_key = (
-            api_access_key.strip()
-            or None
-        )
-
     return Settings(
         app_env=os.getenv(
             "APP_ENV",
@@ -187,7 +191,11 @@ def get_settings() -> Settings:
                 "DOCUMENT_PROCESSED_DIR"
             )
         ),
-        openai_api_key=os.getenv(
+        document_upload_max_bytes=env_int(
+            "DOCUMENT_UPLOAD_MAX_BYTES",
+            25 * 1024 * 1024,
+        ),
+        openai_api_key=optional_secret(
             "OPENAI_API_KEY"
         ),
         openai_model=os.getenv(
@@ -198,7 +206,12 @@ def get_settings() -> Settings:
             "OPENAI_TIMEOUT_SECONDS",
             60.0,
         ),
-        api_access_key=api_access_key,
+        api_access_key=optional_secret(
+            "API_ACCESS_KEY"
+        ),
+        admin_api_key=optional_secret(
+            "ADMIN_API_KEY"
+        ),
         cors_allowed_origins=env_csv(
             "CORS_ALLOWED_ORIGINS"
         ),
