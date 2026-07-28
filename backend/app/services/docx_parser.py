@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -15,6 +17,9 @@ from docx.text.paragraph import Paragraph
 from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
     is_overview_section,
+)
+from app.core.subsection_taxonomy import (
+    get_canonical_subsection,
 )
 
 
@@ -65,8 +70,10 @@ class ParsedSection:
     content: str
 
 
-def _normalize_text(value: str) -> str:
-    """Remove unnecessary whitespace while keeping readable text."""
+def _normalize_text(
+    value: str,
+) -> str:
+    """Normalize whitespace while keeping readable text."""
 
     return " ".join(
         value
@@ -75,31 +82,31 @@ def _normalize_text(value: str) -> str:
     )
 
 
-def _clean_structural_label(value: str) -> str:
+def _clean_structural_label(
+    value: str,
+) -> str:
     """Remove decorative separators surrounding a title."""
 
     normalized = _normalize_text(
         value
     )
 
-    without_leading_decoration = (
-        _LEADING_DECORATION_PATTERN.sub(
-            "",
-            normalized,
-        )
+    normalized = _LEADING_DECORATION_PATTERN.sub(
+        "",
+        normalized,
     )
 
-    without_trailing_decoration = (
-        _TRAILING_DECORATION_PATTERN.sub(
-            "",
-            without_leading_decoration,
-        )
+    normalized = _TRAILING_DECORATION_PATTERN.sub(
+        "",
+        normalized,
     )
 
-    return without_trailing_decoration.strip()
+    return normalized.strip()
 
 
-def _has_alnum(text: str) -> bool:
+def _has_alnum(
+    text: str,
+) -> bool:
     """Return whether text contains useful alphanumeric content."""
 
     return any(
@@ -111,7 +118,7 @@ def _has_alnum(text: str) -> bool:
 def _get_heading_level(
     paragraph: Paragraph,
 ) -> int | None:
-    """Return the Word heading level when available."""
+    """Return the effective Word heading level."""
 
     style_name = (
         paragraph.style.name
@@ -128,20 +135,15 @@ def _get_heading_level(
             style_match.group(1)
         )
 
-    paragraph_properties = (
-        paragraph._p.pPr
-    )
+    paragraph_properties = paragraph._p.pPr
 
     if (
         paragraph_properties is not None
-        and paragraph_properties.outlineLvl
-        is not None
+        and paragraph_properties.outlineLvl is not None
     ):
         return (
             int(
-                paragraph_properties
-                .outlineLvl
-                .val
+                paragraph_properties.outlineLvl.val
             )
             + 1
         )
@@ -152,23 +154,20 @@ def _get_heading_level(
 def _has_numbering(
     paragraph: Paragraph,
 ) -> bool:
-    """Return whether the paragraph belongs to a numbered list."""
+    """Return whether the paragraph belongs to a Word list."""
 
-    paragraph_properties = (
-        paragraph._p.pPr
-    )
+    paragraph_properties = paragraph._p.pPr
 
     return (
         paragraph_properties is not None
-        and paragraph_properties.numPr
-        is not None
+        and paragraph_properties.numPr is not None
     )
 
 
 def _has_topic_number_prefix(
     text: str,
 ) -> bool:
-    """Return whether text begins with an explicit topic number."""
+    """Return whether text begins with a legal-topic number."""
 
     return (
         _TOPIC_NUMBER_PREFIX_PATTERN.match(
@@ -181,7 +180,7 @@ def _has_topic_number_prefix(
 def _has_explicit_bold_text(
     paragraph: Paragraph,
 ) -> bool:
-    """Return whether at least one visible text run is explicitly bold."""
+    """Return whether visible text is explicitly formatted in bold."""
 
     return any(
         run.bold is True
@@ -197,8 +196,7 @@ def _is_false_xml_boolean(
 
     return (
         value is not None
-        and value.lower()
-        in _FALSE_XML_VALUES
+        and value.lower() in _FALSE_XML_VALUES
     )
 
 
@@ -206,28 +204,22 @@ def _is_explicitly_unbolded(
     paragraph: Paragraph,
 ) -> bool:
     """
-    Detect a Heading style explicitly overridden as non-bold.
+    Detect a paragraph whose bold formatting was explicitly disabled.
 
-    Some L&E documents contain body paragraphs using Heading 2 while
-    explicitly setting bold=false. They must remain legal content.
+    Some source documents use heading styles for ordinary body text
+    and override their inherited bold formatting.
     """
 
-    paragraph_properties = (
-        paragraph._p.pPr
-    )
+    paragraph_properties = paragraph._p.pPr
 
     if paragraph_properties is not None:
-        run_properties = (
-            paragraph_properties.find(
-                qn("w:rPr")
-            )
+        run_properties = paragraph_properties.find(
+            qn("w:rPr")
         )
 
         if run_properties is not None:
-            bold_property = (
-                run_properties.find(
-                    qn("w:b")
-                )
+            bold_property = run_properties.find(
+                qn("w:b")
             )
 
             if (
@@ -260,12 +252,7 @@ def _has_main_section_signal(
     text: str,
     heading_level: int | None,
 ) -> bool:
-    """
-    Return whether a recognized topic has a structural signal.
-
-    Exact taxonomy matching alone is insufficient because ordinary
-    content may occasionally equal or contain a topic label.
-    """
+    """Return whether a legal-topic paragraph is structurally a title."""
 
     return any(
         (
@@ -283,29 +270,30 @@ def _has_main_section_signal(
     )
 
 
-def _is_main_legal_section(
+def _get_main_legal_topic(
     paragraph: Paragraph,
     text: str,
     heading_level: int | None,
     country: str | None,
-) -> bool:
-    """Return whether a paragraph starts one of the 11 legal topics."""
+) -> str | None:
+    """Return the canonical topic when a main section is detected."""
 
-    legal_topic = (
-        get_canonical_legal_topic(
-            section=text,
-            country=country,
-        )
+    legal_topic = get_canonical_legal_topic(
+        section=text,
+        country=country,
     )
 
     if legal_topic is None:
-        return False
+        return None
 
-    return _has_main_section_signal(
+    if not _has_main_section_signal(
         paragraph=paragraph,
         text=text,
         heading_level=heading_level,
-    )
+    ):
+        return None
+
+    return legal_topic
 
 
 def _is_overview_heading(
@@ -314,7 +302,7 @@ def _is_overview_heading(
     heading_level: int | None,
     country: str | None,
 ) -> bool:
-    """Return whether a paragraph starts the country overview."""
+    """Return whether the paragraph starts the document overview."""
 
     if not is_overview_section(
         section=text,
@@ -338,13 +326,9 @@ def _is_generic_main_heading(
     country: str | None,
 ) -> bool:
     """
-    Accept a normal Heading 1 when no country metadata is supplied.
+    Accept Heading 1 in generic mode.
 
-    This compatibility mode supports generic DOCX parsing and the
-    original unit tests.
-
-    When a country is supplied, the parser remains strict: only a
-    recognized L&E topic or overview may start a main section.
+    Strict L&E parsing is activated whenever country is supplied.
     """
 
     if country is not None:
@@ -361,32 +345,66 @@ def _is_generic_main_heading(
     return True
 
 
-def _is_reliable_subheading(
+def _get_subsection_label(
     paragraph: Paragraph,
+    text: str,
     heading_level: int | None,
-) -> bool:
+    parent_topic: str | None,
+    country: str | None,
+) -> str | None:
     """
-    Return whether a paragraph is a reliable subsection heading.
+    Return a subsection label when the evidence is reliable.
 
-    Only Heading 2 is used for subsection boundaries. Heading 3 and
-    Heading 4 are deliberately retained as content because several
-    source documents use those styles for lists and body paragraphs.
+    Generic mode accepts normal Heading 2 paragraphs.
+
+    Strict L&E mode requires:
+
+    - a match in the controlled subsection taxonomy; and
+    - Heading 2, Heading 4, or explicit bold formatting.
+
+    Unknown bold paragraphs remain part of the legal content.
     """
-
-    if heading_level != 2:
-        return False
-
-    if _has_numbering(
-        paragraph
-    ):
-        return False
 
     if _is_explicitly_unbolded(
         paragraph
     ):
-        return False
+        return None
 
-    return True
+    if country is None:
+        if heading_level != 2:
+            return None
+
+        if _has_numbering(
+            paragraph
+        ):
+            return None
+
+        return _clean_structural_label(
+            text
+        )
+
+    canonical_subsection = get_canonical_subsection(
+        parent_topic=parent_topic,
+        subsection=text,
+    )
+
+    if canonical_subsection is None:
+        return None
+
+    has_structural_signal = any(
+        (
+            heading_level == 2,
+            heading_level == 4,
+            _has_explicit_bold_text(
+                paragraph
+            ),
+        )
+    )
+
+    if not has_structural_signal:
+        return None
+
+    return canonical_subsection
 
 
 def _is_ignored_text(
@@ -394,26 +412,15 @@ def _is_ignored_text(
 ) -> bool:
     """Return whether text is only a decorative separator."""
 
-    return (
-        text
-        in _IGNORED_PARAGRAPH_TEXTS
-    )
+    return text in _IGNORED_PARAGRAPH_TEXTS
 
 
 def _iter_block_items(
     document: DocxDocument,
 ) -> Iterator[BlockItem]:
-    """
-    Yield paragraphs and tables in their real document order.
+    """Yield paragraphs and tables in their real document order."""
 
-    Using document.paragraphs alone would silently ignore content
-    stored inside Word tables.
-    """
-
-    for child in (
-        document.element.body
-        .iterchildren()
-    ):
+    for child in document.element.body.iterchildren():
         if isinstance(
             child,
             CT_P,
@@ -436,12 +443,7 @@ def _iter_block_items(
 def _serialize_table(
     table: Table,
 ) -> str:
-    """
-    Convert a Word table into readable plain text.
-
-    Each row becomes one line and cells are separated with a vertical
-    bar. Decorative empty tables are ignored.
-    """
+    """Convert a meaningful Word table to readable plain text."""
 
     serialized_rows: list[str] = []
 
@@ -481,34 +483,29 @@ def parse_docx_sections(
     country: str | None = None,
 ) -> list[ParsedSection]:
     """
-    Parse an L&E DOCX and group content into legal sections.
+    Parse a DOCX file into structured sections.
 
-    When country is supplied, main sections are recognized through the
-    approved L&E taxonomy combined with Word structural signals.
+    Strict L&E mode is used when country is provided:
 
-    When country is omitted, a reliable Heading 1 is accepted as a
-    generic main section.
+    - main sections must match the legal taxonomy;
+    - subsections must match the controlled subsection taxonomy;
+    - Heading 2, Heading 4, and bold legacy labels are supported;
+    - unknown formatted paragraphs remain content.
 
-    Heading 2 paragraphs become subsections only when they are not
-    numbered and are not explicitly overridden as non-bold.
+    Generic mode is used without country:
 
-    Unrecognized Heading 1 paragraphs remain content in strict L&E
-    mode, preventing silent loss in malformed source documents.
+    - Heading 1 creates a section;
+    - Heading 2 creates a subsection.
     """
 
-    file_path = (
-        file_path.resolve()
-    )
+    file_path = file_path.resolve()
 
     if not file_path.is_file():
         raise FileNotFoundError(
             f"DOCX file not found: {file_path}"
         )
 
-    if (
-        file_path.suffix.lower()
-        != ".docx"
-    ):
+    if file_path.suffix.lower() != ".docx":
         raise ValueError(
             "Unsupported document format: "
             f"{file_path.suffix}"
@@ -518,9 +515,7 @@ def parse_docx_sections(
         file_path
     )
 
-    parsed_sections: list[
-        ParsedSection
-    ] = []
+    parsed_sections: list[ParsedSection] = []
 
     current_section = (
         f"Employment Law Overview {country}"
@@ -528,6 +523,7 @@ def parse_docx_sections(
         else "General"
     )
 
+    current_legal_topic: str | None = None
     current_subsection: str | None = None
 
     content_buffer: list[str] = []
@@ -537,11 +533,8 @@ def parse_docx_sections(
             content_buffer
         ).strip()
 
-        if (
+        if content and _has_alnum(
             content
-            and _has_alnum(
-                content
-            )
         ):
             parsed_sections.append(
                 ParsedSection(
@@ -572,26 +565,25 @@ def parse_docx_sections(
             ):
                 continue
 
-            heading_level = (
-                _get_heading_level(
-                    block_item
-                )
+            heading_level = _get_heading_level(
+                block_item
             )
 
-            if _is_main_legal_section(
+            legal_topic = _get_main_legal_topic(
                 paragraph=block_item,
                 text=text,
                 heading_level=heading_level,
                 country=country,
-            ):
+            )
+
+            if legal_topic is not None:
                 flush_content()
 
-                current_section = (
-                    _clean_structural_label(
-                        text
-                    )
+                current_section = _clean_structural_label(
+                    text
                 )
 
+                current_legal_topic = legal_topic
                 current_subsection = None
                 continue
 
@@ -603,12 +595,11 @@ def parse_docx_sections(
             ):
                 flush_content()
 
-                current_section = (
-                    _clean_structural_label(
-                        text
-                    )
+                current_section = _clean_structural_label(
+                    text
                 )
 
+                current_legal_topic = None
                 current_subsection = None
                 continue
 
@@ -619,27 +610,26 @@ def parse_docx_sections(
             ):
                 flush_content()
 
-                current_section = (
-                    _clean_structural_label(
-                        text
-                    )
+                current_section = _clean_structural_label(
+                    text
                 )
 
+                current_legal_topic = None
                 current_subsection = None
                 continue
 
-            if _is_reliable_subheading(
+            subsection_label = _get_subsection_label(
                 paragraph=block_item,
+                text=text,
                 heading_level=heading_level,
-            ):
+                parent_topic=current_legal_topic,
+                country=country,
+            )
+
+            if subsection_label is not None:
                 flush_content()
 
-                current_subsection = (
-                    _clean_structural_label(
-                        text
-                    )
-                )
-
+                current_subsection = subsection_label
                 continue
 
             content_buffer.append(
@@ -648,10 +638,8 @@ def parse_docx_sections(
 
             continue
 
-        table_content = (
-            _serialize_table(
-                block_item
-            )
+        table_content = _serialize_table(
+            block_item
         )
 
         if table_content:
