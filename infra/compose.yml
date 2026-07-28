@@ -140,6 +140,10 @@ services:
       DOCUMENT_SOURCE_DIR: /data/documents/source
       DOCUMENT_PROCESSED_DIR: /data/documents/processed
 
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENAI_TIMEOUT_SECONDS: "${OPENAI_TIMEOUT_SECONDS:-60}"
+
     volumes:
       - /var/lib/le-global-chatbot/documents/source:/data/documents/source:ro
       - /var/lib/le-global-chatbot/documents/processed:/data/documents/processed
