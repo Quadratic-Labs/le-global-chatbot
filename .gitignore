@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+backend/.venv/
 
 # JavaScript
 node_modules/
@@ -19,22 +20,19 @@ build/
 logs/
 *.log
 
-# Uploaded and processed documents
-documents/source/*
-documents/processed/*
+# Uploaded and generated legal documents
+documents/source/**
+documents/processed/**
 
-# Keep directories in Git
+# Keep empty document directories in Git
 !documents/source/.gitkeep
 !documents/processed/.gitkeep
+
+# Temporary backup files
+*.bak
 
 # IDE and operating system
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Legal source documents
-documents/*
-!documents/.gitkeep
-*.bak
-*.bak
