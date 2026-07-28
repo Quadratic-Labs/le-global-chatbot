@@ -48,10 +48,75 @@ def env_float(
 
     except ValueError as error:
         raise RuntimeError(
-            f"Invalid floating-point environment variable: {name}"
+            "Invalid floating-point environment "
+            f"variable: {name}"
         ) from error
 
     return parsed_value
+
+
+def env_int(
+    name: str,
+    default: int,
+    minimum: int = 1,
+) -> int:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    try:
+        parsed_value = int(
+            value
+        )
+
+    except ValueError as error:
+        raise RuntimeError(
+            f"Invalid integer environment variable: {name}"
+        ) from error
+
+    if parsed_value < minimum:
+        raise RuntimeError(
+            f"{name} must be greater than or equal "
+            f"to {minimum}."
+        )
+
+    return parsed_value
+
+
+def env_csv(
+    name: str,
+) -> tuple[str, ...]:
+    """Read a comma-separated environment variable."""
+
+    raw_value = os.getenv(
+        name,
+        "",
+    )
+
+    values: list[str] = []
+    seen_values: set[str] = set()
+
+    for value in raw_value.split(","):
+        normalized_value = value.strip()
+
+        if not normalized_value:
+            continue
+
+        if normalized_value in seen_values:
+            continue
+
+        seen_values.add(
+            normalized_value
+        )
+
+        values.append(
+            normalized_value
+        )
+
+    return tuple(
+        values
+    )
 
 
 @dataclass(frozen=True)
@@ -72,9 +137,24 @@ class Settings:
     openai_model: str
     openai_timeout_seconds: float
 
+    api_access_key: str | None
+    cors_allowed_origins: tuple[str, ...]
+    rate_limit_requests: int
+    rate_limit_window_seconds: int
+
 
 @lru_cache
 def get_settings() -> Settings:
+    api_access_key = os.getenv(
+        "API_ACCESS_KEY"
+    )
+
+    if api_access_key is not None:
+        api_access_key = (
+            api_access_key.strip()
+            or None
+        )
+
     return Settings(
         app_env=os.getenv(
             "APP_ENV",
@@ -112,10 +192,22 @@ def get_settings() -> Settings:
         ),
         openai_model=os.getenv(
             "OPENAI_MODEL",
-            "gpt-5",
+            "gpt-5-mini",
         ),
         openai_timeout_seconds=env_float(
             "OPENAI_TIMEOUT_SECONDS",
             60.0,
+        ),
+        api_access_key=api_access_key,
+        cors_allowed_origins=env_csv(
+            "CORS_ALLOWED_ORIGINS"
+        ),
+        rate_limit_requests=env_int(
+            "RATE_LIMIT_REQUESTS",
+            60,
+        ),
+        rate_limit_window_seconds=env_int(
+            "RATE_LIMIT_WINDOW_SECONDS",
+            60,
         ),
     )
