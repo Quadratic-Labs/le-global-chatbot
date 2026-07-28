@@ -1,205 +1,106 @@
 from __future__ import annotations
 
-import re
 import sys
+from collections import Counter
 from pathlib import Path
-from typing import Final
 
 from app.core.legal_taxonomy import (
     LEGAL_TOPICS,
-    get_canonical_legal_topic,
-    is_overview_section,
 )
-from app.services.docx_parser import (
-    ParsedSection,
-    parse_docx_sections,
+from app.services.document_chunk_builder import (
+    build_document_chunks_from_docx,
+    metadata_from_filename,
 )
-
-
-_FILENAME_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(
-        r"^Labour and Employment Law in\s+"
-        r"(?P<country>.+?)"
-        r"(?:\s+(?P<year>(?:19|20)\d{2}))?$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"^Employment Law Overview(?:\s*-\s*)?\s+"
-        r"(?P<country>.+?)"
-        r"(?:\s+(?P<year>(?:19|20)\d{2}))?$",
-        re.IGNORECASE,
-    ),
-)
-
-_COPY_SUFFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\s*\(\d+\)$"
-)
-
-_COUNTRY_ALIASES: Final[dict[str, str]] = {
-    "uk": "United Kingdom",
-    "united kingdom": "United Kingdom",
-}
-
-
-def _normalize_text(value: str) -> str:
-    """Normalize whitespace in metadata values."""
-
-    return " ".join(
-        value
-        .replace("\xa0", " ")
-        .split()
-    )
-
-
-def _country_from_filename(
-    file_path: Path,
-) -> str:
-    """Extract and normalize the country from an L&E filename."""
-
-    original_stem = file_path.stem.strip()
-
-    cleaned_stem = _COPY_SUFFIX_PATTERN.sub(
-        "",
-        original_stem,
-    ).strip()
-
-    for pattern in _FILENAME_PATTERNS:
-        match = pattern.fullmatch(
-            cleaned_stem
-        )
-
-        if match is None:
-            continue
-
-        raw_country = _normalize_text(
-            match.group("country")
-        ).strip(" -_")
-
-        return _COUNTRY_ALIASES.get(
-            raw_country.casefold(),
-            raw_country,
-        )
-
-    raise ValueError(
-        "Unable to detect country from filename: "
-        f"{file_path.name}"
-    )
-
-
-def _topics_from_sections(
-    sections: list[ParsedSection],
-    country: str,
-) -> set[str]:
-    """Return all canonical legal topics reached by the parser."""
-
-    topics: set[str] = set()
-
-    for section in sections:
-        legal_topic = get_canonical_legal_topic(
-            section=section.section,
-            country=country,
-        )
-
-        if legal_topic is not None:
-            topics.add(
-                legal_topic
-            )
-
-    return topics
-
-
-def _unknown_sections(
-    sections: list[ParsedSection],
-    country: str,
-) -> list[str]:
-    """Return main sections outside the taxonomy and overview."""
-
-    unknown: set[str] = set()
-
-    for section in sections:
-        if get_canonical_legal_topic(
-            section=section.section,
-            country=country,
-        ) is not None:
-            continue
-
-        if is_overview_section(
-            section=section.section,
-            country=country,
-        ):
-            continue
-
-        unknown.add(
-            section.section
-        )
-
-    return sorted(
-        unknown
-    )
 
 
 def _validate_file(
     file_path: Path,
 ) -> dict[str, object]:
-    """Run the strict L&E parser against one real DOCX."""
+    """
+    Run the real production ingestion path on one DOCX.
 
-    country = _country_from_filename(
-        file_path
+    The validation uses the same filename parser, country registry,
+    DOCX parser, taxonomy, and chunk builder as production ingestion.
+    """
+
+    metadata = metadata_from_filename(
+        file_path=file_path
     )
 
-    sections = parse_docx_sections(
+    chunks = build_document_chunks_from_docx(
         file_path=file_path,
-        country=country,
+        country_code=metadata.country_code,
+        language=metadata.language,
     )
 
-    topics = _topics_from_sections(
-        sections=sections,
-        country=country,
-    )
+    legal_topics = {
+        chunk.legal_topic
+        for chunk in chunks
+        if chunk.legal_topic is not None
+    }
 
     missing_topics = [
         topic
         for topic in LEGAL_TOPICS
-        if topic not in topics
+        if topic not in legal_topics
     ]
 
-    unknown_sections = _unknown_sections(
-        sections=sections,
-        country=country,
+    document_ids = {
+        chunk.document_id
+        for chunk in chunks
+    }
+
+    chunk_ids = [
+        chunk.chunk_id
+        for chunk in chunks
+    ]
+
+    duplicate_chunk_ids = sorted(
+        chunk_id
+        for chunk_id, count in Counter(
+            chunk_ids
+        ).items()
+        if count > 1
     )
 
-    section_paths = [
-        (
-            section.section,
-            section.subsection,
-        )
-        for section in sections
-    ]
-
-    duplicate_paths = sorted(
-        {
-            path
-            for path in section_paths
-            if section_paths.count(path) > 1
-        }
+    document_type_counts = Counter(
+        chunk.document_type
+        for chunk in chunks
     )
 
     max_content_length = max(
         (
-            len(section.content)
-            for section in sections
+            len(chunk.content)
+            for chunk in chunks
         ),
         default=0,
     )
 
     return {
         "filename": file_path.name,
-        "country": country,
-        "chunks": len(sections),
-        "topics_found": len(topics),
+        "country": metadata.country,
+        "country_code": metadata.country_code,
+        "reference_year": metadata.reference_year,
+        "chunks": len(chunks),
+        "overview_chunks": document_type_counts.get(
+            "overview",
+            0,
+        ),
+        "comparator_chunks": document_type_counts.get(
+            "comparator",
+            0,
+        ),
+        "topics_found": len(
+            legal_topics
+        ),
         "missing_topics": missing_topics,
-        "unknown_sections": unknown_sections,
-        "duplicate_paths": duplicate_paths,
+        "unique_document_ids": len(
+            document_ids
+        ),
+        "unique_chunk_ids": len(
+            set(chunk_ids)
+        ),
+        "duplicate_chunk_ids": duplicate_chunk_ids,
         "max_content_length": max_content_length,
     }
 
@@ -234,13 +135,13 @@ def main() -> None:
             f"{source_directory}"
         )
 
-    results: list[dict[str, object]] = []
-
-    failed_files = 0
+    successful_files = 0
+    attention_files = 0
 
     print(
-        "L&E strict parser validation"
+        "L&E production ingestion validation"
     )
+
     print(
         "=" * 80
     )
@@ -252,37 +153,38 @@ def main() -> None:
             )
 
         except Exception as error:
-            failed_files += 1
+            attention_files += 1
 
             print()
             print(
                 f"[ERROR] {file_path.name}"
             )
+
             print(
                 f"  {type(error).__name__}: {error}"
             )
+
             continue
 
-        results.append(
-            result
-        )
-
-        missing_topics = result[
-            "missing_topics"
-        ]
-
-        unknown_sections = result[
-            "unknown_sections"
-        ]
-
-        duplicate_paths = result[
-            "duplicate_paths"
-        ]
+        successful_files += 1
 
         is_valid = (
-            result["topics_found"] == 11
-            and not missing_topics
-            and not unknown_sections
+            result["topics_found"]
+            == len(LEGAL_TOPICS)
+            and not result[
+                "missing_topics"
+            ]
+            and result[
+                "unique_document_ids"
+            ] == 1
+            and result[
+                "unique_chunk_ids"
+            ] == result[
+                "chunks"
+            ]
+            and not result[
+                "duplicate_chunk_ids"
+            ]
         )
 
         status = (
@@ -292,26 +194,58 @@ def main() -> None:
         )
 
         if not is_valid:
-            failed_files += 1
+            attention_files += 1
 
         print()
         print(
             f"[{status}] {result['filename']}"
         )
+
         print(
-            f"  Country: {result['country']}"
+            "  Country: "
+            f"{result['country']} "
+            f"({result['country_code']})"
         )
+
         print(
-            f"  Parsed chunks: {result['chunks']}"
+            "  Reference year: "
+            f"{result['reference_year'] or '<missing>'}"
         )
+
+        print(
+            f"  Total chunks: {result['chunks']}"
+        )
+
+        print(
+            "  Overview / comparator: "
+            f"{result['overview_chunks']} / "
+            f"{result['comparator_chunks']}"
+        )
+
         print(
             "  Legal topic coverage: "
-            f"{result['topics_found']}/11"
+            f"{result['topics_found']}/"
+            f"{len(LEGAL_TOPICS)}"
         )
+
+        print(
+            "  Unique document IDs: "
+            f"{result['unique_document_ids']}"
+        )
+
+        print(
+            "  Unique chunk IDs: "
+            f"{result['unique_chunk_ids']}"
+        )
+
         print(
             "  Max content length: "
             f"{result['max_content_length']}"
         )
+
+        missing_topics = result[
+            "missing_topics"
+        ]
 
         if missing_topics:
             print(
@@ -321,35 +255,38 @@ def main() -> None:
                 )
             )
 
-        if unknown_sections:
-            print(
-                "  Unknown sections: "
-                + ", ".join(
-                    unknown_sections
-                )
-            )
+        duplicate_chunk_ids = result[
+            "duplicate_chunk_ids"
+        ]
 
-        if duplicate_paths:
+        if duplicate_chunk_ids:
             print(
-                "  Repeated section paths: "
-                f"{len(duplicate_paths)}"
+                "  Duplicate chunk IDs: "
+                + ", ".join(
+                    duplicate_chunk_ids
+                )
             )
 
     print()
     print(
         "=" * 80
     )
+
     print(
         f"Files analysed: {len(files)}"
     )
+
     print(
-        f"Files successfully parsed: {len(results)}"
-    )
-    print(
-        f"Files requiring attention: {failed_files}"
+        "Files successfully processed: "
+        f"{successful_files}"
     )
 
-    if failed_files:
+    print(
+        "Files requiring attention: "
+        f"{attention_files}"
+    )
+
+    if attention_files:
         raise SystemExit(
             1
         )
