@@ -156,6 +156,9 @@ class Settings:
     rate_limit_requests: int
     rate_limit_window_seconds: int
 
+    rerank_enabled: bool
+    rerank_pool_multiplier: int
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -222,5 +225,13 @@ def get_settings() -> Settings:
         rate_limit_window_seconds=env_int(
             "RATE_LIMIT_WINDOW_SECONDS",
             60,
+        ),
+        rerank_enabled=env_bool(
+            "RERANK_ENABLED",
+            False,
+        ),
+        rerank_pool_multiplier=env_int(
+            "RERANK_POOL_MULTIPLIER",
+            3,
         ),
     )

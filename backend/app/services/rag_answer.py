@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from collections.abc import Callable, Sequence
 from typing import Final, Protocol
 
 from app.clients.openai_responses import (
     GeneratedText,
+    OpenAIConfigurationError,
     OpenAIResponseError,
     get_openai_responses_client,
 )
@@ -27,13 +30,26 @@ from app.services.legal_search import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 MAX_CONTEXT_CHARACTERS: Final[int] = 60000
+
+MAX_RERANK_POOL_SIZE: Final[int] = 20
+RERANK_SNIPPET_CHARACTERS: Final[int] = 1500
 
 CITATION_PATTERN: Final[re.Pattern[str]] = (
     re.compile(
         r"\[((?:\d+\s*,\s*)*\d+)\]"
     )
 )
+
+RERANK_INSTRUCTIONS: Final[str] = """
+Return ONLY a JSON array of the candidate numbers, ordered from most
+to least relevant to the question, e.g. [3, 1, 2]. Include every
+candidate number exactly once. No other text, no markdown, no
+explanation.
+""".strip()
 
 NO_INFORMATION_ANSWER: Final[str] = (
     "The available validated L&E Global documents do not "
@@ -200,9 +216,136 @@ def _interleave_hits(
     return combined_hits
 
 
+def _candidate_search_limit(
+    fair_share_limit: int,
+    rerank_enabled: bool,
+    rerank_pool_multiplier: int,
+) -> int:
+    """Return how many candidates to fetch before reranking."""
+
+    if not rerank_enabled:
+        return fair_share_limit
+
+    return min(
+        fair_share_limit * max(1, rerank_pool_multiplier),
+        MAX_RERANK_POOL_SIZE,
+    )
+
+
+def _build_rerank_input(
+    question: str,
+    hits: list[LegalSearchHit],
+) -> str:
+    """Build a compact prompt: question plus truncated candidate snippets."""
+
+    blocks = [
+        (
+            f"[{position}] Country: {hit.country} | "
+            f"Topic: {hit.legal_topic or 'n/a'}\n"
+            f"{hit.content[:RERANK_SNIPPET_CHARACTERS]}"
+        )
+        for position, hit in enumerate(hits, start=1)
+    ]
+
+    return (
+        "QUESTION:\n"
+        + question.strip()
+        + "\n\nCANDIDATES:\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _parse_rerank_order(
+    text: str,
+    candidate_count: int,
+) -> list[int] | None:
+    """Parse a strict JSON array permutation of 1..candidate_count."""
+
+    cleaned = text.strip().strip("`")
+
+    if cleaned.lower().startswith("json"):
+        cleaned = cleaned[4:].strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(parsed, list) or not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in parsed
+    ):
+        return None
+
+    if (
+        len(parsed) != candidate_count
+        or set(parsed) != set(range(1, candidate_count + 1))
+    ):
+        return None
+
+    return parsed
+
+
+def _rerank_hits(
+    question: str,
+    hits: list[LegalSearchHit],
+    generation_client: TextGenerationClient | None,
+) -> list[LegalSearchHit]:
+    """
+    Reorder hits by LLM-judged relevance.
+
+    Never raises: any failure is logged and falls back to the
+    original BM25 order, since reranking is a quality enhancement,
+    not a correctness guarantee.
+    """
+
+    if len(hits) <= 1:
+        return hits
+
+    try:
+        client = (
+            generation_client
+            if generation_client is not None
+            else get_openai_responses_client()
+        )
+
+        generated = client.generate(
+            instructions=RERANK_INSTRUCTIONS,
+            input_text=_build_rerank_input(
+                question=question,
+                hits=hits,
+            ),
+        )
+
+    except (OpenAIConfigurationError, OpenAIResponseError) as error:
+        logger.warning(
+            "Legal search reranking call failed, "
+            "falling back to BM25 order: %s",
+            error,
+        )
+        return hits
+
+    order = _parse_rerank_order(
+        text=generated.text,
+        candidate_count=len(hits),
+    )
+
+    if order is None:
+        logger.warning(
+            "Legal search reranking returned an unparsable "
+            "response, falling back to BM25 order."
+        )
+        return hits
+
+    return [hits[position - 1] for position in order]
+
+
 def _retrieve_search_hits(
     request: LegalChatRequest,
     search_function: SearchFunction,
+    generation_client: TextGenerationClient | None = None,
+    rerank_enabled: bool = False,
+    rerank_pool_multiplier: int = 1,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve legal chunks.
@@ -222,13 +365,26 @@ def _retrieve_search_hits(
             _build_search_request(
                 request=request,
                 country_codes=country_codes,
-                limit=request.max_sources,
+                limit=_candidate_search_limit(
+                    fair_share_limit=request.max_sources,
+                    rerank_enabled=rerank_enabled,
+                    rerank_pool_multiplier=rerank_pool_multiplier,
+                ),
             )
         )
 
+        hits = response.hits
+
+        if rerank_enabled:
+            hits = _rerank_hits(
+                question=request.question,
+                hits=hits,
+                generation_client=generation_client,
+            )[: request.max_sources]
+
         return (
             response.total,
-            response.hits,
+            hits,
         )
 
     if request.max_sources < len(
@@ -269,7 +425,11 @@ def _retrieve_search_hits(
                 country_codes=[
                     country_code
                 ],
-                limit=country_limit,
+                limit=_candidate_search_limit(
+                    fair_share_limit=country_limit,
+                    rerank_enabled=rerank_enabled,
+                    rerank_pool_multiplier=rerank_pool_multiplier,
+                ),
             )
         )
 
@@ -277,8 +437,17 @@ def _retrieve_search_hits(
             response.total
         )
 
+        country_hits = response.hits
+
+        if rerank_enabled:
+            country_hits = _rerank_hits(
+                question=request.question,
+                hits=country_hits,
+                generation_client=generation_client,
+            )
+
         country_hit_groups.append(
-            response.hits
+            country_hits
         )
 
     return (
@@ -498,6 +667,8 @@ def answer_legal_question(
     generation_client: (
         TextGenerationClient | None
     ) = None,
+    rerank_enabled: bool = False,
+    rerank_pool_multiplier: int = 1,
 ) -> LegalChatResponse:
     """Retrieve legal chunks and generate one grounded answer."""
 
@@ -508,6 +679,9 @@ def answer_legal_question(
         ) = _retrieve_search_hits(
             request=request,
             search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
         )
 
     except LegalSearchError as error:

@@ -7,6 +7,9 @@ from app.core.config import env_csv
 from app.middleware.api_protection import (
     ApiProtectionMiddleware,
 )
+from app.routers.admin_document_lifecycle import (
+    router as admin_document_lifecycle_router,
+)
 from app.routers.admin_documents import (
     router as admin_documents_router,
 )
@@ -29,7 +32,7 @@ from app.routers.legal_search import (
 
 app = FastAPI(
     title="L&E Global Chatbot API",
-    version="0.6.0",
+    version="0.7.0",
     description=(
         "Backend API for the L&E Global legal chatbot."
     ),
@@ -50,6 +53,7 @@ app.add_middleware(
     allow_methods=[
         "GET",
         "POST",
+        "DELETE",
         "OPTIONS",
     ],
     allow_headers=[
@@ -83,11 +87,15 @@ app.include_router(
     admin_documents_router
 )
 
+app.include_router(
+    admin_document_lifecycle_router
+)
+
 
 @app.get("/")
 def root() -> dict[str, str]:
     return {
         "service": "le-global-backend",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "documentation": "/docs",
     }
