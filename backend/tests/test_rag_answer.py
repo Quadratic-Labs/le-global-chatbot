@@ -7,6 +7,7 @@ from typing import Any
 
 from app.clients.openai_responses import (
     GeneratedText,
+    OpenAIResponseError,
     _extract_output_text,
 )
 from app.models.chat import (
@@ -17,9 +18,16 @@ from app.models.search import (
     LegalSearchResponse,
 )
 from app.services.rag_answer import (
+    RERANK_INSTRUCTIONS,
+    RERANK_SNIPPET_CHARACTERS,
+    TRUNCATION_SUFFIX,
     InvalidLegalChatRequestError,
     NO_INFORMATION_ANSWER,
     RagAnswerError,
+    _build_rerank_input,
+    _parse_rerank_order,
+    _select_context_hits,
+    _truncate_context,
     answer_legal_question,
 )
 
@@ -70,11 +78,18 @@ class FakeGenerationClient:
             "The minimum notice is one week "
             "in the stated circumstances [1]."
         ),
+        rerank_order: str | None = None,
+        raise_on_rerank: bool = False,
+        raise_on_generate: bool = False,
     ) -> None:
         self.answer = answer
+        self.rerank_order = rerank_order
+        self.raise_on_rerank = raise_on_rerank
+        self.raise_on_generate = raise_on_generate
         self.instructions: str | None = None
         self.input_text: str | None = None
         self.called = False
+        self.calls: list[tuple[str, str]] = []
 
     def generate(
         self,
@@ -84,6 +99,19 @@ class FakeGenerationClient:
         self.called = True
         self.instructions = instructions
         self.input_text = input_text
+        self.calls.append((instructions, input_text))
+
+        if instructions == RERANK_INSTRUCTIONS:
+            if self.raise_on_rerank:
+                raise OpenAIResponseError("boom")
+
+            return GeneratedText(
+                text=self.rerank_order or "[]",
+                model=self.model,
+            )
+
+        if self.raise_on_generate:
+            raise OpenAIResponseError("boom")
 
         return GeneratedText(
             text=self.answer,
@@ -519,6 +547,570 @@ class RagAnswerTests(unittest.TestCase):
 
         self.assertFalse(
             search_called
+        )
+
+    def test_rerank_disabled_keeps_existing_behavior(
+        self,
+    ) -> None:
+        client = FakeGenerationClient()
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        answer_legal_question(
+            request=LegalChatRequest(
+                question="What is the notice period in the UK?",
+                country_codes=["GB"],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertEqual(
+            len(client.calls),
+            1,
+        )
+
+    def test_rerank_reorders_candidates_before_generation(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Supported by the top extract [1].",
+            rerank_order="[3, 1, 2]",
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            hits = [
+                _build_hit(
+                    chunk_id="chunk-1",
+                    content="Content A.",
+                ),
+                _build_hit(
+                    chunk_id="chunk-2",
+                    content="Content B.",
+                ),
+                _build_hit(
+                    chunk_id="chunk-3",
+                    content="Content C.",
+                ),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=3,
+                limit=request.limit,
+                offset=0,
+                took_ms=2,
+                hits=hits,
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question="Notice period",
+                country_codes=["GB"],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            rerank_enabled=True,
+        )
+
+        self.assertEqual(
+            len(client.calls),
+            2,
+        )
+
+        self.assertEqual(
+            response.sources[0].chunk_id,
+            "chunk-3",
+        )
+
+    def test_rerank_falls_back_on_invalid_response(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Supported by the top extract [1].",
+            rerank_order="not a valid ranking",
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            hits = [
+                _build_hit(chunk_id="chunk-1"),
+                _build_hit(chunk_id="chunk-2"),
+                _build_hit(chunk_id="chunk-3"),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=3,
+                limit=request.limit,
+                offset=0,
+                took_ms=2,
+                hits=hits,
+            )
+
+        with self.assertLogs(
+            "app.services.rag_answer",
+            level="WARNING",
+        ):
+            response = answer_legal_question(
+                request=LegalChatRequest(
+                    question="Notice period",
+                    country_codes=["GB"],
+                ),
+                search_function=fake_search,
+                generation_client=client,
+                rerank_enabled=True,
+            )
+
+        self.assertEqual(
+            response.sources[0].chunk_id,
+            "chunk-1",
+        )
+
+    def test_rerank_falls_back_when_call_fails(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Supported by the top extract [1].",
+            raise_on_rerank=True,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            hits = [
+                _build_hit(chunk_id="chunk-1"),
+                _build_hit(chunk_id="chunk-2"),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=2,
+                limit=request.limit,
+                offset=0,
+                took_ms=2,
+                hits=hits,
+            )
+
+        with self.assertLogs(
+            "app.services.rag_answer",
+            level="WARNING",
+        ):
+            response = answer_legal_question(
+                request=LegalChatRequest(
+                    question="Notice period",
+                    country_codes=["GB"],
+                ),
+                search_function=fake_search,
+                generation_client=client,
+                rerank_enabled=True,
+            )
+
+        self.assertEqual(
+            response.sources[0].chunk_id,
+            "chunk-1",
+        )
+
+    def test_rerank_skips_call_for_single_candidate(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Supported by the top extract [1]."
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        answer_legal_question(
+            request=LegalChatRequest(
+                question="Notice period",
+                country_codes=["GB"],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            rerank_enabled=True,
+        )
+
+        self.assertEqual(
+            len(client.calls),
+            1,
+        )
+
+    def test_rerank_preserves_country_balance(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        client = FakeGenerationClient(
+            answer=(
+                "Supported by [1], [2], [3], [4]."
+            ),
+            rerank_order="[1, 2, 3, 4, 5, 6]",
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            country_code = (
+                request.country_codes[0]
+            )
+
+            country = (
+                "United Kingdom"
+                if country_code == "GB"
+                else "Spain"
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-chunk-{index}",
+                    country=country,
+                    country_code=country_code,
+                )
+                for index in range(1, 7)
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=6,
+                limit=request.limit,
+                offset=0,
+                took_ms=2,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare statutory notice periods "
+                    "in the UK and Spain."
+                ),
+                country_codes=[
+                    "GB",
+                    "ES",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            rerank_enabled=True,
+            rerank_pool_multiplier=3,
+        )
+
+        self.assertEqual(
+            captured_requests[0].limit,
+            6,
+        )
+
+        self.assertEqual(
+            captured_requests[1].limit,
+            6,
+        )
+
+        country_codes = [
+            source.country_code
+            for source in response.sources
+        ]
+
+        self.assertEqual(
+            country_codes.count("GB"),
+            2,
+        )
+
+        self.assertEqual(
+            country_codes.count("ES"),
+            2,
+        )
+
+    def test_parse_rerank_order_validates_permutation(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _parse_rerank_order("[3, 1, 2]", 3),
+            [3, 1, 2],
+        )
+
+        self.assertEqual(
+            _parse_rerank_order(
+                "```json\n[2, 1]\n```",
+                2,
+            ),
+            [2, 1],
+        )
+
+        self.assertIsNone(
+            _parse_rerank_order("not json", 3)
+        )
+
+        self.assertIsNone(
+            _parse_rerank_order("[1, 1, 2]", 3)
+        )
+
+        self.assertIsNone(
+            _parse_rerank_order("[1, 2]", 3)
+        )
+
+        self.assertIsNone(
+            _parse_rerank_order("[1, 2, 3, 4]", 3)
+        )
+
+        self.assertIsNone(
+            _parse_rerank_order("", 1)
+        )
+
+    def test_truncate_context_keeps_short_content_unchanged(
+        self,
+    ) -> None:
+        content = "Short extract."
+
+        self.assertEqual(
+            _truncate_context(
+                content=content,
+                maximum_characters=100,
+            ),
+            content,
+        )
+
+    def test_truncate_context_truncates_at_paragraph_boundary(
+        self,
+    ) -> None:
+        first_paragraph = "A" * 20
+        second_paragraph = "B" * 50
+        content = (
+            first_paragraph
+            + "\n\n"
+            + second_paragraph
+        )
+
+        truncated = _truncate_context(
+            content=content,
+            maximum_characters=46,
+        )
+
+        self.assertTrue(
+            truncated.startswith(first_paragraph)
+        )
+
+        self.assertNotIn(
+            second_paragraph,
+            truncated,
+        )
+
+        self.assertTrue(
+            truncated.endswith(TRUNCATION_SUFFIX)
+        )
+
+    def test_truncate_context_hard_cuts_without_boundary(
+        self,
+    ) -> None:
+        content = "A" * 200
+
+        truncated = _truncate_context(
+            content=content,
+            maximum_characters=50,
+        )
+
+        self.assertTrue(
+            truncated.endswith(TRUNCATION_SUFFIX)
+        )
+
+        self.assertLessEqual(
+            len(truncated),
+            50,
+        )
+
+    def test_select_context_hits_keeps_every_hit(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="chunk-1",
+                content="A" * 10000,
+            ),
+            _build_hit(
+                chunk_id="chunk-2",
+                content="B" * 10000,
+            ),
+            _build_hit(
+                chunk_id="chunk-3",
+                content="C" * 10000,
+            ),
+        ]
+
+        selected = _select_context_hits(
+            hits=hits,
+            maximum_characters=6000,
+            maximum_source_characters=4000,
+        )
+
+        self.assertEqual(
+            [hit.chunk_id for hit in selected],
+            [
+                "chunk-1",
+                "chunk-2",
+                "chunk-3",
+            ],
+        )
+
+    def test_select_context_hits_respects_per_source_cap(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="chunk-1",
+                content="A" * 10000,
+            ),
+        ]
+
+        selected = _select_context_hits(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        self.assertLessEqual(
+            len(selected[0].content),
+            4000,
+        )
+
+    def test_select_context_hits_returns_empty_for_no_hits(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _select_context_hits(
+                hits=[],
+                maximum_characters=16000,
+                maximum_source_characters=4000,
+            ),
+            [],
+        )
+
+    def test_answer_preserves_all_countries_with_small_context_budget(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer=(
+                "The UK position is supported by [1]. "
+                "The Spanish position is supported by [2]."
+            )
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            country = (
+                "United Kingdom"
+                if country_code == "GB"
+                else "Spain"
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=2,
+                hits=[
+                    _build_hit(
+                        chunk_id=f"{country_code}-chunk-1",
+                        country=country,
+                        country_code=country_code,
+                        content=(
+                            f"{country_code} " * 5000
+                        ),
+                    ),
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare statutory notice periods "
+                    "in the UK and Spain."
+                ),
+                country_codes=[
+                    "GB",
+                    "ES",
+                ],
+                max_sources=2,
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            max_context_characters=8000,
+            max_source_characters=4000,
+        )
+
+        self.assertEqual(
+            [
+                source.country_code
+                for source in response.sources
+            ],
+            [
+                "GB",
+                "ES",
+            ],
+        )
+
+    def test_build_rerank_input_truncates_content(
+        self,
+    ) -> None:
+        long_content = "A" * (
+            RERANK_SNIPPET_CHARACTERS + 500
+        )
+
+        hit = _build_hit(
+            content=long_content
+        )
+
+        prompt = _build_rerank_input(
+            question="Notice period?",
+            hits=[hit],
+        )
+
+        self.assertIn(
+            "A" * RERANK_SNIPPET_CHARACTERS,
+            prompt,
+        )
+
+        self.assertNotIn(
+            "A" * (RERANK_SNIPPET_CHARACTERS + 1),
+            prompt,
         )
 
 

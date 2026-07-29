@@ -175,6 +175,103 @@ class LegalSearchTests(
             filters,
         )
 
+    def test_minimum_should_match_relaxed_with_country_filter(
+        self,
+    ) -> None:
+        request = LegalSearchRequest(
+            query="overtime rules",
+            country_codes=[
+                "GB",
+            ],
+        )
+
+        body = build_legal_search_body(
+            request
+        )
+
+        multi_match = (
+            body["query"]["bool"]["must"][0][
+                "multi_match"
+            ]
+        )
+
+        self.assertEqual(
+            multi_match["minimum_should_match"],
+            "1",
+        )
+
+    def test_minimum_should_match_relaxed_with_topic_filter(
+        self,
+    ) -> None:
+        request = LegalSearchRequest(
+            query="overtime rules",
+            legal_topics=[
+                "Working Conditions",
+            ],
+        )
+
+        body = build_legal_search_body(
+            request
+        )
+
+        multi_match = (
+            body["query"]["bool"]["must"][0][
+                "multi_match"
+            ]
+        )
+
+        self.assertEqual(
+            multi_match["minimum_should_match"],
+            "1",
+        )
+
+    def test_minimum_should_match_relaxed_with_subsection_filter(
+        self,
+    ) -> None:
+        request = LegalSearchRequest(
+            query="overtime rules",
+            subsections=[
+                "Overtime",
+            ],
+        )
+
+        body = build_legal_search_body(
+            request
+        )
+
+        multi_match = (
+            body["query"]["bool"]["must"][0][
+                "multi_match"
+            ]
+        )
+
+        self.assertEqual(
+            multi_match["minimum_should_match"],
+            "1",
+        )
+
+    def test_minimum_should_match_strict_without_filters(
+        self,
+    ) -> None:
+        request = LegalSearchRequest(
+            query="overtime rules",
+        )
+
+        body = build_legal_search_body(
+            request
+        )
+
+        multi_match = (
+            body["query"]["bool"]["must"][0][
+                "multi_match"
+            ]
+        )
+
+        self.assertEqual(
+            multi_match["minimum_should_match"],
+            "70%",
+        )
+
     def test_search_returns_structured_hits(
         self,
     ) -> None:

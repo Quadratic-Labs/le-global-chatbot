@@ -5,13 +5,18 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+RUN groupadd --gid 10001 appuser \
+    && useradd --uid 10001 --gid appuser --no-create-home --shell /usr/sbin/nologin appuser
+
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
-COPY scripts ./scripts
+COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser scripts ./scripts
+
+USER appuser
 
 EXPOSE 8000
 

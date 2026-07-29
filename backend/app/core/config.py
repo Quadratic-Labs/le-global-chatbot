@@ -149,12 +149,24 @@ class Settings:
     openai_model: str
     openai_timeout_seconds: float
 
+    openai_answer_reasoning_effort: str
+    openai_answer_max_output_tokens: int
+
+    openai_rerank_reasoning_effort: str
+    openai_rerank_max_output_tokens: int
+
     api_access_key: str | None
     admin_api_key: str | None
 
     cors_allowed_origins: tuple[str, ...]
     rate_limit_requests: int
     rate_limit_window_seconds: int
+
+    rerank_enabled: bool
+    rerank_pool_multiplier: int
+
+    rag_max_context_characters: int
+    rag_max_source_characters: int
 
 
 @lru_cache
@@ -206,6 +218,22 @@ def get_settings() -> Settings:
             "OPENAI_TIMEOUT_SECONDS",
             60.0,
         ),
+        openai_answer_reasoning_effort=os.getenv(
+            "OPENAI_ANSWER_REASONING_EFFORT",
+            "low",
+        ),
+        openai_answer_max_output_tokens=env_int(
+            "OPENAI_ANSWER_MAX_OUTPUT_TOKENS",
+            2000,
+        ),
+        openai_rerank_reasoning_effort=os.getenv(
+            "OPENAI_RERANK_REASONING_EFFORT",
+            "low",
+        ),
+        openai_rerank_max_output_tokens=env_int(
+            "OPENAI_RERANK_MAX_OUTPUT_TOKENS",
+            500,
+        ),
         api_access_key=optional_secret(
             "API_ACCESS_KEY"
         ),
@@ -222,5 +250,21 @@ def get_settings() -> Settings:
         rate_limit_window_seconds=env_int(
             "RATE_LIMIT_WINDOW_SECONDS",
             60,
+        ),
+        rerank_enabled=env_bool(
+            "RERANK_ENABLED",
+            False,
+        ),
+        rerank_pool_multiplier=env_int(
+            "RERANK_POOL_MULTIPLIER",
+            3,
+        ),
+        rag_max_context_characters=env_int(
+            "RAG_MAX_CONTEXT_CHARACTERS",
+            16000,
+        ),
+        rag_max_source_characters=env_int(
+            "RAG_MAX_SOURCE_CHARACTERS",
+            4000,
         ),
     )
