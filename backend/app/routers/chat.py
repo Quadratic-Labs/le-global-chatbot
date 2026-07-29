@@ -65,6 +65,12 @@ def legal_chat(
             rerank_pool_multiplier=(
                 settings.rerank_pool_multiplier
             ),
+            max_context_characters=(
+                settings.rag_max_context_characters
+            ),
+            max_source_characters=(
+                settings.rag_max_source_characters
+            ),
         )
 
     except InvalidLegalChatRequestError as error:

@@ -20,11 +20,14 @@ from app.models.search import (
 from app.services.rag_answer import (
     RERANK_INSTRUCTIONS,
     RERANK_SNIPPET_CHARACTERS,
+    TRUNCATION_SUFFIX,
     InvalidLegalChatRequestError,
     NO_INFORMATION_ANSWER,
     RagAnswerError,
     _build_rerank_input,
     _parse_rerank_order,
+    _select_context_hits,
+    _truncate_context,
     answer_legal_question,
 )
 
@@ -885,6 +888,203 @@ class RagAnswerTests(unittest.TestCase):
 
         self.assertIsNone(
             _parse_rerank_order("", 1)
+        )
+
+    def test_truncate_context_keeps_short_content_unchanged(
+        self,
+    ) -> None:
+        content = "Short extract."
+
+        self.assertEqual(
+            _truncate_context(
+                content=content,
+                maximum_characters=100,
+            ),
+            content,
+        )
+
+    def test_truncate_context_truncates_at_paragraph_boundary(
+        self,
+    ) -> None:
+        first_paragraph = "A" * 20
+        second_paragraph = "B" * 50
+        content = (
+            first_paragraph
+            + "\n\n"
+            + second_paragraph
+        )
+
+        truncated = _truncate_context(
+            content=content,
+            maximum_characters=46,
+        )
+
+        self.assertTrue(
+            truncated.startswith(first_paragraph)
+        )
+
+        self.assertNotIn(
+            second_paragraph,
+            truncated,
+        )
+
+        self.assertTrue(
+            truncated.endswith(TRUNCATION_SUFFIX)
+        )
+
+    def test_truncate_context_hard_cuts_without_boundary(
+        self,
+    ) -> None:
+        content = "A" * 200
+
+        truncated = _truncate_context(
+            content=content,
+            maximum_characters=50,
+        )
+
+        self.assertTrue(
+            truncated.endswith(TRUNCATION_SUFFIX)
+        )
+
+        self.assertLessEqual(
+            len(truncated),
+            50,
+        )
+
+    def test_select_context_hits_keeps_every_hit(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="chunk-1",
+                content="A" * 10000,
+            ),
+            _build_hit(
+                chunk_id="chunk-2",
+                content="B" * 10000,
+            ),
+            _build_hit(
+                chunk_id="chunk-3",
+                content="C" * 10000,
+            ),
+        ]
+
+        selected = _select_context_hits(
+            hits=hits,
+            maximum_characters=6000,
+            maximum_source_characters=4000,
+        )
+
+        self.assertEqual(
+            [hit.chunk_id for hit in selected],
+            [
+                "chunk-1",
+                "chunk-2",
+                "chunk-3",
+            ],
+        )
+
+    def test_select_context_hits_respects_per_source_cap(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="chunk-1",
+                content="A" * 10000,
+            ),
+        ]
+
+        selected = _select_context_hits(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        self.assertLessEqual(
+            len(selected[0].content),
+            4000,
+        )
+
+    def test_select_context_hits_returns_empty_for_no_hits(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _select_context_hits(
+                hits=[],
+                maximum_characters=16000,
+                maximum_source_characters=4000,
+            ),
+            [],
+        )
+
+    def test_answer_preserves_all_countries_with_small_context_budget(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer=(
+                "The UK position is supported by [1]. "
+                "The Spanish position is supported by [2]."
+            )
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            country = (
+                "United Kingdom"
+                if country_code == "GB"
+                else "Spain"
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=2,
+                hits=[
+                    _build_hit(
+                        chunk_id=f"{country_code}-chunk-1",
+                        country=country,
+                        country_code=country_code,
+                        content=(
+                            f"{country_code} " * 5000
+                        ),
+                    ),
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare statutory notice periods "
+                    "in the UK and Spain."
+                ),
+                country_codes=[
+                    "GB",
+                    "ES",
+                ],
+                max_sources=2,
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            max_context_characters=8000,
+            max_source_characters=4000,
+        )
+
+        self.assertEqual(
+            [
+                source.country_code
+                for source in response.sources
+            ],
+            [
+                "GB",
+                "ES",
+            ],
         )
 
     def test_build_rerank_input_truncates_content(

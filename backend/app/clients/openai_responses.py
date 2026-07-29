@@ -126,6 +126,8 @@ class OpenAIResponsesClient:
         api_key: str,
         model: str,
         timeout_seconds: float = 60.0,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         normalized_api_key = api_key.strip()
         normalized_model = model.strip()
@@ -145,9 +147,35 @@ class OpenAIResponsesClient:
                 "OPENAI_TIMEOUT_SECONDS must be positive."
             )
 
+        normalized_reasoning_effort = (
+            reasoning_effort.strip()
+            if reasoning_effort is not None
+            else None
+        )
+
+        if (
+            reasoning_effort is not None
+            and not normalized_reasoning_effort
+        ):
+            raise OpenAIConfigurationError(
+                "OpenAI reasoning effort must not be empty."
+            )
+
+        if (
+            max_output_tokens is not None
+            and max_output_tokens <= 0
+        ):
+            raise OpenAIConfigurationError(
+                "OpenAI max output tokens must be positive."
+            )
+
         self.api_key = normalized_api_key
         self.model = normalized_model
         self.timeout_seconds = timeout_seconds
+        self.reasoning_effort = (
+            normalized_reasoning_effort
+        )
+        self.max_output_tokens = max_output_tokens
 
     def generate(
         self,
@@ -162,6 +190,16 @@ class OpenAIResponsesClient:
             "input": input_text,
             "store": False,
         }
+
+        if self.reasoning_effort is not None:
+            request_body["reasoning"] = {
+                "effort": self.reasoning_effort,
+            }
+
+        if self.max_output_tokens is not None:
+            request_body["max_output_tokens"] = (
+                self.max_output_tokens
+            )
 
         encoded_body = json.dumps(
             request_body
@@ -261,6 +299,29 @@ class OpenAIResponsesClient:
                 "OpenAI returned an invalid response."
             )
 
+        if payload.get("status") == "incomplete":
+            incomplete_details = payload.get(
+                "incomplete_details",
+                {},
+            )
+
+            reason = (
+                incomplete_details.get("reason")
+                if isinstance(
+                    incomplete_details,
+                    dict,
+                )
+                else None
+            )
+
+            if not isinstance(reason, str):
+                reason = "unknown reason"
+
+            raise OpenAIResponseError(
+                "OpenAI returned an incomplete response: "
+                f"{reason}."
+            )
+
         response_model = payload.get(
             "model",
             self.model,
@@ -280,8 +341,11 @@ class OpenAIResponsesClient:
         )
 
 
-def get_openai_responses_client() -> OpenAIResponsesClient:
-    """Build the configured OpenAI client."""
+def _get_configured_openai_client(
+    reasoning_effort: str,
+    max_output_tokens: int,
+) -> OpenAIResponsesClient:
+    """Build an OpenAI client with an explicit reasoning/token budget."""
 
     settings = get_settings()
 
@@ -295,5 +359,37 @@ def get_openai_responses_client() -> OpenAIResponsesClient:
         model=settings.openai_model,
         timeout_seconds=(
             settings.openai_timeout_seconds
+        ),
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
+    )
+
+
+def get_openai_answer_client() -> OpenAIResponsesClient:
+    """Build the OpenAI client used for grounded answer generation."""
+
+    settings = get_settings()
+
+    return _get_configured_openai_client(
+        reasoning_effort=(
+            settings.openai_answer_reasoning_effort
+        ),
+        max_output_tokens=(
+            settings.openai_answer_max_output_tokens
+        ),
+    )
+
+
+def get_openai_rerank_client() -> OpenAIResponsesClient:
+    """Build the OpenAI client used for search-result reranking."""
+
+    settings = get_settings()
+
+    return _get_configured_openai_client(
+        reasoning_effort=(
+            settings.openai_rerank_reasoning_effort
+        ),
+        max_output_tokens=(
+            settings.openai_rerank_max_output_tokens
         ),
     )

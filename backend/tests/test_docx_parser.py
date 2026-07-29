@@ -772,6 +772,71 @@ class DocxParserTests(unittest.TestCase):
                 ),
             )
 
+    def test_splits_working_conditions_subsections(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "working-conditions-document.docx"
+            )
+
+            document = Document()
+
+            document.add_heading(
+                "03. Working Conditions",
+                level=1,
+            )
+
+            for title, content in (
+                (
+                    "Overtime",
+                    "Overtime legal content.",
+                ),
+                (
+                    "Work Hours Record",
+                    "Working time recording content.",
+                ),
+                (
+                    "Paid Leave",
+                    "Paid leave legal content.",
+                ),
+            ):
+                paragraph = document.add_paragraph(
+                    title
+                )
+                paragraph.runs[0].bold = True
+
+                document.add_paragraph(
+                    content
+                )
+
+            document.save(
+                file_path
+            )
+
+            sections = parse_docx_sections(
+                file_path=file_path,
+                country="Spain",
+            )
+
+            self.assertEqual(
+                [
+                    section.subsection
+                    for section in sections
+                ],
+                [
+                    "Overtime",
+                    "Work Hours Record",
+                    "Paid Leave",
+                ],
+            )
+
+            self.assertEqual(
+                sections[0].content,
+                "Overtime legal content.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
