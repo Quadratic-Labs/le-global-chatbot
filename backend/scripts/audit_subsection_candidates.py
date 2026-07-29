@@ -11,30 +11,19 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
+from app.core.country_registry import (
+    CountryRegistryError,
+    resolve_country,
+)
 from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
     is_overview_section,
 )
-
-
-_FILENAME_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(
-        r"^Labour and Employment Law in\s+"
-        r"(?P<country>.+?)"
-        r"(?:\s+(?:19|20)\d{2})?$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"^Employment Law Overview(?:\s*-\s*)?\s+"
-        r"(?P<country>.+?)"
-        r"(?:\s+(?:19|20)\d{2})?$",
-        re.IGNORECASE,
-    ),
+from app.services.document_chunk_builder import (
+    _COPY_SUFFIX_PATTERN,
+    _FILENAME_PATTERNS,
 )
 
-_COPY_SUFFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\s*\(\d+\)$"
-)
 
 _HEADING_STYLE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:heading|titre)\s*([1-9])$",
@@ -48,11 +37,6 @@ _FALSE_XML_VALUES: Final[frozenset[str]] = frozenset(
         "off",
     }
 )
-
-_COUNTRY_ALIASES: Final[dict[str, str]] = {
-    "uk": "United Kingdom",
-    "united kingdom": "United Kingdom",
-}
 
 _MAX_UNMATCHED_PER_DOCUMENT: Final[int] = 50
 
@@ -104,16 +88,18 @@ def _country_from_filename(
         if match is None:
             continue
 
-        country = _normalize_text(
+        raw_country = _normalize_text(
             match.group(
                 "country"
             )
         ).strip(" -_")
 
-        return _COUNTRY_ALIASES.get(
-            country.casefold(),
-            country,
-        )
+        try:
+            country, _country_code = resolve_country(raw_country)
+        except CountryRegistryError:
+            country = raw_country
+
+        return country
 
     raise ValueError(
         "Unable to detect country from filename: "

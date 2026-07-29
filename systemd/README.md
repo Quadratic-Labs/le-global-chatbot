@@ -8,6 +8,8 @@ L&E Global Legal Chatbot Docker Compose stack automatically.
 - `le-global-chatbot.service` — starts and stops the complete Docker Compose stack.
 - `99-le-global-chatbot.conf` — configures the Linux kernel settings required by
   OpenSearch and Redis.
+- `verify-rerank.sh` — manual A/B comparison script for `RERANK_ENABLED`; run it
+  against a live backend before leaving reranking enabled in production.
 
 ## Managed services
 
@@ -22,3 +24,41 @@ All services are currently managed through a single Docker Compose project locat
 
 ```text
 /opt/le-global-chatbot/infra
+```
+
+## Post-deployment steps
+
+### Document directory ownership (required before the first deploy of a backend image)
+
+The backend container runs as a non-root user (uid/gid `10001`). The document
+directories are bind-mounted from the host (see `infra/compose.yml`), so Docker
+does not change their ownership automatically. Before starting the stack for
+the first time, or after recreating these directories, run on the host:
+
+```bash
+sudo mkdir -p /var/lib/le-global-chatbot/documents/{source,processed}
+sudo chown -R 10001:10001 /var/lib/le-global-chatbot/documents
+```
+
+Skipping this step causes document upload and reindexing to fail with
+permission errors.
+
+### OpenSearch Dashboards credentials (required after changing the default password)
+
+`OPENSEARCH_DASHBOARDS_USERNAME`/`OPENSEARCH_DASHBOARDS_PASSWORD` in
+`infra/compose.yml` only configure the Dashboards container — they do not
+change the `kibanaserver` account's password inside OpenSearch itself, which
+defaults to `kibanaserver` in the security plugin's demo configuration. After
+the `opensearch` container is healthy (first deployment, or any time this
+password is rotated), align the two by calling the OpenSearch security API
+with the admin credentials:
+
+```bash
+curl -sk -u "admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD}" \
+  -X PATCH "https://localhost:9200/_plugins/_security/api/internalusers/kibanaserver" \
+  -H "Content-Type: application/json" \
+  -d '[{"op":"replace","path":"/password","value":"'"${OPENSEARCH_DASHBOARDS_PASSWORD}"'"}]'
+```
+
+Skipping this step after changing `OPENSEARCH_DASHBOARDS_PASSWORD` causes
+Dashboards to fail authentication and not start.

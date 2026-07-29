@@ -12,111 +12,32 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
+from app.core.country_registry import (
+    CountryRegistryError,
+    resolve_country,
+)
+from app.core.legal_taxonomy import (
+    LEGAL_TOPICS,
+    _TOPIC_ALIASES,
+    _TOPIC_PREFIX_PATTERN,
+    _normalize_text,
+)
+from app.services.document_chunk_builder import (
+    _COPY_SUFFIX_PATTERN,
+    _FILENAME_PATTERNS,
+)
 from app.services.docx_parser import parse_docx_sections
 
-
-LEGAL_TOPICS: Final[tuple[str, ...]] = (
-    "Hiring Practices",
-    "Employment Contracts",
-    "Working Conditions",
-    "Anti-Discrimination Laws",
-    "Pay Equity Laws",
-    "Social Media and Data Privacy",
-    "Termination of Employment Contracts",
-    "Restrictive Covenants",
-    "Transfer of Undertakings",
-    "Trade Unions and Employers Associations",
-    "Employee Benefits",
-)
-
-_TOPIC_ALIASES: Final[dict[str, tuple[str, ...]]] = {
-    "Hiring Practices": ("hiring practices", "hiring practice"),
-    "Employment Contracts": (
-        "employment contracts",
-        "employment contract law",
-    ),
-    "Working Conditions": ("working conditions",),
-    "Anti-Discrimination Laws": (
-        "anti-discrimination laws",
-        "anti discrimination laws",
-    ),
-    "Pay Equity Laws": ("pay equity laws",),
-    "Social Media and Data Privacy": (
-        "social media and data privacy",
-    ),
-    "Termination of Employment Contracts": (
-        "termination of employment contracts",
-        "termination of employment contract",
-    ),
-    "Restrictive Covenants": ("restrictive covenants",),
-    "Transfer of Undertakings": ("transfer of undertakings",),
-    "Trade Unions and Employers Associations": (
-        "trade unions and employers associations",
-        "trade unions and employer associations",
-        "trade unions and employers' associations",
-        "trade unions and employers’ associations",
-    ),
-    "Employee Benefits": ("employee benefits",),
-}
-
-_COUNTRY_ALIASES: Final[dict[str, str]] = {
-    "uk": "United Kingdom",
-    "united kingdom": "United Kingdom",
-}
-
-_COUNTRY_CODES: Final[dict[str, str]] = {
-    "Argentina": "AR",
-    "Australia": "AU",
-    "Belgium": "BE",
-    "Brazil": "BR",
-    "Czech Republic": "CZ",
-    "Greece": "GR",
-    "Italy": "IT",
-    "Japan": "JP",
-    "Mexico": "MX",
-    "Peru": "PE",
-    "Poland": "PL",
-    "Romania": "RO",
-    "Singapore": "SG",
-    "Spain": "ES",
-    "Sweden": "SE",
-    "Switzerland": "CH",
-    "United Kingdom": "GB",
-}
 
 _HEADING_STYLE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:heading|titre)\s*([1-9])$",
     re.IGNORECASE,
 )
 
-_FILENAME_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(
-        r"^Labour and Employment Law in\s+"
-        r"(?P<country>.+?)"
-        r"(?:\s+(?P<year>(?:19|20)\d{2}))?$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"^Employment Law Overview(?:\s*-\s*)?\s+"
-        r"(?P<country>.+?)"
-        r"(?:\s+(?P<year>(?:19|20)\d{2}))?$",
-        re.IGNORECASE,
-    ),
-)
-
-_COPY_SUFFIX_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s*\(\d+\)$")
-_TOPIC_PREFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^\s*(?:[|¦=]+\s*)?(?:\d{1,2}\s*[.)]\s*)?",
-    re.IGNORECASE,
-)
 _DECORATIVE_TEXTS: Final[frozenset[str]] = frozenset({"|", "¦", "="})
 _FALSE_XML_VALUES: Final[frozenset[str]] = frozenset(
     {"0", "false", "off"}
 )
-
-
-def _normalize_text(value: str) -> str:
-    return " ".join(value.replace("\xa0", " ").split())
 
 
 def _metadata_from_filename(file_path: Path) -> dict[str, Any]:
@@ -129,12 +50,16 @@ def _metadata_from_filename(file_path: Path) -> dict[str, Any]:
             continue
 
         raw_country = _normalize_text(match.group("country")).strip(" -_")
-        country = _COUNTRY_ALIASES.get(raw_country.casefold(), raw_country)
         year = match.group("year")
+
+        try:
+            country, country_code = resolve_country(raw_country)
+        except CountryRegistryError:
+            country, country_code = raw_country, None
 
         return {
             "country": country,
-            "country_code": _COUNTRY_CODES.get(country),
+            "country_code": country_code,
             "reference_year": int(year) if year else None,
             "filename_recognized": True,
             "copy_suffix_detected": cleaned_stem != original_stem,
