@@ -49,6 +49,23 @@ class LegalChatMetrics:
     model: str | None = None
     error_type: str | None = None
 
+    generation_attempts: int = 0
+    repair_triggered: bool = False
+    repair_success: bool = False
+    repair_answer_returned: bool = False
+    initial_hard_error_types: list[str] = field(
+        default_factory=list
+    )
+    initial_soft_error_types: list[str] = field(
+        default_factory=list
+    )
+    final_hard_error_types: list[str] = field(
+        default_factory=list
+    )
+    final_soft_error_types: list[str] = field(
+        default_factory=list
+    )
+
     def add_opensearch_seconds(
         self,
         elapsed_seconds: float,
@@ -105,6 +122,26 @@ class LegalChatMetrics:
             "max_sources": self.max_sources,
             "rerank_enabled": self.rerank_enabled,
             "error_type": self.error_type,
+            "generation_attempts": (
+                self.generation_attempts
+            ),
+            "repair_triggered": self.repair_triggered,
+            "repair_success": self.repair_success,
+            "repair_answer_returned": (
+                self.repair_answer_returned
+            ),
+            "initial_hard_error_types": (
+                self.initial_hard_error_types
+            ),
+            "initial_soft_error_types": (
+                self.initial_soft_error_types
+            ),
+            "final_hard_error_types": (
+                self.final_hard_error_types
+            ),
+            "final_soft_error_types": (
+                self.final_soft_error_types
+            ),
         }
 
     def log(self) -> None:

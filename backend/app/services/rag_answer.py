@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Final, Protocol
 
@@ -138,6 +139,19 @@ Rules:
 19. Do not use semicolons inside citations.
 20. Do not add a limitations section unless none of the supplied
     sources contains enough information to answer the question.
+21. Start each country section with a single heading line containing
+    the country name, followed by bullet points starting with a
+    hyphen (-).
+22. Start the comparison section with a heading line containing the
+    word "Comparison", followed by no more than two bullet points
+    starting with a hyphen (-).
+23. When the user asks about paid leave or paid time off:
+    - Include only leave that the sources explicitly describe as
+      paid, remunerated, compensated, covered by an allowance, or
+      covered by an indemnity.
+    - Do not list leave explicitly described as unpaid.
+    - Do not state that a leave entitlement is missing or
+      unspecified. Simply omit unsupported categories.
 """.strip()
 
 
@@ -201,10 +215,74 @@ def _normalize_country_codes(
     return normalized_codes
 
 
+COUNTRY_ADJECTIVES: Final[dict[str, tuple[str, ...]]] = {
+    "AR": (
+        "Argentine",
+        "Argentinian",
+    ),
+    "AU": (
+        "Australian",
+    ),
+    "BE": (
+        "Belgian",
+    ),
+    "BR": (
+        "Brazilian",
+    ),
+    "CZ": (
+        "Czech",
+    ),
+    "GR": (
+        "Greek",
+    ),
+    "IT": (
+        "Italian",
+    ),
+    "JP": (
+        "Japanese",
+    ),
+    "MX": (
+        "Mexican",
+    ),
+    "PE": (
+        "Peruvian",
+    ),
+    "PL": (
+        "Polish",
+    ),
+    "RO": (
+        "Romanian",
+    ),
+    "SG": (
+        "Singaporean",
+    ),
+    "ES": (
+        "Spanish",
+    ),
+    "SE": (
+        "Swedish",
+    ),
+    "CH": (
+        "Swiss",
+    ),
+    "GB": (
+        "British",
+    ),
+}
+
+
 def _country_name_variants_for_codes(
     country_codes: Sequence[str],
 ) -> list[str]:
-    """Return every known display name/alias for the given country codes."""
+    """
+    Return every known display name/alias/adjective for the given codes.
+
+    Covers demonym phrasing such as "the Spanish position" or "British
+    law", which mention a country without using its exact display
+    name - relevant both for stripping country references out of a
+    BM25 query and for checking that a generated answer actually
+    addresses every requested country.
+    """
 
     normalized_codes = {
         code.upper()
@@ -223,6 +301,13 @@ def _country_name_variants_for_codes(
 
         variants.extend(
             country.aliases
+        )
+
+        variants.extend(
+            COUNTRY_ADJECTIVES.get(
+                country.code,
+                (),
+            )
         )
 
     return variants
@@ -746,6 +831,576 @@ def _allocate_country_context_budgets(
     return selected_hits
 
 
+@dataclass(frozen=True, slots=True)
+class QualityError:
+    """One answer-quality violation, tagged with its severity type."""
+
+    error_type: str
+    message: str
+
+
+HARD_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "invalid_citation_format",
+        "unknown_citation",
+        "missing_requested_country",
+        "paid_leave_scope",
+    }
+)
+
+SOFT_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "structure",
+        "internal_reference",
+        "false_absence_claim",
+        "repetition",
+    }
+)
+
+# Only structure is worth a second OpenAI call: it is cheap to fix and
+# the fix is reliable. The other soft warnings stay detected and
+# reported in metrics, but no longer trigger a repair generation - an
+# unrecognized future soft error type must not become repairable by
+# default, so this list is positive/explicit rather than derived.
+REPAIR_TRIGGERING_SOFT_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "structure",
+    }
+)
+
+NON_REPAIRING_SOFT_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "false_absence_claim",
+        "internal_reference",
+        "repetition",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _AnswerSection:
+    """One heading-delimited section of a generated answer."""
+
+    kind: str
+    title: str
+    bullets: list[str]
+
+
+_BULLET_LINE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\s*[-*•]\s+(.*\S)\s*$"
+)
+
+_COMPARISON_HEADING_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"comparison",
+    re.IGNORECASE,
+)
+
+
+def _parse_country_sections(
+    answer: str,
+) -> list[_AnswerSection]:
+    """
+    Split a generated answer into heading-delimited sections.
+
+    A non-bullet line starts a new section; bullet lines (starting
+    with -, *, or a bullet character) are attached to the current
+    section. Relies on rules 21/22 in SYSTEM_INSTRUCTIONS, which ask
+    the model for exactly this heading-then-bullets shape.
+    """
+
+    sections: list[_AnswerSection] = []
+
+    current_kind: str | None = None
+    current_title = ""
+    current_bullets: list[str] = []
+
+    def flush_section() -> None:
+        if current_kind is not None:
+            sections.append(
+                _AnswerSection(
+                    kind=current_kind,
+                    title=current_title,
+                    bullets=list(current_bullets),
+                )
+            )
+
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        bullet_match = _BULLET_LINE_PATTERN.match(
+            line
+        )
+
+        if bullet_match:
+            if current_kind is not None:
+                current_bullets.append(
+                    bullet_match.group(1)
+                )
+            continue
+
+        flush_section()
+
+        current_bullets = []
+        current_title = line.rstrip(
+            ":"
+        ).strip()
+
+        current_kind = (
+            "comparison"
+            if _COMPARISON_HEADING_PATTERN.search(
+                current_title
+            )
+            else "country"
+        )
+
+    flush_section()
+
+    return sections
+
+
+def _validate_answer_structure(
+    answer: str,
+    requested_country_codes: list[str],
+) -> list[QualityError]:
+    """Enforce the bullet-count and section-count limits from the prompt."""
+
+    errors: list[QualityError] = []
+
+    sections = _parse_country_sections(
+        answer
+    )
+
+    if len(requested_country_codes) == 1:
+        total_country_bullets = sum(
+            len(section.bullets)
+            for section in sections
+            if section.kind == "country"
+        )
+
+        if total_country_bullets > 6:
+            errors.append(
+                QualityError(
+                    error_type="structure",
+                    message=(
+                        "A single-country answer must "
+                        "contain no more than six bullets."
+                    ),
+                )
+            )
+
+    else:
+        for section in sections:
+            if (
+                section.kind == "country"
+                and len(section.bullets) > 4
+            ):
+                errors.append(
+                    QualityError(
+                        error_type="structure",
+                        message=(
+                            f"{section.title} contains "
+                            "more than four bullets."
+                        ),
+                    )
+                )
+
+        comparison_sections = [
+            section
+            for section in sections
+            if section.kind == "comparison"
+        ]
+
+        if len(comparison_sections) > 1:
+            errors.append(
+                QualityError(
+                    error_type="structure",
+                    message=(
+                        "Only one comparison section "
+                        "is allowed."
+                    ),
+                )
+            )
+
+        if (
+            comparison_sections
+            and len(
+                comparison_sections[0].bullets
+            ) > 2
+        ):
+            errors.append(
+                QualityError(
+                    error_type="structure",
+                    message=(
+                        "The comparison section must "
+                        "contain no more than two bullets."
+                    ),
+                )
+            )
+
+    return errors
+
+
+def _validate_requested_countries_present(
+    answer: str,
+    requested_country_codes: Sequence[str],
+) -> list[QualityError]:
+    """Reject an answer that drops a requested country entirely."""
+
+    normalized_answer = answer.casefold()
+    errors: list[QualityError] = []
+
+    for country_code in requested_country_codes:
+        variants = _country_name_variants_for_codes(
+            [
+                country_code,
+            ]
+        )
+
+        if not variants:
+            continue
+
+        if not any(
+            variant.casefold() in normalized_answer
+            for variant in variants
+        ):
+            errors.append(
+                QualityError(
+                    error_type=(
+                        "missing_requested_country"
+                    ),
+                    message=(
+                        "The answer does not mention "
+                        f"the requested country {country_code}."
+                    ),
+                )
+            )
+
+    return errors
+
+
+def _validate_no_repetition(
+    answer: str,
+) -> list[QualityError]:
+    """Reject a bullet repeated with substantially the same wording."""
+
+    sections = _parse_country_sections(
+        answer
+    )
+
+    seen_bullets: set[str] = set()
+
+    for section in sections:
+        for bullet in section.bullets:
+            normalized_bullet = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                bullet.casefold(),
+            ).strip()
+
+            if not normalized_bullet:
+                continue
+
+            if normalized_bullet in seen_bullets:
+                return [
+                    QualityError(
+                        error_type="repetition",
+                        message=(
+                            "The answer repeats a bullet "
+                            "using substantially the same "
+                            "wording."
+                        ),
+                    )
+                ]
+
+            seen_bullets.add(
+                normalized_bullet
+            )
+
+    return []
+
+
+FORBIDDEN_INTERNAL_PHRASES: Final[tuple[str, ...]] = (
+    "provided extracts",
+    "supplied extracts",
+    "available extracts",
+    "provided documents",
+    "available documents",
+    "the context",
+    "context limit",
+    "retrieval",
+    "truncated",
+    "source extract",
+)
+
+FORBIDDEN_INTERNAL_PATTERNS: Final[
+    tuple[re.Pattern[str], ...]
+] = tuple(
+    re.compile(
+        pattern,
+        re.IGNORECASE,
+    )
+    for pattern in (
+        r"\b(?:the|these|provided|supplied|available)"
+        r"\s+extracts?\b",
+        r"\b(?:the|these|provided|supplied|available)"
+        r"\s+documents?\b",
+        r"\b(?:the|these|provided|supplied|available)"
+        r"\s+sources?\b",
+        r"\bsource context\b",
+        r"\bretrieved context\b",
+        r"\bcontext limit\b",
+        r"\btruncated\b",
+    )
+)
+
+
+def _validate_no_internal_references(
+    answer: str,
+) -> list[QualityError]:
+    """Reject any internal-mechanism phrase found in the answer."""
+
+    normalized = answer.casefold()
+
+    found_phrases = [
+        phrase
+        for phrase in FORBIDDEN_INTERNAL_PHRASES
+        if phrase in normalized
+    ]
+
+    pattern_matched = any(
+        pattern.search(answer)
+        for pattern in FORBIDDEN_INTERNAL_PATTERNS
+    )
+
+    if not found_phrases and not pattern_matched:
+        return []
+
+    described_phrases = (
+        found_phrases
+        or [
+            "internal-mechanism phrasing",
+        ]
+    )
+
+    quoted_phrases = ", ".join(
+        f'"{phrase}"' for phrase in described_phrases
+    )
+
+    return [
+        QualityError(
+            error_type="internal_reference",
+            message=(
+                "The answer references internal "
+                f"mechanics: {quoted_phrases}."
+            ),
+        )
+    ]
+
+
+def _validate_paid_leave_scope(
+    question: str,
+    answer: str,
+) -> list[QualityError]:
+    """Reject an unpaid-leave mention when paid leave was asked about."""
+
+    question_lower = question.casefold()
+
+    if (
+        "paid leave" not in question_lower
+        and "paid time off" not in question_lower
+    ):
+        return []
+
+    if "unpaid leave" in answer.casefold():
+        return [
+            QualityError(
+                error_type="paid_leave_scope",
+                message=(
+                    "A paid-leave answer contains "
+                    "an unpaid-leave entitlement."
+                ),
+            )
+        ]
+
+    return []
+
+
+ABSENCE_CLAIM_PHRASES: Final[tuple[str, ...]] = (
+    "not specified",
+    "does not specify",
+    "not available in",
+    "no information is available",
+    "not provided in the",
+    "is missing from the",
+    "are missing from the",
+)
+
+_DURATION_NUMBER_PATTERN: Final[str] = (
+    r"(?:\d+|one|two|three|four|five|six|seven|"
+    r"eight|nine|ten|eleven|twelve)"
+)
+
+_CONCRETE_DURATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    rf"\b{_DURATION_NUMBER_PATTERN}\s*"
+    r"(?:day|week|month|year)s?\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_no_false_absence_claims(
+    context: str,
+    answer: str,
+) -> list[QualityError]:
+    """
+    Flag an absence claim contradicted by a concrete figure in context.
+
+    This is a soft, best-effort heuristic: it cannot yet tell which
+    country a duration belongs to, which leave/notice category it
+    covers, or whether the absence claim concerns a general rule
+    rather than one specific figure. Kept soft (triggers a repair
+    attempt, never a 502) until it can be made country-aware by
+    comparing each answer section only against that country's own
+    context.
+    """
+
+    normalized_answer = answer.casefold()
+
+    if not any(
+        phrase in normalized_answer
+        for phrase in ABSENCE_CLAIM_PHRASES
+    ):
+        return []
+
+    if _CONCRETE_DURATION_PATTERN.search(
+        context
+    ):
+        return [
+            QualityError(
+                error_type="false_absence_claim",
+                message=(
+                    "The answer claims information is "
+                    "missing even though a supplied "
+                    "source contains a concrete figure."
+                ),
+            )
+        ]
+
+    return []
+
+
+def _validate_answer_quality(
+    question: str,
+    answer: str,
+    country_codes: Sequence[str],
+    context: str,
+    source_count: int,
+) -> tuple[
+    list[QualityError],
+    list[QualityError],
+]:
+    """
+    Run every content-quality check and split errors by severity.
+
+    Hard errors (HARD_QUALITY_ERROR_TYPES) mean the answer is not
+    legally grounded and must never reach the caller. Soft errors are
+    style/formatting defects: worth one repair attempt, but not worth
+    a 502 when the answer is otherwise legally sound.
+    """
+
+    all_errors: list[QualityError] = []
+
+    all_errors.extend(
+        _validate_citation_format(
+            answer=answer
+        )
+    )
+
+    all_errors.extend(
+        _validate_citation_range(
+            answer=answer,
+            source_count=source_count,
+        )
+    )
+
+    all_errors.extend(
+        _validate_requested_countries_present(
+            answer=answer,
+            requested_country_codes=country_codes,
+        )
+    )
+
+    all_errors.extend(
+        _validate_paid_leave_scope(
+            question=question,
+            answer=answer,
+        )
+    )
+
+    all_errors.extend(
+        _validate_answer_structure(
+            answer=answer,
+            requested_country_codes=list(
+                country_codes
+            ),
+        )
+    )
+
+    all_errors.extend(
+        _validate_no_internal_references(
+            answer
+        )
+    )
+
+    all_errors.extend(
+        _validate_no_false_absence_claims(
+            context=context,
+            answer=answer,
+        )
+    )
+
+    all_errors.extend(
+        _validate_no_repetition(
+            answer
+        )
+    )
+
+    hard_errors = [
+        error
+        for error in all_errors
+        if error.error_type in HARD_QUALITY_ERROR_TYPES
+    ]
+
+    soft_errors = [
+        error
+        for error in all_errors
+        if error.error_type in SOFT_QUALITY_ERROR_TYPES
+    ]
+
+    return hard_errors, soft_errors
+
+
+def _build_repair_instructions(
+    errors: Sequence[QualityError],
+) -> str:
+    """Build a follow-up instruction asking the model to fix known issues."""
+
+    formatted_errors = "\n".join(
+        f"- {error.message}" for error in errors
+    )
+
+    return (
+        "Rewrite the answer using the same sources.\n\n"
+        "Correct all of these issues:\n"
+        f"{formatted_errors}\n\n"
+        "Do not add new legal information.\n"
+        "Preserve valid citations.\n"
+        "Return only the corrected final answer."
+    )
+
+
 def _build_context(
     hits: list[LegalSearchHit],
 ) -> str:
@@ -820,7 +1475,7 @@ def _build_model_input(
 
 def _validate_citation_format(
     answer: str,
-) -> None:
+) -> list[QualityError]:
     """
     Reject citation-like substrings that are not a valid citation.
 
@@ -837,21 +1492,23 @@ def _validate_citation_format(
         if not VALID_CITATION_PATTERN.fullmatch(
             citation_text
         ):
-            raise RagAnswerError(
-                "The generated answer contains "
-                "an invalid citation format."
-            )
+            return [
+                QualityError(
+                    error_type="invalid_citation_format",
+                    message=(
+                        "The generated answer contains "
+                        "an invalid citation format."
+                    ),
+                )
+            ]
+
+    return []
 
 
-def _extract_citation_numbers(
+def _find_citation_numbers(
     answer: str,
-    source_count: int,
 ) -> list[int]:
-    """
-    Extract and validate source numbers cited by the model.
-
-    Only citations that correspond to supplied sources are accepted.
-    """
+    """Extract deduplicated source numbers cited by the model, in order."""
 
     citation_numbers: list[int] = []
     seen_citations: set[int] = set()
@@ -866,15 +1523,6 @@ def _extract_citation_numbers(
                 raw_citation.strip()
             )
 
-            if (
-                citation < 1
-                or citation > source_count
-            ):
-                raise RagAnswerError(
-                    "The generated answer cited an "
-                    "unknown source number."
-                )
-
             if citation in seen_citations:
                 continue
 
@@ -886,13 +1534,45 @@ def _extract_citation_numbers(
                 citation
             )
 
-    if not citation_numbers:
-        raise RagAnswerError(
-            "The generated answer did not include "
-            "a valid source citation."
-        )
-
     return citation_numbers
+
+
+def _validate_citation_range(
+    answer: str,
+    source_count: int,
+) -> list[QualityError]:
+    """Reject a missing citation or one outside the supplied sources."""
+
+    citation_numbers = _find_citation_numbers(
+        answer
+    )
+
+    if not citation_numbers:
+        return [
+            QualityError(
+                error_type="unknown_citation",
+                message=(
+                    "The generated answer did not "
+                    "include a valid source citation."
+                ),
+            )
+        ]
+
+    if any(
+        citation < 1 or citation > source_count
+        for citation in citation_numbers
+    ):
+        return [
+            QualityError(
+                error_type="unknown_citation",
+                message=(
+                    "The generated answer cited an "
+                    "unknown source number."
+                ),
+            )
+        ]
+
+    return []
 
 
 def _build_cited_sources(
@@ -996,46 +1676,186 @@ def answer_legal_question(
         else get_openai_answer_client()
     )
 
-    try:
-        openai_started_at = perf_counter()
-
-        generated_text = client.generate(
-            instructions=SYSTEM_INSTRUCTIONS,
-            input_text=_build_model_input(
-                request=request,
-                hits=selected_hits,
-            ),
-        )
-
-        if metrics is not None:
-            metrics.openai_ms = (
-                perf_counter() - openai_started_at
-            ) * 1000
-
-    except OpenAIResponseError as error:
-        raise RagAnswerError(
-            "Grounded answer generation failed."
-        ) from error
-
-    _validate_citation_format(
-        answer=generated_text.text
-    )
-
-    citation_numbers = (
-        _extract_citation_numbers(
-            answer=generated_text.text,
-            source_count=len(
-                selected_hits
-            ),
-        )
-    )
-
     if metrics is not None:
-        metrics.outcome = "generated"
         metrics.retrieval_total = retrieval_total
         metrics.selected_sources = len(
             selected_hits
         )
+        metrics.model = client.model
+
+    model_input = _build_model_input(
+        request=request,
+        hits=selected_hits,
+    )
+
+    def _generate_with_instructions(
+        instructions: str,
+    ) -> GeneratedText:
+        try:
+            call_started_at = perf_counter()
+
+            result = client.generate(
+                instructions=instructions,
+                input_text=model_input,
+            )
+
+            if metrics is not None:
+                metrics.openai_ms += (
+                    perf_counter() - call_started_at
+                ) * 1000
+
+        except OpenAIResponseError as error:
+            raise RagAnswerError(
+                "Grounded answer generation failed."
+            ) from error
+
+        return result
+
+    def _validate(
+        answer: str,
+    ) -> tuple[
+        list[QualityError],
+        list[QualityError],
+    ]:
+        return _validate_answer_quality(
+            question=request.question,
+            answer=answer,
+            country_codes=request.country_codes,
+            context=context_text,
+            source_count=len(
+                selected_hits
+            ),
+        )
+
+    context_text = _build_context(
+        selected_hits
+    )
+
+    first_generated_text = _generate_with_instructions(
+        SYSTEM_INSTRUCTIONS
+    )
+
+    first_hard_errors, first_soft_errors = _validate(
+        first_generated_text.text
+    )
+
+    generation_attempts = 1
+    repair_triggered = False
+    repair_success = False
+    repair_answer_returned = False
+
+    final_generated_text = first_generated_text
+    final_hard_errors = first_hard_errors
+    final_soft_errors = first_soft_errors
+
+    repairable_soft_errors = [
+        error
+        for error in first_soft_errors
+        if error.error_type in REPAIR_TRIGGERING_SOFT_ERROR_TYPES
+    ]
+
+    should_repair = bool(
+        first_hard_errors or repairable_soft_errors
+    )
+
+    if should_repair:
+        repair_triggered = True
+
+        repaired_generated_text = _generate_with_instructions(
+            SYSTEM_INSTRUCTIONS
+            + "\n\n"
+            + _build_repair_instructions(
+                list(first_hard_errors)
+                + list(first_soft_errors)
+            )
+        )
+
+        generation_attempts = 2
+
+        repaired_hard_errors, repaired_soft_errors = _validate(
+            repaired_generated_text.text
+        )
+
+        repaired_answer_was_returned = False
+
+        if not repaired_hard_errors:
+            # A repaired answer with no remaining hard errors wins,
+            # even if some soft (style-only) issues remain.
+            repaired_answer_was_returned = True
+            final_generated_text = repaired_generated_text
+            final_hard_errors = repaired_hard_errors
+            final_soft_errors = repaired_soft_errors
+
+        elif not first_hard_errors:
+            # The repair attempt degraded an answer that was already
+            # legally sound: keep the first answer instead.
+            final_generated_text = first_generated_text
+            final_hard_errors = first_hard_errors
+            final_soft_errors = first_soft_errors
+
+        else:
+            # Both attempts carry a real grounding failure.
+            final_hard_errors = repaired_hard_errors
+            final_soft_errors = repaired_soft_errors
+
+        repair_answer_returned = bool(
+            repair_triggered
+            and generation_attempts > 1
+            and repaired_answer_was_returned
+        )
+
+    # Computed unconditionally so a direct answer (no repair attempted)
+    # reports a real False rather than leaving repair_success unset.
+    repair_success = bool(
+        repair_triggered
+        and not final_hard_errors
+        and not final_soft_errors
+    )
+
+    if metrics is not None:
+        metrics.generation_attempts = generation_attempts
+        metrics.repair_triggered = repair_triggered
+        metrics.repair_success = repair_success
+        metrics.repair_answer_returned = repair_answer_returned
+        metrics.initial_hard_error_types = sorted(
+            {
+                error.error_type
+                for error in first_hard_errors
+            }
+        )
+        metrics.initial_soft_error_types = sorted(
+            {
+                error.error_type
+                for error in first_soft_errors
+            }
+        )
+        metrics.final_hard_error_types = sorted(
+            {
+                error.error_type
+                for error in final_hard_errors
+            }
+        )
+        metrics.final_soft_error_types = sorted(
+            {
+                error.error_type
+                for error in final_soft_errors
+            }
+        )
+
+    if final_hard_errors:
+        raise RagAnswerError(
+            "The generated answer failed "
+            "grounding validation."
+        )
+
+    generated_text = final_generated_text
+
+    citation_numbers = _find_citation_numbers(
+        generated_text.text
+    )
+
+    if metrics is not None:
+        metrics.outcome = "generated"
         metrics.model = generated_text.model
 
     return LegalChatResponse(
