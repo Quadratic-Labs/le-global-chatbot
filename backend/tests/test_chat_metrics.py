@@ -117,6 +117,33 @@ class LegalChatMetricsTests(unittest.TestCase):
             payload,
         )
 
+    def test_repair_metrics_serialize_boolean_defaults(
+        self,
+    ) -> None:
+        metrics = _build_metrics()
+
+        payload = metrics.as_log_payload()
+
+        self.assertIs(
+            payload["repair_triggered"],
+            False,
+        )
+
+        self.assertIs(
+            payload["repair_answer_returned"],
+            False,
+        )
+
+        self.assertIs(
+            payload["repair_success"],
+            False,
+        )
+
+        self.assertIsInstance(
+            payload["repair_success"],
+            bool,
+        )
+
     def test_log_emits_exactly_one_json_record(
         self,
     ) -> None:

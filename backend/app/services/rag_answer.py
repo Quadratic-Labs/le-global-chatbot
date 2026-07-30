@@ -857,6 +857,25 @@ SOFT_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Only structure is worth a second OpenAI call: it is cheap to fix and
+# the fix is reliable. The other soft warnings stay detected and
+# reported in metrics, but no longer trigger a repair generation - an
+# unrecognized future soft error type must not become repairable by
+# default, so this list is positive/explicit rather than derived.
+REPAIR_TRIGGERING_SOFT_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "structure",
+    }
+)
+
+NON_REPAIRING_SOFT_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "false_absence_claim",
+        "internal_reference",
+        "repetition",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _AnswerSection:
@@ -1722,13 +1741,24 @@ def answer_legal_question(
 
     generation_attempts = 1
     repair_triggered = False
-    repair_success: bool | None = None
+    repair_success = False
+    repair_answer_returned = False
 
     final_generated_text = first_generated_text
     final_hard_errors = first_hard_errors
     final_soft_errors = first_soft_errors
 
-    if first_hard_errors or first_soft_errors:
+    repairable_soft_errors = [
+        error
+        for error in first_soft_errors
+        if error.error_type in REPAIR_TRIGGERING_SOFT_ERROR_TYPES
+    ]
+
+    should_repair = bool(
+        first_hard_errors or repairable_soft_errors
+    )
+
+    if should_repair:
         repair_triggered = True
 
         repaired_generated_text = _generate_with_instructions(
@@ -1746,10 +1776,12 @@ def answer_legal_question(
             repaired_generated_text.text
         )
 
+        repaired_answer_was_returned = False
+
         if not repaired_hard_errors:
             # A repaired answer with no remaining hard errors wins,
             # even if some soft (style-only) issues remain.
-            repair_success = True
+            repaired_answer_was_returned = True
             final_generated_text = repaired_generated_text
             final_hard_errors = repaired_hard_errors
             final_soft_errors = repaired_soft_errors
@@ -1757,21 +1789,34 @@ def answer_legal_question(
         elif not first_hard_errors:
             # The repair attempt degraded an answer that was already
             # legally sound: keep the first answer instead.
-            repair_success = False
             final_generated_text = first_generated_text
             final_hard_errors = first_hard_errors
             final_soft_errors = first_soft_errors
 
         else:
             # Both attempts carry a real grounding failure.
-            repair_success = False
             final_hard_errors = repaired_hard_errors
             final_soft_errors = repaired_soft_errors
+
+        repair_answer_returned = bool(
+            repair_triggered
+            and generation_attempts > 1
+            and repaired_answer_was_returned
+        )
+
+    # Computed unconditionally so a direct answer (no repair attempted)
+    # reports a real False rather than leaving repair_success unset.
+    repair_success = bool(
+        repair_triggered
+        and not final_hard_errors
+        and not final_soft_errors
+    )
 
     if metrics is not None:
         metrics.generation_attempts = generation_attempts
         metrics.repair_triggered = repair_triggered
         metrics.repair_success = repair_success
+        metrics.repair_answer_returned = repair_answer_returned
         metrics.initial_hard_error_types = sorted(
             {
                 error.error_type

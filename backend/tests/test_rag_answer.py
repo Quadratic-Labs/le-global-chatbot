@@ -22,6 +22,8 @@ from app.services.chat_metrics import (
 )
 from app.services.rag_answer import (
     HARD_QUALITY_ERROR_TYPES,
+    NON_REPAIRING_SOFT_ERROR_TYPES,
+    REPAIR_TRIGGERING_SOFT_ERROR_TYPES,
     RERANK_INSTRUCTIONS,
     RERANK_SNIPPET_CHARACTERS,
     SOFT_QUALITY_ERROR_TYPES,
@@ -76,6 +78,46 @@ def _build_hit(
         source_format="docx",
         reference_year=2026,
     )
+
+
+def _build_metrics(
+    request_id: str,
+) -> LegalChatMetrics:
+    """Build one LegalChatMetrics instance with the shared test defaults."""
+
+    return LegalChatMetrics(
+        request_id=request_id,
+        question_characters=10,
+        max_sources=6,
+        rerank_enabled=False,
+    )
+
+
+def _make_search_function(
+    *,
+    hits: list[LegalSearchHit] | None = None,
+):
+    """Build a fake OpenSearch search function returning fixed hits."""
+
+    resolved_hits = (
+        hits
+        if hits is not None
+        else [_build_hit()]
+    )
+
+    def fake_search(
+        request: Any,
+    ) -> LegalSearchResponse:
+        return LegalSearchResponse(
+            query=request.query,
+            total=1,
+            limit=request.limit,
+            offset=0,
+            took_ms=1,
+            hits=resolved_hits,
+        )
+
+    return fake_search
 
 
 class FakeGenerationClient:
@@ -147,6 +189,214 @@ class FakeGenerationClient:
 
 class RagAnswerTests(unittest.TestCase):
     """Tests for retrieval and grounded generation."""
+
+    def _ask(
+        self,
+        *,
+        question: str,
+        country_codes: list[str],
+        client: FakeGenerationClient,
+        metrics: LegalChatMetrics,
+        search_function=None,
+    ):
+        """Run answer_legal_question with the repeated test skeleton."""
+
+        return answer_legal_question(
+            request=LegalChatRequest(
+                question=question,
+                country_codes=country_codes,
+            ),
+            search_function=(
+                search_function
+                if search_function is not None
+                else _make_search_function()
+            ),
+            generation_client=client,
+            metrics=metrics,
+        )
+
+    def _assert_non_repairing_soft_warning(
+        self,
+        *,
+        warning_type: str,
+        initial_answer: str,
+        question: str = "What notice period applies?",
+        country_codes: list[str] | None = None,
+        search_function=None,
+    ):
+        """Assert one soft warning is detected but never triggers a repair."""
+
+        client = FakeGenerationClient(
+            answer=initial_answer,
+        )
+
+        metrics = _build_metrics(
+            f"test-non-repairing-{warning_type}"
+        )
+
+        result = self._ask(
+            question=question,
+            country_codes=country_codes or ["GB"],
+            client=client,
+            metrics=metrics,
+            search_function=search_function,
+        )
+
+        main_calls = [
+            call
+            for call in client.calls
+            if call[0] != RERANK_INSTRUCTIONS
+        ]
+
+        self.assertEqual(
+            len(main_calls),
+            1,
+        )
+
+        self.assertEqual(
+            result.answer,
+            initial_answer,
+        )
+
+        self.assertTrue(
+            result.grounded
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            1,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            False,
+        )
+
+        self.assertIs(
+            metrics.repair_answer_returned,
+            False,
+        )
+
+        self.assertIs(
+            metrics.repair_success,
+            False,
+        )
+
+        self.assertIn(
+            warning_type,
+            metrics.initial_soft_error_types,
+        )
+
+        self.assertIn(
+            warning_type,
+            metrics.final_soft_error_types,
+        )
+
+        self.assertEqual(
+            metrics.initial_hard_error_types,
+            [],
+        )
+
+        self.assertEqual(
+            metrics.final_hard_error_types,
+            [],
+        )
+
+        return result, metrics, client
+
+    def _assert_repair_triggered(
+        self,
+        *,
+        initial_answer: str,
+        repaired_answer: str,
+        expected_initial_error_type: str,
+        expected_initial_error_category: str,
+        expected_repair_success: bool,
+        expected_final_soft_error_types: list[str] | None = None,
+        expected_final_hard_error_types: list[str] | None = None,
+        question: str = "What notice period applies?",
+        country_codes: list[str] | None = None,
+        search_function=None,
+    ):
+        """Assert a repair is triggered and check its outcome metrics."""
+
+        client = FakeGenerationClient(
+            answer=initial_answer,
+            repair_answer=repaired_answer,
+        )
+
+        metrics = _build_metrics(
+            f"test-repair-{expected_initial_error_type}"
+        )
+
+        result = self._ask(
+            question=question,
+            country_codes=country_codes or ["GB"],
+            client=client,
+            metrics=metrics,
+            search_function=search_function,
+        )
+
+        self.assertEqual(
+            len(client.calls),
+            2,
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            2,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            True,
+        )
+
+        self.assertIs(
+            metrics.repair_answer_returned,
+            True,
+        )
+
+        self.assertIs(
+            metrics.repair_success,
+            expected_repair_success,
+        )
+
+        self.assertEqual(
+            result.answer,
+            repaired_answer,
+        )
+
+        initial_errors = (
+            metrics.initial_hard_error_types
+            if expected_initial_error_category == "hard"
+            else metrics.initial_soft_error_types
+        )
+
+        self.assertIn(
+            expected_initial_error_type,
+            initial_errors,
+        )
+
+        # A hard error must never survive to the returned answer: if it
+        # did, answer_legal_question would have raised instead of
+        # returning here.
+        self.assertEqual(
+            metrics.final_hard_error_types,
+            (
+                expected_final_hard_error_types
+                if expected_final_hard_error_types is not None
+                else []
+            ),
+        )
+
+        if expected_final_soft_error_types is not None:
+            self.assertEqual(
+                metrics.final_soft_error_types,
+                expected_final_soft_error_types,
+            )
+
+        return result, metrics, client
 
     def test_grounded_answer_uses_retrieved_source(
         self,
@@ -1839,72 +2089,40 @@ class RagAnswerTests(unittest.TestCase):
                 generation_client=client,
             )
 
-    def test_never_denies_available_italian_maternity_duration(
+    def test_false_absence_claim_no_longer_auto_repairs_italian_maternity(
         self,
     ) -> None:
-        context_content = (
-            "Maternity leave is compulsory for two "
-            "months prior to the expected date of "
-            "childbirth and three months after "
-            "childbirth."
-        )
-
         bad_answer = (
             "The duration of Italian maternity leave "
-            "is not specified in the sources [1]."
+            "is not specified [1]."
         )
 
-        good_answer = (
-            "Italy\n"
-            "- Maternity leave lasts two months prior "
-            "to childbirth and three months after [1]."
-        )
-
-        client = FakeGenerationClient(
-            answer=bad_answer,
-            repair_answer=good_answer,
-        )
-
-        def fake_search(
-            request: Any,
-        ) -> LegalSearchResponse:
-            return LegalSearchResponse(
-                query=request.query,
-                total=1,
-                limit=request.limit,
-                offset=0,
-                took_ms=1,
+        result, _metrics, _client = self._assert_non_repairing_soft_warning(
+            warning_type="false_absence_claim",
+            initial_answer=bad_answer,
+            question="What is the maternity leave duration in Italy?",
+            country_codes=["IT"],
+            search_function=_make_search_function(
                 hits=[
                     _build_hit(
                         country="Italy",
                         country_code="IT",
-                        content=context_content,
+                        content=(
+                            "Maternity leave is compulsory for two "
+                            "months prior to the expected date of "
+                            "childbirth and three months after "
+                            "childbirth."
+                        ),
                     )
-                ],
-            )
-
-        response = answer_legal_question(
-            request=LegalChatRequest(
-                question=(
-                    "What is the maternity leave "
-                    "duration in Italy?"
-                ),
-                country_codes=[
-                    "IT",
-                ],
+                ]
             ),
-            search_function=fake_search,
-            generation_client=client,
         )
 
-        self.assertNotIn(
-            "not specified",
-            response.answer.casefold(),
-        )
-
-        self.assertEqual(
-            response.answer,
-            good_answer,
+        # Business regression guard: the false absence claim must
+        # survive untouched, not be silently corrected away.
+        self.assertIn(
+            "is not specified",
+            result.answer,
         )
 
     def test_soft_validation_failure_never_returns_502(
@@ -1948,6 +2166,8 @@ class RagAnswerTests(unittest.TestCase):
             response.grounded
         )
 
+        # internal_reference is a non-repairing soft warning: it is
+        # detected but must not trigger a second generation call.
         main_calls = [
             call
             for call in client.calls
@@ -1956,7 +2176,7 @@ class RagAnswerTests(unittest.TestCase):
 
         self.assertEqual(
             len(main_calls),
-            2,
+            1,
         )
 
     def test_repaired_answer_with_only_soft_errors_is_returned(
@@ -2288,6 +2508,279 @@ class RagAnswerTests(unittest.TestCase):
         self.assertIn(
             "missing_requested_country",
             metrics.final_hard_error_types,
+        )
+
+    def test_repair_triggering_and_non_repairing_soft_sets_are_disjoint(
+        self,
+    ) -> None:
+        self.assertEqual(
+            REPAIR_TRIGGERING_SOFT_ERROR_TYPES,
+            frozenset({"structure"}),
+        )
+
+        self.assertEqual(
+            NON_REPAIRING_SOFT_ERROR_TYPES,
+            frozenset(
+                {
+                    "false_absence_claim",
+                    "internal_reference",
+                    "repetition",
+                }
+            ),
+        )
+
+        self.assertFalse(
+            REPAIR_TRIGGERING_SOFT_ERROR_TYPES
+            & NON_REPAIRING_SOFT_ERROR_TYPES
+        )
+
+        self.assertEqual(
+            REPAIR_TRIGGERING_SOFT_ERROR_TYPES
+            | NON_REPAIRING_SOFT_ERROR_TYPES,
+            SOFT_QUALITY_ERROR_TYPES,
+        )
+
+    def test_false_absence_soft_warning_does_not_trigger_repair(
+        self,
+    ) -> None:
+        self._assert_non_repairing_soft_warning(
+            warning_type="false_absence_claim",
+            initial_answer=(
+                "United Kingdom\n"
+                "- The exact entitlement is not "
+                "specified [1]."
+            ),
+            question="What is the parental leave duration in the UK?",
+            search_function=_make_search_function(
+                hits=[
+                    _build_hit(
+                        content=(
+                            "Employees are entitled to "
+                            "four weeks of parental leave."
+                        ),
+                    )
+                ]
+            ),
+        )
+
+    def test_internal_reference_soft_warning_does_not_trigger_repair(
+        self,
+    ) -> None:
+        self._assert_non_repairing_soft_warning(
+            warning_type="internal_reference",
+            initial_answer=(
+                "United Kingdom\n"
+                "- Notice period is one week, as "
+                "covered in the provided extracts [1]."
+            ),
+        )
+
+    def test_repetition_soft_warning_does_not_trigger_repair(
+        self,
+    ) -> None:
+        self._assert_non_repairing_soft_warning(
+            warning_type="repetition",
+            initial_answer=(
+                "United Kingdom\n"
+                "- Notice period is one week for "
+                "qualifying employees [1].\n"
+                "- Notice period is one week for "
+                "qualifying employees [1]."
+            ),
+        )
+
+    def test_clean_direct_answer_has_false_repair_metrics(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n"
+            "- Notice period is one week for "
+            "qualifying employees [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=answer,
+        )
+
+        metrics = _build_metrics(
+            "request-clean-direct"
+        )
+
+        result = self._ask(
+            question="What is the notice period in the UK?",
+            country_codes=["GB"],
+            client=client,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            result.answer,
+            answer,
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            1,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            False,
+        )
+
+        self.assertIs(
+            metrics.repair_answer_returned,
+            False,
+        )
+
+        self.assertIs(
+            metrics.repair_success,
+            False,
+        )
+
+        self.assertEqual(
+            metrics.initial_hard_error_types,
+            [],
+        )
+
+        self.assertEqual(
+            metrics.initial_soft_error_types,
+            [],
+        )
+
+        self.assertEqual(
+            metrics.final_hard_error_types,
+            [],
+        )
+
+        self.assertEqual(
+            metrics.final_soft_error_types,
+            [],
+        )
+
+    def test_structure_soft_error_triggers_repair(
+        self,
+    ) -> None:
+        self._assert_repair_triggered(
+            initial_answer=(
+                "United Kingdom\n"
+                "- Bullet one covering notice periods [1].\n"
+                "- Bullet two covering notice periods [1].\n"
+                "- Bullet three covering notice periods [1].\n"
+                "- Bullet four covering notice periods [1].\n"
+                "- Bullet five covering notice periods [1].\n"
+                "- Bullet six covering notice periods [1].\n"
+                "- Bullet seven covering notice periods [1]."
+            ),
+            repaired_answer=(
+                "United Kingdom\n"
+                "- Notice period is one week for "
+                "qualifying employees [1].\n"
+                "- Notice increases with length of "
+                "service [1].\n"
+                "- Statutory minimums apply regardless "
+                "of contract terms [1]."
+            ),
+            expected_initial_error_type="structure",
+            expected_initial_error_category="soft",
+            expected_repair_success=True,
+            expected_final_soft_error_types=[],
+        )
+
+    def test_hard_error_still_triggers_repair(
+        self,
+    ) -> None:
+        self._assert_repair_triggered(
+            initial_answer=(
+                "United Kingdom\n"
+                "- Employees are entitled to unpaid "
+                "leave for family reasons [1]."
+            ),
+            repaired_answer=(
+                "United Kingdom\n"
+                "- Employees are entitled to paid "
+                "parental leave for four weeks [1]."
+            ),
+            expected_initial_error_type="paid_leave_scope",
+            expected_initial_error_category="hard",
+            expected_repair_success=True,
+            expected_final_soft_error_types=[],
+            question="What is the paid leave entitlement in the UK?",
+        )
+
+    def test_repair_success_requires_no_final_quality_errors(
+        self,
+    ) -> None:
+        with self.subTest("clean repair"):
+            self._assert_repair_triggered(
+                initial_answer=(
+                    "United Kingdom\n"
+                    "- Employees are entitled to unpaid "
+                    "leave for family reasons [1]."
+                ),
+                repaired_answer=(
+                    "United Kingdom\n"
+                    "- Employees are entitled to paid "
+                    "parental leave for four weeks [1]."
+                ),
+                expected_initial_error_type="paid_leave_scope",
+                expected_initial_error_category="hard",
+                expected_repair_success=True,
+                expected_final_soft_error_types=[],
+                question="What is the paid leave entitlement in the UK?",
+            )
+
+        with self.subTest("returned repair with residual warning"):
+            self._assert_repair_triggered(
+                initial_answer="Supported by [1].",
+                repaired_answer=(
+                    "United Kingdom\n"
+                    "- Notice entitlement is one week, as "
+                    "set out in the provided extracts [1]."
+                ),
+                expected_initial_error_type=(
+                    "missing_requested_country"
+                ),
+                expected_initial_error_category="hard",
+                expected_repair_success=False,
+                expected_final_soft_error_types=[
+                    "internal_reference",
+                ],
+            )
+
+    def test_structure_with_non_repairing_warning_still_triggers_repair(
+        self,
+    ) -> None:
+        bad_answer = (
+            "United Kingdom\n"
+            "- Bullet one covering notice periods [1].\n"
+            "- Bullet two covering notice periods [1].\n"
+            "- Bullet three covering notice periods [1].\n"
+            "- Bullet four covering notice periods [1].\n"
+            "- Bullet five covering notice periods [1].\n"
+            "- Bullet six covering notice periods [1].\n"
+            "- Bullet seven, as covered in the "
+            "provided extracts [1]."
+        )
+
+        _result, metrics, _client = self._assert_repair_triggered(
+            initial_answer=bad_answer,
+            repaired_answer=bad_answer,
+            expected_initial_error_type="structure",
+            expected_initial_error_category="soft",
+            expected_repair_success=False,
+            expected_final_soft_error_types=[
+                "internal_reference",
+                "structure",
+            ],
+        )
+
+        # The presence of "structure" alone must be enough to trigger a
+        # repair, even though "internal_reference" - on its own
+        # non-repairing - is also present.
+        self.assertIn(
+            "internal_reference",
+            metrics.initial_soft_error_types,
         )
 
 
