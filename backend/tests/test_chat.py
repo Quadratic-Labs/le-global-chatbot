@@ -216,7 +216,10 @@ class ChatScopeTests(unittest.TestCase):
             )
 
         client = FakeGenerationClient(
-            answer="Supported by the extract [1]."
+            answer=(
+                "Spain\n"
+                "- Supported by the top extract [1]."
+            )
         )
 
         response = resolve_legal_chat_response(
@@ -354,7 +357,10 @@ class ChatScopeTests(unittest.TestCase):
             )
 
         client = FakeGenerationClient(
-            answer="Supported by the extract [1]."
+            answer=(
+                "Spain\n"
+                "- Supported by the top extract [1]."
+            )
         )
 
         response = resolve_legal_chat_response(
@@ -400,7 +406,10 @@ class ChatScopeTests(unittest.TestCase):
             )
 
         client = FakeGenerationClient(
-            answer="Supported by the extract [1]."
+            answer=(
+                "Spain\n"
+                "- Supported by the top extract [1]."
+            )
         )
 
         resolve_legal_chat_response(
@@ -462,13 +471,25 @@ class ChatScopeTests(unittest.TestCase):
                 ],
             )
 
-        citations = " ".join(
-            f"[{position}]"
-            for position in range(1, 7)
+        country_names = [
+            "United Kingdom",
+            "Spain",
+            "Italy",
+            "Czech Republic",
+            "Sweden",
+            "Switzerland",
+        ]
+
+        answer = "\n".join(
+            f"{name}\n- Supported by [{position}]."
+            for position, name in enumerate(
+                country_names,
+                start=1,
+            )
         )
 
         client = FakeGenerationClient(
-            answer=f"Supported by {citations}."
+            answer=answer
         )
 
         response = resolve_legal_chat_response(
@@ -568,7 +589,10 @@ class ChatMetricsTests(unittest.TestCase):
             )
 
         client = FakeGenerationClient(
-            answer="Supported by the extract [1].",
+            answer=(
+                "Spain\n"
+                "- Supported by the top extract [1]."
+            ),
             delay_seconds=0.001,
         )
 
@@ -659,13 +683,25 @@ class ChatMetricsTests(unittest.TestCase):
                 ],
             )
 
-        citations = " ".join(
-            f"[{position}]"
-            for position in range(1, 7)
+        country_names = [
+            "United Kingdom",
+            "Spain",
+            "Italy",
+            "Czech Republic",
+            "Sweden",
+            "Switzerland",
+        ]
+
+        answer = "\n".join(
+            f"{name}\n- Supported by [{position}]."
+            for position, name in enumerate(
+                country_names,
+                start=1,
+            )
         )
 
         client = FakeGenerationClient(
-            answer=f"Supported by {citations}."
+            answer=answer
         )
 
         with self.assertLogs(
@@ -939,7 +975,8 @@ class ChatMetricsTests(unittest.TestCase):
         )
 
         distinctive_answer = (
-            "The confidential clause ZQ-42-secret "
+            "Spain\n"
+            "- The confidential clause ZQ-42-secret "
             "applies here [1]."
         )
 
@@ -1028,7 +1065,10 @@ class ChatMetricsTests(unittest.TestCase):
             )
 
         client = FakeGenerationClient(
-            answer="Supported by the extract [1]."
+            answer=(
+                "Spain\n"
+                "- Supported by the top extract [1]."
+            )
         )
 
         with self.assertLogs(
