@@ -129,6 +129,7 @@ services:
 
     environment:
       APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
 
       OPENSEARCH_URL: https://opensearch:9200
       OPENSEARCH_USERNAME: admin
