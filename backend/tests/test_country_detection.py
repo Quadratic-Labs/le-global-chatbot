@@ -1,4 +1,4 @@
-"""Tests for automatic country detection."""
+"""Tests for automatic country detection and availability."""
 
 from __future__ import annotations
 
@@ -10,9 +10,12 @@ from app.models.catalog import (
 )
 from app.models.chat import LegalChatRequest
 from app.services.country_detection import (
-    detect_country_codes,
-    prepare_legal_chat_request,
+    CountryDetectionError,
+    detect_mentioned_country_codes,
+    resolve_country_availability,
+    resolve_country_display_name,
 )
+from app.services.legal_catalog import LegalCatalogError
 
 
 def _build_catalog() -> LegalCatalogResponse:
@@ -53,17 +56,14 @@ def _catalog_provider() -> LegalCatalogResponse:
 
 
 class CountryDetectionTests(unittest.TestCase):
-    """Tests for country extraction from questions."""
+    """Tests for worldwide country-name detection."""
 
     def test_detects_alias_and_country_name(
         self,
     ) -> None:
-        detected_codes = detect_country_codes(
-            question=(
-                "Compare notice periods in "
-                "the UK and Spain."
-            ),
-            catalog_provider=_catalog_provider,
+        detected_codes = detect_mentioned_country_codes(
+            "Compare notice periods in "
+            "the UK and Spain."
         )
 
         self.assertEqual(
@@ -74,31 +74,23 @@ class CountryDetectionTests(unittest.TestCase):
             ],
         )
 
-    def test_detects_explicit_uppercase_code(
+    def test_bare_uppercase_code_in_free_text_is_not_detected(
         self,
     ) -> None:
-        detected_codes = detect_country_codes(
-            question=(
-                "What is the notice period in IT?"
-            ),
-            catalog_provider=_catalog_provider,
+        detected_codes = detect_mentioned_country_codes(
+            "What is the notice period in IT?"
         )
 
         self.assertEqual(
             detected_codes,
-            [
-                "IT",
-            ],
+            [],
         )
 
     def test_lowercase_word_is_not_country_code(
         self,
     ) -> None:
-        detected_codes = detect_country_codes(
-            question=(
-                "Can it be terminated immediately?"
-            ),
-            catalog_provider=_catalog_provider,
+        detected_codes = detect_mentioned_country_codes(
+            "Can it be terminated immediately?"
         )
 
         self.assertEqual(
@@ -109,11 +101,8 @@ class CountryDetectionTests(unittest.TestCase):
     def test_detects_country_alias(
         self,
     ) -> None:
-        detected_codes = detect_country_codes(
-            question=(
-                "What rules apply in Czechia?"
-            ),
-            catalog_provider=_catalog_provider,
+        detected_codes = detect_mentioned_country_codes(
+            "What rules apply in Czechia?"
         )
 
         self.assertEqual(
@@ -123,22 +112,123 @@ class CountryDetectionTests(unittest.TestCase):
             ],
         )
 
-    def test_unavailable_country_is_ignored(
+    def test_detects_country_outside_the_corpus(
         self,
     ) -> None:
-        detected_codes = detect_country_codes(
-            question=(
-                "What is the law in France?"
+        detected_codes = detect_mentioned_country_codes(
+            "What are the overtime rules in Canada?"
+        )
+
+        self.assertEqual(
+            detected_codes,
+            [
+                "CA",
+            ],
+        )
+
+
+class CountryAvailabilityTests(unittest.TestCase):
+    """Tests for splitting mentioned countries by corpus availability."""
+
+    def test_available_country_is_reported_as_available(
+        self,
+    ) -> None:
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in "
+                    "the UK and Spain."
+                )
             ),
             catalog_provider=_catalog_provider,
         )
 
         self.assertEqual(
-            detected_codes,
+            availability.available_codes,
+            [
+                "GB",
+                "ES",
+            ],
+        )
+
+        self.assertEqual(
+            availability.unavailable_codes,
             [],
         )
 
-    def test_explicit_filters_take_priority(
+    def test_unavailable_country_is_reported_not_ignored(
+        self,
+    ) -> None:
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question=(
+                    "What is the law in France?"
+                )
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(
+            availability.available_codes,
+            [],
+        )
+
+        self.assertEqual(
+            availability.unavailable_codes,
+            [
+                "FR",
+            ],
+        )
+
+    def test_mixed_available_and_unavailable_countries(
+        self,
+    ) -> None:
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question=(
+                    "Compare overtime in Spain and Canada."
+                )
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(
+            availability.available_codes,
+            [
+                "ES",
+            ],
+        )
+
+        self.assertEqual(
+            availability.unavailable_codes,
+            [
+                "CA",
+            ],
+        )
+
+    def test_no_country_mentioned_is_empty_scope(
+        self,
+    ) -> None:
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question=(
+                    "What is the statutory notice period?"
+                )
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(
+            availability.available_codes,
+            [],
+        )
+
+        self.assertEqual(
+            availability.unavailable_codes,
+            [],
+        )
+
+    def test_explicit_codes_are_checked_against_the_catalog(
         self,
     ) -> None:
         catalog_called = False
@@ -149,57 +239,97 @@ class CountryDetectionTests(unittest.TestCase):
 
             return _build_catalog()
 
-        prepared_request = (
-            prepare_legal_chat_request(
-                request=LegalChatRequest(
-                    question=(
-                        "Compare the UK and Spain."
-                    ),
-                    country_codes=[
-                        " it ",
-                    ],
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question=(
+                    "Compare the UK and Spain."
                 ),
-                catalog_provider=catalog_provider,
-            )
+                country_codes=[
+                    " it ",
+                ],
+            ),
+            catalog_provider=catalog_provider,
         )
 
-        self.assertFalse(
+        self.assertTrue(
             catalog_called
         )
 
         self.assertEqual(
-            prepared_request.country_codes,
+            availability.available_codes,
             [
                 "IT",
             ],
         )
 
-    def test_detected_filters_are_added_to_request(
+    def test_explicit_unavailable_code_is_reported(
         self,
     ) -> None:
-        prepared_request = (
-            prepare_legal_chat_request(
-                request=LegalChatRequest(
-                    question=(
-                        "Compare the UK and Spain."
-                    ),
-                    max_sources=4,
-                ),
-                catalog_provider=_catalog_provider,
-            )
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question="What is the law here?",
+                country_codes=[
+                    "ca",
+                ],
+            ),
+            catalog_provider=_catalog_provider,
         )
 
         self.assertEqual(
-            prepared_request.country_codes,
+            availability.available_codes,
+            [],
+        )
+
+        self.assertEqual(
+            availability.unavailable_codes,
             [
-                "GB",
-                "ES",
+                "CA",
             ],
         )
 
+    def test_catalog_error_is_wrapped(
+        self,
+    ) -> None:
+        def failing_catalog_provider() -> (
+            LegalCatalogResponse
+        ):
+            raise LegalCatalogError(
+                "unavailable"
+            )
+
+        with self.assertRaises(
+            CountryDetectionError
+        ):
+            resolve_country_availability(
+                request=LegalChatRequest(
+                    question="What is the law in Canada?"
+                ),
+                catalog_provider=failing_catalog_provider,
+            )
+
+
+class CountryDisplayNameTests(unittest.TestCase):
+    """Tests for resolving readable country names from codes."""
+
+    def test_resolves_known_code(
+        self,
+    ) -> None:
         self.assertEqual(
-            prepared_request.max_sources,
-            4,
+            resolve_country_display_name("CA"),
+            "Canada",
+        )
+
+        self.assertEqual(
+            resolve_country_display_name("gb"),
+            "United Kingdom",
+        )
+
+    def test_unknown_code_falls_back_to_the_code(
+        self,
+    ) -> None:
+        self.assertEqual(
+            resolve_country_display_name("ZZ"),
+            "ZZ",
         )
 
 

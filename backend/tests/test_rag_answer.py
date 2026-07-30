@@ -24,7 +24,9 @@ from app.services.rag_answer import (
     InvalidLegalChatRequestError,
     NO_INFORMATION_ANSWER,
     RagAnswerError,
+    _build_retrieval_query,
     _build_rerank_input,
+    _country_name_variants_for_codes,
     _parse_rerank_order,
     _select_context_hits,
     _truncate_context,
@@ -1085,6 +1087,116 @@ class RagAnswerTests(unittest.TestCase):
                 "GB",
                 "ES",
             ],
+        )
+
+    def test_country_name_variants_for_codes(
+        self,
+    ) -> None:
+        variants = _country_name_variants_for_codes(
+            [
+                "GB",
+            ]
+        )
+
+        self.assertIn(
+            "United Kingdom",
+            variants,
+        )
+
+        self.assertIn(
+            "UK",
+            variants,
+        )
+
+    def test_build_retrieval_query_strips_country_names(
+        self,
+    ) -> None:
+        cleaned = _build_retrieval_query(
+            question=(
+                "Compare overtime rules in the "
+                "United Kingdom and Spain."
+            ),
+            country_name_variants=(
+                _country_name_variants_for_codes(
+                    [
+                        "GB",
+                        "ES",
+                    ]
+                )
+            ),
+        )
+
+        self.assertEqual(
+            cleaned,
+            "overtime",
+        )
+
+    def test_build_retrieval_query_falls_back_when_empty(
+        self,
+    ) -> None:
+        question = "Compare the UK and Spain."
+
+        cleaned = _build_retrieval_query(
+            question=question,
+            country_name_variants=(
+                _country_name_variants_for_codes(
+                    [
+                        "GB",
+                        "ES",
+                    ]
+                )
+            ),
+        )
+
+        self.assertEqual(
+            cleaned,
+            question,
+        )
+
+    def test_search_query_is_cleaned_before_retrieval(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=0,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            )
+
+        answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare overtime rules in the "
+                    "United Kingdom and Spain."
+                ),
+                country_codes=[
+                    "GB",
+                    "ES",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+        )
+
+        self.assertEqual(
+            captured_requests[0].query,
+            "overtime",
+        )
+
+        self.assertEqual(
+            captured_requests[1].query,
+            "overtime",
         )
 
     def test_build_rerank_input_truncates_content(
