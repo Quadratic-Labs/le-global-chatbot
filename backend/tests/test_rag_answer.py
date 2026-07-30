@@ -20,16 +20,16 @@ from app.models.search import (
 from app.services.rag_answer import (
     RERANK_INSTRUCTIONS,
     RERANK_SNIPPET_CHARACTERS,
-    TRUNCATION_SUFFIX,
     InvalidLegalChatRequestError,
     NO_INFORMATION_ANSWER,
     RagAnswerError,
+    _allocate_country_context_budgets,
     _build_retrieval_query,
     _build_rerank_input,
     _country_name_variants_for_codes,
     _parse_rerank_order,
-    _select_context_hits,
     _truncate_context,
+    _validate_citation_format,
     answer_legal_question,
 )
 
@@ -399,6 +399,67 @@ class RagAnswerTests(unittest.TestCase):
                 generation_client=client,
             )
 
+    def test_validate_citation_format_accepts_valid_citations(
+        self,
+    ) -> None:
+        _validate_citation_format(
+            "Supported by [1] and also [1, 2]."
+        )
+
+    def test_validate_citation_format_rejects_semicolons(
+        self,
+    ) -> None:
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            _validate_citation_format(
+                "Supported by [1; 2]."
+            )
+
+    def test_validate_citation_format_rejects_mixed_separators(
+        self,
+    ) -> None:
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            _validate_citation_format(
+                "Supported by [1, 3; 2]."
+            )
+
+    def test_malformed_citation_rejects_the_whole_answer(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer=(
+                "Supported by the extracts [1, 3; 2]."
+            )
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            answer_legal_question(
+                request=LegalChatRequest(
+                    question="Notice period",
+                ),
+                search_function=fake_search,
+                generation_client=client,
+            )
+
     def test_multi_country_retrieval_is_balanced(
         self,
     ) -> None:
@@ -407,7 +468,7 @@ class RagAnswerTests(unittest.TestCase):
         client = FakeGenerationClient(
             answer=(
                 "The UK position is supported by [1]. "
-                "The Spanish position is supported by [2]."
+                "The Spanish position is supported by [3]."
             )
         )
 
@@ -918,20 +979,17 @@ class RagAnswerTests(unittest.TestCase):
 
         truncated = _truncate_context(
             content=content,
-            maximum_characters=46,
+            maximum_characters=30,
         )
 
-        self.assertTrue(
-            truncated.startswith(first_paragraph)
+        self.assertEqual(
+            truncated,
+            first_paragraph,
         )
 
         self.assertNotIn(
-            second_paragraph,
+            "B",
             truncated,
-        )
-
-        self.assertTrue(
-            truncated.endswith(TRUNCATION_SUFFIX)
         )
 
     def test_truncate_context_hard_cuts_without_boundary(
@@ -944,16 +1002,30 @@ class RagAnswerTests(unittest.TestCase):
             maximum_characters=50,
         )
 
-        self.assertTrue(
-            truncated.endswith(TRUNCATION_SUFFIX)
+        self.assertEqual(
+            truncated,
+            "A" * 50,
         )
 
-        self.assertLessEqual(
-            len(truncated),
-            50,
+    def test_truncate_context_never_adds_a_marker(
+        self,
+    ) -> None:
+        truncated = _truncate_context(
+            content="A" * 200,
+            maximum_characters=50,
         )
 
-    def test_select_context_hits_keeps_every_hit(
+        self.assertNotIn(
+            "truncated",
+            truncated.lower(),
+        )
+
+        self.assertNotIn(
+            "[",
+            truncated,
+        )
+
+    def test_allocate_country_context_budgets_keeps_every_hit(
         self,
     ) -> None:
         hits = [
@@ -971,7 +1043,7 @@ class RagAnswerTests(unittest.TestCase):
             ),
         ]
 
-        selected = _select_context_hits(
+        selected = _allocate_country_context_budgets(
             hits=hits,
             maximum_characters=6000,
             maximum_source_characters=4000,
@@ -986,7 +1058,7 @@ class RagAnswerTests(unittest.TestCase):
             ],
         )
 
-    def test_select_context_hits_respects_per_source_cap(
+    def test_allocate_country_context_budgets_respects_per_source_cap(
         self,
     ) -> None:
         hits = [
@@ -996,7 +1068,7 @@ class RagAnswerTests(unittest.TestCase):
             ),
         ]
 
-        selected = _select_context_hits(
+        selected = _allocate_country_context_budgets(
             hits=hits,
             maximum_characters=16000,
             maximum_source_characters=4000,
@@ -1007,17 +1079,222 @@ class RagAnswerTests(unittest.TestCase):
             4000,
         )
 
-    def test_select_context_hits_returns_empty_for_no_hits(
+    def test_allocate_country_context_budgets_returns_empty_for_no_hits(
         self,
     ) -> None:
         self.assertEqual(
-            _select_context_hits(
+            _allocate_country_context_budgets(
                 hits=[],
                 maximum_characters=16000,
                 maximum_source_characters=4000,
             ),
             [],
         )
+
+    def test_budget_is_split_per_country_not_per_source(
+        self,
+    ) -> None:
+        hits = []
+
+        for country_code in (
+            "GB",
+            "ES",
+            "IT",
+        ):
+            hits.append(
+                _build_hit(
+                    chunk_id=f"{country_code}-1",
+                    country_code=country_code,
+                    content="A" * 10000,
+                )
+            )
+
+            hits.append(
+                _build_hit(
+                    chunk_id=f"{country_code}-2",
+                    country_code=country_code,
+                    content="B" * 10000,
+                )
+            )
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        lengths_by_chunk_id = {
+            hit.chunk_id: len(hit.content)
+            for hit in selected
+        }
+
+        for country_code in (
+            "GB",
+            "ES",
+            "IT",
+        ):
+            self.assertEqual(
+                lengths_by_chunk_id[
+                    f"{country_code}-1"
+                ],
+                4000,
+            )
+
+            self.assertEqual(
+                lengths_by_chunk_id[
+                    f"{country_code}-2"
+                ],
+                1333,
+            )
+
+    def test_every_country_stays_represented_after_allocation(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="GB-1",
+                country_code="GB",
+                content="A" * 10000,
+            ),
+            _build_hit(
+                chunk_id="ES-1",
+                country_code="ES",
+                content="B" * 10000,
+            ),
+            _build_hit(
+                chunk_id="IT-1",
+                country_code="IT",
+                content="C" * 10000,
+            ),
+        ]
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        self.assertEqual(
+            sorted(
+                hit.country_code
+                for hit in selected
+            ),
+            [
+                "ES",
+                "GB",
+                "IT",
+            ],
+        )
+
+    def test_paid_leave_context_preserves_belgium_parental_leave(
+        self,
+    ) -> None:
+        """
+        Three countries, two sources per country (6 sources total).
+
+        Under the old per-source split (16000 // 6 = 2666 characters
+        each), Belgium's primary source is cut before reaching its
+        "Maternity and Paternity Leave" section, which starts past
+        character 2666. Under the per-country split, that same source
+        gets up to 4000 characters and the section survives in full.
+        """
+
+        filler = (
+            "General leave provisions apply to all workers. "
+            * 60
+        )
+
+        belgium_primary_content = (
+            filler
+            + "Maternity and Paternity Leave: parents are "
+            "entitled to fifteen days of paid leave "
+            "following the birth of a child."
+        )
+
+        hits = [
+            _build_hit(
+                chunk_id="BE-1",
+                country_code="BE",
+                content=belgium_primary_content,
+            ),
+            _build_hit(
+                chunk_id="BE-2",
+                country_code="BE",
+                content="Other Belgian leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="GB-1",
+                country_code="GB",
+                content="UK leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="GB-2",
+                country_code="GB",
+                content="UK secondary leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="FR-1",
+                country_code="FR",
+                content="French leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="FR-2",
+                country_code="FR",
+                content=(
+                    "French secondary leave content. " * 200
+                ),
+            ),
+        ]
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        belgium_primary = next(
+            hit
+            for hit in selected
+            if hit.chunk_id == "BE-1"
+        )
+
+        self.assertIn(
+            "Maternity and Paternity Leave",
+            belgium_primary.content,
+        )
+
+    def test_no_truncation_marker_leaks_into_context(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="GB-1",
+                country_code="GB",
+                content="A" * 10000,
+            ),
+            _build_hit(
+                chunk_id="ES-1",
+                country_code="ES",
+                content="B" * 10000,
+            ),
+        ]
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=8000,
+            maximum_source_characters=4000,
+        )
+
+        for hit in selected:
+            self.assertNotIn(
+                "Extract truncated",
+                hit.content,
+            )
+
+            self.assertNotIn(
+                "[",
+                hit.content,
+            )
 
     def test_answer_preserves_all_countries_with_small_context_budget(
         self,
