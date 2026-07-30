@@ -175,6 +175,12 @@ def build_legal_search_body(
             }
         )
 
+    has_structured_filters = bool(
+        request.country_codes
+        or request.legal_topics
+        or request.subsections
+    )
+
     return {
         "from": request.offset,
         "size": request.limit,
@@ -193,7 +199,9 @@ def build_legal_search_body(
                             ],
                             "type": "best_fields",
                             "minimum_should_match": (
-                                "70%"
+                                "1"
+                                if has_structured_filters
+                                else "70%"
                             ),
                             "tie_breaker": 0.2,
                         }

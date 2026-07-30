@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Final
 
 from app.models.chat import LegalChatRequest
@@ -16,6 +17,21 @@ TOPIC_RULES: Final[
         ...,
     ]
 ] = (
+    (
+        (
+            "hiring practices",
+            "recruitment",
+            "background check",
+            "interview questions",
+            "work permit",
+            "employment visa",
+            "pre-employment screening",
+            "local entity",
+        ),
+        (
+            "Hiring Practices",
+        ),
+    ),
     (
         (
             "notice period",
@@ -71,17 +87,38 @@ TOPIC_RULES: Final[
     ),
     (
         (
-            "annual leave",
-            "paid leave",
-            "sick leave",
-            "maternity leave",
-            "paternity leave",
-            "parental leave",
-            "employee benefits",
-            "social security",
+            "discrimination",
+            "harassment",
+            "reasonable accommodation",
+            "protected characteristic",
         ),
         (
-            "Employee Benefits",
+            "Anti-Discrimination Laws",
+        ),
+    ),
+    (
+        (
+            "equal pay",
+            "pay equity",
+            "gender pay gap",
+        ),
+        (
+            "Pay Equity Laws",
+        ),
+    ),
+    (
+        (
+            "employee monitoring",
+            "monitoring employees",
+            "monitor employee",
+            "monitor employees",
+            "electronic communications",
+            "data privacy",
+            "personal data",
+            "social media",
+        ),
+        (
+            "Social Media and Data Privacy",
         ),
     ),
     (
@@ -97,7 +134,65 @@ TOPIC_RULES: Final[
             "Restrictive Covenants",
         ),
     ),
+    (
+        (
+            "transfer of undertaking",
+            "transfer of undertakings",
+            "business transfer",
+            "tupe",
+        ),
+        (
+            "Transfer of Undertakings",
+        ),
+    ),
+    (
+        (
+            "trade union",
+            "trade unions",
+            "works council",
+            "collective bargaining",
+            "employee representative",
+        ),
+        (
+            "Trade Unions and Employers Associations",
+        ),
+    ),
+    (
+        (
+            "annual leave",
+            "paid leave",
+            "sick leave",
+            "maternity leave",
+            "paternity leave",
+            "parental leave",
+            "employee benefits",
+            "social security",
+        ),
+        (
+            "Employee Benefits",
+        ),
+    ),
 )
+
+
+OVERVIEW_PHRASES: Final[tuple[str, ...]] = (
+    "employment law overview",
+    "labour law overview",
+    "labor law overview",
+    "main employment law rules",
+    "key employment law issues",
+    "general employment law",
+    "employment law in general",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LegalScope:
+    """Legal-topic scope resolved for one question."""
+
+    legal_topics: list[str]
+    is_overview_question: bool
+    is_supported: bool
 
 
 def _normalize_text(
@@ -206,41 +301,70 @@ def detect_legal_topics(
     return detected_topics
 
 
-def prepare_legal_chat_topics(
-    request: LegalChatRequest,
-) -> LegalChatRequest:
-    """
-    Add automatically detected topics when no topic filter exists.
+def is_overview_question(
+    question: str,
+) -> bool:
+    """Return whether a question asks for a general country overview."""
 
-    Explicit filters supplied by the API consumer always remain
-    authoritative.
+    normalized_question = _normalize_text(
+        question
+    )
+
+    if not normalized_question:
+        return False
+
+    return any(
+        _normalize_text(
+            phrase
+        ) in normalized_question
+        for phrase in OVERVIEW_PHRASES
+    )
+
+
+def resolve_legal_scope(
+    request: LegalChatRequest,
+) -> LegalScope:
+    """
+    Resolve the legal-topic scope of one question.
+
+    A question is considered supported when it carries an explicit or
+    detected legal topic, an explicit subsection, or asks for a general
+    overview. Anything else (unrelated legal areas such as tax, VAT, or
+    patents) is reported as unsupported so the caller can skip
+    retrieval entirely instead of searching without a topic filter.
     """
 
     explicit_topics = _normalize_topics(
         request.legal_topics
     )
 
-    if explicit_topics:
-        legal_topics = explicit_topics
+    explicit_subsections = _normalize_topics(
+        request.subsections
+    )
 
-    else:
-        legal_topics = detect_legal_topics(
-            request.question
+    if explicit_topics:
+        return LegalScope(
+            legal_topics=explicit_topics,
+            is_overview_question=False,
+            is_supported=True,
         )
 
-    if legal_topics == request.legal_topics:
-        return request
+    detected_topics = detect_legal_topics(
+        request.question
+    )
 
-    return LegalChatRequest(
-        question=request.question,
-        country_codes=list(
-            request.country_codes
-        ),
-        legal_topics=legal_topics,
-        subsections=list(
-            request.subsections
-        ),
-        language=request.language,
-        reference_year=request.reference_year,
-        max_sources=request.max_sources,
+    overview_question = is_overview_question(
+        request.question
+    )
+
+    is_supported = bool(
+        detected_topics
+        or explicit_subsections
+        or overview_question
+    )
+
+    return LegalScope(
+        legal_topics=detected_topics,
+        is_overview_question=overview_question,
+        is_supported=is_supported,
     )

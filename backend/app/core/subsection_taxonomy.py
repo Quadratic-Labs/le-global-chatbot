@@ -155,6 +155,23 @@ SUBSECTION_DEFINITIONS: Final[
     ),
     SubsectionDefinition(
         parent_topic="Working Conditions",
+        canonical_name="Work Hours Record",
+        aliases=(
+            "Work hours record",
+            "Working hours record",
+            "Working time record",
+            "Work time record",
+        ),
+    ),
+    SubsectionDefinition(
+        parent_topic="Working Conditions",
+        canonical_name="Paid Leave",
+        aliases=(
+            "Paid leave",
+        ),
+    ),
+    SubsectionDefinition(
+        parent_topic="Working Conditions",
         canonical_name=(
             "Employer's Obligation to Provide "
             "a Healthy and Safe Workplace"

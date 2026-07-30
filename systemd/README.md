@@ -62,3 +62,24 @@ curl -sk -u "admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD}" \
 
 Skipping this step after changing `OPENSEARCH_DASHBOARDS_PASSWORD` causes
 Dashboards to fail authentication and not start.
+
+## RAG / OpenAI tuning variables
+
+Set these in `/etc/le-global-chatbot/le-global-chatbot.env`. All have safe
+defaults (shown below) and are optional.
+
+- `OPENAI_ANSWER_REASONING_EFFORT` (default `low`), `OPENAI_ANSWER_MAX_OUTPUT_TOKENS`
+  (default `2000`) — budget for the final grounded-answer generation call.
+- `OPENAI_RERANK_REASONING_EFFORT` (default `low`), `OPENAI_RERANK_MAX_OUTPUT_TOKENS`
+  (default `500`) — separate, smaller budget for the reranking call, since it
+  only needs to output a short ordering, not prose. `max_output_tokens`
+  includes both the visible output and the model's internal reasoning tokens.
+- `RAG_MAX_CONTEXT_CHARACTERS` (default `16000`) — total character budget
+  shared across all retrieved sources sent to the model.
+- `RAG_MAX_SOURCE_CHARACTERS` (default `4000`) — additional per-source cap,
+  whichever of the two budgets is smaller applies. Every retrieved source
+  stays represented (truncated, never dropped), so a comparison across
+  several countries never silently loses a country because an earlier
+  source consumed the whole budget.
+- `RERANK_ENABLED` (default `false`), `RERANK_POOL_MULTIPLIER` (default `3`)
+  — see `verify-rerank.sh` before enabling this in production.
