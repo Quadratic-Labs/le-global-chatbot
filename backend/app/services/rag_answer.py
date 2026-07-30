@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
+from time import perf_counter
 from typing import Final, Protocol
 
 from app.clients.openai_responses import (
@@ -14,6 +15,12 @@ from app.clients.openai_responses import (
     OpenAIResponseError,
     get_openai_answer_client,
     get_openai_rerank_client,
+)
+from app.core.country_registry import (
+    COUNTRIES,
+)
+from app.services.chat_metrics import (
+    LegalChatMetrics,
 )
 from app.models.chat import (
     LegalAnswerSource,
@@ -43,6 +50,36 @@ TRUNCATION_SUFFIX: Final[str] = (
 
 MAX_RERANK_POOL_SIZE: Final[int] = 20
 RERANK_SNIPPET_CHARACTERS: Final[int] = 1500
+
+GENERIC_QUERY_TERMS: Final[frozenset[str]] = frozenset(
+    {
+        "compare",
+        "comparison",
+        "explain",
+        "rules",
+        "rule",
+        "requirements",
+        "requirement",
+        "law",
+        "laws",
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "for",
+        "to",
+        "of",
+        "and",
+        "or",
+        "is",
+        "are",
+        "what",
+        "which",
+        "how",
+    }
+)
 
 CITATION_PATTERN: Final[re.Pattern[str]] = (
     re.compile(
@@ -153,7 +190,82 @@ def _normalize_country_codes(
     return normalized_codes
 
 
+def _country_name_variants_for_codes(
+    country_codes: Sequence[str],
+) -> list[str]:
+    """Return every known display name/alias for the given country codes."""
+
+    normalized_codes = {
+        code.upper()
+        for code in country_codes
+    }
+
+    variants: list[str] = []
+
+    for country in COUNTRIES:
+        if country.code not in normalized_codes:
+            continue
+
+        variants.append(
+            country.display_name
+        )
+
+        variants.extend(
+            country.aliases
+        )
+
+    return variants
+
+
+def _build_retrieval_query(
+    question: str,
+    country_name_variants: Sequence[str],
+) -> str:
+    """
+    Build a BM25 query stripped of country names and generic filler.
+
+    Country names (for whichever countries are being searched) and
+    generic comparison words carry no retrieval signal and can crowd
+    out the actual legal terms, especially for multi-country
+    comparisons where the other country's name never appears in a
+    given country's own content.
+    """
+
+    normalized_question = question
+
+    for variant in sorted(
+        country_name_variants,
+        key=len,
+        reverse=True,
+    ):
+        normalized_question = re.sub(
+            rf"\b{re.escape(variant)}\b",
+            " ",
+            normalized_question,
+            flags=re.IGNORECASE,
+        )
+
+    words = [
+        word
+        for word in re.findall(
+            r"[A-Za-z0-9'-]+",
+            normalized_question,
+        )
+        if word.casefold() not in GENERIC_QUERY_TERMS
+    ]
+
+    cleaned_query = " ".join(
+        words
+    ).strip()
+
+    if len(cleaned_query) < 2:
+        return question.strip()
+
+    return cleaned_query
+
+
 def _build_search_request(
+    query: str,
     request: LegalChatRequest,
     country_codes: list[str],
     limit: int,
@@ -161,7 +273,7 @@ def _build_search_request(
     """Build one OpenSearch request from chat criteria."""
 
     return LegalSearchRequest(
-        query=request.question,
+        query=query,
         country_codes=country_codes,
         legal_topics=request.legal_topics,
         subsections=request.subsections,
@@ -358,6 +470,7 @@ def _retrieve_search_hits(
     generation_client: TextGenerationClient | None = None,
     rerank_enabled: bool = False,
     rerank_pool_multiplier: int = 1,
+    metrics: LegalChatMetrics | None = None,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve legal chunks.
@@ -370,11 +483,23 @@ def _retrieve_search_hits(
         request.country_codes
     )
 
+    retrieval_query = _build_retrieval_query(
+        question=request.question,
+        country_name_variants=(
+            _country_name_variants_for_codes(
+                country_codes
+            )
+        ),
+    )
+
     if len(
         country_codes
     ) <= 1:
+        search_started_at = perf_counter()
+
         response = search_function(
             _build_search_request(
+                query=retrieval_query,
                 request=request,
                 country_codes=country_codes,
                 limit=_candidate_search_limit(
@@ -385,14 +510,26 @@ def _retrieve_search_hits(
             )
         )
 
+        if metrics is not None:
+            metrics.add_opensearch_seconds(
+                perf_counter() - search_started_at
+            )
+
         hits = response.hits
 
         if rerank_enabled:
+            rerank_started_at = perf_counter()
+
             hits = _rerank_hits(
                 question=request.question,
                 hits=hits,
                 generation_client=generation_client,
             )[: request.max_sources]
+
+            if metrics is not None:
+                metrics.add_rerank_seconds(
+                    perf_counter() - rerank_started_at
+                )
 
         return (
             response.total,
@@ -431,8 +568,11 @@ def _retrieve_search_hits(
             )
         )
 
+        search_started_at = perf_counter()
+
         response = search_function(
             _build_search_request(
+                query=retrieval_query,
                 request=request,
                 country_codes=[
                     country_code
@@ -445,6 +585,11 @@ def _retrieve_search_hits(
             )
         )
 
+        if metrics is not None:
+            metrics.add_opensearch_seconds(
+                perf_counter() - search_started_at
+            )
+
         retrieval_total += (
             response.total
         )
@@ -452,11 +597,18 @@ def _retrieve_search_hits(
         country_hits = response.hits
 
         if rerank_enabled:
+            rerank_started_at = perf_counter()
+
             country_hits = _rerank_hits(
                 question=request.question,
                 hits=country_hits,
                 generation_client=generation_client,
             )
+
+            if metrics is not None:
+                metrics.add_rerank_seconds(
+                    perf_counter() - rerank_started_at
+                )
 
         country_hit_groups.append(
             country_hits
@@ -723,6 +875,7 @@ def answer_legal_question(
     max_source_characters: int = (
         DEFAULT_MAX_SOURCE_CHARACTERS
     ),
+    metrics: LegalChatMetrics | None = None,
 ) -> LegalChatResponse:
     """Retrieve legal chunks and generate one grounded answer."""
 
@@ -736,6 +889,7 @@ def answer_legal_question(
             generation_client=generation_client,
             rerank_enabled=rerank_enabled,
             rerank_pool_multiplier=rerank_pool_multiplier,
+            metrics=metrics,
         )
 
     except LegalSearchError as error:
@@ -750,6 +904,11 @@ def answer_legal_question(
     )
 
     if not selected_hits:
+        if metrics is not None:
+            metrics.outcome = "empty_retrieval"
+            metrics.retrieval_total = retrieval_total
+            metrics.selected_sources = 0
+
         return LegalChatResponse(
             question=request.question.strip(),
             answer=NO_INFORMATION_ANSWER,
@@ -766,6 +925,8 @@ def answer_legal_question(
     )
 
     try:
+        openai_started_at = perf_counter()
+
         generated_text = client.generate(
             instructions=SYSTEM_INSTRUCTIONS,
             input_text=_build_model_input(
@@ -773,6 +934,11 @@ def answer_legal_question(
                 hits=selected_hits,
             ),
         )
+
+        if metrics is not None:
+            metrics.openai_ms = (
+                perf_counter() - openai_started_at
+            ) * 1000
 
     except OpenAIResponseError as error:
         raise RagAnswerError(
@@ -787,6 +953,14 @@ def answer_legal_question(
             ),
         )
     )
+
+    if metrics is not None:
+        metrics.outcome = "generated"
+        metrics.retrieval_total = retrieval_total
+        metrics.selected_sources = len(
+            selected_hits
+        )
+        metrics.model = generated_text.model
 
     return LegalChatResponse(
         question=request.question.strip(),

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import defaultdict
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Final
 
-from app.models.catalog import (
-    LegalCatalogCountry,
-    LegalCatalogResponse,
-)
+import pycountry
+
+from app.models.catalog import LegalCatalogResponse
 from app.models.chat import LegalChatRequest
 from app.services.legal_catalog import (
     LegalCatalogError,
@@ -24,44 +25,32 @@ CountryCatalogProvider = Callable[
 ]
 
 
-COUNTRY_ALIASES: Final[
-    dict[str, tuple[str, ...]]
-] = {
-    "GB": (
-        "UK",
-        "U.K.",
-        "Great Britain",
-        "Britain",
-    ),
-    "US": (
-        "USA",
-        "U.S.A.",
-        "United States of America",
-    ),
-    "CZ": (
-        "Czechia",
-    ),
-    "KR": (
-        "South Korea",
-        "Republic of Korea",
-    ),
-    "AE": (
-        "UAE",
-        "U.A.E.",
-        "United Arab Emirates",
-    ),
+COUNTRY_ALIAS_OVERRIDES: Final[dict[str, str]] = {
+    "uk": "GB",
+    "u.k.": "GB",
+    "great britain": "GB",
+    "britain": "GB",
+    "usa": "US",
+    "u.s.": "US",
+    "u.s.a.": "US",
+    "america": "US",
+    "south korea": "KR",
+    "czechia": "CZ",
+    "uae": "AE",
+    "u.a.e.": "AE",
 }
-
-
-UPPERCASE_COUNTRY_CODE_PATTERN: Final[
-    re.Pattern[str]
-] = re.compile(
-    r"(?<![A-Za-z])([A-Z]{2})(?![A-Za-z])"
-)
 
 
 class CountryDetectionError(RuntimeError):
     """Raised when automatic country detection fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class CountryAvailability:
+    """Countries mentioned in a question, split by corpus availability."""
+
+    available_codes: list[str]
+    unavailable_codes: list[str]
 
 
 def _normalize_for_matching(
@@ -126,77 +115,140 @@ def _normalize_country_codes(
     return normalized_codes
 
 
-def _build_country_phrase_map(
-    countries: Sequence[LegalCatalogCountry],
-) -> dict[str, str]:
-    """Build country-name and alias mappings."""
+def _build_global_country_data() -> (
+    tuple[
+        dict[str, str],
+        dict[str, list[str]],
+    ]
+):
+    """
+    Build a worldwide country phrase map and a reverse name index.
 
-    available_codes = {
-        country.country_code.upper()
-        for country in countries
-    }
+    The phrase map covers every ISO 3166-1 country (via pycountry) plus
+    a small set of business aliases, so a country can be recognized as
+    "mentioned" even when it is not part of the indexed corpus. The
+    reverse index returns the display names/aliases known for one code,
+    used to build user-facing messages.
+    """
 
     phrase_map: dict[str, str] = {}
+    names_by_code: defaultdict[str, list[str]] = defaultdict(list)
 
-    for country in countries:
-        country_code = (
-            country.country_code.upper()
+    for country in pycountry.countries:
+        code = country.alpha_2.upper()
+
+        candidate_names = {country.name}
+
+        official_name = getattr(
+            country,
+            "official_name",
+            None,
         )
 
-        normalized_country_name = (
-            _normalize_for_matching(
-                country.country
+        if official_name:
+            candidate_names.add(
+                official_name
             )
+
+        for name in candidate_names:
+            normalized_name = _normalize_for_matching(
+                name
+            )
+
+            if not normalized_name:
+                continue
+
+            phrase_map.setdefault(
+                normalized_name,
+                code,
+            )
+
+            names_by_code[code].append(
+                name
+            )
+
+    for alias, code in COUNTRY_ALIAS_OVERRIDES.items():
+        normalized_alias = _normalize_for_matching(
+            alias
         )
 
-        if normalized_country_name:
-            phrase_map[
-                normalized_country_name
-            ] = country_code
-
-    for country_code, aliases in (
-        COUNTRY_ALIASES.items()
-    ):
-        if country_code not in available_codes:
+        if not normalized_alias:
             continue
 
-        for alias in aliases:
-            normalized_alias = (
-                _normalize_for_matching(
-                    alias
-                )
-            )
+        normalized_code = code.upper()
 
-            if normalized_alias:
-                phrase_map[
-                    normalized_alias
-                ] = country_code
-
-    return phrase_map
-
-
-def _find_named_country_candidates(
-    question: str,
-    countries: Sequence[LegalCatalogCountry],
-) -> list[tuple[int, int, str]]:
-    """Find country names and aliases inside a question."""
-
-    normalized_question = (
-        _normalize_for_matching(
-            question
+        phrase_map[normalized_alias] = (
+            normalized_code
         )
+
+        names_by_code[normalized_code].append(
+            alias
+        )
+
+    return (
+        phrase_map,
+        dict(names_by_code),
     )
 
-    phrase_map = _build_country_phrase_map(
-        countries
+
+(
+    _GLOBAL_COUNTRY_PHRASE_MAP,
+    _COUNTRY_NAMES_BY_CODE,
+) = _build_global_country_data()
+
+
+def get_country_name_variants(
+    country_code: str,
+) -> list[str]:
+    """Return the known display names/aliases for one country code."""
+
+    return _COUNTRY_NAMES_BY_CODE.get(
+        country_code.upper(),
+        [],
     )
+
+
+def resolve_country_display_name(
+    country_code: str,
+) -> str:
+    """Return a readable display name for one ISO alpha-2 country code."""
+
+    country = pycountry.countries.get(
+        alpha_2=country_code.upper()
+    )
+
+    if country is not None:
+        return country.name
+
+    return country_code.upper()
+
+
+def detect_mentioned_country_codes(
+    question: str,
+) -> list[str]:
+    """
+    Detect ISO country codes for every country named in a question.
+
+    This covers every ISO 3166-1 country, not only the ones indexed in
+    the corpus, so that mentioned-but-unindexed countries (for example
+    Canada) can be reported instead of silently ignored. Bare two-letter
+    codes are intentionally not scanned for in free text, since common
+    words can collide with real ISO codes (for example "IN").
+    """
+
+    normalized_question = _normalize_for_matching(
+        question
+    )
+
+    if not normalized_question:
+        return []
 
     candidates: list[
         tuple[int, int, str]
     ] = []
 
     sorted_phrases = sorted(
-        phrase_map,
+        _GLOBAL_COUNTRY_PHRASE_MAP,
         key=len,
         reverse=True,
     )
@@ -215,85 +267,11 @@ def _find_named_country_candidates(
                     -len(
                         phrase
                     ),
-                    phrase_map[
+                    _GLOBAL_COUNTRY_PHRASE_MAP[
                         phrase
                     ],
                 )
             )
-
-    return candidates
-
-
-def _find_country_code_candidates(
-    question: str,
-    countries: Sequence[LegalCatalogCountry],
-) -> list[tuple[int, int, str]]:
-    """Find explicit uppercase ISO country codes."""
-
-    available_codes = {
-        country.country_code.upper()
-        for country in countries
-    }
-
-    candidates: list[
-        tuple[int, int, str]
-    ] = []
-
-    for match in (
-        UPPERCASE_COUNTRY_CODE_PATTERN.finditer(
-            question
-        )
-    ):
-        country_code = match.group(
-            1
-        )
-
-        if country_code not in available_codes:
-            continue
-
-        candidates.append(
-            (
-                match.start(),
-                -2,
-                country_code,
-            )
-        )
-
-    return candidates
-
-
-def detect_country_codes(
-    question: str,
-    catalog_provider: CountryCatalogProvider = (
-        get_legal_catalog
-    ),
-) -> list[str]:
-    """Detect indexed countries mentioned in a question."""
-
-    normalized_question = question.strip()
-
-    if not normalized_question:
-        return []
-
-    try:
-        catalog = catalog_provider()
-
-    except LegalCatalogError as error:
-        raise CountryDetectionError(
-            "The indexed country catalog "
-            "could not be read."
-        ) from error
-
-    candidates = (
-        _find_named_country_candidates(
-            question=normalized_question,
-            countries=catalog.countries,
-        )
-        + _find_country_code_candidates(
-            question=normalized_question,
-            countries=catalog.countries,
-        )
-    )
 
     candidates.sort(
         key=lambda candidate: (
@@ -320,59 +298,66 @@ def detect_country_codes(
     return detected_codes
 
 
-def prepare_legal_chat_request(
+def resolve_country_availability(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider = (
         get_legal_catalog
     ),
-) -> LegalChatRequest:
+) -> CountryAvailability:
     """
-    Add detected countries when no explicit filter exists.
+    Split requested/mentioned countries into available and unavailable.
 
-    Explicit filters always remain authoritative.
+    Explicit country_codes always take priority over free-text
+    detection. Every mentioned code (explicit or detected) is checked
+    against the indexed corpus, so a country outside the corpus is
+    reported instead of triggering an unfiltered search.
     """
 
-    explicit_country_codes = (
-        _normalize_country_codes(
-            request.country_codes
+    explicit_codes = _normalize_country_codes(
+        request.country_codes
+    )
+
+    mentioned_codes = (
+        explicit_codes
+        if explicit_codes
+        else detect_mentioned_country_codes(
+            request.question
         )
     )
 
-    if explicit_country_codes:
-        return LegalChatRequest(
-            question=request.question,
-            country_codes=explicit_country_codes,
-            legal_topics=list(
-                request.legal_topics
-            ),
-            subsections=list(
-                request.subsections
-            ),
-            language=request.language,
-            reference_year=request.reference_year,
-            max_sources=request.max_sources,
+    if not mentioned_codes:
+        return CountryAvailability(
+            available_codes=[],
+            unavailable_codes=[],
         )
 
-    detected_country_codes = (
-        detect_country_codes(
-            question=request.question,
-            catalog_provider=catalog_provider,
-        )
-    )
+    try:
+        catalog = catalog_provider()
 
-    if not detected_country_codes:
-        return request
+    except LegalCatalogError as error:
+        raise CountryDetectionError(
+            "The indexed country catalog "
+            "could not be read."
+        ) from error
 
-    return LegalChatRequest(
-        question=request.question,
-        country_codes=detected_country_codes,
-        legal_topics=list(
-            request.legal_topics
-        ),
-        subsections=list(
-            request.subsections
-        ),
-        language=request.language,
-        reference_year=request.reference_year,
-        max_sources=request.max_sources,
+    indexed_codes = {
+        country.country_code.upper()
+        for country in catalog.countries
+    }
+
+    available_codes = [
+        code
+        for code in mentioned_codes
+        if code in indexed_codes
+    ]
+
+    unavailable_codes = [
+        code
+        for code in mentioned_codes
+        if code not in indexed_codes
+    ]
+
+    return CountryAvailability(
+        available_codes=available_codes,
+        unavailable_codes=unavailable_codes,
     )

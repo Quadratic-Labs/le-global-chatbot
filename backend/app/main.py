@@ -1,3 +1,6 @@
+import logging
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import (
     CORSMiddleware,
@@ -27,6 +30,20 @@ from app.routers.legal_catalog import (
 )
 from app.routers.legal_search import (
     router as legal_search_router,
+)
+
+
+LOG_LEVEL = os.getenv(
+    "LOG_LEVEL",
+    "INFO",
+).upper()
+
+logging.getLogger("app").setLevel(
+    getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    )
 )
 
 
