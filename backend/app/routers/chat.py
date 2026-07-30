@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from time import perf_counter
 from typing import Final
+from uuid import uuid4
 
 from fastapi import (
     APIRouter,
+    Header,
     HTTPException,
+    Response,
     status,
 )
 
@@ -17,6 +21,9 @@ from app.core.config import get_settings
 from app.models.chat import (
     LegalChatRequest,
     LegalChatResponse,
+)
+from app.services.chat_metrics import (
+    LegalChatMetrics,
 )
 from app.services.country_detection import (
     CountryCatalogProvider,
@@ -95,6 +102,7 @@ def _unavailable_countries_answer(
 
 def resolve_legal_chat_response(
     request: LegalChatRequest,
+    request_id: str | None = None,
     catalog_provider: CountryCatalogProvider = (
         get_legal_catalog
     ),
@@ -121,78 +129,159 @@ def resolve_legal_chat_response(
     carries no recognized legal topic and is not a general overview
     request. This avoids searching without a meaningful filter and
     citing unrelated passages.
+
+    Exactly one "legal_chat_performance" log event is emitted per
+    call, on every path (fallback, success, or error).
     """
 
-    country_scope = resolve_country_availability(
-        request=request,
-        catalog_provider=catalog_provider,
-    )
+    total_started_at = perf_counter()
 
-    if (
-        country_scope.unavailable_codes
-        and not country_scope.available_codes
-    ):
-        return LegalChatResponse(
-            question=request.question.strip(),
-            answer=_unavailable_countries_answer(
-                country_scope.unavailable_codes
-            ),
-            grounded=False,
-            model=None,
-            retrieval_total=0,
-            sources=[],
-        )
-
-    legal_scope = resolve_legal_scope(
-        request
-    )
-
-    if not legal_scope.is_supported:
-        return LegalChatResponse(
-            question=request.question.strip(),
-            answer=NO_INFORMATION_ANSWER,
-            grounded=False,
-            model=None,
-            retrieval_total=0,
-            sources=[],
-        )
-
-    prepared_request = request.model_copy(
-        update={
-            "country_codes": (
-                country_scope.available_codes
-            ),
-            "legal_topics": (
-                legal_scope.legal_topics
-            ),
-        }
-    )
-
-    response = answer_legal_question(
-        prepared_request,
-        search_function=search_function,
-        generation_client=generation_client,
+    metrics = LegalChatMetrics(
+        request_id=(
+            request_id
+            if request_id
+            else str(uuid4())
+        ),
+        question_characters=len(
+            request.question
+        ),
+        max_sources=request.max_sources,
         rerank_enabled=rerank_enabled,
-        rerank_pool_multiplier=rerank_pool_multiplier,
-        max_context_characters=max_context_characters,
-        max_source_characters=max_source_characters,
     )
 
-    if country_scope.unavailable_codes:
-        note = (
-            "\n\nNote: "
-            + _unavailable_countries_answer(
-                country_scope.unavailable_codes
-            )
+    try:
+        detection_started_at = perf_counter()
+
+        country_scope = resolve_country_availability(
+            request=request,
+            catalog_provider=catalog_provider,
         )
 
-        response = response.model_copy(
+        metrics.country_detection_ms = (
+            perf_counter() - detection_started_at
+        ) * 1000
+
+        metrics.country_codes = list(
+            country_scope.available_codes
+        )
+        metrics.unavailable_country_codes = list(
+            country_scope.unavailable_codes
+        )
+
+        if (
+            country_scope.unavailable_codes
+            and not country_scope.available_codes
+        ):
+            metrics.outcome = (
+                "fallback_unavailable_country"
+            )
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+
+            metrics.log()
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=_unavailable_countries_answer(
+                    country_scope.unavailable_codes
+                ),
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+            )
+
+        detection_started_at = perf_counter()
+
+        legal_scope = resolve_legal_scope(
+            request
+        )
+
+        metrics.topic_detection_ms = (
+            perf_counter() - detection_started_at
+        ) * 1000
+
+        metrics.legal_topics = list(
+            legal_scope.legal_topics
+        )
+
+        if not legal_scope.is_supported:
+            metrics.outcome = (
+                "fallback_unsupported_topic"
+            )
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+
+            metrics.log()
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=NO_INFORMATION_ANSWER,
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+            )
+
+        prepared_request = request.model_copy(
             update={
-                "answer": response.answer + note,
+                "country_codes": (
+                    country_scope.available_codes
+                ),
+                "legal_topics": (
+                    legal_scope.legal_topics
+                ),
             }
         )
 
-    return response
+        response = answer_legal_question(
+            prepared_request,
+            search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+            max_context_characters=max_context_characters,
+            max_source_characters=max_source_characters,
+            metrics=metrics,
+        )
+
+        if country_scope.unavailable_codes:
+            note = (
+                "\n\nNote: "
+                + _unavailable_countries_answer(
+                    country_scope.unavailable_codes
+                )
+            )
+
+            response = response.model_copy(
+                update={
+                    "answer": response.answer + note,
+                }
+            )
+
+        metrics.total_ms = (
+            perf_counter() - total_started_at
+        ) * 1000
+
+        metrics.log()
+
+        return response
+
+    except Exception as error:
+        metrics.outcome = "error"
+        metrics.error_type = type(error).__name__
+
+        metrics.total_ms = (
+            perf_counter() - total_started_at
+        ) * 1000
+
+        metrics.log()
+
+        raise
 
 
 @router.post(
@@ -202,14 +291,28 @@ def resolve_legal_chat_response(
 )
 def legal_chat(
     request: LegalChatRequest,
+    response: Response,
+    x_request_id: str | None = Header(
+        default=None,
+        alias="X-Request-ID",
+    ),
 ) -> LegalChatResponse:
     """Generate an answer grounded in validated documents."""
 
     settings = get_settings()
 
+    request_id = (
+        x_request_id.strip()
+        if x_request_id
+        else str(uuid4())
+    )
+
+    response.headers["X-Request-ID"] = request_id
+
     try:
         return resolve_legal_chat_response(
             request,
+            request_id=request_id,
             rerank_enabled=settings.rerank_enabled,
             rerank_pool_multiplier=(
                 settings.rerank_pool_multiplier
@@ -230,6 +333,9 @@ def legal_chat(
             detail=str(
                 error
             ),
+            headers={
+                "X-Request-ID": request_id,
+            },
         ) from error
 
     except OpenAIConfigurationError as error:
@@ -241,6 +347,9 @@ def legal_chat(
                 "The answer generation service "
                 "is not configured."
             ),
+            headers={
+                "X-Request-ID": request_id,
+            },
         ) from error
 
     except CountryDetectionError as error:
@@ -250,6 +359,9 @@ def legal_chat(
                 "The country detection service "
                 "is temporarily unavailable."
             ),
+            headers={
+                "X-Request-ID": request_id,
+            },
         ) from error
 
     except RagAnswerError as error:
@@ -259,4 +371,7 @@ def legal_chat(
                 "The grounded legal answer service "
                 "is temporarily unavailable."
             ),
+            headers={
+                "X-Request-ID": request_id,
+            },
         ) from error
