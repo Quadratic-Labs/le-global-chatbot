@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from typing import Any
 
@@ -88,15 +89,22 @@ class FakeGenerationClient:
         self,
         answer: str,
         raise_error: bool = False,
+        delay_seconds: float = 0.0,
     ) -> None:
         self.answer = answer
         self.raise_error = raise_error
+        self.delay_seconds = delay_seconds
 
     def generate(
         self,
         instructions: str,
         input_text: str,
     ) -> GeneratedText:
+        if self.delay_seconds:
+            time.sleep(
+                self.delay_seconds
+            )
+
         if self.raise_error:
             raise OpenAIResponseError(
                 "boom"
@@ -541,6 +549,10 @@ class ChatMetricsTests(unittest.TestCase):
         def fake_search(
             request: Any,
         ) -> LegalSearchResponse:
+            time.sleep(
+                0.001
+            )
+
             return LegalSearchResponse(
                 query=request.query,
                 total=1,
@@ -556,7 +568,8 @@ class ChatMetricsTests(unittest.TestCase):
             )
 
         client = FakeGenerationClient(
-            answer="Supported by the extract [1]."
+            answer="Supported by the extract [1].",
+            delay_seconds=0.001,
         )
 
         with self.assertLogs(
@@ -626,6 +639,10 @@ class ChatMetricsTests(unittest.TestCase):
         def fake_search(
             request: Any,
         ) -> LegalSearchResponse:
+            time.sleep(
+                0.001
+            )
+
             code = request.country_codes[0]
 
             return LegalSearchResponse(

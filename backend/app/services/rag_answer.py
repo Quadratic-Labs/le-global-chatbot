@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Final, Protocol
 
@@ -138,6 +139,19 @@ Rules:
 19. Do not use semicolons inside citations.
 20. Do not add a limitations section unless none of the supplied
     sources contains enough information to answer the question.
+21. Start each country section with a single heading line containing
+    the country name, followed by bullet points starting with a
+    hyphen (-).
+22. Start the comparison section with a heading line containing the
+    word "Comparison", followed by no more than two bullet points
+    starting with a hyphen (-).
+23. When the user asks about paid leave or paid time off:
+    - Include only leave that the sources explicitly describe as
+      paid, remunerated, compensated, covered by an allowance, or
+      covered by an indemnity.
+    - Do not list leave explicitly described as unpaid.
+    - Do not state that a leave entitlement is missing or
+      unspecified. Simply omit unsupported categories.
 """.strip()
 
 
@@ -746,6 +760,319 @@ def _allocate_country_context_budgets(
     return selected_hits
 
 
+@dataclass(frozen=True, slots=True)
+class _AnswerSection:
+    """One heading-delimited section of a generated answer."""
+
+    kind: str
+    title: str
+    bullets: list[str]
+
+
+_BULLET_LINE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\s*[-*•]\s+(.*\S)\s*$"
+)
+
+_COMPARISON_HEADING_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"comparison",
+    re.IGNORECASE,
+)
+
+
+def _parse_country_sections(
+    answer: str,
+) -> list[_AnswerSection]:
+    """
+    Split a generated answer into heading-delimited sections.
+
+    A non-bullet line starts a new section; bullet lines (starting
+    with -, *, or a bullet character) are attached to the current
+    section. Relies on rules 21/22 in SYSTEM_INSTRUCTIONS, which ask
+    the model for exactly this heading-then-bullets shape.
+    """
+
+    sections: list[_AnswerSection] = []
+
+    current_kind: str | None = None
+    current_title = ""
+    current_bullets: list[str] = []
+
+    def flush_section() -> None:
+        if current_kind is not None:
+            sections.append(
+                _AnswerSection(
+                    kind=current_kind,
+                    title=current_title,
+                    bullets=list(current_bullets),
+                )
+            )
+
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        bullet_match = _BULLET_LINE_PATTERN.match(
+            line
+        )
+
+        if bullet_match:
+            if current_kind is not None:
+                current_bullets.append(
+                    bullet_match.group(1)
+                )
+            continue
+
+        flush_section()
+
+        current_bullets = []
+        current_title = line.rstrip(
+            ":"
+        ).strip()
+
+        current_kind = (
+            "comparison"
+            if _COMPARISON_HEADING_PATTERN.search(
+                current_title
+            )
+            else "country"
+        )
+
+    flush_section()
+
+    return sections
+
+
+def _validate_answer_structure(
+    answer: str,
+    requested_country_codes: list[str],
+) -> list[str]:
+    """Enforce the bullet-count and section-count limits from the prompt."""
+
+    errors: list[str] = []
+
+    sections = _parse_country_sections(
+        answer
+    )
+
+    if len(requested_country_codes) == 1:
+        total_country_bullets = sum(
+            len(section.bullets)
+            for section in sections
+            if section.kind == "country"
+        )
+
+        if total_country_bullets > 6:
+            errors.append(
+                "A single-country answer must contain "
+                "no more than six bullets."
+            )
+
+    else:
+        for section in sections:
+            if (
+                section.kind == "country"
+                and len(section.bullets) > 4
+            ):
+                errors.append(
+                    f"{section.title} contains more "
+                    "than four bullets."
+                )
+
+        comparison_sections = [
+            section
+            for section in sections
+            if section.kind == "comparison"
+        ]
+
+        if len(comparison_sections) > 1:
+            errors.append(
+                "Only one comparison section is allowed."
+            )
+
+        if (
+            comparison_sections
+            and len(
+                comparison_sections[0].bullets
+            ) > 2
+        ):
+            errors.append(
+                "The comparison section must contain "
+                "no more than two bullets."
+            )
+
+    return errors
+
+
+FORBIDDEN_INTERNAL_PHRASES: Final[tuple[str, ...]] = (
+    "provided extracts",
+    "supplied extracts",
+    "available extracts",
+    "provided documents",
+    "available documents",
+    "the context",
+    "context limit",
+    "retrieval",
+    "truncated",
+    "source extract",
+)
+
+
+def _validate_no_internal_references(
+    answer: str,
+) -> list[str]:
+    """Return every internal-mechanism phrase found in the answer."""
+
+    normalized = answer.casefold()
+
+    return [
+        phrase
+        for phrase in FORBIDDEN_INTERNAL_PHRASES
+        if phrase in normalized
+    ]
+
+
+def _validate_paid_leave_scope(
+    question: str,
+    answer: str,
+) -> list[str]:
+    """Reject an unpaid-leave mention when paid leave was asked about."""
+
+    question_lower = question.casefold()
+
+    if (
+        "paid leave" not in question_lower
+        and "paid time off" not in question_lower
+    ):
+        return []
+
+    if "unpaid leave" in answer.casefold():
+        return [
+            "A paid-leave answer contains "
+            "an unpaid-leave entitlement."
+        ]
+
+    return []
+
+
+ABSENCE_CLAIM_PHRASES: Final[tuple[str, ...]] = (
+    "not specified",
+    "does not specify",
+    "not available in",
+    "no information is available",
+    "not provided in the",
+    "is missing from the",
+    "are missing from the",
+)
+
+_DURATION_NUMBER_PATTERN: Final[str] = (
+    r"(?:\d+|one|two|three|four|five|six|seven|"
+    r"eight|nine|ten|eleven|twelve)"
+)
+
+_CONCRETE_DURATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    rf"\b{_DURATION_NUMBER_PATTERN}\s*"
+    r"(?:day|week|month|year)s?\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_no_false_absence_claims(
+    context: str,
+    answer: str,
+) -> list[str]:
+    """
+    Reject an absence claim contradicted by a concrete figure in context.
+
+    Catches the answer stating that a duration or figure is missing
+    when a supplied source extract plainly contains one (for example
+    "two months prior" and "three months after" for Italian maternity
+    leave).
+    """
+
+    normalized_answer = answer.casefold()
+
+    if not any(
+        phrase in normalized_answer
+        for phrase in ABSENCE_CLAIM_PHRASES
+    ):
+        return []
+
+    if _CONCRETE_DURATION_PATTERN.search(
+        context
+    ):
+        return [
+            "The answer claims information is missing "
+            "even though a supplied source contains a "
+            "concrete figure."
+        ]
+
+    return []
+
+
+def _validate_answer_quality(
+    question: str,
+    answer: str,
+    country_codes: Sequence[str],
+    context: str,
+) -> list[str]:
+    """Run every content-quality check and combine their errors."""
+
+    errors: list[str] = []
+
+    errors.extend(
+        _validate_answer_structure(
+            answer=answer,
+            requested_country_codes=list(
+                country_codes
+            ),
+        )
+    )
+
+    errors.extend(
+        f'The answer references internal mechanics: "{phrase}".'
+        for phrase in _validate_no_internal_references(
+            answer
+        )
+    )
+
+    errors.extend(
+        _validate_paid_leave_scope(
+            question=question,
+            answer=answer,
+        )
+    )
+
+    errors.extend(
+        _validate_no_false_absence_claims(
+            context=context,
+            answer=answer,
+        )
+    )
+
+    return errors
+
+
+def _build_repair_instructions(
+    errors: Sequence[str],
+) -> str:
+    """Build a follow-up instruction asking the model to fix known issues."""
+
+    formatted_errors = "\n".join(
+        f"- {error}" for error in errors
+    )
+
+    return (
+        "Rewrite the answer using the same sources.\n\n"
+        "Correct all of these issues:\n"
+        f"{formatted_errors}\n\n"
+        "Do not add new legal information.\n"
+        "Preserve valid citations.\n"
+        "Return only the corrected final answer."
+    )
+
+
 def _build_context(
     hits: list[LegalSearchHit],
 ) -> str:
@@ -996,30 +1323,78 @@ def answer_legal_question(
         else get_openai_answer_client()
     )
 
-    try:
-        openai_started_at = perf_counter()
+    model_input = _build_model_input(
+        request=request,
+        hits=selected_hits,
+    )
 
-        generated_text = client.generate(
-            instructions=SYSTEM_INSTRUCTIONS,
-            input_text=_build_model_input(
-                request=request,
-                hits=selected_hits,
-            ),
-        )
+    def _generate_with_instructions(
+        instructions: str,
+    ) -> GeneratedText:
+        try:
+            call_started_at = perf_counter()
 
-        if metrics is not None:
-            metrics.openai_ms = (
-                perf_counter() - openai_started_at
-            ) * 1000
+            result = client.generate(
+                instructions=instructions,
+                input_text=model_input,
+            )
 
-    except OpenAIResponseError as error:
-        raise RagAnswerError(
-            "Grounded answer generation failed."
-        ) from error
+            if metrics is not None:
+                metrics.openai_ms += (
+                    perf_counter() - call_started_at
+                ) * 1000
+
+        except OpenAIResponseError as error:
+            raise RagAnswerError(
+                "Grounded answer generation failed."
+            ) from error
+
+        return result
+
+    context_text = _build_context(
+        selected_hits
+    )
+
+    generated_text = _generate_with_instructions(
+        SYSTEM_INSTRUCTIONS
+    )
 
     _validate_citation_format(
         answer=generated_text.text
     )
+
+    quality_errors = _validate_answer_quality(
+        question=request.question,
+        answer=generated_text.text,
+        country_codes=request.country_codes,
+        context=context_text,
+    )
+
+    if quality_errors:
+        generated_text = _generate_with_instructions(
+            SYSTEM_INSTRUCTIONS
+            + "\n\n"
+            + _build_repair_instructions(
+                quality_errors
+            )
+        )
+
+        _validate_citation_format(
+            answer=generated_text.text
+        )
+
+        quality_errors = _validate_answer_quality(
+            question=request.question,
+            answer=generated_text.text,
+            country_codes=request.country_codes,
+            context=context_text,
+        )
+
+        if quality_errors:
+            raise RagAnswerError(
+                "The generated answer did not satisfy "
+                "the required quality constraints."
+            )
 
     citation_numbers = (
         _extract_citation_numbers(
