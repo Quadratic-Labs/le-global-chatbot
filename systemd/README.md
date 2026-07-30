@@ -83,3 +83,7 @@ defaults (shown below) and are optional.
   source consumed the whole budget.
 - `RERANK_ENABLED` (default `false`), `RERANK_POOL_MULTIPLIER` (default `3`)
   — see `verify-rerank.sh` before enabling this in production.
+- `LOG_LEVEL` (default `INFO`) — level for the `app` logger hierarchy,
+  including the `legal_chat_performance` metrics events emitted by
+  `app.services.chat_metrics`. Set to `WARNING` to silence them, or
+  `DEBUG` for more verbose output.

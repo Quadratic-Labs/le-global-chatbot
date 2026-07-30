@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import (
@@ -33,18 +34,38 @@ from app.routers.legal_search import (
 )
 
 
-LOG_LEVEL = os.getenv(
-    "LOG_LEVEL",
-    "INFO",
-).upper()
+def configure_application_logging() -> None:
+    """Configure application logs for container stdout."""
 
-logging.getLogger("app").setLevel(
-    getattr(
+    level_name = os.getenv(
+        "LOG_LEVEL",
+        "INFO",
+    ).strip().upper()
+
+    level = getattr(
         logging,
-        LOG_LEVEL,
+        level_name,
         logging.INFO,
     )
-)
+
+    app_logger = logging.getLogger("app")
+    app_logger.setLevel(level)
+    app_logger.propagate = False
+
+    if not app_logger.handlers:
+        handler = logging.StreamHandler(
+            sys.stdout
+        )
+
+        handler.setLevel(level)
+        handler.setFormatter(
+            logging.Formatter("%(message)s")
+        )
+
+        app_logger.addHandler(handler)
+
+
+configure_application_logging()
 
 
 app = FastAPI(
