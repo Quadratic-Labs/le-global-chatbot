@@ -17,19 +17,28 @@ from app.models.search import (
     LegalSearchHit,
     LegalSearchResponse,
 )
+from app.services.chat_metrics import (
+    LegalChatMetrics,
+)
 from app.services.rag_answer import (
+    HARD_QUALITY_ERROR_TYPES,
     RERANK_INSTRUCTIONS,
     RERANK_SNIPPET_CHARACTERS,
-    TRUNCATION_SUFFIX,
+    SOFT_QUALITY_ERROR_TYPES,
     InvalidLegalChatRequestError,
     NO_INFORMATION_ANSWER,
     RagAnswerError,
+    _allocate_country_context_budgets,
     _build_retrieval_query,
     _build_rerank_input,
     _country_name_variants_for_codes,
     _parse_rerank_order,
-    _select_context_hits,
     _truncate_context,
+    _validate_answer_structure,
+    _validate_citation_format,
+    _validate_no_false_absence_claims,
+    _validate_no_internal_references,
+    _validate_paid_leave_scope,
     answer_legal_question,
 )
 
@@ -77,14 +86,17 @@ class FakeGenerationClient:
     def __init__(
         self,
         answer: str = (
-            "The minimum notice is one week "
+            "United Kingdom\n"
+            "- The minimum notice is one week "
             "in the stated circumstances [1]."
         ),
+        repair_answer: str | None = None,
         rerank_order: str | None = None,
         raise_on_rerank: bool = False,
         raise_on_generate: bool = False,
     ) -> None:
         self.answer = answer
+        self.repair_answer = repair_answer
         self.rerank_order = rerank_order
         self.raise_on_rerank = raise_on_rerank
         self.raise_on_generate = raise_on_generate
@@ -92,6 +104,7 @@ class FakeGenerationClient:
         self.input_text: str | None = None
         self.called = False
         self.calls: list[tuple[str, str]] = []
+        self._main_call_count = 0
 
     def generate(
         self,
@@ -114,6 +127,17 @@ class FakeGenerationClient:
 
         if self.raise_on_generate:
             raise OpenAIResponseError("boom")
+
+        self._main_call_count += 1
+
+        if (
+            self._main_call_count >= 2
+            and self.repair_answer is not None
+        ):
+            return GeneratedText(
+                text=self.repair_answer,
+                model=self.model,
+            )
 
         return GeneratedText(
             text=self.answer,
@@ -399,6 +423,80 @@ class RagAnswerTests(unittest.TestCase):
                 generation_client=client,
             )
 
+    def test_validate_citation_format_accepts_valid_citations(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _validate_citation_format(
+                "Supported by [1] and also [1, 2]."
+            ),
+            [],
+        )
+
+    def test_validate_citation_format_rejects_semicolons(
+        self,
+    ) -> None:
+        errors = _validate_citation_format(
+            "Supported by [1; 2]."
+        )
+
+        self.assertTrue(
+            any(
+                error.error_type
+                == "invalid_citation_format"
+                for error in errors
+            )
+        )
+
+    def test_validate_citation_format_rejects_mixed_separators(
+        self,
+    ) -> None:
+        errors = _validate_citation_format(
+            "Supported by [1, 3; 2]."
+        )
+
+        self.assertTrue(
+            any(
+                error.error_type
+                == "invalid_citation_format"
+                for error in errors
+            )
+        )
+
+    def test_malformed_citation_rejects_the_whole_answer(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer=(
+                "Supported by the extracts [1, 3; 2]."
+            )
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            answer_legal_question(
+                request=LegalChatRequest(
+                    question="Notice period",
+                ),
+                search_function=fake_search,
+                generation_client=client,
+            )
+
     def test_multi_country_retrieval_is_balanced(
         self,
     ) -> None:
@@ -407,7 +505,7 @@ class RagAnswerTests(unittest.TestCase):
         client = FakeGenerationClient(
             answer=(
                 "The UK position is supported by [1]. "
-                "The Spanish position is supported by [2]."
+                "The Spanish position is supported by [3]."
             )
         )
 
@@ -588,7 +686,7 @@ class RagAnswerTests(unittest.TestCase):
         self,
     ) -> None:
         client = FakeGenerationClient(
-            answer="Supported by the top extract [1].",
+            answer="United Kingdom\n- Supported by the top extract [1].",
             rerank_order="[3, 1, 2]",
         )
 
@@ -643,7 +741,7 @@ class RagAnswerTests(unittest.TestCase):
         self,
     ) -> None:
         client = FakeGenerationClient(
-            answer="Supported by the top extract [1].",
+            answer="United Kingdom\n- Supported by the top extract [1].",
             rerank_order="not a valid ranking",
         )
 
@@ -688,7 +786,7 @@ class RagAnswerTests(unittest.TestCase):
         self,
     ) -> None:
         client = FakeGenerationClient(
-            answer="Supported by the top extract [1].",
+            answer="United Kingdom\n- Supported by the top extract [1].",
             raise_on_rerank=True,
         )
 
@@ -732,7 +830,7 @@ class RagAnswerTests(unittest.TestCase):
         self,
     ) -> None:
         client = FakeGenerationClient(
-            answer="Supported by the top extract [1]."
+            answer="United Kingdom\n- Supported by the top extract [1]."
         )
 
         def fake_search(
@@ -771,7 +869,10 @@ class RagAnswerTests(unittest.TestCase):
 
         client = FakeGenerationClient(
             answer=(
-                "Supported by [1], [2], [3], [4]."
+                "United Kingdom\n"
+                "- Supported by [1], [2].\n"
+                "Spain\n"
+                "- Supported by [3], [4]."
             ),
             rerank_order="[1, 2, 3, 4, 5, 6]",
         )
@@ -918,20 +1019,17 @@ class RagAnswerTests(unittest.TestCase):
 
         truncated = _truncate_context(
             content=content,
-            maximum_characters=46,
+            maximum_characters=30,
         )
 
-        self.assertTrue(
-            truncated.startswith(first_paragraph)
+        self.assertEqual(
+            truncated,
+            first_paragraph,
         )
 
         self.assertNotIn(
-            second_paragraph,
+            "B",
             truncated,
-        )
-
-        self.assertTrue(
-            truncated.endswith(TRUNCATION_SUFFIX)
         )
 
     def test_truncate_context_hard_cuts_without_boundary(
@@ -944,16 +1042,30 @@ class RagAnswerTests(unittest.TestCase):
             maximum_characters=50,
         )
 
-        self.assertTrue(
-            truncated.endswith(TRUNCATION_SUFFIX)
+        self.assertEqual(
+            truncated,
+            "A" * 50,
         )
 
-        self.assertLessEqual(
-            len(truncated),
-            50,
+    def test_truncate_context_never_adds_a_marker(
+        self,
+    ) -> None:
+        truncated = _truncate_context(
+            content="A" * 200,
+            maximum_characters=50,
         )
 
-    def test_select_context_hits_keeps_every_hit(
+        self.assertNotIn(
+            "truncated",
+            truncated.lower(),
+        )
+
+        self.assertNotIn(
+            "[",
+            truncated,
+        )
+
+    def test_allocate_country_context_budgets_keeps_every_hit(
         self,
     ) -> None:
         hits = [
@@ -971,7 +1083,7 @@ class RagAnswerTests(unittest.TestCase):
             ),
         ]
 
-        selected = _select_context_hits(
+        selected = _allocate_country_context_budgets(
             hits=hits,
             maximum_characters=6000,
             maximum_source_characters=4000,
@@ -986,7 +1098,7 @@ class RagAnswerTests(unittest.TestCase):
             ],
         )
 
-    def test_select_context_hits_respects_per_source_cap(
+    def test_allocate_country_context_budgets_respects_per_source_cap(
         self,
     ) -> None:
         hits = [
@@ -996,7 +1108,7 @@ class RagAnswerTests(unittest.TestCase):
             ),
         ]
 
-        selected = _select_context_hits(
+        selected = _allocate_country_context_budgets(
             hits=hits,
             maximum_characters=16000,
             maximum_source_characters=4000,
@@ -1007,17 +1119,222 @@ class RagAnswerTests(unittest.TestCase):
             4000,
         )
 
-    def test_select_context_hits_returns_empty_for_no_hits(
+    def test_allocate_country_context_budgets_returns_empty_for_no_hits(
         self,
     ) -> None:
         self.assertEqual(
-            _select_context_hits(
+            _allocate_country_context_budgets(
                 hits=[],
                 maximum_characters=16000,
                 maximum_source_characters=4000,
             ),
             [],
         )
+
+    def test_budget_is_split_per_country_not_per_source(
+        self,
+    ) -> None:
+        hits = []
+
+        for country_code in (
+            "GB",
+            "ES",
+            "IT",
+        ):
+            hits.append(
+                _build_hit(
+                    chunk_id=f"{country_code}-1",
+                    country_code=country_code,
+                    content="A" * 10000,
+                )
+            )
+
+            hits.append(
+                _build_hit(
+                    chunk_id=f"{country_code}-2",
+                    country_code=country_code,
+                    content="B" * 10000,
+                )
+            )
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        lengths_by_chunk_id = {
+            hit.chunk_id: len(hit.content)
+            for hit in selected
+        }
+
+        for country_code in (
+            "GB",
+            "ES",
+            "IT",
+        ):
+            self.assertEqual(
+                lengths_by_chunk_id[
+                    f"{country_code}-1"
+                ],
+                4000,
+            )
+
+            self.assertEqual(
+                lengths_by_chunk_id[
+                    f"{country_code}-2"
+                ],
+                1333,
+            )
+
+    def test_every_country_stays_represented_after_allocation(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="GB-1",
+                country_code="GB",
+                content="A" * 10000,
+            ),
+            _build_hit(
+                chunk_id="ES-1",
+                country_code="ES",
+                content="B" * 10000,
+            ),
+            _build_hit(
+                chunk_id="IT-1",
+                country_code="IT",
+                content="C" * 10000,
+            ),
+        ]
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        self.assertEqual(
+            sorted(
+                hit.country_code
+                for hit in selected
+            ),
+            [
+                "ES",
+                "GB",
+                "IT",
+            ],
+        )
+
+    def test_paid_leave_context_preserves_belgium_parental_leave(
+        self,
+    ) -> None:
+        """
+        Three countries, two sources per country (6 sources total).
+
+        Under the old per-source split (16000 // 6 = 2666 characters
+        each), Belgium's primary source is cut before reaching its
+        "Maternity and Paternity Leave" section, which starts past
+        character 2666. Under the per-country split, that same source
+        gets up to 4000 characters and the section survives in full.
+        """
+
+        filler = (
+            "General leave provisions apply to all workers. "
+            * 60
+        )
+
+        belgium_primary_content = (
+            filler
+            + "Maternity and Paternity Leave: parents are "
+            "entitled to fifteen days of paid leave "
+            "following the birth of a child."
+        )
+
+        hits = [
+            _build_hit(
+                chunk_id="BE-1",
+                country_code="BE",
+                content=belgium_primary_content,
+            ),
+            _build_hit(
+                chunk_id="BE-2",
+                country_code="BE",
+                content="Other Belgian leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="GB-1",
+                country_code="GB",
+                content="UK leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="GB-2",
+                country_code="GB",
+                content="UK secondary leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="FR-1",
+                country_code="FR",
+                content="French leave content. " * 200,
+            ),
+            _build_hit(
+                chunk_id="FR-2",
+                country_code="FR",
+                content=(
+                    "French secondary leave content. " * 200
+                ),
+            ),
+        ]
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        belgium_primary = next(
+            hit
+            for hit in selected
+            if hit.chunk_id == "BE-1"
+        )
+
+        self.assertIn(
+            "Maternity and Paternity Leave",
+            belgium_primary.content,
+        )
+
+    def test_no_truncation_marker_leaks_into_context(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="GB-1",
+                country_code="GB",
+                content="A" * 10000,
+            ),
+            _build_hit(
+                chunk_id="ES-1",
+                country_code="ES",
+                content="B" * 10000,
+            ),
+        ]
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=8000,
+            maximum_source_characters=4000,
+        )
+
+        for hit in selected:
+            self.assertNotIn(
+                "Extract truncated",
+                hit.content,
+            )
+
+            self.assertNotIn(
+                "[",
+                hit.content,
+            )
 
     def test_answer_preserves_all_countries_with_small_context_budget(
         self,
@@ -1223,6 +1540,754 @@ class RagAnswerTests(unittest.TestCase):
         self.assertNotIn(
             "A" * (RERANK_SNIPPET_CHARACTERS + 1),
             prompt,
+        )
+
+    def test_single_country_rejects_more_than_six_bullets(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n"
+            + "\n".join(
+                f"- Bullet {position}"
+                for position in range(1, 8)
+            )
+        )
+
+        errors = _validate_answer_structure(
+            answer=answer,
+            requested_country_codes=[
+                "GB",
+            ],
+        )
+
+        self.assertTrue(
+            any(
+                "six bullets" in error.message
+                for error in errors
+            )
+        )
+
+    def test_comparison_rejects_more_than_four_bullets_per_country(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n"
+            + "\n".join(
+                f"- UK point {position}"
+                for position in range(1, 6)
+            )
+            + "\nSpain\n"
+            "- ES point 1\n"
+            "Comparison\n"
+            "- Compare point 1"
+        )
+
+        errors = _validate_answer_structure(
+            answer=answer,
+            requested_country_codes=[
+                "GB",
+                "ES",
+            ],
+        )
+
+        self.assertTrue(
+            any(
+                "more than four bullets" in error.message
+                for error in errors
+            )
+        )
+
+    def test_comparison_rejects_more_than_two_comparison_bullets(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n"
+            "- UK point 1\n"
+            "Spain\n"
+            "- ES point 1\n"
+            "Comparison\n"
+            "- Compare 1\n"
+            "- Compare 2\n"
+            "- Compare 3"
+        )
+
+        errors = _validate_answer_structure(
+            answer=answer,
+            requested_country_codes=[
+                "GB",
+                "ES",
+            ],
+        )
+
+        self.assertTrue(
+            any(
+                "no more than two bullets" in error.message
+                for error in errors
+            )
+        )
+
+    def test_rejects_internal_extract_references(
+        self,
+    ) -> None:
+        errors = _validate_no_internal_references(
+            "Based on the provided extracts, "
+            "the rule is X [1]."
+        )
+
+        self.assertTrue(
+            any(
+                "provided extracts" in error.message
+                for error in errors
+            )
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "internal_reference"
+                for error in errors
+            )
+        )
+
+    def test_generic_in_the_extracts_phrase_is_detected(
+        self,
+    ) -> None:
+        for phrase in (
+            "The rule is described in the extracts.",
+            "The extract does not specify a duration.",
+            "This is confirmed by the sources provided.",
+        ):
+            errors = _validate_no_internal_references(
+                phrase
+            )
+
+            self.assertTrue(
+                errors,
+                msg=f"Expected a match for: {phrase!r}",
+            )
+
+    def test_paid_leave_rejects_unpaid_leave(
+        self,
+    ) -> None:
+        errors = _validate_paid_leave_scope(
+            question=(
+                "What is the paid leave "
+                "entitlement in Spain?"
+            ),
+            answer=(
+                "Employees are entitled to unpaid "
+                "leave for family reasons [1]."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+    def test_quality_failure_triggers_one_repair_generation(
+        self,
+    ) -> None:
+        bad_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to unpaid "
+            "leave for family reasons [1]."
+        )
+
+        good_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to paid "
+            "parental leave for four weeks [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=bad_answer,
+            repair_answer=good_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "What is the paid leave "
+                    "entitlement in the UK?"
+                ),
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        main_calls = [
+            call
+            for call in client.calls
+            if call[0] != RERANK_INSTRUCTIONS
+        ]
+
+        self.assertEqual(
+            len(main_calls),
+            2,
+        )
+
+    def test_valid_repair_answer_is_returned(
+        self,
+    ) -> None:
+        bad_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to unpaid "
+            "leave for family reasons [1]."
+        )
+
+        good_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to paid "
+            "parental leave for four weeks [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=bad_answer,
+            repair_answer=good_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "What is the paid leave "
+                    "entitlement in the UK?"
+                ),
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertEqual(
+            response.answer,
+            good_answer,
+        )
+
+    def test_second_invalid_answer_raises_controlled_error(
+        self,
+    ) -> None:
+        bad_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to unpaid "
+            "leave for family reasons [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=bad_answer
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            answer_legal_question(
+                request=LegalChatRequest(
+                    question=(
+                        "What is the paid leave "
+                        "entitlement in the UK?"
+                    ),
+                    country_codes=[
+                        "GB",
+                    ],
+                ),
+                search_function=fake_search,
+                generation_client=client,
+            )
+
+    def test_never_denies_available_italian_maternity_duration(
+        self,
+    ) -> None:
+        context_content = (
+            "Maternity leave is compulsory for two "
+            "months prior to the expected date of "
+            "childbirth and three months after "
+            "childbirth."
+        )
+
+        bad_answer = (
+            "The duration of Italian maternity leave "
+            "is not specified in the sources [1]."
+        )
+
+        good_answer = (
+            "Italy\n"
+            "- Maternity leave lasts two months prior "
+            "to childbirth and three months after [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=bad_answer,
+            repair_answer=good_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country="Italy",
+                        country_code="IT",
+                        content=context_content,
+                    )
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "What is the maternity leave "
+                    "duration in Italy?"
+                ),
+                country_codes=[
+                    "IT",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertNotIn(
+            "not specified",
+            response.answer.casefold(),
+        )
+
+        self.assertEqual(
+            response.answer,
+            good_answer,
+        )
+
+    def test_soft_validation_failure_never_returns_502(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer=(
+                "United Kingdom\n"
+                "- Supported by the provided extracts [1]."
+            )
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "What is the notice period in the UK?"
+                ),
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertTrue(
+            response.grounded
+        )
+
+        main_calls = [
+            call
+            for call in client.calls
+            if call[0] != RERANK_INSTRUCTIONS
+        ]
+
+        self.assertEqual(
+            len(main_calls),
+            2,
+        )
+
+    def test_repaired_answer_with_only_soft_errors_is_returned(
+        self,
+    ) -> None:
+        bad_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to unpaid "
+            "leave for family reasons [1]."
+        )
+
+        repaired_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to paid leave "
+            "for four weeks, as described in the "
+            "provided extracts [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=bad_answer,
+            repair_answer=repaired_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "What is the paid leave "
+                    "entitlement in the UK?"
+                ),
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertEqual(
+            response.answer,
+            repaired_answer,
+        )
+
+    def test_first_answer_is_returned_when_repair_introduces_hard_error(
+        self,
+    ) -> None:
+        first_answer = (
+            "United Kingdom\n"
+            "- Supported by the provided extracts [1]."
+        )
+
+        repaired_answer = "Supported by [1]."
+
+        client = FakeGenerationClient(
+            answer=first_answer,
+            repair_answer=repaired_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "What is the notice period in the UK?"
+                ),
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertEqual(
+            response.answer,
+            first_answer,
+        )
+
+    def test_two_hard_validation_failures_raise_rag_answer_error(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Supported by [1]."
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            answer_legal_question(
+                request=LegalChatRequest(
+                    question=(
+                        "What is the notice period in the UK?"
+                    ),
+                    country_codes=[
+                        "GB",
+                    ],
+                ),
+                search_function=fake_search,
+                generation_client=client,
+            )
+
+    def test_false_absence_claim_is_soft(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context=(
+                "Maternity leave is compulsory for "
+                "two months prior to childbirth."
+            ),
+            answer=(
+                "The exact duration is not specified "
+                "in the sources [1]."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type in SOFT_QUALITY_ERROR_TYPES
+                for error in errors
+            )
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type not in HARD_QUALITY_ERROR_TYPES
+                for error in errors
+            )
+        )
+
+    def test_multi_country_duration_does_not_create_cross_country_hard_failure(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = request.country_codes[0]
+
+            if country_code == "GB":
+                hit = _build_hit(
+                    country="United Kingdom",
+                    country_code="GB",
+                    content=(
+                        "Employees are entitled to "
+                        "one week's notice."
+                    ),
+                )
+            else:
+                hit = _build_hit(
+                    chunk_id="chunk-2",
+                    country="Spain",
+                    country_code="ES",
+                    content=(
+                        "Spain applies its general annual "
+                        "leave rules without a fixed figure "
+                        "stated in this extract."
+                    ),
+                )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    hit
+                ],
+            )
+
+        answer = (
+            "United Kingdom\n"
+            "- Notice period is one week [1].\n"
+            "Spain\n"
+            "- The exact annual leave duration is "
+            "not specified in the sources [2]."
+        )
+
+        client = FakeGenerationClient(
+            answer=answer
+        )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and leave rules "
+                    "in the UK and Spain."
+                ),
+                country_codes=[
+                    "GB",
+                    "ES",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+        )
+
+        self.assertTrue(
+            response.grounded
+        )
+
+        self.assertIn(
+            "not specified",
+            response.answer.casefold(),
+        )
+
+    def test_error_metrics_preserve_retrieval_and_selected_source_counts(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Supported by [1]."
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        metrics = LegalChatMetrics(
+            request_id="request-1",
+            question_characters=10,
+            max_sources=6,
+            rerank_enabled=False,
+        )
+
+        with self.assertRaises(
+            RagAnswerError
+        ):
+            answer_legal_question(
+                request=LegalChatRequest(
+                    question=(
+                        "What is the notice period in the UK?"
+                    ),
+                    country_codes=[
+                        "GB",
+                    ],
+                ),
+                search_function=fake_search,
+                generation_client=client,
+                metrics=metrics,
+            )
+
+        self.assertEqual(
+            metrics.retrieval_total,
+            1,
+        )
+
+        self.assertEqual(
+            metrics.selected_sources,
+            1,
+        )
+
+        self.assertEqual(
+            metrics.model,
+            "test-model",
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            2,
+        )
+
+        self.assertTrue(
+            metrics.repair_triggered
+        )
+
+        self.assertFalse(
+            metrics.repair_success
+        )
+
+        self.assertIn(
+            "missing_requested_country",
+            metrics.final_hard_error_types,
         )
 
 
