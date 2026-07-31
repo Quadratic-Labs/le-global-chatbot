@@ -107,6 +107,11 @@ NO_INFORMATION_ANSWER: Final[str] = (
     "for country-specific legal advice."
 )
 
+MISSING_COUNTRY_ANSWER: Final[str] = (
+    "Please select or name at least one country so I can answer "
+    "from the relevant validated L&E Global documents."
+)
+
 SYSTEM_INSTRUCTIONS: Final[str] = """
 You are the L&E Global employment law assistant.
 
@@ -117,13 +122,19 @@ Rules:
 1. Do not use external knowledge.
 2. Do not invent legal rules, dates, thresholds, procedures, or cases.
 3. Cite supporting sources using [1], [2], or [1, 2].
-4. Every material legal statement must have a source citation.
+4. Every material legal statement, and every individual bullet
+   point, must have its own source citation.
 5. Never cite a source number that was not provided.
-6. When comparing countries, use a separate section for each country
-   followed by a concise comparison.
+6. When comparing countries, use a separate section for each
+   country, citing only that country's own sources, followed by a
+   concise comparison section that may combine citations from every
+   compared country.
 7. Clearly distinguish the law applicable in each country.
-8. When the extracts are insufficient, state that the available
-   L&E Global documents do not contain enough information.
+8. If a requested detail is not supported by the supplied sources,
+   omit that unsupported detail or state only that a definitive
+   answer cannot be provided for that specific point. Never mention
+   documents, extracts, materials, context, retrieval, source
+   availability, or internal system limitations in the answer.
 9. Do not claim to provide legal advice.
 10. Give a direct, structured, professional, and concise answer.
 11. Answer only the legal issue explicitly requested by the user.
@@ -142,12 +153,15 @@ Rules:
 19. Do not use semicolons inside citations.
 20. Do not add a limitations section unless none of the supplied
     sources contains enough information to answer the question.
-21. Start each country section with a single heading line containing
-    the country name, followed by bullet points starting with a
-    hyphen (-).
+21. Start the answer directly with the first requested country's
+    heading - no preamble - and use only that country's name as each
+    country heading. Put every legal statement in a hyphen-prefixed
+    bullet point, each with its own citation. A continuation of a
+    bullet must stay indented under it; never place legal content as
+    unindented standalone prose next to a heading or between bullets.
 22. Start the comparison section with a heading line containing the
-    word "Comparison", followed by no more than two bullet points
-    starting with a hyphen (-).
+    word "Comparison", followed by no more than two hyphen-prefixed
+    bullet points, each with its own citation.
 23. When the user asks about paid leave or paid time off:
     - Include only leave that the sources explicitly describe as
       paid, remunerated, compensated, covered by an allowance, or
@@ -155,6 +169,19 @@ Rules:
     - Do not list leave explicitly described as unpaid.
     - Do not state that a leave entitlement is missing or
       unspecified. Simply omit unsupported categories.
+24. Preserve the exact legal scope of every statement: keep the
+    precise category (sexual harassment, not harassment in general),
+    the persons concerned, eligibility conditions, thresholds,
+    durations, and exceptions exactly as the sources state them.
+    Never turn a specific category into a general one, a condition
+    into a universal rule, a possibility (may, can) into an
+    obligation (must), a capped amount (up to X) into an automatic
+    entitlement, an exception into the general principle, or an
+    employer duty into an employee one. In a comparison, apply each
+    country's rule only to that country; never transfer or
+    harmonize a rule across countries. If the sources do not
+    support a broader statement, keep the precise wording and note
+    that the sources do not specify the broader point.
 """.strip()
 
 
@@ -216,6 +243,42 @@ def _normalize_country_codes(
         )
 
     return normalized_codes
+
+
+def _normalize_requested_legal_topics(
+    legal_topics: Sequence[str],
+) -> tuple[str, ...]:
+    """
+    Deduplicate and clean requested legal topics, preserving order.
+
+    Strips whitespace and drops empty entries only - never changes
+    casing or canonical wording, and never guesses or fuzzy-matches a
+    topic that wasn't explicitly requested.
+    """
+
+    normalized_topics: list[str] = []
+    seen_topics: set[str] = set()
+
+    for topic in legal_topics:
+        stripped_topic = topic.strip()
+
+        if not stripped_topic:
+            continue
+
+        if stripped_topic in seen_topics:
+            continue
+
+        seen_topics.add(
+            stripped_topic
+        )
+
+        normalized_topics.append(
+            stripped_topic
+        )
+
+    return tuple(
+        normalized_topics
+    )
 
 
 COUNTRY_ADJECTIVES: Final[dict[str, tuple[str, ...]]] = {
@@ -368,13 +431,26 @@ def _build_search_request(
     request: LegalChatRequest,
     country_codes: list[str],
     limit: int,
+    legal_topics: Sequence[str] | None = None,
 ) -> LegalSearchRequest:
-    """Build one OpenSearch request from chat criteria."""
+    """
+    Build one OpenSearch request from chat criteria.
+
+    `legal_topics` overrides request.legal_topics for this one search
+    only - request itself is never mutated - so a single topic can be
+    searched for on its own without touching the public API. Every
+    other filter (subsections, language, reference_year) always comes
+    from `request`, exactly as before.
+    """
 
     return LegalSearchRequest(
         query=query,
         country_codes=country_codes,
-        legal_topics=request.legal_topics,
+        legal_topics=(
+            list(legal_topics)
+            if legal_topics is not None
+            else request.legal_topics
+        ),
         subsections=request.subsections,
         language=request.language,
         reference_year=request.reference_year,
@@ -439,6 +515,36 @@ def _interleave_hits(
     return combined_hits
 
 
+def _deduplicate_hits(
+    hits: Sequence[LegalSearchHit],
+) -> list[LegalSearchHit]:
+    """
+    Remove hits sharing a chunk_id, keeping the first occurrence.
+
+    Identity is chunk_id alone - content is never compared, hits are
+    never mutated, and nothing here is logged. Guards against the same
+    chunk coming back across more than one candidate group (for
+    example two per-topic searches for the same country).
+    """
+
+    deduplicated_hits: list[LegalSearchHit] = []
+    seen_chunk_ids: set[str] = set()
+
+    for hit in hits:
+        if hit.chunk_id in seen_chunk_ids:
+            continue
+
+        seen_chunk_ids.add(
+            hit.chunk_id
+        )
+
+        deduplicated_hits.append(
+            hit
+        )
+
+    return deduplicated_hits
+
+
 def _candidate_search_limit(
     fair_share_limit: int,
     rerank_enabled: bool,
@@ -480,6 +586,101 @@ def _candidate_limit_per_country(
         ),
         MIN_CANDIDATE_LIMIT_PER_COUNTRY,
     )
+
+
+def _select_topic_balanced_hits(
+    hits: Sequence[LegalSearchHit],
+    legal_topics: Sequence[str],
+    limit: int,
+) -> list[LegalSearchHit]:
+    """
+    Select up to `limit` hits, covering every requested topic first.
+
+    `hits` must already be ranked - BM25 order when reranking is
+    disabled, reranked order otherwise. With zero or one topic, this
+    is simply the first unique hits up to `limit`. With multiple
+    topics, it round-robins across the normalized topics in the order
+    they were requested: each round takes, for the current topic, the
+    best not-yet-selected hit whose own legal_topic (stripped) matches
+    it - never a content search. Rounds continue while the limit isn't
+    reached and at least one hit was added during the round; any
+    remaining capacity is then filled with the best leftover hits in
+    their original rank order, which is what lets a topic with no
+    results (or fewer than its share) be compensated by another
+    topic's deeper candidates instead of leaving the quota unfilled.
+    """
+
+    if limit <= 0:
+        return []
+
+    normalized_topics = _normalize_requested_legal_topics(
+        legal_topics
+    )
+
+    deduplicated_hits = _deduplicate_hits(
+        hits
+    )
+
+    if len(normalized_topics) <= 1:
+        return deduplicated_hits[:limit]
+
+    selected_hits: list[LegalSearchHit] = []
+    selected_chunk_ids: set[str] = set()
+
+    def _hit_topic(
+        hit: LegalSearchHit,
+    ) -> str | None:
+        return (
+            hit.legal_topic.strip()
+            if hit.legal_topic is not None
+            else None
+        )
+
+    made_progress = True
+
+    while (
+        len(selected_hits) < limit
+        and made_progress
+    ):
+        made_progress = False
+
+        for topic in normalized_topics:
+            if len(selected_hits) >= limit:
+                break
+
+            for hit in deduplicated_hits:
+                if hit.chunk_id in selected_chunk_ids:
+                    continue
+
+                if _hit_topic(hit) != topic:
+                    continue
+
+                selected_hits.append(
+                    hit
+                )
+                selected_chunk_ids.add(
+                    hit.chunk_id
+                )
+                made_progress = True
+
+                break
+
+    if len(selected_hits) < limit:
+        for hit in deduplicated_hits:
+            if len(selected_hits) >= limit:
+                break
+
+            if hit.chunk_id in selected_chunk_ids:
+                continue
+
+            selected_hits.append(
+                hit
+            )
+            selected_chunk_ids.add(
+                hit.chunk_id
+            )
+
+    return selected_hits
 
 
 def _build_rerank_input(
@@ -590,6 +791,181 @@ def _rerank_hits(
     return [hits[position - 1] for position in order]
 
 
+def _retrieve_country_hits(
+    request: LegalChatRequest,
+    country_code: str,
+    retrieval_query: str,
+    output_limit: int,
+    search_function: SearchFunction,
+    generation_client: TextGenerationClient | None,
+    rerank_enabled: bool,
+    rerank_pool_multiplier: int,
+    metrics: LegalChatMetrics | None = None,
+) -> tuple[int, list[LegalSearchHit]]:
+    """
+    Retrieve and select up to output_limit hits for one country.
+
+    `retrieval_query` must already have every requested country's name
+    stripped out by the caller (via _build_retrieval_query over the
+    full comparison, not just this one country) - a per-country query
+    built from only this country's own name would leave every other
+    compared country's name sitting in the query text.
+
+    With zero or one requested legal topic, this is the original
+    single-search path: one OpenSearch call using every requested
+    topic together, optionally reranked, truncated to output_limit.
+
+    With multiple topics, one search is issued per topic for this
+    country instead, so every topic gets its own retrieval capacity
+    rather than competing against the others inside a single mixed
+    query - this is what stops one topic's chunks from crowding out
+    another's before either had a chance to be selected. The combined,
+    deduplicated pool is reranked at most once (never once per topic,
+    to keep the OpenAI call budget identical to today's per-country
+    reranking), then _select_topic_balanced_hits picks the final
+    topic-balanced result. If every topic-specific search comes back
+    empty, one broad fallback search using the request's original
+    topics is issued instead of returning nothing.
+    """
+
+    normalized_topics = _normalize_requested_legal_topics(
+        request.legal_topics
+    )
+
+    def run_search(
+        search_request: LegalSearchRequest,
+    ) -> LegalSearchResponse:
+        started_at = perf_counter()
+
+        try:
+            return search_function(search_request)
+        finally:
+            if metrics is not None:
+                metrics.add_opensearch_seconds(
+                    perf_counter() - started_at
+                )
+
+    def run_rerank(
+        hits: list[LegalSearchHit],
+    ) -> list[LegalSearchHit]:
+        started_at = perf_counter()
+
+        try:
+            return _rerank_hits(
+                question=request.question,
+                hits=hits,
+                generation_client=generation_client,
+            )
+        finally:
+            if metrics is not None:
+                metrics.add_rerank_seconds(
+                    perf_counter() - started_at
+                )
+
+    def _broad_search() -> tuple[int, list[LegalSearchHit]]:
+        response = run_search(
+            _build_search_request(
+                query=retrieval_query,
+                request=request,
+                country_codes=[
+                    country_code,
+                ],
+                limit=_candidate_search_limit(
+                    fair_share_limit=output_limit,
+                    rerank_enabled=rerank_enabled,
+                    rerank_pool_multiplier=rerank_pool_multiplier,
+                ),
+            )
+        )
+
+        hits = response.hits
+
+        if rerank_enabled:
+            hits = run_rerank(hits)
+
+        return (
+            response.total,
+            hits[:output_limit],
+        )
+
+    if len(normalized_topics) <= 1:
+        return _broad_search()
+
+    retrieval_total = 0
+    topic_hit_groups: list[
+        list[LegalSearchHit]
+    ] = []
+
+    topic_search_limit = min(
+        _candidate_search_limit(
+            fair_share_limit=output_limit,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+        ),
+        MAX_RERANK_POOL_SIZE,
+    )
+
+    for topic in normalized_topics:
+        response = run_search(
+            _build_search_request(
+                query=retrieval_query,
+                request=request,
+                country_codes=[
+                    country_code,
+                ],
+                limit=topic_search_limit,
+                legal_topics=[
+                    topic,
+                ],
+            )
+        )
+
+        retrieval_total += (
+            response.total
+        )
+
+        topic_hit_groups.append(
+            response.hits
+        )
+
+    if not any(
+        topic_hit_groups
+    ):
+        # No topic-specific search returned anything - a precise
+        # topic filter matching zero results should not be treated as
+        # a hard failure; fall back to one broad search instead.
+        fallback_total, fallback_hits = _broad_search()
+
+        return (
+            retrieval_total + fallback_total,
+            fallback_hits,
+        )
+
+    combined_hits = _deduplicate_hits(
+        _interleave_hits(
+            hit_groups=topic_hit_groups,
+            limit=sum(
+                len(group)
+                for group in topic_hit_groups
+            ),
+        )
+    )[:MAX_RERANK_POOL_SIZE]
+
+    if rerank_enabled:
+        combined_hits = run_rerank(combined_hits)
+
+    selected_hits = _select_topic_balanced_hits(
+        hits=combined_hits,
+        legal_topics=normalized_topics,
+        limit=output_limit,
+    )
+
+    return (
+        retrieval_total,
+        selected_hits,
+    )
+
+
 def _retrieve_search_hits(
     request: LegalChatRequest,
     search_function: SearchFunction,
@@ -618,9 +994,12 @@ def _retrieve_search_hits(
         ),
     )
 
-    if len(
-        country_codes
-    ) <= 1:
+    if not country_codes:
+        # No country filter at all. answer_legal_question's own guard
+        # means this is not reached in production, but this function
+        # may still be exercised directly without one - preserved
+        # exactly as before, since _retrieve_country_hits requires one
+        # concrete country to search and topic-balance for.
         search_started_at = perf_counter()
 
         response = search_function(
@@ -662,6 +1041,26 @@ def _retrieve_search_hits(
             hits,
         )
 
+    if len(
+        country_codes
+    ) == 1:
+        retrieval_total, hits = _retrieve_country_hits(
+            request=request,
+            country_code=country_codes[0],
+            retrieval_query=retrieval_query,
+            output_limit=request.max_sources,
+            search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+            metrics=metrics,
+        )
+
+        return (
+            retrieval_total,
+            hits,
+        )
+
     if request.max_sources < len(
         country_codes
     ):
@@ -683,47 +1082,21 @@ def _retrieve_search_hits(
     ] = []
 
     for country_code in country_codes:
-        search_started_at = perf_counter()
-
-        response = search_function(
-            _build_search_request(
-                query=retrieval_query,
-                request=request,
-                country_codes=[
-                    country_code
-                ],
-                limit=_candidate_search_limit(
-                    fair_share_limit=country_limit,
-                    rerank_enabled=rerank_enabled,
-                    rerank_pool_multiplier=rerank_pool_multiplier,
-                ),
-            )
+        country_retrieval_total, country_hits = _retrieve_country_hits(
+            request=request,
+            country_code=country_code,
+            retrieval_query=retrieval_query,
+            output_limit=country_limit,
+            search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+            metrics=metrics,
         )
-
-        if metrics is not None:
-            metrics.add_opensearch_seconds(
-                perf_counter() - search_started_at
-            )
 
         retrieval_total += (
-            response.total
+            country_retrieval_total
         )
-
-        country_hits = response.hits
-
-        if rerank_enabled:
-            rerank_started_at = perf_counter()
-
-            country_hits = _rerank_hits(
-                question=request.question,
-                hits=country_hits,
-                generation_client=generation_client,
-            )
-
-            if metrics is not None:
-                metrics.add_rerank_seconds(
-                    perf_counter() - rerank_started_at
-                )
 
         country_hit_groups.append(
             country_hits
@@ -864,6 +1237,9 @@ HARD_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
         "unknown_citation",
         "missing_requested_country",
         "paid_leave_scope",
+        "uncited_material_claim",
+        "citation_country_mismatch",
+        "invalid_grounding_structure",
     }
 )
 
@@ -903,6 +1279,42 @@ class _AnswerSection:
     kind: str
     title: str
     bullets: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _AnswerClaim:
+    """
+    One material legal statement (bullet) and its grounding metadata.
+
+    Internal only - never exposed through the API. `text` is held only
+    for the duration of validation and must never be logged.
+    """
+
+    section_kind: str
+    section_title: str
+    country_code: str | None
+    text: str
+    citation_numbers: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _GroundingSection:
+    """
+    One heading-delimited section, aware of standalone (non-bullet)
+    content and multi-line bullet continuations.
+
+    Internal only - never exposed through the API, and never logged.
+    `bullets` holds each bullet's full text (continuation lines
+    already joined in); `standalone_lines` holds non-bullet content
+    that appeared before the section's first bullet - a signal that
+    legal prose escaped the required bullet structure.
+    """
+
+    section_kind: str
+    section_title: str
+    country_code: str | None
+    bullets: tuple[str, ...]
+    standalone_lines: tuple[str, ...]
 
 
 _BULLET_LINE_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -978,6 +1390,559 @@ def _parse_country_sections(
     flush_section()
 
     return sections
+
+
+def _normalize_title_words(
+    value: str,
+) -> tuple[str, ...]:
+    """
+    Normalize a heading or country name into comparable lowercase words.
+
+    Strips markdown emphasis markers, trailing colons, and punctuation
+    so headings such as "**United Kingdom**" or "United Kingdom:"
+    compare equal to the plain country name.
+    """
+
+    stripped = (
+        value.strip()
+        .strip("*")
+        .strip()
+        .rstrip(":")
+        .strip()
+    )
+
+    return tuple(
+        re.findall(
+            r"[a-z0-9]+",
+            stripped.casefold(),
+        )
+    )
+
+
+def _contains_contiguous_word_sequence(
+    words: Sequence[str],
+    candidate: Sequence[str],
+) -> bool:
+    """
+    Return whether `candidate` occurs as a contiguous run inside `words`.
+
+    Operates purely on already-normalized whole words: "australia" can
+    never match inside "austria" this way, since they are different
+    single words, not overlapping substrings. An empty candidate never
+    matches - it would otherwise match every title.
+    """
+
+    candidate_length = len(
+        candidate
+    )
+
+    if candidate_length == 0:
+        return False
+
+    if candidate_length > len(
+        words
+    ):
+        return False
+
+    for start in range(
+        len(words) - candidate_length + 1
+    ):
+        if (
+            tuple(
+                words[start:start + candidate_length]
+            )
+            == tuple(candidate)
+        ):
+            return True
+
+    return False
+
+
+def _resolve_section_country_code(
+    section_title: str,
+    requested_country_codes: Sequence[str],
+) -> str | None:
+    """
+    Resolve a section heading to exactly one requested country code.
+
+    Matches a requested country's display name, alias, or adjective as
+    a contiguous run of normalized whole words anywhere in the title -
+    never a raw substring, which could confuse one country's name with
+    another's (a raw substring search would let "Austria" match
+    "Australia"). This lets headings carry extra words such as
+    "Australia - Notice requirements" or "Notice requirements in
+    Australia" while still resolving unambiguously. Returns None
+    rather than guessing when zero or more than one requested country
+    matches.
+    """
+
+    title_words = _normalize_title_words(
+        section_title
+    )
+
+    if not title_words:
+        return None
+
+    matched_codes: set[str] = set()
+
+    for country_code in requested_country_codes:
+        variants = _country_name_variants_for_codes(
+            [
+                country_code,
+            ]
+        )
+
+        for variant in variants:
+            if _contains_contiguous_word_sequence(
+                words=title_words,
+                candidate=_normalize_title_words(
+                    variant
+                ),
+            ):
+                matched_codes.add(
+                    country_code
+                )
+                break
+
+    if len(matched_codes) == 1:
+        return next(
+            iter(matched_codes)
+        )
+
+    return None
+
+
+def _country_heading_variants_for_code(
+    country_code: str,
+) -> tuple[str, ...]:
+    """
+    Return the exact heading forms allowed for one country's section.
+
+    Only the display name and its aliases - never the demonym
+    adjectives from COUNTRY_ADJECTIVES ("Australian" names the
+    country without being a valid section heading on its own; only
+    "Australia" is).
+    """
+
+    normalized_code = country_code.upper()
+
+    for country in COUNTRIES:
+        if country.code == normalized_code:
+            return (
+                country.display_name,
+                *country.aliases,
+            )
+
+    return ()
+
+
+def _is_canonical_country_heading(
+    section_title: str,
+    country_code: str,
+) -> bool:
+    """
+    Return whether a heading is EXACTLY one country's name - no more.
+
+    Unlike _resolve_section_country_code (which tolerates extra words
+    around the country name so it can still identify which country an
+    enriched or malformed heading refers to), this requires an exact
+    match after normalization: "Australia" is canonical, "Australia -
+    Notice requirements" and "Australian law" are not.
+    """
+
+    title_words = _normalize_title_words(
+        section_title
+    )
+
+    if not title_words:
+        return False
+
+    for variant in _country_heading_variants_for_code(
+        country_code
+    ):
+        if (
+            _normalize_title_words(variant)
+            == title_words
+        ):
+            return True
+
+    return False
+
+
+_CANONICAL_COMPARISON_WORDS: Final[tuple[str, ...]] = (
+    "comparison",
+)
+
+
+def _is_canonical_comparison_heading(
+    section_title: str,
+) -> bool:
+    """
+    Return whether a heading is EXACTLY the word "Comparison" - no more.
+
+    A sentence that merely contains the word ("For comparison, the
+    rules differ") must never be treated as the comparison heading.
+    """
+
+    return (
+        _normalize_title_words(section_title)
+        == _CANONICAL_COMPARISON_WORDS
+    )
+
+
+def _parse_grounding_sections(
+    answer: str,
+    requested_country_codes: Sequence[str],
+) -> list[_GroundingSection]:
+    """
+    Split a generated answer into sections for grounding validation.
+
+    Shared by _extract_answer_claims, _validate_grounding_section_
+    structure, _validate_material_claim_citations, and _validate_
+    country_citation_alignment, so every one of them interprets the
+    same answer the same way.
+
+    A non-bullet line only starts a new "country" or "comparison"
+    section when it is itself a CANONICAL heading (exactly one
+    requested country's name, or exactly "Comparison" -
+    _is_canonical_country_heading / _is_canonical_comparison_heading).
+    Anything else - a preamble, a legal sentence, a heading-shaped line
+    that turns out to be a country name plus extra words ("Australia -
+    Notice requirements"), or a bullet appearing before any heading -
+    is never silently dropped: it is folded into an "unresolved"
+    section instead (bootstrapped lazily the first time such content
+    appears with nothing open yet), which _validate_grounding_section_
+    structure always rejects. This is what closes off a legal
+    statement masquerading as a heading, or a leading bullet/preamble
+    being ignored.
+
+    A non-bullet line following an open bullet is a continuation of
+    that bullet only if it is indented; an unindented line is instead
+    standalone content of the section already open (rejected by
+    _validate_grounding_section_structure, since a country or
+    Comparison section must never contain anything other than
+    bullets).
+    """
+
+    sections: list[_GroundingSection] = []
+
+    current_kind: str | None = None
+    current_title = ""
+    current_country_code: str | None = None
+    current_bullets: list[str] = []
+    current_standalone_lines: list[str] = []
+
+    def flush_section() -> None:
+        if current_kind is not None:
+            sections.append(
+                _GroundingSection(
+                    section_kind=current_kind,
+                    section_title=current_title,
+                    country_code=current_country_code,
+                    bullets=tuple(
+                        current_bullets
+                    ),
+                    standalone_lines=tuple(
+                        current_standalone_lines
+                    ),
+                )
+            )
+
+    for raw_line in answer.splitlines():
+        stripped_line = raw_line.strip()
+
+        if not stripped_line:
+            continue
+
+        is_indented = bool(
+            raw_line[:1].isspace()
+        )
+
+        bullet_match = _BULLET_LINE_PATTERN.match(
+            stripped_line
+        )
+
+        canonical_country_code: str | None = None
+        is_canonical_comparison = False
+
+        if not bullet_match:
+            candidate_title = stripped_line.rstrip(
+                ":"
+            ).strip()
+
+            for country_code in requested_country_codes:
+                if _is_canonical_country_heading(
+                    section_title=candidate_title,
+                    country_code=country_code,
+                ):
+                    canonical_country_code = country_code
+                    break
+
+            is_canonical_comparison = _is_canonical_comparison_heading(
+                candidate_title
+            )
+
+        if (
+            canonical_country_code is not None
+            or is_canonical_comparison
+        ):
+            flush_section()
+
+            current_bullets = []
+            current_standalone_lines = []
+            current_title = candidate_title
+            current_country_code = canonical_country_code
+            current_kind = (
+                "comparison"
+                if is_canonical_comparison
+                else "country"
+            )
+
+            continue
+
+        if current_kind is None:
+            # Bootstrap an "unresolved" holding section instead of
+            # silently dropping a leading bullet or preamble line.
+            current_kind = "unresolved"
+            current_title = ""
+            current_country_code = None
+            current_bullets = []
+            current_standalone_lines = []
+
+        if bullet_match:
+            current_bullets.append(
+                bullet_match.group(1)
+            )
+            continue
+
+        if is_indented and current_bullets:
+            current_bullets[-1] = (
+                f"{current_bullets[-1]} {stripped_line}"
+            )
+        else:
+            current_standalone_lines.append(
+                stripped_line
+            )
+
+    flush_section()
+
+    return sections
+
+
+def _extract_answer_claims(
+    answer: str,
+    requested_country_codes: Sequence[str],
+) -> list[_AnswerClaim]:
+    """
+    Break a generated answer into one claim per bullet point.
+
+    Built on _parse_grounding_sections, so a claim is only ever
+    created for an actual bullet - never for a heading, a tolerated
+    preamble, or standalone prose already rejected by
+    _validate_grounding_section_structure.
+    """
+
+    claims: list[_AnswerClaim] = []
+
+    for section in _parse_grounding_sections(
+        answer=answer,
+        requested_country_codes=requested_country_codes,
+    ):
+        for bullet in section.bullets:
+            claims.append(
+                _AnswerClaim(
+                    section_kind=section.section_kind,
+                    section_title=section.section_title,
+                    country_code=section.country_code,
+                    text=bullet,
+                    citation_numbers=tuple(
+                        _find_citation_numbers(
+                            bullet
+                        )
+                    ),
+                )
+            )
+
+    return claims
+
+
+_STRUCTURE_MESSAGE_START_DIRECTLY: Final[str] = (
+    "Start the answer directly with a requested country heading."
+)
+
+_STRUCTURE_MESSAGE_HEADING_NAME_ONLY: Final[str] = (
+    "Use only the country name as each country section heading."
+)
+
+_STRUCTURE_MESSAGE_BULLETS_ONLY: Final[str] = (
+    "Put all legal content in hyphen-prefixed bullet points."
+)
+
+_STRUCTURE_MESSAGE_MISSING_COUNTRY_SECTION: Final[str] = (
+    "Each requested country must have a dedicated country section."
+)
+
+
+def _validate_grounding_section_structure(
+    answer: str,
+    requested_country_codes: Sequence[str],
+) -> list[QualityError]:
+    """
+    Reject a structurally malformed answer before citations are checked.
+
+    Catches: any content before the first canonical heading (a
+    preamble, a leading bullet, or a heading-shaped line that is not
+    exactly a requested country's name or "Comparison"); a resolved
+    country section with no bullets; a country or Comparison section
+    that contains anything other than bullets (with or without a
+    citation - no linguistic judgment is made about the content); and
+    a requested country that never got its own dedicated section
+    (being named only inside Comparison does not count). Error
+    messages are always generic and never echo the generated answer's
+    text, since that text is untrusted model output that would
+    otherwise get reflected back into the repair prompt. Returns on
+    the first violation so that prompt stays short.
+    """
+
+    sections = _parse_grounding_sections(
+        answer=answer,
+        requested_country_codes=requested_country_codes,
+    )
+
+    for index, section in enumerate(sections):
+        if section.section_kind == "unresolved":
+            message = (
+                _STRUCTURE_MESSAGE_START_DIRECTLY
+                if index == 0
+                else _STRUCTURE_MESSAGE_HEADING_NAME_ONLY
+            )
+
+            return [
+                QualityError(
+                    error_type="invalid_grounding_structure",
+                    message=message,
+                )
+            ]
+
+        if section.standalone_lines:
+            return [
+                QualityError(
+                    error_type="invalid_grounding_structure",
+                    message=_STRUCTURE_MESSAGE_BULLETS_ONLY,
+                )
+            ]
+
+        if (
+            section.section_kind == "country"
+            and not section.bullets
+        ):
+            return [
+                QualityError(
+                    error_type="invalid_grounding_structure",
+                    message=_STRUCTURE_MESSAGE_BULLETS_ONLY,
+                )
+            ]
+
+    for country_code in requested_country_codes:
+        has_dedicated_section = any(
+            section.section_kind == "country"
+            and section.country_code == country_code
+            for section in sections
+        )
+
+        if not has_dedicated_section:
+            return [
+                QualityError(
+                    error_type="invalid_grounding_structure",
+                    message=_STRUCTURE_MESSAGE_MISSING_COUNTRY_SECTION,
+                )
+            ]
+
+    return []
+
+
+def _validate_material_claim_citations(
+    answer: str,
+    requested_country_codes: Sequence[str],
+) -> list[QualityError]:
+    """
+    Reject a country or comparison bullet that lacks its own citation.
+
+    A citation present elsewhere in the answer does not count: every
+    non-empty bullet must carry a valid citation of its own. Returns
+    on the first violation so the repair prompt stays short.
+    """
+
+    claims = _extract_answer_claims(
+        answer=answer,
+        requested_country_codes=requested_country_codes,
+    )
+
+    for claim in claims:
+        if not claim.text.strip():
+            continue
+
+        if not claim.citation_numbers:
+            return [
+                QualityError(
+                    error_type="uncited_material_claim",
+                    message=(
+                        "Every legal bullet must include its "
+                        "own source citation."
+                    ),
+                )
+            ]
+
+    return []
+
+
+def _validate_country_citation_alignment(
+    answer: str,
+    requested_country_codes: Sequence[str],
+    hits: Sequence[LegalSearchHit],
+) -> list[QualityError]:
+    """
+    Reject a country-section bullet that cites another country's source.
+
+    Only sections whose heading resolves unambiguously to one
+    requested country are checked; a Comparison section may freely
+    combine citations from every compared country. Bullets without a
+    citation (uncited_material_claim) and out-of-range citation
+    numbers (unknown_citation) are left to their own validators.
+    """
+
+    claims = _extract_answer_claims(
+        answer=answer,
+        requested_country_codes=requested_country_codes,
+    )
+
+    for claim in claims:
+        if claim.section_kind != "country":
+            continue
+
+        if claim.country_code is None:
+            continue
+
+        for citation in claim.citation_numbers:
+            if citation < 1 or citation > len(hits):
+                continue
+
+            hit = hits[
+                citation - 1
+            ]
+
+            if hit.country_code != claim.country_code:
+                return [
+                    QualityError(
+                        error_type="citation_country_mismatch",
+                        message=(
+                            "A country section cites a source "
+                            "belonging to a different country."
+                        ),
+                    )
+                ]
+
+    return []
 
 
 def _validate_answer_structure(
@@ -1315,7 +2280,7 @@ def _validate_answer_quality(
     answer: str,
     country_codes: Sequence[str],
     context: str,
-    source_count: int,
+    hits: Sequence[LegalSearchHit],
 ) -> tuple[
     list[QualityError],
     list[QualityError],
@@ -1340,7 +2305,9 @@ def _validate_answer_quality(
     all_errors.extend(
         _validate_citation_range(
             answer=answer,
-            source_count=source_count,
+            source_count=len(
+                hits
+            ),
         )
     )
 
@@ -1350,6 +2317,35 @@ def _validate_answer_quality(
             requested_country_codes=country_codes,
         )
     )
+
+    grounding_structure_errors = _validate_grounding_section_structure(
+        answer=answer,
+        requested_country_codes=country_codes,
+    )
+
+    all_errors.extend(
+        grounding_structure_errors
+    )
+
+    if not grounding_structure_errors:
+        # A structurally malformed answer has no reliable sections or
+        # bullets to check claims/citations against - skip those two
+        # validators rather than raise confusing secondary errors (or
+        # analyze claims parsed out of an already-invalid structure).
+        all_errors.extend(
+            _validate_material_claim_citations(
+                answer=answer,
+                requested_country_codes=country_codes,
+            )
+        )
+
+        all_errors.extend(
+            _validate_country_citation_alignment(
+                answer=answer,
+                requested_country_codes=country_codes,
+                hits=hits,
+            )
+        )
 
     all_errors.extend(
         _validate_paid_leave_scope(
@@ -1414,6 +2410,10 @@ def _build_repair_instructions(
         "Rewrite the answer using the same sources.\n\n"
         "Correct all of these issues:\n"
         f"{formatted_errors}\n\n"
+        "If the previous answer broadened the legal scope of a "
+        "source (rule 24), restore its exact category, conditions, "
+        "thresholds, and modality instead of rephrasing the same "
+        "overly broad claim.\n"
         "Do not add new legal information.\n"
         "Preserve valid citations.\n"
         "Return only the corrected final answer."
@@ -1650,6 +2650,34 @@ def answer_legal_question(
 ) -> LegalChatResponse:
     """Retrieve legal chunks and generate one grounded answer."""
 
+    if not any(
+        code.strip()
+        for code in request.country_codes
+    ):
+        # No country to search or ground an answer against - detecting
+        # or guessing one is the caller's responsibility, not this
+        # function's. Skip retrieval and generation entirely rather
+        # than let every requested-country validator reject an answer
+        # that was never groundable in the first place.
+        if metrics is not None:
+            metrics.outcome = "fallback_missing_country"
+            metrics.retrieval_total = 0
+            metrics.selected_sources = 0
+            metrics.model = None
+            metrics.generation_attempts = 0
+            metrics.repair_triggered = False
+            metrics.repair_success = False
+            metrics.repair_answer_returned = False
+
+        return LegalChatResponse(
+            question=request.question.strip(),
+            answer=MISSING_COUNTRY_ANSWER,
+            grounded=False,
+            model=None,
+            retrieval_total=0,
+            sources=[],
+        )
+
     try:
         (
             retrieval_total,
@@ -1741,9 +2769,7 @@ def answer_legal_question(
             answer=answer,
             country_codes=request.country_codes,
             context=context_text,
-            source_count=len(
-                selected_hits
-            ),
+            hits=selected_hits,
         )
 
     context_text = _build_context(
