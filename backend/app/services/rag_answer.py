@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ DEFAULT_MAX_SOURCE_CHARACTERS: Final[int] = 4000
 
 MAX_RERANK_POOL_SIZE: Final[int] = 20
 RERANK_SNIPPET_CHARACTERS: Final[int] = 1500
+
+MIN_CANDIDATE_LIMIT_PER_COUNTRY: Final[int] = 4
 
 GENERIC_QUERY_TERMS: Final[frozenset[str]] = frozenset(
     {
@@ -452,6 +455,33 @@ def _candidate_search_limit(
     )
 
 
+def _candidate_limit_per_country(
+    max_sources: int,
+    country_count: int,
+) -> int:
+    """
+    Return how many OpenSearch candidates to fetch for one country.
+
+    Kept independent of, and more generous than, the final selection
+    cap: `_interleave_hits` still limits the merged result across all
+    countries to `max_sources`. Splitting `max_sources` evenly across
+    the candidate *search* limit (the previous behaviour) shrinks fast
+    as more countries are compared - with 3 countries and 6 sources,
+    each country's own search was capped at 2 results, silently
+    excluding a relevant but lower-ranked chunk from candidacy before
+    it ever had a chance to be selected. A floor keeps every country's
+    candidate pool wide enough regardless of how many countries are
+    being compared.
+    """
+
+    return max(
+        math.ceil(
+            max_sources / country_count
+        ),
+        MIN_CANDIDATE_LIMIT_PER_COUNTRY,
+    )
+
+
 def _build_rerank_input(
     question: str,
     hits: list[LegalSearchHit],
@@ -640,9 +670,9 @@ def _retrieve_search_hits(
             "to the number of requested countries."
         )
 
-    base_limit, remainder = divmod(
-        request.max_sources,
-        len(
+    country_limit = _candidate_limit_per_country(
+        max_sources=request.max_sources,
+        country_count=len(
             country_codes
         ),
     )
@@ -652,18 +682,7 @@ def _retrieve_search_hits(
         list[LegalSearchHit]
     ] = []
 
-    for position, country_code in enumerate(
-        country_codes
-    ):
-        country_limit = (
-            base_limit
-            + (
-                1
-                if position < remainder
-                else 0
-            )
-        )
-
+    for country_code in country_codes:
         search_started_at = perf_counter()
 
         response = search_function(

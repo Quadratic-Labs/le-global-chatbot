@@ -33,8 +33,11 @@ from app.services.rag_answer import (
     _allocate_country_context_budgets,
     _build_retrieval_query,
     _build_rerank_input,
+    _candidate_limit_per_country,
     _country_name_variants_for_codes,
+    _interleave_hits,
     _parse_rerank_order,
+    _retrieve_search_hits,
     _truncate_context,
     _validate_answer_structure,
     _validate_citation_format,
@@ -837,14 +840,18 @@ class RagAnswerTests(unittest.TestCase):
             ["ES"],
         )
 
+        # Candidate search limit is now floored at
+        # MIN_CANDIDATE_LIMIT_PER_COUNTRY (4), not split as
+        # max_sources // country_count (which would give 2 here) -
+        # see Correction B.
         self.assertEqual(
             captured_requests[0].limit,
-            2,
+            4,
         )
 
         self.assertEqual(
             captured_requests[1].limit,
-            2,
+            4,
         )
 
         self.assertEqual(
@@ -898,6 +905,514 @@ class RagAnswerTests(unittest.TestCase):
         self.assertFalse(
             search_called
         )
+
+    def test_single_country_candidate_limit_uses_max_sources_directly(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=0,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            )
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question="What is the notice period in the UK?",
+                country_codes=["GB"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        self.assertEqual(
+            len(captured_requests),
+            1,
+        )
+
+        self.assertEqual(
+            captured_requests[0].limit,
+            6,
+        )
+
+    def test_two_country_candidate_limit_is_floored_at_four(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=0,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            )
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the UK and Spain."
+                ),
+                country_codes=["GB", "ES"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        self.assertEqual(
+            len(captured_requests),
+            2,
+        )
+
+        self.assertEqual(
+            captured_requests[0].limit,
+            4,
+        )
+
+        self.assertEqual(
+            captured_requests[1].limit,
+            4,
+        )
+
+    def test_three_country_candidate_limit_is_floored_at_four(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=0,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            )
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the United "
+                    "Kingdom, Australia and Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        self.assertEqual(
+            len(captured_requests),
+            3,
+        )
+
+        for request in captured_requests:
+            self.assertEqual(
+                request.limit,
+                4,
+            )
+
+    def test_candidate_limit_per_country_formula(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _candidate_limit_per_country(
+                max_sources=6,
+                country_count=1,
+            ),
+            6,
+        )
+
+        self.assertEqual(
+            _candidate_limit_per_country(
+                max_sources=6,
+                country_count=2,
+            ),
+            4,
+        )
+
+        self.assertEqual(
+            _candidate_limit_per_country(
+                max_sources=6,
+                country_count=3,
+            ),
+            4,
+        )
+
+    def test_interleave_hits_deduplicates_chunk_ids(
+        self,
+    ) -> None:
+        duplicate_in_first_group = _build_hit(
+            chunk_id="shared-chunk",
+            country="United Kingdom",
+            country_code="GB",
+        )
+
+        duplicate_in_second_group = _build_hit(
+            chunk_id="shared-chunk",
+            country="Spain",
+            country_code="ES",
+        )
+
+        unique_hit = _build_hit(
+            chunk_id="unique-chunk",
+            country="Spain",
+            country_code="ES",
+        )
+
+        merged = _interleave_hits(
+            hit_groups=[
+                [duplicate_in_first_group],
+                [
+                    duplicate_in_second_group,
+                    unique_hit,
+                ],
+            ],
+            limit=6,
+        )
+
+        chunk_ids = [
+            hit.chunk_id
+            for hit in merged
+        ]
+
+        self.assertEqual(
+            len(chunk_ids),
+            len(set(chunk_ids)),
+        )
+
+        self.assertIn(
+            "shared-chunk",
+            chunk_ids,
+        )
+
+        self.assertIn(
+            "unique-chunk",
+            chunk_ids,
+        )
+
+        self.assertEqual(
+            len(merged),
+            2,
+        )
+
+    def test_country_with_single_result_is_still_represented(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            if country_code == "GB":
+                hits = [
+                    _build_hit(
+                        chunk_id="gb-only",
+                        country="United Kingdom",
+                        country_code="GB",
+                    )
+                ]
+            else:
+                hits = [
+                    _build_hit(
+                        chunk_id=f"es-{index}",
+                        country="Spain",
+                        country_code="ES",
+                    )
+                    for index in range(1, 5)
+                ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the UK and Spain."
+                ),
+                country_codes=["GB", "ES"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        chunk_ids = [
+            hit.chunk_id
+            for hit in hits
+        ]
+
+        self.assertIn(
+            "gb-only",
+            chunk_ids,
+        )
+
+        self.assertEqual(
+            retrieval_total,
+            1 + 4,
+        )
+
+    def test_country_without_any_document_does_not_break_retrieval(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            if country_code == "GB":
+                hits = [
+                    _build_hit(
+                        chunk_id=f"gb-{index}",
+                        country="United Kingdom",
+                        country_code="GB",
+                    )
+                    for index in range(1, 5)
+                ]
+            else:
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the UK and Bhutan."
+                ),
+                country_codes=["GB", "BT"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        country_codes_found = {
+            hit.country_code
+            for hit in hits
+        }
+
+        self.assertEqual(
+            country_codes_found,
+            {"GB"},
+        )
+
+        self.assertEqual(
+            retrieval_total,
+            4,
+        )
+
+    def test_final_selection_never_exceeds_max_sources(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{index}",
+                    country=country_code,
+                    country_code=country_code,
+                )
+                for index in range(1, 10)
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        _, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the United "
+                    "Kingdom, Australia and Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        self.assertEqual(
+            len(hits),
+            6,
+        )
+
+    def test_context_stays_within_16000_characters_with_wider_candidates(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            long_content = (
+                f"{country_code} legal content. " * 500
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{index}",
+                    country=country_code,
+                    country_code=country_code,
+                    content=long_content,
+                )
+                for index in range(1, 5)
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        _, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the United "
+                    "Kingdom, Australia and Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        total_length = sum(
+            len(hit.content)
+            for hit in selected
+        )
+
+        self.assertLessEqual(
+            total_length,
+            16000,
+        )
+
+    def test_each_source_stays_within_4000_characters_with_wider_candidates(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            long_content = (
+                f"{country_code} legal content. " * 500
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{index}",
+                    country=country_code,
+                    country_code=country_code,
+                    content=long_content,
+                )
+                for index in range(1, 5)
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        _, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the United "
+                    "Kingdom, Australia and Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+        )
+
+        selected = _allocate_country_context_budgets(
+            hits=hits,
+            maximum_characters=16000,
+            maximum_source_characters=4000,
+        )
+
+        for hit in selected:
+            self.assertLessEqual(
+                len(hit.content),
+                4000,
+            )
 
     def test_rerank_disabled_keeps_existing_behavior(
         self,
@@ -1182,14 +1697,16 @@ class RagAnswerTests(unittest.TestCase):
             rerank_pool_multiplier=3,
         )
 
+        # Candidate limit per country is now floored at 4 (Correction B),
+        # then multiplied by rerank_pool_multiplier=3 -> 12.
         self.assertEqual(
             captured_requests[0].limit,
-            6,
+            12,
         )
 
         self.assertEqual(
             captured_requests[1].limit,
-            6,
+            12,
         )
 
         country_codes = [
