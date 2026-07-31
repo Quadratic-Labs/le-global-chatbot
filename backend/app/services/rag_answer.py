@@ -130,8 +130,11 @@ Rules:
    concise comparison section that may combine citations from every
    compared country.
 7. Clearly distinguish the law applicable in each country.
-8. When the extracts are insufficient, state that the available
-   L&E Global documents do not contain enough information.
+8. If a requested detail is not supported by the supplied sources,
+   omit that unsupported detail or state only that a definitive
+   answer cannot be provided for that specific point. Never mention
+   documents, extracts, materials, context, retrieval, source
+   availability, or internal system limitations in the answer.
 9. Do not claim to provide legal advice.
 10. Give a direct, structured, professional, and concise answer.
 11. Answer only the legal issue explicitly requested by the user.
@@ -240,6 +243,42 @@ def _normalize_country_codes(
         )
 
     return normalized_codes
+
+
+def _normalize_requested_legal_topics(
+    legal_topics: Sequence[str],
+) -> tuple[str, ...]:
+    """
+    Deduplicate and clean requested legal topics, preserving order.
+
+    Strips whitespace and drops empty entries only - never changes
+    casing or canonical wording, and never guesses or fuzzy-matches a
+    topic that wasn't explicitly requested.
+    """
+
+    normalized_topics: list[str] = []
+    seen_topics: set[str] = set()
+
+    for topic in legal_topics:
+        stripped_topic = topic.strip()
+
+        if not stripped_topic:
+            continue
+
+        if stripped_topic in seen_topics:
+            continue
+
+        seen_topics.add(
+            stripped_topic
+        )
+
+        normalized_topics.append(
+            stripped_topic
+        )
+
+    return tuple(
+        normalized_topics
+    )
 
 
 COUNTRY_ADJECTIVES: Final[dict[str, tuple[str, ...]]] = {
@@ -392,13 +431,26 @@ def _build_search_request(
     request: LegalChatRequest,
     country_codes: list[str],
     limit: int,
+    legal_topics: Sequence[str] | None = None,
 ) -> LegalSearchRequest:
-    """Build one OpenSearch request from chat criteria."""
+    """
+    Build one OpenSearch request from chat criteria.
+
+    `legal_topics` overrides request.legal_topics for this one search
+    only - request itself is never mutated - so a single topic can be
+    searched for on its own without touching the public API. Every
+    other filter (subsections, language, reference_year) always comes
+    from `request`, exactly as before.
+    """
 
     return LegalSearchRequest(
         query=query,
         country_codes=country_codes,
-        legal_topics=request.legal_topics,
+        legal_topics=(
+            list(legal_topics)
+            if legal_topics is not None
+            else request.legal_topics
+        ),
         subsections=request.subsections,
         language=request.language,
         reference_year=request.reference_year,
@@ -463,6 +515,36 @@ def _interleave_hits(
     return combined_hits
 
 
+def _deduplicate_hits(
+    hits: Sequence[LegalSearchHit],
+) -> list[LegalSearchHit]:
+    """
+    Remove hits sharing a chunk_id, keeping the first occurrence.
+
+    Identity is chunk_id alone - content is never compared, hits are
+    never mutated, and nothing here is logged. Guards against the same
+    chunk coming back across more than one candidate group (for
+    example two per-topic searches for the same country).
+    """
+
+    deduplicated_hits: list[LegalSearchHit] = []
+    seen_chunk_ids: set[str] = set()
+
+    for hit in hits:
+        if hit.chunk_id in seen_chunk_ids:
+            continue
+
+        seen_chunk_ids.add(
+            hit.chunk_id
+        )
+
+        deduplicated_hits.append(
+            hit
+        )
+
+    return deduplicated_hits
+
+
 def _candidate_search_limit(
     fair_share_limit: int,
     rerank_enabled: bool,
@@ -504,6 +586,101 @@ def _candidate_limit_per_country(
         ),
         MIN_CANDIDATE_LIMIT_PER_COUNTRY,
     )
+
+
+def _select_topic_balanced_hits(
+    hits: Sequence[LegalSearchHit],
+    legal_topics: Sequence[str],
+    limit: int,
+) -> list[LegalSearchHit]:
+    """
+    Select up to `limit` hits, covering every requested topic first.
+
+    `hits` must already be ranked - BM25 order when reranking is
+    disabled, reranked order otherwise. With zero or one topic, this
+    is simply the first unique hits up to `limit`. With multiple
+    topics, it round-robins across the normalized topics in the order
+    they were requested: each round takes, for the current topic, the
+    best not-yet-selected hit whose own legal_topic (stripped) matches
+    it - never a content search. Rounds continue while the limit isn't
+    reached and at least one hit was added during the round; any
+    remaining capacity is then filled with the best leftover hits in
+    their original rank order, which is what lets a topic with no
+    results (or fewer than its share) be compensated by another
+    topic's deeper candidates instead of leaving the quota unfilled.
+    """
+
+    if limit <= 0:
+        return []
+
+    normalized_topics = _normalize_requested_legal_topics(
+        legal_topics
+    )
+
+    deduplicated_hits = _deduplicate_hits(
+        hits
+    )
+
+    if len(normalized_topics) <= 1:
+        return deduplicated_hits[:limit]
+
+    selected_hits: list[LegalSearchHit] = []
+    selected_chunk_ids: set[str] = set()
+
+    def _hit_topic(
+        hit: LegalSearchHit,
+    ) -> str | None:
+        return (
+            hit.legal_topic.strip()
+            if hit.legal_topic is not None
+            else None
+        )
+
+    made_progress = True
+
+    while (
+        len(selected_hits) < limit
+        and made_progress
+    ):
+        made_progress = False
+
+        for topic in normalized_topics:
+            if len(selected_hits) >= limit:
+                break
+
+            for hit in deduplicated_hits:
+                if hit.chunk_id in selected_chunk_ids:
+                    continue
+
+                if _hit_topic(hit) != topic:
+                    continue
+
+                selected_hits.append(
+                    hit
+                )
+                selected_chunk_ids.add(
+                    hit.chunk_id
+                )
+                made_progress = True
+
+                break
+
+    if len(selected_hits) < limit:
+        for hit in deduplicated_hits:
+            if len(selected_hits) >= limit:
+                break
+
+            if hit.chunk_id in selected_chunk_ids:
+                continue
+
+            selected_hits.append(
+                hit
+            )
+            selected_chunk_ids.add(
+                hit.chunk_id
+            )
+
+    return selected_hits
 
 
 def _build_rerank_input(
@@ -614,6 +791,181 @@ def _rerank_hits(
     return [hits[position - 1] for position in order]
 
 
+def _retrieve_country_hits(
+    request: LegalChatRequest,
+    country_code: str,
+    retrieval_query: str,
+    output_limit: int,
+    search_function: SearchFunction,
+    generation_client: TextGenerationClient | None,
+    rerank_enabled: bool,
+    rerank_pool_multiplier: int,
+    metrics: LegalChatMetrics | None = None,
+) -> tuple[int, list[LegalSearchHit]]:
+    """
+    Retrieve and select up to output_limit hits for one country.
+
+    `retrieval_query` must already have every requested country's name
+    stripped out by the caller (via _build_retrieval_query over the
+    full comparison, not just this one country) - a per-country query
+    built from only this country's own name would leave every other
+    compared country's name sitting in the query text.
+
+    With zero or one requested legal topic, this is the original
+    single-search path: one OpenSearch call using every requested
+    topic together, optionally reranked, truncated to output_limit.
+
+    With multiple topics, one search is issued per topic for this
+    country instead, so every topic gets its own retrieval capacity
+    rather than competing against the others inside a single mixed
+    query - this is what stops one topic's chunks from crowding out
+    another's before either had a chance to be selected. The combined,
+    deduplicated pool is reranked at most once (never once per topic,
+    to keep the OpenAI call budget identical to today's per-country
+    reranking), then _select_topic_balanced_hits picks the final
+    topic-balanced result. If every topic-specific search comes back
+    empty, one broad fallback search using the request's original
+    topics is issued instead of returning nothing.
+    """
+
+    normalized_topics = _normalize_requested_legal_topics(
+        request.legal_topics
+    )
+
+    def run_search(
+        search_request: LegalSearchRequest,
+    ) -> LegalSearchResponse:
+        started_at = perf_counter()
+
+        try:
+            return search_function(search_request)
+        finally:
+            if metrics is not None:
+                metrics.add_opensearch_seconds(
+                    perf_counter() - started_at
+                )
+
+    def run_rerank(
+        hits: list[LegalSearchHit],
+    ) -> list[LegalSearchHit]:
+        started_at = perf_counter()
+
+        try:
+            return _rerank_hits(
+                question=request.question,
+                hits=hits,
+                generation_client=generation_client,
+            )
+        finally:
+            if metrics is not None:
+                metrics.add_rerank_seconds(
+                    perf_counter() - started_at
+                )
+
+    def _broad_search() -> tuple[int, list[LegalSearchHit]]:
+        response = run_search(
+            _build_search_request(
+                query=retrieval_query,
+                request=request,
+                country_codes=[
+                    country_code,
+                ],
+                limit=_candidate_search_limit(
+                    fair_share_limit=output_limit,
+                    rerank_enabled=rerank_enabled,
+                    rerank_pool_multiplier=rerank_pool_multiplier,
+                ),
+            )
+        )
+
+        hits = response.hits
+
+        if rerank_enabled:
+            hits = run_rerank(hits)
+
+        return (
+            response.total,
+            hits[:output_limit],
+        )
+
+    if len(normalized_topics) <= 1:
+        return _broad_search()
+
+    retrieval_total = 0
+    topic_hit_groups: list[
+        list[LegalSearchHit]
+    ] = []
+
+    topic_search_limit = min(
+        _candidate_search_limit(
+            fair_share_limit=output_limit,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+        ),
+        MAX_RERANK_POOL_SIZE,
+    )
+
+    for topic in normalized_topics:
+        response = run_search(
+            _build_search_request(
+                query=retrieval_query,
+                request=request,
+                country_codes=[
+                    country_code,
+                ],
+                limit=topic_search_limit,
+                legal_topics=[
+                    topic,
+                ],
+            )
+        )
+
+        retrieval_total += (
+            response.total
+        )
+
+        topic_hit_groups.append(
+            response.hits
+        )
+
+    if not any(
+        topic_hit_groups
+    ):
+        # No topic-specific search returned anything - a precise
+        # topic filter matching zero results should not be treated as
+        # a hard failure; fall back to one broad search instead.
+        fallback_total, fallback_hits = _broad_search()
+
+        return (
+            retrieval_total + fallback_total,
+            fallback_hits,
+        )
+
+    combined_hits = _deduplicate_hits(
+        _interleave_hits(
+            hit_groups=topic_hit_groups,
+            limit=sum(
+                len(group)
+                for group in topic_hit_groups
+            ),
+        )
+    )[:MAX_RERANK_POOL_SIZE]
+
+    if rerank_enabled:
+        combined_hits = run_rerank(combined_hits)
+
+    selected_hits = _select_topic_balanced_hits(
+        hits=combined_hits,
+        legal_topics=normalized_topics,
+        limit=output_limit,
+    )
+
+    return (
+        retrieval_total,
+        selected_hits,
+    )
+
+
 def _retrieve_search_hits(
     request: LegalChatRequest,
     search_function: SearchFunction,
@@ -642,9 +994,12 @@ def _retrieve_search_hits(
         ),
     )
 
-    if len(
-        country_codes
-    ) <= 1:
+    if not country_codes:
+        # No country filter at all. answer_legal_question's own guard
+        # means this is not reached in production, but this function
+        # may still be exercised directly without one - preserved
+        # exactly as before, since _retrieve_country_hits requires one
+        # concrete country to search and topic-balance for.
         search_started_at = perf_counter()
 
         response = search_function(
@@ -686,6 +1041,26 @@ def _retrieve_search_hits(
             hits,
         )
 
+    if len(
+        country_codes
+    ) == 1:
+        retrieval_total, hits = _retrieve_country_hits(
+            request=request,
+            country_code=country_codes[0],
+            retrieval_query=retrieval_query,
+            output_limit=request.max_sources,
+            search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+            metrics=metrics,
+        )
+
+        return (
+            retrieval_total,
+            hits,
+        )
+
     if request.max_sources < len(
         country_codes
     ):
@@ -707,47 +1082,21 @@ def _retrieve_search_hits(
     ] = []
 
     for country_code in country_codes:
-        search_started_at = perf_counter()
-
-        response = search_function(
-            _build_search_request(
-                query=retrieval_query,
-                request=request,
-                country_codes=[
-                    country_code
-                ],
-                limit=_candidate_search_limit(
-                    fair_share_limit=country_limit,
-                    rerank_enabled=rerank_enabled,
-                    rerank_pool_multiplier=rerank_pool_multiplier,
-                ),
-            )
+        country_retrieval_total, country_hits = _retrieve_country_hits(
+            request=request,
+            country_code=country_code,
+            retrieval_query=retrieval_query,
+            output_limit=country_limit,
+            search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+            metrics=metrics,
         )
-
-        if metrics is not None:
-            metrics.add_opensearch_seconds(
-                perf_counter() - search_started_at
-            )
 
         retrieval_total += (
-            response.total
+            country_retrieval_total
         )
-
-        country_hits = response.hits
-
-        if rerank_enabled:
-            rerank_started_at = perf_counter()
-
-            country_hits = _rerank_hits(
-                question=request.question,
-                hits=country_hits,
-                generation_client=generation_client,
-            )
-
-            if metrics is not None:
-                metrics.add_rerank_seconds(
-                    perf_counter() - rerank_started_at
-                )
 
         country_hit_groups.append(
             country_hits

@@ -506,9 +506,15 @@ class ChatScopeTests(unittest.TestCase):
             generation_client=client,
         )
 
+        # "notice periods" detects two legal topics (Employment
+        # Contracts and Termination of Employment Contracts), so
+        # topic-balanced retrieval now searches each topic separately
+        # per country: 2 topics x 6 countries = 12, not 6. This is the
+        # intended effect of giving each topic its own retrieval
+        # capacity rather than one mixed-topic search per country.
         self.assertEqual(
             len(captured_requests),
-            6,
+            12,
         )
 
         self.assertEqual(
