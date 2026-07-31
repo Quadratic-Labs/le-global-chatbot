@@ -20,6 +20,7 @@ from app.core.legal_taxonomy import (
 )
 from app.core.subsection_taxonomy import (
     get_canonical_subsection,
+    get_subsection_topic_override,
 )
 
 
@@ -296,6 +297,28 @@ def _get_main_legal_topic(
     return legal_topic
 
 
+def _get_subsection_topic_override(
+    paragraph: Paragraph,
+    text: str,
+) -> str | None:
+    """
+    Return a one-off legal-topic override for specific known headings.
+
+    See SUBSECTION_TOPIC_OVERRIDES in subsection_taxonomy.py for why
+    this table exists: some content-topic mismatches cannot be
+    detected from DOCX structure alone.
+    """
+
+    if not _has_explicit_bold_text(
+        paragraph
+    ):
+        return None
+
+    return get_subsection_topic_override(
+        text
+    )
+
+
 def _is_overview_heading(
     paragraph: Paragraph,
     text: str,
@@ -526,6 +549,15 @@ def parse_docx_sections(
     current_legal_topic: str | None = None
     current_subsection: str | None = None
 
+    # Set while inside a one-off SUBSECTION_TOPIC_OVERRIDES block: holds
+    # the (section, legal_topic) to restore as soon as the next heading
+    # of any kind is found, so the override never permanently changes
+    # what topic subsequent subsections of the enclosing section
+    # resolve against.
+    pending_topic_override: (
+        tuple[str, str | None] | None
+    ) = None
+
     content_buffer: list[str] = []
 
     def flush_content() -> None:
@@ -569,6 +601,28 @@ def parse_docx_sections(
                 block_item
             )
 
+            topic_override = _get_subsection_topic_override(
+                paragraph=block_item,
+                text=text,
+            )
+
+            if topic_override is not None:
+                flush_content()
+
+                if pending_topic_override is None:
+                    pending_topic_override = (
+                        current_section,
+                        current_legal_topic,
+                    )
+
+                current_section = _clean_structural_label(
+                    text
+                )
+
+                current_legal_topic = topic_override
+                current_subsection = None
+                continue
+
             legal_topic = _get_main_legal_topic(
                 paragraph=block_item,
                 text=text,
@@ -585,6 +639,7 @@ def parse_docx_sections(
 
                 current_legal_topic = legal_topic
                 current_subsection = None
+                pending_topic_override = None
                 continue
 
             if _is_overview_heading(
@@ -601,6 +656,7 @@ def parse_docx_sections(
 
                 current_legal_topic = None
                 current_subsection = None
+                pending_topic_override = None
                 continue
 
             if _is_generic_main_heading(
@@ -616,18 +672,33 @@ def parse_docx_sections(
 
                 current_legal_topic = None
                 current_subsection = None
+                pending_topic_override = None
                 continue
+
+            subsection_parent_topic = (
+                pending_topic_override[1]
+                if pending_topic_override is not None
+                else current_legal_topic
+            )
 
             subsection_label = _get_subsection_label(
                 paragraph=block_item,
                 text=text,
                 heading_level=heading_level,
-                parent_topic=current_legal_topic,
+                parent_topic=subsection_parent_topic,
                 country=country,
             )
 
             if subsection_label is not None:
                 flush_content()
+
+                if pending_topic_override is not None:
+                    (
+                        current_section,
+                        current_legal_topic,
+                    ) = pending_topic_override
+
+                    pending_topic_override = None
 
                 current_subsection = subsection_label
                 continue

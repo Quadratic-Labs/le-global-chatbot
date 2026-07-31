@@ -7,6 +7,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
+from app.core.legal_taxonomy import get_canonical_legal_topic
+from app.core.subsection_taxonomy import get_subsection_topic_override
 from app.services.docx_parser import parse_docx_sections
 
 
@@ -835,6 +837,182 @@ class DocxParserTests(unittest.TestCase):
             self.assertEqual(
                 sections[0].content,
                 "Overtime legal content.",
+            )
+
+    def test_notice_of_termination_and_redundancy_pay_starts_new_section(
+        self,
+    ) -> None:
+        """
+        Regression test for a real L&E document defect.
+
+        In the Australia source document, a bold "Notice of Termination
+        and Redundancy Pay" paragraph appears inside the "Working
+        Conditions" section (after "Overtime"), using the same plain
+        bold-"Normal"-style formatting as ordinary emphasis elsewhere in
+        the document. Before the fix, this heading was not recognized
+        by any taxonomy rule, so its content silently stayed folded
+        into the preceding Overtime subsection under the wrong legal
+        topic - making it unreachable for questions about redundancy
+        pay, which are filtered by legal topic.
+        """
+
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "working-conditions-termination-document.docx"
+            )
+
+            document = Document()
+
+            document.add_heading(
+                "03. Working Conditions",
+                level=1,
+            )
+
+            overtime_heading = document.add_paragraph(
+                "Overtime"
+            )
+            overtime_heading.runs[0].bold = True
+
+            document.add_paragraph(
+                "Overtime is paid at a premium rate."
+            )
+
+            redundancy_heading = document.add_paragraph(
+                "Notice of Termination and Redundancy Pay"
+            )
+            redundancy_heading.runs[0].bold = True
+
+            document.add_paragraph(
+                "An employee is entitled to redundancy pay "
+                "calculated using the employee's base rate of pay."
+            )
+
+            paid_leave_heading = document.add_paragraph(
+                "Paid Leave"
+            )
+            paid_leave_heading.runs[0].bold = True
+
+            document.add_paragraph(
+                "Employees accrue paid leave over each year "
+                "of service."
+            )
+
+            document.save(
+                file_path
+            )
+
+            sections = parse_docx_sections(
+                file_path=file_path,
+                country="Australia",
+            )
+
+            overtime_section = next(
+                section
+                for section in sections
+                if section.subsection == "Overtime"
+            )
+
+            self.assertNotIn(
+                "redundancy pay",
+                overtime_section.content.casefold(),
+            )
+
+            self.assertIn(
+                "premium rate",
+                overtime_section.content,
+            )
+
+            redundancy_section = next(
+                (
+                    section
+                    for section in sections
+                    if "redundancy" in section.content.casefold()
+                ),
+                None,
+            )
+
+            self.assertIsNotNone(
+                redundancy_section
+            )
+
+            self.assertEqual(
+                redundancy_section.section,
+                "Notice of Termination and Redundancy Pay",
+            )
+
+            self.assertIsNone(
+                redundancy_section.subsection
+            )
+
+            # The section text alone is not a canonical topic heading
+            # (structure cannot tell it apart from ordinary bold
+            # emphasis) - the override table is what supplies the
+            # correct topic, exactly as document_chunk_builder does.
+            self.assertIsNone(
+                get_canonical_legal_topic(
+                    section=redundancy_section.section,
+                    country="Australia",
+                )
+            )
+
+            self.assertEqual(
+                get_subsection_topic_override(
+                    redundancy_section.section
+                ),
+                "Termination of Employment Contracts",
+            )
+
+            self.assertIn(
+                "base rate of pay",
+                redundancy_section.content,
+            )
+
+            self.assertLess(
+                sections.index(
+                    overtime_section
+                ),
+                sections.index(
+                    redundancy_section
+                ),
+            )
+
+            # Regression guard: a legitimate Working Conditions
+            # subsection following the override must not be swallowed
+            # into the override's topic - the parser must revert to
+            # the enclosing section/topic as soon as this next real
+            # subsection is recognized.
+            paid_leave_section = next(
+                section
+                for section in sections
+                if section.subsection == "Paid Leave"
+            )
+
+            self.assertNotIn(
+                "redundancy",
+                paid_leave_section.content.casefold(),
+            )
+
+            self.assertIn(
+                "accrue paid leave",
+                paid_leave_section.content,
+            )
+
+            self.assertEqual(
+                get_canonical_legal_topic(
+                    section=paid_leave_section.section,
+                    country="Australia",
+                ),
+                "Working Conditions",
+            )
+
+            self.assertLess(
+                sections.index(
+                    redundancy_section
+                ),
+                sections.index(
+                    paid_leave_section
+                ),
             )
 
 

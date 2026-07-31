@@ -622,3 +622,34 @@ def is_known_subsection(
         )
         is not None
     )
+
+
+# Some source documents embed a heading whose content belongs to a
+# different legal topic than the section it is physically placed in
+# (for example, Australia presents "Notice of Termination and
+# Redundancy Pay" as a bold "Normal"-style paragraph inside "Working
+# Conditions", identical in DOCX structure to ordinary bold emphasis
+# elsewhere in the same document). This table lets the parser start a
+# distinct chunk under the correct topic for that one heading only,
+# without permanently changing the enclosing section's topic, so
+# subsequent subsections of the enclosing section continue to resolve
+# normally.
+SUBSECTION_TOPIC_OVERRIDES: Final[
+    dict[str, str]
+] = {
+    normalize_subsection_label(
+        "Notice of Termination and Redundancy Pay"
+    ): "Termination of Employment Contracts",
+}
+
+
+def get_subsection_topic_override(
+    subsection: str,
+) -> str | None:
+    """Return a one-off legal-topic override for a specific heading."""
+
+    return SUBSECTION_TOPIC_OVERRIDES.get(
+        normalize_subsection_label(
+            subsection
+        )
+    )
