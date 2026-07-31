@@ -15,6 +15,9 @@ from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
     is_overview_section,
 )
+from app.core.subsection_taxonomy import (
+    get_subsection_topic_override,
+)
 from app.models.document import DocumentChunk
 from app.services.docx_parser import (
     ParsedSection,
@@ -395,6 +398,9 @@ def build_document_chunks(
                 get_canonical_legal_topic(
                     section=section,
                     country=country,
+                )
+                or get_subsection_topic_override(
+                    section
                 )
             )
 

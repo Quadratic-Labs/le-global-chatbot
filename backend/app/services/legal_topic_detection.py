@@ -65,7 +65,11 @@ TOPIC_RULES: Final[
             "employment contracts",
             "fixed term contract",
             "fixed-term contract",
+            "probation",
+            "probation period",
+            "probation periods",
             "probationary period",
+            "probationary periods",
             "trial period",
         ),
         (
