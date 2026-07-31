@@ -155,6 +155,19 @@ Rules:
     - Do not list leave explicitly described as unpaid.
     - Do not state that a leave entitlement is missing or
       unspecified. Simply omit unsupported categories.
+24. Preserve the exact legal scope of every statement: keep the
+    precise category (sexual harassment, not harassment in general),
+    the persons concerned, eligibility conditions, thresholds,
+    durations, and exceptions exactly as the sources state them.
+    Never turn a specific category into a general one, a condition
+    into a universal rule, a possibility (may, can) into an
+    obligation (must), a capped amount (up to X) into an automatic
+    entitlement, an exception into the general principle, or an
+    employer duty into an employee one. In a comparison, apply each
+    country's rule only to that country; never transfer or
+    harmonize a rule across countries. If the sources do not
+    support a broader statement, keep the precise wording and note
+    that the sources do not specify the broader point.
 """.strip()
 
 
@@ -1414,6 +1427,10 @@ def _build_repair_instructions(
         "Rewrite the answer using the same sources.\n\n"
         "Correct all of these issues:\n"
         f"{formatted_errors}\n\n"
+        "If the previous answer broadened the legal scope of a "
+        "source (rule 24), restore its exact category, conditions, "
+        "thresholds, and modality instead of rephrasing the same "
+        "overly broad claim.\n"
         "Do not add new legal information.\n"
         "Preserve valid citations.\n"
         "Return only the corrected final answer."

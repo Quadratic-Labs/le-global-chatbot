@@ -27,10 +27,13 @@ from app.services.rag_answer import (
     RERANK_INSTRUCTIONS,
     RERANK_SNIPPET_CHARACTERS,
     SOFT_QUALITY_ERROR_TYPES,
+    SYSTEM_INSTRUCTIONS,
     InvalidLegalChatRequestError,
     NO_INFORMATION_ANSWER,
+    QualityError,
     RagAnswerError,
     _allocate_country_context_budgets,
+    _build_repair_instructions,
     _build_retrieval_query,
     _build_rerank_input,
     _candidate_limit_per_country,
@@ -3298,6 +3301,176 @@ class RagAnswerTests(unittest.TestCase):
         self.assertIn(
             "internal_reference",
             metrics.initial_soft_error_types,
+        )
+
+
+class ScopePreservationRuleTests(unittest.TestCase):
+    """Correction C: legal-scope-preservation instruction."""
+
+    def setUp(
+        self,
+    ) -> None:
+        self.normalized_instructions = " ".join(
+            SYSTEM_INSTRUCTIONS.split()
+        )
+
+    def test_main_prompt_forbids_scope_broadening(
+        self,
+    ) -> None:
+        self.assertIn(
+            "Preserve the exact legal scope of every statement",
+            self.normalized_instructions,
+        )
+
+    def test_specific_category_must_not_become_general(
+        self,
+    ) -> None:
+        self.assertIn(
+            "Never turn a specific category into a general one",
+            self.normalized_instructions,
+        )
+
+    def test_conditions_thresholds_and_exceptions_are_preserved(
+        self,
+    ) -> None:
+        for phrase in (
+            "eligibility conditions, thresholds, durations, and "
+            "exceptions exactly as the sources state them",
+            "a condition into a universal rule",
+            "an exception into the general principle",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase,
+                    self.normalized_instructions,
+                )
+
+    def test_legal_modality_is_preserved(
+        self,
+    ) -> None:
+        for phrase in (
+            "a possibility (may, can) into an obligation (must)",
+            "a capped amount (up to X) into an automatic entitlement",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase,
+                    self.normalized_instructions,
+                )
+
+    def test_employer_and_employee_duties_are_not_conflated(
+        self,
+    ) -> None:
+        self.assertIn(
+            "an employer duty into an employee one",
+            self.normalized_instructions,
+        )
+
+    def test_comparisons_do_not_transfer_rules_between_countries(
+        self,
+    ) -> None:
+        self.assertIn(
+            "never transfer or harmonize a rule across countries",
+            self.normalized_instructions,
+        )
+
+    def test_repair_prompt_reuses_scope_preservation_obligation(
+        self,
+    ) -> None:
+        instructions = _build_repair_instructions(
+            errors=[
+                QualityError(
+                    error_type="structure",
+                    message="Missing required heading.",
+                )
+            ]
+        )
+
+        self.assertIn(
+            "broadened the legal scope",
+            instructions,
+        )
+        self.assertIn(
+            "rule 24",
+            instructions,
+        )
+        self.assertIn(
+            "Do not add new legal information.",
+            instructions,
+        )
+        self.assertIn(
+            "Preserve valid citations.",
+            instructions,
+        )
+
+    def test_citation_and_format_rules_are_still_present(
+        self,
+    ) -> None:
+        for phrase in (
+            "Cite supporting sources using [1], [2], or [1, 2]",
+            "Start each country section with a single heading line",
+            "Citations must use only these formats: [1] or [1, 2]",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase,
+                    self.normalized_instructions,
+                )
+
+    def test_scope_rule_names_no_specific_country_or_identifier(
+        self,
+    ) -> None:
+        rule_24_start = SYSTEM_INSTRUCTIONS.index(
+            "24. Preserve"
+        )
+        rule_24_text = SYSTEM_INSTRUCTIONS[
+            rule_24_start:
+        ].casefold()
+
+        for forbidden in (
+            "gb",
+            "uk",
+            "united kingdom",
+            "peru",
+            "australia",
+            "singapore",
+            "chunk_",
+            "document_id",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    rule_24_text,
+                )
+
+    def test_scope_rule_additions_stay_within_size_budget(
+        self,
+    ) -> None:
+        rule_24_start = SYSTEM_INSTRUCTIONS.index(
+            "24. Preserve"
+        )
+        rule_24_text = SYSTEM_INSTRUCTIONS[
+            rule_24_start:
+        ]
+
+        self.assertLessEqual(
+            len(rule_24_text),
+            900,
+        )
+
+        repair_addition_start = (
+            "If the previous answer broadened"
+        )
+        instructions = _build_repair_instructions(errors=[])
+        repair_addition = instructions[
+            instructions.index(
+                repair_addition_start
+            ):
+        ]
+
+        self.assertLessEqual(
+            len(repair_addition),
+            700,
         )
 
 
