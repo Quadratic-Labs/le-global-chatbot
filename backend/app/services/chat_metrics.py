@@ -51,7 +51,8 @@ class LegalChatMetrics:
 
     generation_attempts: int = 0
     repair_triggered: bool = False
-    repair_success: bool | None = None
+    repair_success: bool = False
+    repair_answer_returned: bool = False
     initial_hard_error_types: list[str] = field(
         default_factory=list
     )
@@ -126,6 +127,9 @@ class LegalChatMetrics:
             ),
             "repair_triggered": self.repair_triggered,
             "repair_success": self.repair_success,
+            "repair_answer_returned": (
+                self.repair_answer_returned
+            ),
             "initial_hard_error_types": (
                 self.initial_hard_error_types
             ),

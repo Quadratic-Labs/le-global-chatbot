@@ -5,6 +5,9 @@ from __future__ import annotations
 import unittest
 
 from app.models.chat import LegalChatRequest
+from app.services.country_detection import (
+    detect_mentioned_country_codes,
+)
 from app.services.legal_topic_detection import (
     detect_legal_topics,
     is_overview_question,
@@ -242,6 +245,157 @@ class LegalScopeTests(unittest.TestCase):
         )
 
         self.assertTrue(
+            scope.is_supported
+        )
+
+    def test_comparative_probation_question_detects_supported_topic(
+        self,
+    ) -> None:
+        question = (
+            "Compare the legal treatment of probation periods "
+            "in the United Kingdom and Singapore."
+        )
+
+        country_codes = detect_mentioned_country_codes(
+            question
+        )
+
+        self.assertEqual(
+            sorted(country_codes),
+            ["GB", "SG"],
+        )
+
+        scope = resolve_legal_scope(
+            LegalChatRequest(
+                question=question,
+                country_codes=country_codes,
+            )
+        )
+
+        self.assertEqual(
+            scope.legal_topics,
+            [
+                "Employment Contracts",
+            ],
+        )
+
+        self.assertTrue(
+            scope.is_supported
+        )
+
+    def test_probationary_periods_phrase_detects_supported_topic(
+        self,
+    ) -> None:
+        question = (
+            "Compare probationary periods in Australia and Peru."
+        )
+
+        country_codes = detect_mentioned_country_codes(
+            question
+        )
+
+        self.assertEqual(
+            sorted(country_codes),
+            ["AU", "PE"],
+        )
+
+        scope = resolve_legal_scope(
+            LegalChatRequest(
+                question=question,
+                country_codes=country_codes,
+            )
+        )
+
+        self.assertEqual(
+            scope.legal_topics,
+            [
+                "Employment Contracts",
+            ],
+        )
+
+        self.assertTrue(
+            scope.is_supported
+        )
+
+    def test_single_country_probation_question_remains_supported(
+        self,
+    ) -> None:
+        question = (
+            "What rules apply to probation periods in Singapore?"
+        )
+
+        country_codes = detect_mentioned_country_codes(
+            question
+        )
+
+        self.assertEqual(
+            country_codes,
+            ["SG"],
+        )
+
+        scope = resolve_legal_scope(
+            LegalChatRequest(
+                question=question,
+                country_codes=country_codes,
+            )
+        )
+
+        self.assertEqual(
+            scope.legal_topics,
+            [
+                "Employment Contracts",
+            ],
+        )
+
+        self.assertTrue(
+            scope.is_supported
+        )
+
+    def test_australian_corporate_tax_question_remains_unsupported(
+        self,
+    ) -> None:
+        scope = resolve_legal_scope(
+            LegalChatRequest(
+                question=(
+                    "What is the corporate income "
+                    "tax rate in Australia?"
+                ),
+                country_codes=[
+                    "AU",
+                ],
+            )
+        )
+
+        self.assertEqual(
+            scope.legal_topics,
+            [],
+        )
+
+        self.assertFalse(
+            scope.is_supported
+        )
+
+    def test_peru_stock_options_question_remains_unsupported(
+        self,
+    ) -> None:
+        scope = resolve_legal_scope(
+            LegalChatRequest(
+                question=(
+                    "How are employee stock options "
+                    "taxed in Peru?"
+                ),
+                country_codes=[
+                    "PE",
+                ],
+            )
+        )
+
+        self.assertEqual(
+            scope.legal_topics,
+            [],
+        )
+
+        self.assertFalse(
             scope.is_supported
         )
 
