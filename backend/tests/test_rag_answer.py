@@ -2649,8 +2649,8 @@ class RagAnswerTests(unittest.TestCase):
     ) -> None:
         bad_answer = (
             "Italy\n"
-            "- The duration of Italian maternity leave "
-            "is not specified [1]."
+            "- No information is available on the "
+            "duration of Italian maternity leave [1]."
         )
 
         result, _metrics, _client = self._assert_non_repairing_soft_warning(
@@ -2677,7 +2677,7 @@ class RagAnswerTests(unittest.TestCase):
         # Business regression guard: the false absence claim must
         # survive untouched, not be silently corrected away.
         self.assertIn(
-            "is not specified",
+            "No information is available",
             result.answer,
         )
 
@@ -2882,8 +2882,8 @@ class RagAnswerTests(unittest.TestCase):
                 "two months prior to childbirth."
             ),
             answer=(
-                "The exact duration is not specified "
-                "in the sources [1]."
+                "No information is available on the exact "
+                "duration in the sources [1]."
             ),
         )
 
@@ -3104,7 +3104,7 @@ class RagAnswerTests(unittest.TestCase):
             initial_answer=(
                 "United Kingdom\n"
                 "- The exact entitlement is not "
-                "specified [1]."
+                "available in the supplied sources [1]."
             ),
             question="What is the parental leave duration in the UK?",
             search_function=_make_search_function(
@@ -6954,6 +6954,497 @@ class RetrievalMetricsSeparationTests(unittest.TestCase):
         )
 
         metrics.add_rerank_seconds.assert_not_called()
+
+
+class FalseAbsencePrecisionAndStructureRepairTests(unittest.TestCase):
+    """
+    false_absence_claim must ignore ordinary contractual/statutory
+    wording and only flag genuine unavailable-information claims;
+    the structure repair prompt must explicitly state the bullet
+    limits so the model actually consolidates excess bullets.
+    """
+
+    def test_false_absence_ignores_contract_does_not_specify(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to 1 week's notice.",
+            answer=(
+                "If the employment contract does not specify "
+                "the notice period, the statutory defaults "
+                "apply [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_no_contractual_notice_provision(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of notice.",
+            answer=(
+                "Employees with no contractual notice provision "
+                "may be entitled to a reasonable period of "
+                "notice [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_less_than_service_condition(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to two weeks of annual leave.",
+            answer=(
+                "An employee with not less than three months "
+                "of service is entitled to annual leave [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_carryover_prohibition(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to two weeks of annual leave.",
+            answer="Statutory leave cannot normally be carried over [1].",
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_detects_no_information_available(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to one week's notice.",
+            answer=(
+                "No information is available on the statutory "
+                "notice period."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_detects_definitive_answer_unavailable(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of notice.",
+            answer=(
+                "A definitive answer cannot be provided for "
+                "the statutory notice period."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_requires_concrete_duration_in_context(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="The applicable rules are described in general terms.",
+            answer=(
+                "No information is available on the statutory "
+                "notice period."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_available_in_time_condition(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer="The benefit is not available in the first year [1].",
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_available_in_legal_instrument(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer=(
+                "The option is not available in collective "
+                "agreements [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_provided_in_contract(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer=(
+                "The payment date is not provided in the "
+                "employment contract [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_missing_from_agreement(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer="The clause is missing from the agreement [1].",
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_detects_not_available_in_supplied_sources(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to one week's notice.",
+            answer=(
+                "The statutory notice period is not available "
+                "in the supplied sources."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_detects_not_provided_in_documents(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of notice.",
+            answer=(
+                "The statutory duration is not provided in "
+                "the documents."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_detects_missing_from_provided_materials(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to 14 days of notice.",
+            answer=(
+                "The relevant information is missing from "
+                "the provided materials."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_structure_repair_instructions_include_exact_limits(
+        self,
+    ) -> None:
+        instructions = _build_repair_instructions(
+            errors=[
+                QualityError(
+                    error_type="structure",
+                    message="Australia contains more than four bullets.",
+                )
+            ]
+        )
+
+        self.assertIn(
+            "no more than four concise bullets",
+            instructions,
+        )
+
+        self.assertIn(
+            "no more than two bullets",
+            instructions,
+        )
+
+        self.assertIn(
+            "no more than six bullets",
+            instructions,
+        )
+
+        self.assertIn(
+            "Merge closely related points",
+            instructions,
+        )
+
+    def test_non_structure_repair_does_not_add_bullet_limit_instruction(
+        self,
+    ) -> None:
+        instructions = _build_repair_instructions(
+            errors=[
+                QualityError(
+                    error_type="internal_reference",
+                    message="The answer references internal mechanics.",
+                )
+            ]
+        )
+
+        self.assertNotIn(
+            "consolidate each country section",
+            instructions,
+        )
+
+        self.assertNotIn(
+            "Merge closely related points",
+            instructions,
+        )
+
+    def test_structure_repair_succeeds_after_consolidation(
+        self,
+    ) -> None:
+        first_answer = (
+            "United Kingdom\n"
+            "- UK point 1 [1].\n"
+            "Australia\n"
+            "- AU point 1 [2].\n"
+            "- AU point 2 [2].\n"
+            "- AU point 3 [2].\n"
+            "- AU point 4 [2].\n"
+            "- AU point 5 [2].\n"
+            "- AU point 6 [2].\n"
+            "Singapore\n"
+            "- SG point 1 [3].\n"
+            "Comparison\n"
+            "- Comparison point 1 [1, 2]."
+        )
+
+        repaired_answer = (
+            "United Kingdom\n"
+            "- UK point 1 [1].\n"
+            "Australia\n"
+            "- AU point 1 [2].\n"
+            "- AU point 2 [2].\n"
+            "- AU point 3 [2].\n"
+            "- AU point 4 [2].\n"
+            "Singapore\n"
+            "- SG point 1 [3].\n"
+            "Comparison\n"
+            "- Comparison point 1 [1, 2]."
+        )
+
+        client = FakeGenerationClient(
+            answer=first_answer,
+            repair_answer=repaired_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = request.country_codes[0]
+
+            hit = {
+                "GB": _build_hit(
+                    chunk_id="chunk-gb",
+                    country="United Kingdom",
+                    country_code="GB",
+                ),
+                "AU": _build_hit(
+                    chunk_id="chunk-au",
+                    country="Australia",
+                    country_code="AU",
+                ),
+                "SG": _build_hit(
+                    chunk_id="chunk-sg",
+                    country="Singapore",
+                    country_code="SG",
+                ),
+            }[country_code]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    hit,
+                ],
+            )
+
+        metrics = _build_metrics(
+            "test-structure-repair-consolidation"
+        )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare annual leave rules in the UK, "
+                    "Australia and Singapore."
+                ),
+                country_codes=[
+                    "GB",
+                    "AU",
+                    "SG",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            2,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            True,
+        )
+
+        self.assertIs(
+            metrics.repair_answer_returned,
+            True,
+        )
+
+        self.assertIs(
+            metrics.repair_success,
+            True,
+        )
+
+        self.assertEqual(
+            metrics.final_soft_error_types,
+            [],
+        )
+
+        self.assertEqual(
+            response.answer,
+            repaired_answer,
+        )
+
+    def test_false_absence_remains_non_repairing(
+        self,
+    ) -> None:
+        initial_answer = (
+            "United Kingdom\n"
+            "- No information is available on the "
+            "statutory notice period [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=initial_answer,
+        )
+
+        metrics = _build_metrics(
+            "test-false-absence-remains-non-repairing"
+        )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question="What is the statutory notice period in the UK?",
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=_make_search_function(
+                hits=[
+                    _build_hit(
+                        content=(
+                            "Employees are entitled to "
+                            "one week's notice."
+                        ),
+                    )
+                ]
+            ),
+            generation_client=client,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            response.answer,
+            initial_answer,
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            1,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            False,
+        )
+
+        self.assertIn(
+            "false_absence_claim",
+            metrics.initial_soft_error_types,
+        )
 
 
 if __name__ == "__main__":

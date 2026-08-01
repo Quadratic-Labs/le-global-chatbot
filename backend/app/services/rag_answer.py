@@ -2213,13 +2213,48 @@ def _validate_paid_leave_scope(
 
 
 ABSENCE_CLAIM_PHRASES: Final[tuple[str, ...]] = (
-    "not specified",
-    "does not specify",
-    "not available in",
     "no information is available",
-    "not provided in the",
-    "is missing from the",
-    "are missing from the",
+    "a definitive answer cannot be provided",
+    "cannot provide a definitive answer",
+    "there is insufficient information to determine",
+)
+
+# Required after "not available in" / "not provided in" / "is/are
+# missing from" before those three phrasings count as an absence
+# claim - otherwise they also match ordinary legal wording such as
+# "not available in the first year" or "missing from the agreement",
+# which describe a rule's own content rather than a gap in the
+# supplied sources.
+_INFORMATION_CONTAINER_PATTERN: Final[str] = (
+    r"(?:the\s+)?"
+    r"(?:(?:supplied|provided|available|retrieved|cited)\s+)?"
+    r"(?:sources?|documents?|materials?|context|information)\b"
+)
+
+_SOURCE_SCOPED_ABSENCE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(
+        rf"\bnot available in\s+{_INFORMATION_CONTAINER_PATTERN}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bnot provided in\s+{_INFORMATION_CONTAINER_PATTERN}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:is|are) missing from\s+{_INFORMATION_CONTAINER_PATTERN}",
+        re.IGNORECASE,
+    ),
+)
+
+_ABSENCE_CLAIM_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    tuple(
+        re.compile(
+            rf"\b{re.escape(phrase)}\b",
+            re.IGNORECASE,
+        )
+        for phrase in ABSENCE_CLAIM_PHRASES
+    )
+    + _SOURCE_SCOPED_ABSENCE_PATTERNS
 )
 
 _DURATION_NUMBER_PATTERN: Final[str] = (
@@ -2241,20 +2276,30 @@ def _validate_no_false_absence_claims(
     """
     Flag an absence claim contradicted by a concrete figure in context.
 
-    This is a soft, best-effort heuristic: it cannot yet tell which
-    country a duration belongs to, which leave/notice category it
-    covers, or whether the absence claim concerns a general rule
-    rather than one specific figure. Kept soft (triggers a repair
-    attempt, never a 502) until it can be made country-aware by
+    This is a soft, best-effort heuristic, reported in metrics but
+    never repaired (NON_REPAIRING_SOFT_ERROR_TYPES): it cannot yet
+    tell which country a duration belongs to, which leave/notice
+    category it covers, or whether the absence claim concerns a
+    general rule rather than one specific figure. It deliberately
+    matches only high-precision phrasings that state a definitive
+    answer or piece of information is unavailable - not general
+    contractual or statutory wording such as "does not specify" or
+    "not specified", which routinely describes a normal legal
+    condition (e.g. "if the contract does not specify the notice
+    period...") rather than a gap in the supplied sources. The three
+    "not available in" / "not provided in" / "is or are missing
+    from" phrasings are additionally scoped to an explicit
+    information container (source, document, material, context,
+    information) so they don't fire on ordinary legal wording like
+    "not available in the first year" or "missing from the
+    agreement". Kept soft until it can be made country-aware by
     comparing each answer section only against that country's own
     context.
     """
 
-    normalized_answer = answer.casefold()
-
     if not any(
-        phrase in normalized_answer
-        for phrase in ABSENCE_CLAIM_PHRASES
+        pattern.search(answer)
+        for pattern in _ABSENCE_CLAIM_PATTERNS
     ):
         return []
 
@@ -2406,6 +2451,22 @@ def _build_repair_instructions(
         f"- {error.message}" for error in errors
     )
 
+    structure_instruction = (
+        (
+            "For a comparison, consolidate each country section to "
+            "no more than four concise bullets and keep the "
+            "Comparison section to no more than two bullets. Merge "
+            "closely related points or omit lower-priority details "
+            "rather than exceeding these limits. For a "
+            "single-country answer, use no more than six bullets.\n"
+        )
+        if any(
+            error.error_type == "structure"
+            for error in errors
+        )
+        else ""
+    )
+
     return (
         "Rewrite the answer using the same sources.\n\n"
         "Correct all of these issues:\n"
@@ -2414,6 +2475,7 @@ def _build_repair_instructions(
         "source (rule 24), restore its exact category, conditions, "
         "thresholds, and modality instead of rephrasing the same "
         "overly broad claim.\n"
+        f"{structure_instruction}"
         "Do not add new legal information.\n"
         "Preserve valid citations.\n"
         "Return only the corrected final answer."
