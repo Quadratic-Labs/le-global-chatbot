@@ -27,6 +27,14 @@ final class LE_Global_Chatbot_Plugin
         '/api/v1/chat'
     );
 
+    private const CHAT_LANGUAGE = 'en';
+
+    private const MAX_SOURCES_DEFAULT = 6;
+
+    private const MAX_SOURCES_MIN = 1;
+
+    private const MAX_SOURCES_MAX = 10;
+
     public static function init(): void
     {
         add_action(
@@ -359,6 +367,40 @@ final class LE_Global_Chatbot_Plugin
             );
         }
 
+        $max_sources = self::MAX_SOURCES_DEFAULT;
+
+        if (
+            isset(
+                $parameters['max_sources']
+            )
+        ) {
+            $requested_max_sources = (int) (
+                $parameters['max_sources']
+            );
+
+            if (
+                $requested_max_sources
+                < self::MAX_SOURCES_MIN
+                || $requested_max_sources
+                > self::MAX_SOURCES_MAX
+            ) {
+                return new WP_Error(
+                    'le_global_invalid_max_sources',
+                    sprintf(
+                        'max_sources must be between '
+                        . '%d and %d.',
+                        self::MAX_SOURCES_MIN,
+                        self::MAX_SOURCES_MAX
+                    ),
+                    [
+                        'status' => 422,
+                    ]
+                );
+            }
+
+            $max_sources = $requested_max_sources;
+        }
+
         $payload = [
             'question' => $question,
             'country_codes' => (
@@ -383,22 +425,12 @@ final class LE_Global_Chatbot_Plugin
                     ] ?? []
                 )
             ),
-            'language' => isset(
-                $parameters['language']
-            )
-                ? sanitize_key(
-                    (string) (
-                        $parameters['language']
-                    )
-                )
-                : 'en',
-            'max_sources' => isset(
-                $parameters['max_sources']
-            )
-                ? absint(
-                    $parameters['max_sources']
-                )
-                : 6,
+            // Public clients may never choose the response
+            // language: any client-supplied 'language' value is
+            // ignored, since the product only ever answers in
+            // English.
+            'language' => self::CHAT_LANGUAGE,
+            'max_sources' => $max_sources,
         ];
 
         if (
