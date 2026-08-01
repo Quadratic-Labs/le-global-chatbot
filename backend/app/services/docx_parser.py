@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+import zipfile
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
-from typing import TypeAlias
+from typing import Final, TypeAlias
 
 from docx import Document
 from docx.document import Document as DocxDocument
@@ -721,3 +723,528 @@ def parse_docx_sections(
     flush_content()
 
     return parsed_sections
+
+
+# --- Contact-card extraction -------------------------------------------
+#
+# Word text boxes (w:drawing > wps:txbx > w:txbxContent) are anchored
+# drawings, not part of the document body's main paragraph/table flow
+# that parse_docx_sections walks - so the firm/office and "CONTACT
+# PERSON" cards every L&E Global document carries in its introduction
+# are invisible to it. These functions are a separate, additive reader
+# for that one container, used only to build one dedicated Contact
+# chunk per document; they never change how normal legal sections are
+# parsed or chunked.
+
+_CONTACT_PERSON_MARKERS: Final[frozenset[str]] = frozenset(
+    {
+        "contact person",
+        "contact persons",
+    }
+)
+
+_EMAIL_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
+
+_WEBSITE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?:https?://\S+|www\.\S+)",
+    re.IGNORECASE,
+)
+
+_PHONE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\+?\d[\d\s().-]{5,}\d"
+)
+
+_MISSING_WORD_BOUNDARY_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])"
+)
+
+_REPEATED_COMMA_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r",\s*,+"
+)
+
+_TEXT_BOX_CONTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<w:txbxContent>(.*?)</w:txbxContent>",
+    re.DOTALL,
+)
+
+_TEXT_BOX_PARAGRAPH_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<w:p[ >].*?</w:p>",
+    re.DOTALL,
+)
+
+# Matches either a run's text (captured in group 1) or a line break,
+# in document order, so a break between two runs can be turned into a
+# separator instead of silently disappearing between two <w:t> tags.
+_TEXT_BOX_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<w:t[^>]*>(.*?)</w:t>|<w:br\s*/>",
+    re.DOTALL,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedContact:
+    """One validated L&E Global contact, extracted from a source DOCX."""
+
+    member_firm: str | None = None
+    contact_person: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    website: str | None = None
+
+    def has_any_field(self) -> bool:
+        """Return whether at least one field was actually found."""
+
+        return any(
+            (
+                self.member_firm,
+                self.contact_person,
+                self.email,
+                self.phone,
+                self.address,
+                self.website,
+            )
+        )
+
+
+def _clean_text_box_line(
+    value: str,
+) -> str:
+    """
+    Repair the two artifacts of reconstructing one visual line from
+    separate XML runs and line breaks:
+
+    - a missing space where two visually wrapped runs were joined
+      without one, for example "BuildingEC3A" -> "Building EC3A",
+      since Word text boxes routinely rely on the box width to wrap a
+      line rather than an explicit break;
+    - a doubled comma where a run's own trailing punctuation meets the
+      comma this reader inserts for a line break, for example
+      "Castro, " + break + "Ono" -> "Castro, , Ono" -> "Castro, Ono".
+    """
+
+    without_missing_boundaries = (
+        _MISSING_WORD_BOUNDARY_PATTERN.sub(
+            " ",
+            value,
+        )
+    )
+
+    return _REPEATED_COMMA_PATTERN.sub(
+        ",",
+        without_missing_boundaries,
+    )
+
+
+def _extract_text_box_blocks(
+    file_path: Path,
+) -> list[list[str]]:
+    """
+    Extract every text box's non-empty paragraph lines, in order.
+
+    Compatibility fallbacks (mc:Fallback) duplicate the same text box
+    content for older Word versions, so a block identical to the one
+    immediately before it is treated as that duplicate and dropped.
+    """
+
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+    except (
+        KeyError,
+        OSError,
+        zipfile.BadZipFile,
+    ):
+        return []
+
+    blocks: list[list[str]] = []
+    previous_lines: list[str] | None = None
+
+    for raw_block in _TEXT_BOX_CONTENT_PATTERN.findall(
+        document_xml
+    ):
+        lines: list[str] = []
+
+        for paragraph_xml in _TEXT_BOX_PARAGRAPH_PATTERN.findall(
+            raw_block
+        ):
+            tokens = [
+                match.group(1)
+                if match.group(1) is not None
+                else ", "
+                for match in _TEXT_BOX_TOKEN_PATTERN.finditer(
+                    paragraph_xml
+                )
+            ]
+
+            line = _clean_text_box_line(
+                _normalize_text(
+                    unescape(
+                        "".join(tokens)
+                    )
+                )
+            )
+
+            if line:
+                lines.append(line)
+
+        if lines and lines == previous_lines:
+            continue
+
+        if lines:
+            blocks.append(lines)
+            previous_lines = lines
+
+    return blocks
+
+
+def parse_contact_blocks(
+    blocks: Sequence[Sequence[str]],
+    country: str | None = None,
+) -> list[ExtractedContact]:
+    """
+    Classify already-extracted text-box blocks into contact entries.
+
+    Pure text-processing function - takes plain lines, not a DOCX
+    file - so it can be exercised directly with a synthetic block
+    structure. Two block shapes are recognized generically, without
+    any per-document or per-country assumption:
+
+    - a "CONTACT PERSON" (or "CONTACT PERSONS") block: a line matching
+      that marker, followed by a name and one or more emails;
+    - a firm/office block: any other block containing an email or a
+      phone-like pattern (a bare website mention alone is not enough,
+      since a generic site link can appear elsewhere in a document
+      without being part of a contact card). Its first line is taken
+      as the member firm name; any other line becomes the address,
+      except one that repeats the supplied country name, since that
+      is expected to come from validated document metadata instead.
+
+    Firm/office blocks and CONTACT PERSON blocks are collected
+    separately, in document order, then paired position-by-position:
+    the first firm block with the first CONTACT PERSON block found
+    anywhere in the document, and so on - since different source
+    documents lay these two cards out in different relative order. A
+    document with several such pairs yields several contacts, in
+    order. A block of either kind with no counterpart is still
+    reported using only the fields it actually has - never inventing
+    the other side. Exact duplicate entries (the same document's
+    compatibility fallback markup surfacing as a second, near-identical
+    block) are collapsed to one.
+    """
+
+    normalized_country = (
+        _normalize_text(
+            country
+        ).casefold()
+        if country
+        else None
+    )
+
+    firm_entries: list[dict[str, str | None]] = []
+    person_entries: list[
+        tuple[str | None, str | None]
+    ] = []
+
+    for block in blocks:
+        marker_index = next(
+            (
+                index
+                for index, line in enumerate(block)
+                if line.strip().casefold()
+                in _CONTACT_PERSON_MARKERS
+            ),
+            None,
+        )
+
+        if marker_index is not None:
+            emails: list[str] = []
+            name_lines: list[str] = []
+
+            for line in block[marker_index + 1:]:
+                email_match = _EMAIL_PATTERN.search(
+                    line
+                )
+
+                if email_match:
+                    emails.append(
+                        email_match.group(0)
+                    )
+                    continue
+
+                name_lines.append(
+                    line
+                )
+
+            person_entries.append(
+                (
+                    (
+                        name_lines[0]
+                        if name_lines
+                        else None
+                    ),
+                    (
+                        ", ".join(emails)
+                        if emails
+                        else None
+                    ),
+                )
+            )
+
+            continue
+
+        joined = " ".join(
+            block
+        )
+
+        phone_match = _PHONE_PATTERN.search(
+            joined
+        )
+
+        website_match = _WEBSITE_PATTERN.search(
+            joined
+        )
+
+        if not (
+            _EMAIL_PATTERN.search(joined)
+            or phone_match
+        ):
+            continue
+
+        address_lines = [
+            line
+            for line in block[1:]
+            if not (
+                phone_match
+                and line == phone_match.group(0)
+            )
+            and not (
+                website_match
+                and line == website_match.group(0)
+            )
+            and (
+                normalized_country is None
+                or line.casefold() != normalized_country
+            )
+        ]
+
+        firm_entries.append(
+            {
+                "member_firm": (
+                    block[0]
+                    if block
+                    else None
+                ),
+                "phone": (
+                    phone_match.group(0)
+                    if phone_match
+                    else None
+                ),
+                "website": (
+                    website_match.group(0)
+                    if website_match
+                    else None
+                ),
+                "address": (
+                    ", ".join(
+                        address_lines
+                    )
+                    if address_lines
+                    else None
+                ),
+            }
+        )
+
+    # Collapse near-duplicate compatibility blocks that the raw-line
+    # dedup in _extract_text_box_blocks missed because they differ in
+    # some incidental XML detail (for example two different internal
+    # hyperlink relationship ids for the same displayed email), so
+    # they do not each consume a slot in the position-based pairing
+    # below.
+    deduplicated_person_entries: list[
+        tuple[str | None, str | None]
+    ] = []
+    seen_person_keys: set[
+        tuple[str | None, str | None]
+    ] = set()
+
+    for person_entry in person_entries:
+        if person_entry in seen_person_keys:
+            continue
+
+        seen_person_keys.add(
+            person_entry
+        )
+
+        deduplicated_person_entries.append(
+            person_entry
+        )
+
+    person_entries = deduplicated_person_entries
+
+    deduplicated_firm_entries: list[
+        dict[str, str | None]
+    ] = []
+    seen_firm_keys: set[
+        tuple[str | None, ...]
+    ] = set()
+
+    for firm_entry in firm_entries:
+        firm_key = tuple(
+            firm_entry.get(field_name)
+            for field_name in (
+                "member_firm",
+                "phone",
+                "website",
+                "address",
+            )
+        )
+
+        if firm_key in seen_firm_keys:
+            continue
+
+        seen_firm_keys.add(
+            firm_key
+        )
+
+        deduplicated_firm_entries.append(
+            firm_entry
+        )
+
+    firm_entries = deduplicated_firm_entries
+
+    pair_count = max(
+        len(firm_entries),
+        len(person_entries),
+    )
+
+    contacts: list[ExtractedContact] = []
+    seen_contacts: set[
+        tuple[str | None, str | None, str | None]
+    ] = set()
+
+    for index in range(pair_count):
+        firm_fields = (
+            firm_entries[index]
+            if index < len(firm_entries)
+            else {}
+        )
+
+        contact_person, email = (
+            person_entries[index]
+            if index < len(person_entries)
+            else (None, None)
+        )
+
+        contact = ExtractedContact(
+            member_firm=firm_fields.get(
+                "member_firm"
+            ),
+            contact_person=contact_person,
+            email=email,
+            phone=firm_fields.get(
+                "phone"
+            ),
+            address=firm_fields.get(
+                "address"
+            ),
+            website=firm_fields.get(
+                "website"
+            ),
+        )
+
+        if not contact.has_any_field():
+            continue
+
+        dedup_key = (
+            contact.member_firm,
+            contact.contact_person,
+            contact.email,
+        )
+
+        if dedup_key in seen_contacts:
+            continue
+
+        seen_contacts.add(
+            dedup_key
+        )
+
+        contacts.append(
+            contact
+        )
+
+    return contacts
+
+
+def extract_contacts_from_docx(
+    file_path: Path,
+    country: str | None = None,
+) -> list[ExtractedContact]:
+    """Extract every validated contact card from one source DOCX."""
+
+    return parse_contact_blocks(
+        _extract_text_box_blocks(
+            file_path
+        ),
+        country=country,
+    )
+
+
+def build_contact_chunk_content(
+    contacts: Sequence[ExtractedContact],
+) -> str:
+    """Build the structured text of one Contact-subsection chunk."""
+
+    entries: list[str] = []
+
+    for contact in contacts:
+        lines: list[str] = []
+
+        if contact.member_firm:
+            lines.append(
+                f"Member firm: {contact.member_firm}"
+            )
+
+        if contact.contact_person:
+            lines.append(
+                f"Contact person: {contact.contact_person}"
+            )
+
+        if contact.email:
+            lines.append(
+                f"Email: {contact.email}"
+            )
+
+        if contact.phone:
+            lines.append(
+                f"Phone: {contact.phone}"
+            )
+
+        if contact.address:
+            lines.append(
+                f"Address: {contact.address}"
+            )
+
+        if contact.website:
+            lines.append(
+                f"Website: {contact.website}"
+            )
+
+        if lines:
+            entries.append(
+                "\n".join(
+                    lines
+                )
+            )
+
+    return "\n\n".join(
+        entries
+    )

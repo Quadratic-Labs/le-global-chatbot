@@ -9,7 +9,11 @@ from docx.text.paragraph import Paragraph
 
 from app.core.legal_taxonomy import get_canonical_legal_topic
 from app.core.subsection_taxonomy import get_subsection_topic_override
-from app.services.docx_parser import parse_docx_sections
+from app.services.docx_parser import (
+    build_contact_chunk_content,
+    parse_contact_blocks,
+    parse_docx_sections,
+)
 
 
 def _mark_as_numbered(
@@ -1014,6 +1018,326 @@ class DocxParserTests(unittest.TestCase):
                     paid_leave_section
                 ),
             )
+
+
+class ContactBlockParsingTests(unittest.TestCase):
+    """
+    Tests for parse_contact_blocks() against a synthetic paragraph
+    structure - the shape _extract_text_box_blocks() would have
+    produced from a real DOCX, without needing one.
+    """
+
+    def test_firm_then_contact_person_are_paired(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Example & Partners Advogados",
+                "Freedonia",
+                "1 Example Street, 6th floor, 00000 Sample City",
+                "+00 000 000 00",
+                "www.example-partners.test",
+            ],
+            [
+                "CONTACT PERSON",
+                "Alex Example",
+                "alex@example-partners.test",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks,
+            country="Freedonia",
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        contact = contacts[0]
+
+        self.assertEqual(
+            contact.member_firm,
+            "Example & Partners Advogados",
+        )
+        self.assertEqual(
+            contact.contact_person,
+            "Alex Example",
+        )
+        self.assertEqual(
+            contact.email,
+            "alex@example-partners.test",
+        )
+        self.assertEqual(
+            contact.phone,
+            "+00 000 000 00",
+        )
+        self.assertEqual(
+            contact.website,
+            "www.example-partners.test",
+        )
+
+        # The country line is excluded from the address since it must
+        # come from validated document metadata instead.
+        self.assertNotIn(
+            "Freedonia",
+            contact.address or "",
+        )
+
+    def test_contact_person_before_firm_block_are_still_paired(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "CONTACT PERSON",
+                "Nicolás Grandi",
+                "ngrandi@allende.com",
+            ],
+            [
+                "Allende & Brea",
+                "Argentina",
+                "Torre IRSA, Maipú 1300",
+                "+54 114 318 9984",
+                "www.allendebrea.com",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks,
+            country="Argentina",
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        contact = contacts[0]
+
+        self.assertEqual(
+            contact.member_firm,
+            "Allende & Brea",
+        )
+        self.assertEqual(
+            contact.contact_person,
+            "Nicolás Grandi",
+        )
+        self.assertEqual(
+            contact.email,
+            "ngrandi@allende.com",
+        )
+
+    def test_bare_website_alone_is_not_a_firm_block(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "www.leglobal.law",
+            ],
+            [
+                "Some Firm",
+                "Country",
+                "123 Main Street",
+                "+1 555 000 0000",
+                "www.somefirm.example",
+            ],
+            [
+                "CONTACT PERSON",
+                "Jane Doe",
+                "jane@somefirm.example",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        self.assertEqual(
+            contacts[0].member_firm,
+            "Some Firm",
+        )
+
+    def test_plural_contact_persons_marker_with_multiple_emails(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Van Olmen & Wynant",
+                "Belgium",
+                "Avenue Louise 221, 1050 Brussels",
+                "+32 264 405 11",
+                "www.vow.be",
+            ],
+            [
+                "CONTACT PERSONS",
+                "Chris van Olmen and Nicolas Simon",
+                "chris.van.olmen@vow.be",
+                "nicolas.simon@vow.be",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks,
+            country="Belgium",
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        contact = contacts[0]
+
+        self.assertEqual(
+            contact.contact_person,
+            "Chris van Olmen and Nicolas Simon",
+        )
+
+        self.assertIn(
+            "chris.van.olmen@vow.be",
+            contact.email or "",
+        )
+        self.assertIn(
+            "nicolas.simon@vow.be",
+            contact.email or "",
+        )
+
+    def test_multiple_documents_worth_of_contacts_are_all_kept(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Firm One",
+                "123 Street",
+                "+1 555 111 1111",
+            ],
+            [
+                "CONTACT PERSON",
+                "Person One",
+                "one@example.com",
+            ],
+            [
+                "Firm Two",
+                "456 Avenue",
+                "+1 555 222 2222",
+            ],
+            [
+                "CONTACT PERSON",
+                "Person Two",
+                "two@example.com",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks
+        )
+
+        self.assertEqual(
+            len(contacts),
+            2,
+        )
+
+        self.assertEqual(
+            [
+                contact.email
+                for contact in contacts
+            ],
+            [
+                "one@example.com",
+                "two@example.com",
+            ],
+        )
+
+    def test_no_text_box_blocks_returns_no_contacts(
+        self,
+    ) -> None:
+        self.assertEqual(
+            parse_contact_blocks(
+                []
+            ),
+            [],
+        )
+
+    def test_unmatched_firm_block_reports_only_its_own_fields(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Only Firm",
+                "42 Road",
+                "+1 555 333 3333",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        self.assertEqual(
+            contacts[0].member_firm,
+            "Only Firm",
+        )
+        self.assertIsNone(
+            contacts[0].contact_person
+        )
+        self.assertIsNone(
+            contacts[0].email
+        )
+
+    def test_build_contact_chunk_content_omits_missing_fields(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "CONTACT PERSON",
+                "Jane Doe",
+                "jane@example.com",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks
+        )
+
+        content = build_contact_chunk_content(
+            contacts
+        )
+
+        self.assertIn(
+            "Contact person: Jane Doe",
+            content,
+        )
+        self.assertIn(
+            "Email: jane@example.com",
+            content,
+        )
+        self.assertNotIn(
+            "Member firm",
+            content,
+        )
+        self.assertNotIn(
+            "Phone",
+            content,
+        )
+        self.assertNotIn(
+            "Address",
+            content,
+        )
+        self.assertNotIn(
+            "Website",
+            content,
+        )
 
 
 if __name__ == "__main__":

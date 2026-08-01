@@ -66,6 +66,11 @@ class LegalChatMetrics:
         default_factory=list
     )
 
+    # Counts only - never the history content itself.
+    history_messages: int = 0
+    history_characters: int = 0
+    contextual_question_used: bool = False
+
     def add_opensearch_seconds(
         self,
         elapsed_seconds: float,
@@ -141,6 +146,11 @@ class LegalChatMetrics:
             ),
             "final_soft_error_types": (
                 self.final_soft_error_types
+            ),
+            "history_messages": self.history_messages,
+            "history_characters": self.history_characters,
+            "contextual_question_used": (
+                self.contextual_question_used
             ),
         }
 
