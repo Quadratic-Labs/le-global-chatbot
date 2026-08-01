@@ -477,7 +477,12 @@ def delete_indexed_document(
     Delete an indexed document and its source DOCX safely.
 
     When the source exists, it is temporarily moved before the
-    OpenSearch deletion and restored if the deletion fails.
+    OpenSearch deletion and restored if the deletion fails. The
+    backup is created next to the source file (source_path.parent),
+    not in processed_directory: those are separate bind mounts in
+    production, and os.replace() cannot perform an atomic rename
+    across mount points (OSError: Invalid cross-device link).
+    processed_directory is kept only for public-signature stability.
     """
 
     validated_document_id = (
@@ -513,17 +518,12 @@ def delete_indexed_document(
 
     if source_file_present:
         try:
-            processed_directory.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
             backup_path = (
-                processed_directory
+                source_path.parent
                 / (
                     ".delete-backup-"
                     f"{uuid.uuid4().hex}-"
-                    f"{source_filename}"
+                    f"{source_path.name}.bak"
                 )
             )
 

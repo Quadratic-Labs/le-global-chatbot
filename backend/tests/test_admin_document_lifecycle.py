@@ -136,6 +136,81 @@ class FakeOpenSearchClient:
         }
 
 
+class BackupInspectingOpenSearchClient(FakeOpenSearchClient):
+    """
+    Records on-disk backup state at the moment chunks are deleted.
+
+    This is the only point in delete_indexed_document where the
+    source DOCX has already been moved but the operation has not
+    yet completed - the right moment to observe where the backup
+    was actually created.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_directory: Path,
+        processed_directory: Path,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.source_directory = source_directory
+        self.processed_directory = processed_directory
+        self.backup_path_at_delete_time: Path | None = None
+        self.processed_directory_entries_at_delete_time: list[str] = []
+
+    def delete_by_query(
+        self,
+        *,
+        index: str,
+        body: dict[str, Any],
+        conflicts: str,
+        refresh: bool,
+    ) -> dict[str, Any]:
+        backups = [
+            path
+            for path in self.source_directory.iterdir()
+            if path.name.startswith(".delete-backup-")
+        ]
+
+        if backups:
+            self.backup_path_at_delete_time = backups[0]
+
+        if self.processed_directory.exists():
+            self.processed_directory_entries_at_delete_time = [
+                path.name
+                for path in self.processed_directory.iterdir()
+            ]
+
+        return super().delete_by_query(
+            index=index,
+            body=body,
+            conflicts=conflicts,
+            refresh=refresh,
+        )
+
+
+class FailingDeleteOpenSearchClient(FakeOpenSearchClient):
+    """Simulates an OpenSearch failure during chunk deletion."""
+
+    def delete_by_query(
+        self,
+        *,
+        index: str,
+        body: dict[str, Any],
+        conflicts: str,
+        refresh: bool,
+    ) -> dict[str, Any]:
+        del index
+        del body
+        del conflicts
+        del refresh
+
+        raise RuntimeError(
+            "Simulated OpenSearch deletion failure."
+        )
+
+
 class AdminDocumentLifecycleTests(
     unittest.TestCase
 ):
@@ -368,6 +443,180 @@ class AdminDocumentLifecycleTests(
                 client.deleted_document_ids,
                 [
                     OLD_DOCUMENT_ID,
+                ],
+            )
+
+            # No leftover backup file: source_directory must end up
+            # completely empty, not just missing the original name.
+            self.assertEqual(
+                list(
+                    source_directory.iterdir()
+                ),
+                [],
+            )
+
+    def test_delete_backup_is_created_next_to_source_not_processed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = (
+                Path(root)
+                / "source"
+            )
+
+            processed_directory = (
+                Path(root)
+                / "processed"
+            )
+
+            source_directory.mkdir()
+
+            source_filename = "UK 2026.docx"
+
+            source_path = (
+                source_directory
+                / source_filename
+            )
+
+            source_path.write_bytes(
+                b"docx"
+            )
+
+            client = BackupInspectingOpenSearchClient(
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                source_filename=source_filename,
+            )
+
+            delete_indexed_document(
+                document_id=OLD_DOCUMENT_ID,
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                client=client,
+            )
+
+            self.assertIsNotNone(
+                client.backup_path_at_delete_time
+            )
+
+            self.assertEqual(
+                client.backup_path_at_delete_time.parent,
+                source_directory,
+            )
+
+            self.assertEqual(
+                client.processed_directory_entries_at_delete_time,
+                [],
+            )
+
+    def test_delete_backup_path_does_not_end_with_docx(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = (
+                Path(root)
+                / "source"
+            )
+
+            processed_directory = (
+                Path(root)
+                / "processed"
+            )
+
+            source_directory.mkdir()
+
+            source_filename = "UK 2026.docx"
+
+            source_path = (
+                source_directory
+                / source_filename
+            )
+
+            source_path.write_bytes(
+                b"docx"
+            )
+
+            client = BackupInspectingOpenSearchClient(
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                source_filename=source_filename,
+            )
+
+            delete_indexed_document(
+                document_id=OLD_DOCUMENT_ID,
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                client=client,
+            )
+
+            self.assertIsNotNone(
+                client.backup_path_at_delete_time
+            )
+
+            self.assertFalse(
+                client.backup_path_at_delete_time.name.endswith(
+                    ".docx"
+                )
+            )
+
+    def test_delete_restores_source_file_exactly_on_opensearch_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = (
+                Path(root)
+                / "source"
+            )
+
+            processed_directory = (
+                Path(root)
+                / "processed"
+            )
+
+            source_directory.mkdir()
+
+            source_filename = "UK 2026.docx"
+
+            source_path = (
+                source_directory
+                / source_filename
+            )
+
+            original_bytes = b"original-docx-bytes"
+
+            source_path.write_bytes(
+                original_bytes
+            )
+
+            client = FailingDeleteOpenSearchClient(
+                source_filename=source_filename
+            )
+
+            with self.assertRaises(
+                RuntimeError
+            ):
+                delete_indexed_document(
+                    document_id=OLD_DOCUMENT_ID,
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    client=client,
+                )
+
+            self.assertTrue(
+                source_path.exists()
+            )
+
+            self.assertEqual(
+                source_path.read_bytes(),
+                original_bytes,
+            )
+
+            self.assertEqual(
+                list(
+                    source_directory.iterdir()
+                ),
+                [
+                    source_path,
                 ],
             )
 
