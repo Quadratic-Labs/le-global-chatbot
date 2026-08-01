@@ -132,9 +132,113 @@
             }
         );
 
-        loadConfiguration();
+        const mode = (
+            widget.dataset.mode === "floating"
+                ? "floating"
+                : "inline"
+        );
+
+        let configurationLoaded = false;
+        let configurationPromise = null;
+
+        function ensureConfigurationLoaded() {
+            if (configurationLoaded) {
+                return Promise.resolve(true);
+            }
+
+            if (configurationPromise) {
+                return configurationPromise;
+            }
+
+            configurationPromise = loadConfiguration()
+                .then((succeeded) => {
+                    configurationLoaded = succeeded;
+                    return succeeded;
+                })
+                .finally(() => {
+                    configurationPromise = null;
+                });
+
+            return configurationPromise;
+        }
+
+        if (mode === "floating") {
+            initializeFloatingMode();
+        } else {
+            void ensureConfigurationLoaded();
+        }
+
+        function initializeFloatingMode() {
+            const floatingWrapper = widget.closest(
+                "[data-floating-wrapper]"
+            );
+
+            const launcher = (
+                floatingWrapper
+                    ? floatingWrapper.querySelector(
+                        "[data-launcher]"
+                    )
+                    : null
+            );
+
+            const closeButton = widget.querySelector(
+                "[data-close]"
+            );
+
+            if (!floatingWrapper || !launcher || !closeButton) {
+                void ensureConfigurationLoaded();
+                return;
+            }
+
+            launcher.addEventListener(
+                "click",
+                openPanel
+            );
+
+            closeButton.addEventListener(
+                "click",
+                closePanel
+            );
+
+            widget.addEventListener(
+                "keydown",
+                (event) => {
+                    if (event.key === "Escape") {
+                        closePanel();
+                    }
+                }
+            );
+
+            function openPanel() {
+                void ensureConfigurationLoaded();
+
+                widget.hidden = false;
+                launcher.setAttribute(
+                    "aria-expanded",
+                    "true"
+                );
+
+                questionInput.focus();
+            }
+
+            function closePanel() {
+                if (widget.hidden) {
+                    return;
+                }
+
+                widget.hidden = true;
+                launcher.setAttribute(
+                    "aria-expanded",
+                    "false"
+                );
+
+                launcher.focus();
+            }
+        }
 
         async function loadConfiguration() {
+            clearError();
+
             setLoading(
                 true,
                 "Loading the legal catalog…"
@@ -178,6 +282,8 @@
                 renderCountries(
                     configuration.catalog?.countries || []
                 );
+
+                return true;
             } catch (error) {
                 countriesContainer.innerHTML = "";
 
@@ -186,6 +292,8 @@
                         ? error.message
                         : "The legal catalog could not be loaded."
                 );
+
+                return false;
             } finally {
                 setLoading(false);
             }

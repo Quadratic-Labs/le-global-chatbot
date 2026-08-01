@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.2.1
+ * Version: 0.3.0
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.2.1';
+    private const VERSION = '0.3.0';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -140,8 +140,9 @@ final class LE_Global_Chatbot_Plugin
         );
     }
 
-    public static function render_shortcode(): string
-    {
+    public static function render_shortcode(
+        $attributes = []
+    ): string {
         wp_enqueue_style(
             'le-global-chatbot'
         );
@@ -149,6 +150,28 @@ final class LE_Global_Chatbot_Plugin
         wp_enqueue_script(
             'le-global-chatbot'
         );
+
+        $normalized_attributes = shortcode_atts(
+            [
+                'mode' => 'inline',
+            ],
+            is_array($attributes)
+                ? $attributes
+                : [],
+            self::SHORTCODE
+        );
+
+        $mode = (
+            strtolower(
+                trim(
+                    (string) $normalized_attributes['mode']
+                )
+            ) === 'floating'
+                ? 'floating'
+                : 'inline'
+        );
+
+        $is_floating = ($mode === 'floating');
 
         $instance_id = wp_unique_id(
             'le-global-chatbot-'
@@ -162,13 +185,54 @@ final class LE_Global_Chatbot_Plugin
 
         ob_start();
         ?>
+        <?php if ($is_floating) : ?>
+        <div
+            class="le-global-chatbot-floating"
+            data-floating-wrapper
+        >
+            <button
+                type="button"
+                class="le-global-chatbot-floating__launcher"
+                aria-expanded="false"
+                aria-controls="<?php
+                    echo esc_attr(
+                        $instance_id
+                    );
+                ?>"
+                aria-label="Open the employment law assistant"
+                data-launcher
+            >
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    width="28"
+                    height="28"
+                    aria-hidden="true"
+                    focusable="false"
+                >
+                    <path
+                        fill="currentColor"
+                        d="M12 3C7.03 3 3 6.58 3 11c0 2.36 1.14 4.47 2.94 5.94L5 21l4.24-1.7c.87.18 1.79.28 2.76.28 4.97 0 9-3.58 9-8s-4.03-8-9-8z"
+                    />
+                </svg>
+            </button>
+        <?php endif; ?>
         <section
             id="<?php
                 echo esc_attr(
                     $instance_id
                 );
             ?>"
-            class="le-global-chatbot"
+            class="le-global-chatbot<?php
+                echo $is_floating
+                    ? ' le-global-chatbot--floating'
+                    : '';
+            ?>"
+            data-mode="<?php
+                echo esc_attr(
+                    $mode
+                );
+            ?>"
             data-config-endpoint="<?php
                 echo esc_url(
                     $rest_base . '/config'
@@ -179,7 +243,22 @@ final class LE_Global_Chatbot_Plugin
                     $rest_base . '/chat'
                 );
             ?>"
+            <?php if ($is_floating) : ?>
+            role="dialog"
+            aria-label="Employment Law Assistant"
+            hidden
+            <?php endif; ?>
         >
+            <?php if ($is_floating) : ?>
+            <button
+                type="button"
+                class="le-global-chatbot-floating__close"
+                aria-label="Close the employment law assistant"
+                data-close
+            >
+                <span aria-hidden="true">&times;</span>
+            </button>
+            <?php endif; ?>
             <header class="le-global-chatbot__header">
                 <p class="le-global-chatbot__eyebrow">
                     L&amp;E Global
@@ -312,6 +391,9 @@ final class LE_Global_Chatbot_Plugin
                 </p>
             </article>
         </section>
+        <?php if ($is_floating) : ?>
+        </div>
+        <?php endif; ?>
         <?php
 
         return (string) ob_get_clean();
