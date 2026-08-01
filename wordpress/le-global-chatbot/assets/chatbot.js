@@ -14,7 +14,7 @@
         const chatEndpoint = widget.dataset.chatEndpoint;
 
         const form = widget.querySelector(
-            ".le-global-chatbot__form"
+            ".le-global-chatbot__composer"
         );
 
         const questionInput = widget.querySelector(
@@ -25,8 +25,8 @@
             "[data-character-count]"
         );
 
-        const countriesContainer = widget.querySelector(
-            "[data-countries]"
+        const conversationElement = widget.querySelector(
+            "[data-conversation]"
         );
 
         const submitButton = widget.querySelector(
@@ -45,6 +45,14 @@
             "[data-response]"
         );
 
+        const userQuestionElement = widget.querySelector(
+            "[data-user-question]"
+        );
+
+        const assistantMessageElement = widget.querySelector(
+            "[data-assistant-message]"
+        );
+
         const answerElement = widget.querySelector(
             "[data-answer]"
         );
@@ -56,6 +64,24 @@
         const sourcesElement = widget.querySelector(
             "[data-sources]"
         );
+
+        if (
+            !form
+            || !questionInput
+            || !characterCount
+            || !conversationElement
+            || !submitButton
+            || !statusElement
+            || !errorElement
+            || !responseElement
+            || !userQuestionElement
+            || !assistantMessageElement
+            || !answerElement
+            || !sourcesSection
+            || !sourcesElement
+        ) {
+            return;
+        }
 
         let maximumQuestionLength = 2000;
         let defaultMaximumSources = 6;
@@ -74,9 +100,6 @@
             async (event) => {
                 event.preventDefault();
 
-                clearError();
-                hideResponse();
-
                 const question = questionInput.value.trim();
 
                 if (question.length < 2) {
@@ -88,13 +111,16 @@
                     return;
                 }
 
-                const selectedCountries = Array.from(
-                    countriesContainer.querySelectorAll(
-                        'input[type="checkbox"]:checked'
-                    )
-                ).map(
-                    (input) => input.value
-                );
+                clearError();
+
+                userQuestionElement.textContent = question;
+                assistantMessageElement.hidden = true;
+                answerElement.textContent = "";
+                sourcesElement.innerHTML = "";
+                sourcesSection.hidden = true;
+                responseElement.hidden = false;
+
+                scrollConversationToBottom();
 
                 setLoading(
                     true,
@@ -112,7 +138,6 @@
                             credentials: "same-origin",
                             body: JSON.stringify({
                                 question,
-                                country_codes: selectedCountries,
                                 language: "en",
                                 max_sources: defaultMaximumSources,
                             }),
@@ -126,6 +151,8 @@
                             ? error.message
                             : "The legal assistant is unavailable."
                     );
+
+                    scrollConversationToBottom();
                 } finally {
                     setLoading(false);
                 }
@@ -192,7 +219,7 @@
 
             launcher.addEventListener(
                 "click",
-                openPanel
+                togglePanel
             );
 
             closeButton.addEventListener(
@@ -200,22 +227,42 @@
                 closePanel
             );
 
-            widget.addEventListener(
+            document.addEventListener(
                 "keydown",
                 (event) => {
-                    if (event.key === "Escape") {
+                    if (
+                        event.key === "Escape"
+                        && !widget.hidden
+                    ) {
                         closePanel();
                     }
                 }
             );
 
+            function togglePanel() {
+                if (widget.hidden) {
+                    openPanel();
+                } else {
+                    closePanel();
+                }
+            }
+
             function openPanel() {
                 void ensureConfigurationLoaded();
 
                 widget.hidden = false;
+                floatingWrapper.classList.add(
+                    "le-global-chatbot-floating--open"
+                );
+
                 launcher.setAttribute(
                     "aria-expanded",
                     "true"
+                );
+
+                launcher.setAttribute(
+                    "aria-label",
+                    "Close the employment law assistant"
                 );
 
                 questionInput.focus();
@@ -227,9 +274,18 @@
                 }
 
                 widget.hidden = true;
+                floatingWrapper.classList.remove(
+                    "le-global-chatbot-floating--open"
+                );
+
                 launcher.setAttribute(
                     "aria-expanded",
                     "false"
+                );
+
+                launcher.setAttribute(
+                    "aria-label",
+                    "Open the employment law assistant"
                 );
 
                 launcher.focus();
@@ -279,14 +335,8 @@
                     );
                 }
 
-                renderCountries(
-                    configuration.catalog?.countries || []
-                );
-
                 return true;
             } catch (error) {
-                countriesContainer.innerHTML = "";
-
                 showError(
                     error instanceof Error
                         ? error.message
@@ -297,59 +347,6 @@
             } finally {
                 setLoading(false);
             }
-        }
-
-        function renderCountries(countries) {
-            countriesContainer.innerHTML = "";
-
-            if (!countries.length) {
-                const emptyMessage = document.createElement(
-                    "p"
-                );
-
-                emptyMessage.className = (
-                    "le-global-chatbot__help"
-                );
-
-                emptyMessage.textContent = (
-                    "No country filter is currently available."
-                );
-
-                countriesContainer.appendChild(
-                    emptyMessage
-                );
-
-                return;
-            }
-
-            countries.forEach((country) => {
-                const label = document.createElement(
-                    "label"
-                );
-
-                label.className = (
-                    "le-global-chatbot__country"
-                );
-
-                const input = document.createElement(
-                    "input"
-                );
-
-                input.type = "checkbox";
-                input.name = "country_codes";
-                input.value = country.country_code;
-
-                const text = document.createElement(
-                    "span"
-                );
-
-                text.textContent = country.country;
-
-                label.appendChild(input);
-                label.appendChild(text);
-
-                countriesContainer.appendChild(label);
-            });
         }
 
         function renderResponse(response) {
@@ -410,17 +407,16 @@
             sourcesSection.hidden = sources.length === 0;
             responseElement.hidden = false;
 
-            responseElement.scrollIntoView({
-                behavior: "smooth",
-                block: "start",
-            });
+            assistantMessageElement.hidden = false;
+
+            scrollConversationToBottom();
         }
 
-        function hideResponse() {
-            responseElement.hidden = true;
-            answerElement.textContent = "";
-            sourcesElement.innerHTML = "";
-            sourcesSection.hidden = true;
+        function scrollConversationToBottom() {
+            conversationElement.scrollTo({
+                top: conversationElement.scrollHeight,
+                behavior: "smooth",
+            });
         }
 
         function showError(message) {
