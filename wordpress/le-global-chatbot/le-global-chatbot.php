@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.2.0
+ * Version: 0.2.1
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.2.0';
+    private const VERSION = '0.2.1';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -555,14 +555,23 @@ final class LE_Global_Chatbot_Plugin
         );
 
         if (is_wp_error($response)) {
+            error_log(
+                sprintf(
+                    '[L&E Global Chatbot] Backend request '
+                    . 'failed (%s).',
+                    sanitize_key(
+                        (string) (
+                            $response->get_error_code()
+                        )
+                    )
+                )
+            );
+
             return new WP_Error(
                 'le_global_backend_unavailable',
                 'The legal assistant is temporarily unavailable.',
                 [
                     'status' => 502,
-                    'backend_error' => (
-                        $response->get_error_message()
-                    ),
                 ]
             );
         }
