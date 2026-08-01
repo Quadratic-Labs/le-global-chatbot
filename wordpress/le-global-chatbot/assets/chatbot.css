@@ -49,6 +49,31 @@
     min-width: 0;
 }
 
+.le-global-chatbot__panel-actions {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.le-global-chatbot__new-conversation {
+    flex-shrink: 0;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--le-global-border);
+    border-radius: 8px;
+    background: #fff;
+    color: var(--le-global-muted);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.82rem;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.le-global-chatbot__new-conversation:hover {
+    background: var(--le-global-soft);
+}
+
 .le-global-chatbot__eyebrow {
     margin: 0 0 0.35rem;
     color: var(--le-global-primary);
@@ -95,6 +120,16 @@
     margin: 0;
     white-space: pre-wrap;
     overflow-wrap: break-word;
+}
+
+.le-global-chatbot__message--pending {
+    color: var(--le-global-muted);
+    font-style: italic;
+}
+
+.le-global-chatbot__message--error {
+    background: #fff1f1;
+    color: var(--le-global-error);
 }
 
 .le-global-chatbot__composer {
@@ -293,13 +328,56 @@
     gap: 0.5rem;
 }
 
+.le-global-chatbot.le-global-chatbot--floating {
+    font-size: 14px;
+    line-height: 1.45;
+}
+
 .le-global-chatbot--floating .le-global-chatbot__eyebrow {
     margin: 0;
+    font-size: 10.5px;
 }
 
 .le-global-chatbot--floating .le-global-chatbot__title {
-    font-size: 1.05rem;
+    font-size: 15.5px;
     line-height: 1.3;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__new-conversation {
+    font-size: 11.5px;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__message {
+    padding: 0.65rem 0.8rem;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__question {
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__submit {
+    font-size: 14px;
+    padding: 0.55rem 1.1rem;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__sources-title {
+    font-size: 13px;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__source,
+.le-global-chatbot--floating .le-global-chatbot__source-metadata {
+    font-size: 12.5px;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__disclaimer {
+    font-size: 11.5px;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__counter {
+    font-size: 11.5px;
 }
 
 .le-global-chatbot-floating__close {

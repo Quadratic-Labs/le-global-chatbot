@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.3.1
+ * Version: 0.4.0
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.3.1';
+    private const VERSION = '0.4.0';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -34,6 +34,17 @@ final class LE_Global_Chatbot_Plugin
     private const MAX_SOURCES_MIN = 1;
 
     private const MAX_SOURCES_MAX = 10;
+
+    private const HISTORY_MAX_MESSAGES = 6;
+
+    private const HISTORY_MESSAGE_MAX_CHARACTERS = 4000;
+
+    private const HISTORY_TOTAL_MAX_CHARACTERS = 10000;
+
+    private const HISTORY_ALLOWED_ROLES = [
+        'user',
+        'assistant',
+    ];
 
     public static function init(): void
     {
@@ -110,6 +121,10 @@ final class LE_Global_Chatbot_Plugin
                     'max_sources' => [
                         'required' => false,
                         'type' => 'integer',
+                    ],
+                    'history' => [
+                        'required' => false,
+                        'type' => 'array',
                     ],
                 ],
             ]
@@ -273,16 +288,27 @@ final class LE_Global_Chatbot_Plugin
                     </h2>
                 </div>
 
-                <?php if ($is_floating) : ?>
-                <button
-                    type="button"
-                    class="le-global-chatbot-floating__close"
-                    aria-label="Close the employment law assistant"
-                    data-close
-                >
-                    <span aria-hidden="true">&times;</span>
-                </button>
-                <?php endif; ?>
+                <div class="le-global-chatbot__panel-actions">
+                    <button
+                        type="button"
+                        class="le-global-chatbot__new-conversation"
+                        aria-label="Start a new conversation"
+                        data-new-conversation
+                    >
+                        New conversation
+                    </button>
+
+                    <?php if ($is_floating) : ?>
+                    <button
+                        type="button"
+                        class="le-global-chatbot-floating__close"
+                        aria-label="Close the employment law assistant"
+                        data-close
+                    >
+                        <span aria-hidden="true">&times;</span>
+                    </button>
+                    <?php endif; ?>
+                </div>
             </header>
 
             <div
@@ -291,11 +317,11 @@ final class LE_Global_Chatbot_Plugin
             >
                 <div
                     class="le-global-chatbot__message le-global-chatbot__message--assistant"
+                    data-welcome-message
                 >
-                    Ask a question about employment law.
-                    Countries and legal topics are detected
-                    automatically. Answers are based exclusively
-                    on validated L&amp;E Global documents.
+                    Ask an employment law question. Countries
+                    and legal topics are detected automatically.
+                    Answers use validated L&amp;E Global documents.
                 </div>
 
                 <div
@@ -312,49 +338,10 @@ final class LE_Global_Chatbot_Plugin
                     hidden
                 ></div>
 
-                <article
-                    class="le-global-chatbot__response"
-                    data-response
-                    hidden
-                >
-                    <div
-                        class="le-global-chatbot__message le-global-chatbot__message--user"
-                    >
-                        <p data-user-question></p>
-                    </div>
-
-                    <div
-                        class="le-global-chatbot__message le-global-chatbot__message--assistant"
-                        data-assistant-message
-                        hidden
-                    >
-                        <div
-                            class="le-global-chatbot__answer"
-                            data-answer
-                        ></div>
-
-                        <section
-                            class="le-global-chatbot__sources-section"
-                            data-sources-section
-                            hidden
-                        >
-                            <h4 class="le-global-chatbot__sources-title">
-                                Sources
-                            </h4>
-
-                            <ol
-                                class="le-global-chatbot__sources"
-                                data-sources
-                            ></ol>
-                        </section>
-
-                        <p class="le-global-chatbot__disclaimer">
-                            This information is based on the
-                            available L&amp;E Global documents
-                            and does not constitute legal advice.
-                        </p>
-                    </div>
-                </article>
+                <div
+                    class="le-global-chatbot__message-list"
+                    data-message-list
+                ></div>
             </div>
 
             <form class="le-global-chatbot__composer">
@@ -396,7 +383,7 @@ final class LE_Global_Chatbot_Plugin
                         class="le-global-chatbot__submit"
                         type="submit"
                     >
-                        Ask the assistant
+                        Send
                     </button>
                 </div>
             </form>
@@ -493,8 +480,17 @@ final class LE_Global_Chatbot_Plugin
             $max_sources = $requested_max_sources;
         }
 
+        $history = self::sanitize_history(
+            $parameters['history'] ?? []
+        );
+
+        if (is_wp_error($history)) {
+            return $history;
+        }
+
         $payload = [
             'question' => $question,
+            'history' => $history,
             'country_codes' => (
                 self::sanitize_string_list(
                     $parameters[
@@ -585,6 +581,208 @@ final class LE_Global_Chatbot_Plugin
         return array_values(
             $sanitized_values
         );
+    }
+
+    /**
+     * Count the Unicode characters (not bytes) of a string.
+     *
+     * Falls back to strlen() only when mbstring is unavailable, since
+     * the character budgets below must match the backend's Python
+     * len() semantics, not a raw byte count.
+     */
+    private static function string_length(string $value): int
+    {
+        if (function_exists('mb_strlen')) {
+            return mb_strlen($value, 'UTF-8');
+        }
+
+        return strlen($value);
+    }
+
+    /**
+     * Validate and sanitize the optional conversation history.
+     *
+     * Mirrors every shape rule LegalChatHistoryMessage enforces on
+     * the backend (message count, per-message and total character
+     * budgets, first=user/last=assistant, strict alternation), so a
+     * malformed history is rejected here with a generic 422 instead
+     * of being forwarded to FastAPI only to fail there. This
+     * duplication is intentional defense in depth - the Pydantic
+     * model remains the final authority and is not relaxed by it.
+     * Never logs or echoes rejected content - only a generic message
+     * is returned for any structural problem.
+     *
+     * @return array|WP_Error
+     */
+    private static function sanitize_history(
+        mixed $raw_history
+    ) {
+        if (!is_array($raw_history)) {
+            return new WP_Error(
+                'le_global_invalid_history',
+                'history must be a list of messages.',
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        if (count($raw_history) > self::HISTORY_MAX_MESSAGES) {
+            return new WP_Error(
+                'le_global_invalid_history',
+                sprintf(
+                    'history must contain at most %d messages.',
+                    self::HISTORY_MAX_MESSAGES
+                ),
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        $sanitized_history = [];
+
+        foreach ($raw_history as $entry) {
+            if (!is_array($entry)) {
+                return new WP_Error(
+                    'le_global_invalid_history',
+                    'Each history entry must be an object '
+                    . 'with role and content.',
+                    [
+                        'status' => 422,
+                    ]
+                );
+            }
+
+            $role = isset($entry['role'])
+                ? sanitize_key(
+                    (string) $entry['role']
+                )
+                : '';
+
+            if (
+                !in_array(
+                    $role,
+                    self::HISTORY_ALLOWED_ROLES,
+                    true
+                )
+            ) {
+                return new WP_Error(
+                    'le_global_invalid_history',
+                    'history role must be "user" or '
+                    . '"assistant".',
+                    [
+                        'status' => 422,
+                    ]
+                );
+            }
+
+            $content = isset($entry['content'])
+                ? sanitize_textarea_field(
+                    (string) $entry['content']
+                )
+                : '';
+
+            if (trim($content) === '') {
+                return new WP_Error(
+                    'le_global_invalid_history',
+                    'Each history entry must have '
+                    . 'non-empty content.',
+                    [
+                        'status' => 422,
+                    ]
+                );
+            }
+
+            if (
+                self::string_length($content)
+                > self::HISTORY_MESSAGE_MAX_CHARACTERS
+            ) {
+                return new WP_Error(
+                    'le_global_invalid_history',
+                    sprintf(
+                        'history content must be at most '
+                        . '%d characters.',
+                        self::HISTORY_MESSAGE_MAX_CHARACTERS
+                    ),
+                    [
+                        'status' => 422,
+                    ]
+                );
+            }
+
+            $sanitized_history[] = [
+                'role' => $role,
+                'content' => $content,
+            ];
+        }
+
+        if (empty($sanitized_history)) {
+            return $sanitized_history;
+        }
+
+        if ($sanitized_history[0]['role'] !== 'user') {
+            return new WP_Error(
+                'le_global_invalid_history',
+                'history must start with a "user" message.',
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        $last_index = count($sanitized_history) - 1;
+
+        if ($sanitized_history[$last_index]['role'] !== 'assistant') {
+            return new WP_Error(
+                'le_global_invalid_history',
+                'history must end with an "assistant" message.',
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        $total_characters = 0;
+        $previous_role = null;
+
+        foreach ($sanitized_history as $entry) {
+            if (
+                $previous_role !== null
+                && $entry['role'] === $previous_role
+            ) {
+                return new WP_Error(
+                    'le_global_invalid_history',
+                    'history roles must strictly alternate '
+                    . 'between "user" and "assistant".',
+                    [
+                        'status' => 422,
+                    ]
+                );
+            }
+
+            $previous_role = $entry['role'];
+
+            $total_characters += self::string_length(
+                $entry['content']
+            );
+        }
+
+        if ($total_characters > self::HISTORY_TOTAL_MAX_CHARACTERS) {
+            return new WP_Error(
+                'le_global_invalid_history',
+                sprintf(
+                    'history total content length must not '
+                    . 'exceed %d characters.',
+                    self::HISTORY_TOTAL_MAX_CHARACTERS
+                ),
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        return $sanitized_history;
     }
 
     private static function proxy_backend_request(
