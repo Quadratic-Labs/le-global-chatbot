@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.2.0
+ * Version: 0.3.1
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.2.0';
+    private const VERSION = '0.3.1';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -140,8 +140,9 @@ final class LE_Global_Chatbot_Plugin
         );
     }
 
-    public static function render_shortcode(): string
-    {
+    public static function render_shortcode(
+        $attributes = []
+    ): string {
         wp_enqueue_style(
             'le-global-chatbot'
         );
@@ -150,9 +151,33 @@ final class LE_Global_Chatbot_Plugin
             'le-global-chatbot'
         );
 
+        $normalized_attributes = shortcode_atts(
+            [
+                'mode' => 'inline',
+            ],
+            is_array($attributes)
+                ? $attributes
+                : [],
+            self::SHORTCODE
+        );
+
+        $mode = (
+            strtolower(
+                trim(
+                    (string) $normalized_attributes['mode']
+                )
+            ) === 'floating'
+                ? 'floating'
+                : 'inline'
+        );
+
+        $is_floating = ($mode === 'floating');
+
         $instance_id = wp_unique_id(
             'le-global-chatbot-'
         );
+
+        $title_id = $instance_id . '-title';
 
         $rest_base = untrailingslashit(
             rest_url(
@@ -162,13 +187,54 @@ final class LE_Global_Chatbot_Plugin
 
         ob_start();
         ?>
+        <?php if ($is_floating) : ?>
+        <div
+            class="le-global-chatbot-floating"
+            data-floating-wrapper
+        >
+            <button
+                type="button"
+                class="le-global-chatbot-floating__launcher"
+                aria-expanded="false"
+                aria-controls="<?php
+                    echo esc_attr(
+                        $instance_id
+                    );
+                ?>"
+                aria-label="Open the employment law assistant"
+                data-launcher
+            >
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    width="28"
+                    height="28"
+                    aria-hidden="true"
+                    focusable="false"
+                >
+                    <path
+                        fill="currentColor"
+                        d="M12 3C7.03 3 3 6.58 3 11c0 2.36 1.14 4.47 2.94 5.94L5 21l4.24-1.7c.87.18 1.79.28 2.76.28 4.97 0 9-3.58 9-8s-4.03-8-9-8z"
+                    />
+                </svg>
+            </button>
+        <?php endif; ?>
         <section
             id="<?php
                 echo esc_attr(
                     $instance_id
                 );
             ?>"
-            class="le-global-chatbot"
+            class="le-global-chatbot<?php
+                echo $is_floating
+                    ? ' le-global-chatbot--floating'
+                    : '';
+            ?>"
+            data-mode="<?php
+                echo esc_attr(
+                    $mode
+                );
+            ?>"
             data-config-endpoint="<?php
                 echo esc_url(
                     $rest_base . '/config'
@@ -179,80 +245,153 @@ final class LE_Global_Chatbot_Plugin
                     $rest_base . '/chat'
                 );
             ?>"
+            <?php if ($is_floating) : ?>
+            role="dialog"
+            aria-labelledby="<?php
+                echo esc_attr(
+                    $title_id
+                );
+            ?>"
+            hidden
+            <?php endif; ?>
         >
-            <header class="le-global-chatbot__header">
-                <p class="le-global-chatbot__eyebrow">
-                    L&amp;E Global
-                </p>
+            <header class="le-global-chatbot__panel-header">
+                <div class="le-global-chatbot__panel-heading">
+                    <p class="le-global-chatbot__eyebrow">
+                        L&amp;E Global
+                    </p>
 
-                <h2 class="le-global-chatbot__title">
-                    Employment Law Assistant
-                </h2>
-
-                <p class="le-global-chatbot__introduction">
-                    Ask a question about employment law.
-                    Answers are generated exclusively from
-                    validated L&amp;E Global documents.
-                </p>
-            </header>
-
-            <form class="le-global-chatbot__form">
-                <div class="le-global-chatbot__field">
-                    <label
-                        class="le-global-chatbot__label"
-                        for="<?php
+                    <h2
+                        class="le-global-chatbot__title"
+                        id="<?php
                             echo esc_attr(
-                                $instance_id
-                                . '-question'
+                                $title_id
                             );
                         ?>"
                     >
-                        Your question
-                    </label>
+                        Employment Law Assistant
+                    </h2>
+                </div>
 
-                    <textarea
-                        id="<?php
-                            echo esc_attr(
-                                $instance_id
-                                . '-question'
-                            );
-                        ?>"
-                        class="le-global-chatbot__question"
-                        name="question"
-                        rows="5"
-                        minlength="2"
-                        maxlength="2000"
-                        required
-                        placeholder="Example: What is the statutory notice period in the United Kingdom?"
-                    ></textarea>
+                <?php if ($is_floating) : ?>
+                <button
+                    type="button"
+                    class="le-global-chatbot-floating__close"
+                    aria-label="Close the employment law assistant"
+                    data-close
+                >
+                    <span aria-hidden="true">&times;</span>
+                </button>
+                <?php endif; ?>
+            </header>
 
+            <div
+                class="le-global-chatbot__conversation"
+                data-conversation
+            >
+                <div
+                    class="le-global-chatbot__message le-global-chatbot__message--assistant"
+                >
+                    Ask a question about employment law.
+                    Countries and legal topics are detected
+                    automatically. Answers are based exclusively
+                    on validated L&amp;E Global documents.
+                </div>
+
+                <div
+                    class="le-global-chatbot__status"
+                    data-status
+                    role="status"
+                    aria-live="polite"
+                ></div>
+
+                <div
+                    class="le-global-chatbot__error"
+                    data-error
+                    role="alert"
+                    hidden
+                ></div>
+
+                <article
+                    class="le-global-chatbot__response"
+                    data-response
+                    hidden
+                >
+                    <div
+                        class="le-global-chatbot__message le-global-chatbot__message--user"
+                    >
+                        <p data-user-question></p>
+                    </div>
+
+                    <div
+                        class="le-global-chatbot__message le-global-chatbot__message--assistant"
+                        data-assistant-message
+                        hidden
+                    >
+                        <div
+                            class="le-global-chatbot__answer"
+                            data-answer
+                        ></div>
+
+                        <section
+                            class="le-global-chatbot__sources-section"
+                            data-sources-section
+                            hidden
+                        >
+                            <h4 class="le-global-chatbot__sources-title">
+                                Sources
+                            </h4>
+
+                            <ol
+                                class="le-global-chatbot__sources"
+                                data-sources
+                            ></ol>
+                        </section>
+
+                        <p class="le-global-chatbot__disclaimer">
+                            This information is based on the
+                            available L&amp;E Global documents
+                            and does not constitute legal advice.
+                        </p>
+                    </div>
+                </article>
+            </div>
+
+            <form class="le-global-chatbot__composer">
+                <label
+                    class="le-global-chatbot__sr-only"
+                    for="<?php
+                        echo esc_attr(
+                            $instance_id
+                            . '-question'
+                        );
+                    ?>"
+                >
+                    Your question
+                </label>
+
+                <textarea
+                    id="<?php
+                        echo esc_attr(
+                            $instance_id
+                            . '-question'
+                        );
+                    ?>"
+                    class="le-global-chatbot__question"
+                    name="question"
+                    rows="3"
+                    minlength="2"
+                    maxlength="2000"
+                    required
+                    placeholder="Ask an employment law question…"
+                ></textarea>
+
+                <div class="le-global-chatbot__composer-footer">
                     <div class="le-global-chatbot__counter">
                         <span data-character-count>0</span>
                         / 2000
                     </div>
-                </div>
 
-                <fieldset class="le-global-chatbot__fieldset">
-                    <legend class="le-global-chatbot__label">
-                        Countries
-                    </legend>
-
-                    <p class="le-global-chatbot__help">
-                        Optional. Leave empty to detect countries
-                        automatically from your question.
-                    </p>
-
-                    <div
-                        class="le-global-chatbot__countries"
-                        data-countries
-                    >
-                        <p class="le-global-chatbot__loading">
-                            Loading available countries…
-                        </p>
-                    </div>
-                </fieldset>
-
-                <div class="le-global-chatbot__actions">
                     <button
                         class="le-global-chatbot__submit"
                         type="submit"
@@ -261,57 +400,10 @@ final class LE_Global_Chatbot_Plugin
                     </button>
                 </div>
             </form>
-
-            <div
-                class="le-global-chatbot__status"
-                data-status
-                role="status"
-                aria-live="polite"
-            ></div>
-
-            <div
-                class="le-global-chatbot__error"
-                data-error
-                role="alert"
-                hidden
-            ></div>
-
-            <article
-                class="le-global-chatbot__response"
-                data-response
-                hidden
-            >
-                <h3 class="le-global-chatbot__response-title">
-                    Answer
-                </h3>
-
-                <div
-                    class="le-global-chatbot__answer"
-                    data-answer
-                ></div>
-
-                <section
-                    class="le-global-chatbot__sources-section"
-                    data-sources-section
-                    hidden
-                >
-                    <h4 class="le-global-chatbot__sources-title">
-                        Sources
-                    </h4>
-
-                    <ol
-                        class="le-global-chatbot__sources"
-                        data-sources
-                    ></ol>
-                </section>
-
-                <p class="le-global-chatbot__disclaimer">
-                    This information is based on the available
-                    L&amp;E Global documents and does not constitute
-                    legal advice.
-                </p>
-            </article>
         </section>
+        <?php if ($is_floating) : ?>
+        </div>
+        <?php endif; ?>
         <?php
 
         return (string) ob_get_clean();
@@ -555,14 +647,23 @@ final class LE_Global_Chatbot_Plugin
         );
 
         if (is_wp_error($response)) {
+            error_log(
+                sprintf(
+                    '[L&E Global Chatbot] Backend request '
+                    . 'failed (%s).',
+                    sanitize_key(
+                        (string) (
+                            $response->get_error_code()
+                        )
+                    )
+                )
+            );
+
             return new WP_Error(
                 'le_global_backend_unavailable',
                 'The legal assistant is temporarily unavailable.',
                 [
                     'status' => 502,
-                    'backend_error' => (
-                        $response->get_error_message()
-                    ),
                 ]
             );
         }

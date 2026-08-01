@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.2.0';
+    private const VERSION = '0.3.1';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -1166,14 +1166,21 @@ final class LE_Global_Chatbot_Admin
         );
 
         if (is_wp_error($response)) {
+            error_log(
+                sprintf(
+                    '[L&E Global Chatbot] Backend request '
+                    . 'failed (%s).',
+                    sanitize_key(
+                        (string) (
+                            $response->get_error_code()
+                        )
+                    )
+                )
+            );
+
             return new WP_Error(
                 'le_global_admin_backend_unavailable',
-                'The legal document service is temporarily unavailable.',
-                [
-                    'backend_error' => (
-                        $response->get_error_message()
-                    ),
-                ]
+                'The legal document service is temporarily unavailable.'
             );
         }
 
