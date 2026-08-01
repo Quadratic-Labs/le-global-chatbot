@@ -38,18 +38,23 @@ from app.services.rag_answer import (
     _build_repair_instructions,
     _build_retrieval_query,
     _build_rerank_input,
+    _build_search_request,
     _candidate_limit_per_country,
     _contains_contiguous_word_sequence,
     _country_heading_variants_for_code,
     _country_name_variants_for_codes,
+    _deduplicate_hits,
     _extract_answer_claims,
     _interleave_hits,
     _is_canonical_comparison_heading,
     _is_canonical_country_heading,
+    _normalize_requested_legal_topics,
     _parse_grounding_sections,
     _parse_rerank_order,
     _resolve_section_country_code,
+    _retrieve_country_hits,
     _retrieve_search_hits,
+    _select_topic_balanced_hits,
     _truncate_context,
     _validate_answer_quality,
     _validate_answer_structure,
@@ -73,18 +78,20 @@ def _build_hit(
         "Employees with between one month and two years "
         "of service are entitled to one week's notice."
     ),
+    legal_topic: str = "Employment Contracts",
+    score: float = 12.5,
 ) -> LegalSearchHit:
     """Build one valid legal search hit."""
 
     return LegalSearchHit(
-        score=12.5,
+        score=score,
         document_id=(
             f"document-{country_code.lower()}"
         ),
         chunk_id=chunk_id,
         country=country,
         country_code=country_code,
-        legal_topic="Employment Contracts",
+        legal_topic=legal_topic,
         document_type="comparator",
         language="en",
         section="02. Employment Contracts",
@@ -2642,8 +2649,8 @@ class RagAnswerTests(unittest.TestCase):
     ) -> None:
         bad_answer = (
             "Italy\n"
-            "- The duration of Italian maternity leave "
-            "is not specified [1]."
+            "- No information is available on the "
+            "duration of Italian maternity leave [1]."
         )
 
         result, _metrics, _client = self._assert_non_repairing_soft_warning(
@@ -2670,7 +2677,7 @@ class RagAnswerTests(unittest.TestCase):
         # Business regression guard: the false absence claim must
         # survive untouched, not be silently corrected away.
         self.assertIn(
-            "is not specified",
+            "No information is available",
             result.answer,
         )
 
@@ -2875,8 +2882,8 @@ class RagAnswerTests(unittest.TestCase):
                 "two months prior to childbirth."
             ),
             answer=(
-                "The exact duration is not specified "
-                "in the sources [1]."
+                "No information is available on the exact "
+                "duration in the sources [1]."
             ),
         )
 
@@ -3097,7 +3104,7 @@ class RagAnswerTests(unittest.TestCase):
             initial_answer=(
                 "United Kingdom\n"
                 "- The exact entitlement is not "
-                "specified [1]."
+                "available in the supplied sources [1]."
             ),
             question="What is the parental leave duration in the UK?",
             search_function=_make_search_function(
@@ -5144,6 +5151,2299 @@ class CitationGroundingTests(unittest.TestCase):
 
         self.assertTrue(
             response.grounded
+        )
+
+
+class TopicBalancedRetrievalTests(unittest.TestCase):
+    """Retrieval balances candidate selection by country and by topic."""
+
+    def test_normalize_requested_legal_topics_preserves_order(
+        self,
+    ) -> None:
+        result = _normalize_requested_legal_topics(
+            [
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+                "Employment Contracts",
+                "   ",
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            (
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            ),
+        )
+
+    def test_select_topic_balanced_hits_selects_one_per_topic(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="termination-a",
+                legal_topic="Termination of Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="termination-b",
+                legal_topic="Termination of Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="employment-a",
+                legal_topic="Employment Contracts",
+            ),
+        ]
+
+        result = _select_topic_balanced_hits(
+            hits=hits,
+            legal_topics=[
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            ],
+            limit=2,
+        )
+
+        self.assertEqual(
+            len(result),
+            2,
+        )
+
+        self.assertEqual(
+            {
+                hit.legal_topic
+                for hit in result
+            },
+            {
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            },
+        )
+
+    def test_select_topic_balanced_hits_preserves_rank_within_topic(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="termination-a",
+                legal_topic="Termination of Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="termination-b",
+                legal_topic="Termination of Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="employment-a",
+                legal_topic="Employment Contracts",
+            ),
+        ]
+
+        result = _select_topic_balanced_hits(
+            hits=hits,
+            legal_topics=[
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            ],
+            limit=2,
+        )
+
+        chunk_ids = [
+            hit.chunk_id
+            for hit in result
+        ]
+
+        self.assertIn(
+            "termination-a",
+            chunk_ids,
+        )
+
+        self.assertNotIn(
+            "termination-b",
+            chunk_ids,
+        )
+
+    def test_select_topic_balanced_hits_fills_missing_topic_capacity(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="termination-a",
+                legal_topic="Termination of Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="termination-b",
+                legal_topic="Termination of Employment Contracts",
+            ),
+        ]
+
+        result = _select_topic_balanced_hits(
+            hits=hits,
+            legal_topics=[
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            ],
+            limit=2,
+        )
+
+        self.assertEqual(
+            [
+                hit.chunk_id
+                for hit in result
+            ],
+            [
+                "termination-a",
+                "termination-b",
+            ],
+        )
+
+    def test_select_topic_balanced_hits_deduplicates_chunk_ids(
+        self,
+    ) -> None:
+        hits = [
+            _build_hit(
+                chunk_id="shared",
+                legal_topic="Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="shared",
+                legal_topic="Employment Contracts",
+            ),
+            _build_hit(
+                chunk_id="termination-a",
+                legal_topic="Termination of Employment Contracts",
+            ),
+        ]
+
+        result = _select_topic_balanced_hits(
+            hits=hits,
+            legal_topics=[
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            ],
+            limit=2,
+        )
+
+        chunk_ids = [
+            hit.chunk_id
+            for hit in result
+        ]
+
+        self.assertEqual(
+            len(chunk_ids),
+            len(set(chunk_ids)),
+        )
+
+        self.assertIn(
+            "shared",
+            chunk_ids,
+        )
+
+    def test_single_country_single_topic_keeps_one_search(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit()
+                ],
+            )
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question="What is the notice period in the UK?",
+                country_codes=["GB"],
+                legal_topics=["Employment Contracts"],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        self.assertEqual(
+            len(captured_requests),
+            1,
+        )
+
+        self.assertEqual(
+            captured_requests[0].limit,
+            6,
+        )
+
+    def test_single_country_multiple_topics_is_topic_balanced(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if topic == "Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id="employment-a",
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+            elif topic == "Termination of Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id="termination-a",
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    ),
+                    _build_hit(
+                        chunk_id="termination-b",
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    ),
+                ]
+            else:
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        self.assertEqual(
+            len(captured_requests),
+            2,
+        )
+
+        self.assertEqual(
+            {
+                hit.legal_topic
+                for hit in hits
+            },
+            {
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            },
+        )
+
+        self.assertLessEqual(
+            len(hits),
+            4,
+        )
+
+    def test_multi_country_multiple_topics_balances_country_and_topic(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if topic == "Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id=f"{country_code}-employment",
+                        country_code=country_code,
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+            elif topic == "Termination of Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id=f"{country_code}-termination-1",
+                        country_code=country_code,
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    ),
+                    _build_hit(
+                        chunk_id=f"{country_code}-termination-2",
+                        country_code=country_code,
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    ),
+                ]
+            else:
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in the United "
+                    "Kingdom, Australia and Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        self.assertEqual(
+            len(hits),
+            6,
+        )
+
+        counts_by_country: dict[str, int] = {}
+        topics_by_country: dict[str, set[str]] = {}
+
+        for hit in hits:
+            counts_by_country[hit.country_code] = (
+                counts_by_country.get(hit.country_code, 0) + 1
+            )
+            topics_by_country.setdefault(
+                hit.country_code,
+                set(),
+            ).add(
+                hit.legal_topic
+            )
+
+        self.assertEqual(
+            counts_by_country,
+            {
+                "GB": 2,
+                "AU": 2,
+                "SG": 2,
+            },
+        )
+
+        for topics in topics_by_country.values():
+            self.assertEqual(
+                topics,
+                {
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                },
+            )
+
+    def test_multi_country_topic_balance_regression_for_uk_notice(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if country_code == "GB":
+                if topic == "Termination of Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id="gb-severance",
+                            country_code="GB",
+                            legal_topic=(
+                                "Termination of Employment "
+                                "Contracts"
+                            ),
+                            score=20.0,
+                        ),
+                        _build_hit(
+                            chunk_id="gb-general-termination",
+                            country_code="GB",
+                            legal_topic=(
+                                "Termination of Employment "
+                                "Contracts"
+                            ),
+                            score=18.0,
+                        ),
+                    ]
+                elif topic == "Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id="gb-statutory-notice",
+                            country_code="GB",
+                            legal_topic="Employment Contracts",
+                            score=10.0,
+                        )
+                    ]
+                else:
+                    hits = []
+            else:
+                if topic == "Termination of Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id=f"{country_code}-termination",
+                            country_code=country_code,
+                            legal_topic=(
+                                "Termination of Employment "
+                                "Contracts"
+                            ),
+                        )
+                    ]
+                elif topic == "Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id=f"{country_code}-employment",
+                            country_code=country_code,
+                            legal_topic="Employment Contracts",
+                        )
+                    ]
+                else:
+                    hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare termination notice requirements "
+                    "in the United Kingdom, Australia and "
+                    "Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        chunk_ids = [
+            hit.chunk_id
+            for hit in hits
+        ]
+
+        self.assertIn(
+            "gb-statutory-notice",
+            chunk_ids,
+        )
+
+        gb_chunk_ids = {
+            hit.chunk_id
+            for hit in hits
+            if hit.country_code == "GB"
+        }
+
+        self.assertNotEqual(
+            gb_chunk_ids,
+            {
+                "gb-severance",
+                "gb-general-termination",
+            },
+        )
+
+        self.assertLessEqual(
+            len(hits),
+            6,
+        )
+
+    def test_topic_specific_search_requests_use_exact_topic_filter(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{topic}-hit",
+                    legal_topic=topic,
+                )
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                subsections=["Notice Period"],
+                language="en",
+                reference_year=2026,
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        self.assertEqual(
+            len(captured_requests),
+            2,
+        )
+
+        self.assertEqual(
+            [
+                request.legal_topics
+                for request in captured_requests
+            ],
+            [
+                ["Employment Contracts"],
+                ["Termination of Employment Contracts"],
+            ],
+        )
+
+        query_texts = {
+            request.query
+            for request in captured_requests
+        }
+
+        self.assertEqual(
+            len(query_texts),
+            1,
+        )
+
+        for request in captured_requests:
+            self.assertEqual(
+                request.country_codes,
+                ["GB"],
+            )
+
+            self.assertEqual(
+                request.subsections,
+                ["Notice Period"],
+            )
+
+            self.assertEqual(
+                request.language,
+                "en",
+            )
+
+            self.assertEqual(
+                request.reference_year,
+                2026,
+            )
+
+    def test_topic_search_empty_falls_back_to_broad_country_search(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            if len(
+                request.legal_topics
+            ) == 1:
+                hits = []
+            else:
+                hits = [
+                    _build_hit(
+                        chunk_id="broad-hit",
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        broad_requests = [
+            request
+            for request in captured_requests
+            if len(
+                request.legal_topics
+            ) == 2
+        ]
+
+        self.assertEqual(
+            len(broad_requests),
+            1,
+        )
+
+        self.assertEqual(
+            [
+                hit.chunk_id
+                for hit in hits
+            ],
+            [
+                "broad-hit",
+            ],
+        )
+
+    def test_partial_topic_results_do_not_trigger_broad_fallback(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            captured_requests.append(
+                request
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if topic == "Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id="employment-a",
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+            else:
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        broad_requests = [
+            request
+            for request in captured_requests
+            if len(
+                request.legal_topics
+            ) == 2
+        ]
+
+        self.assertEqual(
+            len(broad_requests),
+            0,
+        )
+
+        self.assertEqual(
+            [
+                hit.chunk_id
+                for hit in hits
+            ],
+            [
+                "employment-a",
+            ],
+        )
+
+    def test_rerank_runs_once_per_country_not_once_per_topic(
+        self,
+    ) -> None:
+        rerank_call_count = {
+            "count": 0,
+        }
+
+        class _CountingRerankClient:
+            model = "test-model"
+
+            def generate(
+                self,
+                instructions: str,
+                input_text: str,
+            ) -> GeneratedText:
+                rerank_call_count["count"] += 1
+
+                return GeneratedText(
+                    text="not valid json",
+                    model=self.model,
+                )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else "Employment Contracts"
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}-1",
+                    country_code=country_code,
+                    legal_topic=topic,
+                ),
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}-2",
+                    country_code=country_code,
+                    legal_topic=topic,
+                ),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK and Spain."
+                ),
+                country_codes=["GB", "ES"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=_CountingRerankClient(),
+            rerank_enabled=True,
+            rerank_pool_multiplier=1,
+        )
+
+        self.assertEqual(
+            rerank_call_count["count"],
+            2,
+        )
+
+        self.assertEqual(
+            {
+                hit.country_code
+                for hit in hits
+            },
+            {
+                "GB",
+                "ES",
+            },
+        )
+
+    def test_rerank_failure_falls_back_to_topic_balanced_bm25(
+        self,
+    ) -> None:
+        class _RaisingRerankClient:
+            model = "test-model"
+
+            def generate(
+                self,
+                instructions: str,
+                input_text: str,
+            ) -> GeneratedText:
+                raise OpenAIResponseError(
+                    "boom"
+                )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if topic == "Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id="employment-a",
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+            elif topic == "Termination of Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id="termination-a",
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    ),
+                    _build_hit(
+                        chunk_id="termination-b",
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    ),
+                ]
+            else:
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=_RaisingRerankClient(),
+            rerank_enabled=True,
+            rerank_pool_multiplier=1,
+        )
+
+        self.assertEqual(
+            {
+                hit.legal_topic
+                for hit in hits
+            },
+            {
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            },
+        )
+
+    def test_retrieval_total_sums_topic_search_totals(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if topic == "Employment Contracts":
+                total = 5
+                hits = [
+                    _build_hit(
+                        chunk_id="employment-a",
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+            elif topic == "Termination of Employment Contracts":
+                total = 7
+                hits = [
+                    _build_hit(
+                        chunk_id="termination-a",
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                    )
+                ]
+            else:
+                total = 0
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=total,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        retrieval_total, _hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        self.assertEqual(
+            retrieval_total,
+            12,
+        )
+
+    def test_selected_hits_never_exceed_max_sources(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else "Employment Contracts"
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}-{index}",
+                    country_code=country_code,
+                    legal_topic=topic,
+                )
+                for index in range(5)
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[
+                    :request.limit
+                ],
+            )
+
+        for country_codes in (
+            ["GB"],
+            ["GB", "AU"],
+            ["GB", "AU", "SG"],
+        ):
+            with self.subTest(
+                country_codes=country_codes
+            ):
+                _retrieval_total, hits = _retrieve_search_hits(
+                    request=LegalChatRequest(
+                        question=(
+                            "Compare notice and termination "
+                            "rules."
+                        ),
+                        country_codes=country_codes,
+                        legal_topics=[
+                            "Employment Contracts",
+                            "Termination of Employment Contracts",
+                        ],
+                        max_sources=6,
+                    ),
+                    search_function=fake_search,
+                    rerank_enabled=False,
+                )
+
+                self.assertLessEqual(
+                    len(hits),
+                    6,
+                )
+
+    def test_country_balance_remains_when_topic_missing_for_one_country(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else None
+            )
+
+            if country_code == "GB":
+                if topic == "Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id="gb-employment-1",
+                            country_code="GB",
+                            legal_topic="Employment Contracts",
+                        ),
+                        _build_hit(
+                            chunk_id="gb-employment-2",
+                            country_code="GB",
+                            legal_topic="Employment Contracts",
+                        ),
+                    ]
+                else:
+                    hits = []
+            else:
+                if topic == "Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id=f"{country_code}-employment",
+                            country_code=country_code,
+                            legal_topic="Employment Contracts",
+                        )
+                    ]
+                elif topic == "Termination of Employment Contracts":
+                    hits = [
+                        _build_hit(
+                            chunk_id=f"{country_code}-termination",
+                            country_code=country_code,
+                            legal_topic=(
+                                "Termination of Employment "
+                                "Contracts"
+                            ),
+                        )
+                    ]
+                else:
+                    hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        _retrieval_total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the United Kingdom and Australia."
+                ),
+                country_codes=["GB", "AU"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+        )
+
+        country_codes_found = {
+            hit.country_code
+            for hit in hits
+        }
+
+        self.assertEqual(
+            country_codes_found,
+            {
+                "GB",
+                "AU",
+            },
+        )
+
+        counts: dict[str, int] = {}
+
+        for hit in hits:
+            counts[hit.country_code] = (
+                counts.get(hit.country_code, 0) + 1
+            )
+
+        self.assertLessEqual(
+            counts.get("GB", 0),
+            2,
+        )
+
+        self.assertLessEqual(
+            counts.get("AU", 0),
+            2,
+        )
+
+    def test_system_instructions_do_not_request_internal_references(
+        self,
+    ) -> None:
+        self.assertNotIn(
+            "available L&E Global documents do not contain "
+            "enough information",
+            SYSTEM_INSTRUCTIONS,
+        )
+
+        normalized_instructions = " ".join(SYSTEM_INSTRUCTIONS.split())
+        self.assertIn(
+            "Never mention documents, extracts, materials, "
+            "context, retrieval, source availability",
+            normalized_instructions,
+        )
+
+    def test_supported_multi_country_answer_has_no_internal_reference(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to notice [1].\n"
+            "Australia\n"
+            "- Notice depends on length of service [2].\n"
+            "Comparison\n"
+            "- Both jurisdictions recognise notice "
+            "obligations [1, 2]."
+        )
+
+        self.assertEqual(
+            _validate_no_internal_references(
+                answer
+            ),
+            [],
+        )
+
+    def test_topic_balancing_does_not_add_generation_call(
+        self,
+    ) -> None:
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+                if request.legal_topics
+                else "Employment Contracts"
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}",
+                    country_code=country_code,
+                    legal_topic=topic,
+                )
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        client = FakeGenerationClient(
+            answer=(
+                "United Kingdom\n"
+                "- Employees are entitled to notice [1].\n"
+                "- Additional termination protections "
+                "apply [2]."
+            ),
+        )
+
+        metrics = _build_metrics(
+            "test-topic-balance-single-generation"
+        )
+
+        result = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            rerank_enabled=False,
+            metrics=metrics,
+        )
+
+        self.assertTrue(
+            result.grounded
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            1,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            False,
+        )
+
+        main_calls = [
+            call
+            for call in client.calls
+            if call[0] != RERANK_INSTRUCTIONS
+        ]
+
+        self.assertEqual(
+            len(main_calls),
+            1,
+        )
+
+
+class RetrievalMetricsSeparationTests(unittest.TestCase):
+    """opensearch_ms and rerank_ms must never double-count the same call."""
+
+    @staticmethod
+    def _assert_all_durations_non_negative(
+        metric_mock: mock.Mock,
+    ) -> None:
+        for call in metric_mock.call_args_list:
+            (duration,) = call.args
+            assert duration >= 0
+
+    def test_multi_topic_without_rerank_records_only_search_timings(
+        self,
+    ) -> None:
+        search_call_count = {
+            "count": 0,
+        }
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            search_call_count["count"] += 1
+
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}-1",
+                    country_code=country_code,
+                    legal_topic=topic,
+                )
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        metrics = mock.Mock()
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK, Australia and Singapore."
+                ),
+                country_codes=["GB", "AU", "SG"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=6,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            search_call_count["count"],
+            6,
+        )
+
+        self.assertEqual(
+            metrics.add_opensearch_seconds.call_count,
+            6,
+        )
+
+        metrics.add_rerank_seconds.assert_not_called()
+
+        self._assert_all_durations_non_negative(
+            metrics.add_opensearch_seconds
+        )
+
+    def test_multi_topic_with_rerank_separates_search_and_rerank_timings(
+        self,
+    ) -> None:
+        search_call_count = {
+            "count": 0,
+        }
+
+        rerank_call_count = {
+            "count": 0,
+        }
+
+        class _CountingRerankClient:
+            model = "test-model"
+
+            def generate(
+                self,
+                instructions: str,
+                input_text: str,
+            ) -> GeneratedText:
+                rerank_call_count["count"] += 1
+
+                return GeneratedText(
+                    text="not valid json",
+                    model=self.model,
+                )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            search_call_count["count"] += 1
+
+            country_code = (
+                request.country_codes[0]
+            )
+
+            topic = (
+                request.legal_topics[0]
+            )
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}-1",
+                    country_code=country_code,
+                    legal_topic=topic,
+                ),
+                _build_hit(
+                    chunk_id=f"{country_code}-{topic}-2",
+                    country_code=country_code,
+                    legal_topic=topic,
+                ),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        metrics = mock.Mock()
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK and Spain."
+                ),
+                country_codes=["GB", "ES"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=_CountingRerankClient(),
+            rerank_enabled=True,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            search_call_count["count"],
+            4,
+        )
+
+        self.assertEqual(
+            metrics.add_opensearch_seconds.call_count,
+            4,
+        )
+
+        self.assertEqual(
+            rerank_call_count["count"],
+            2,
+        )
+
+        self.assertEqual(
+            metrics.add_rerank_seconds.call_count,
+            2,
+        )
+
+        self._assert_all_durations_non_negative(
+            metrics.add_opensearch_seconds
+        )
+
+        self._assert_all_durations_non_negative(
+            metrics.add_rerank_seconds
+        )
+
+    def test_single_country_single_topic_rerank_metrics(
+        self,
+    ) -> None:
+        search_call_count = {
+            "count": 0,
+        }
+
+        rerank_call_count = {
+            "count": 0,
+        }
+
+        class _CountingRerankClient:
+            model = "test-model"
+
+            def generate(
+                self,
+                instructions: str,
+                input_text: str,
+            ) -> GeneratedText:
+                rerank_call_count["count"] += 1
+
+                return GeneratedText(
+                    text="not valid json",
+                    model=self.model,
+                )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            search_call_count["count"] += 1
+
+            hits = [
+                _build_hit(
+                    chunk_id="gb-hit-1",
+                ),
+                _build_hit(
+                    chunk_id="gb-hit-2",
+                ),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        metrics = mock.Mock()
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question="What is the notice period in the UK?",
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=_CountingRerankClient(),
+            rerank_enabled=True,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            search_call_count["count"],
+            1,
+        )
+
+        self.assertEqual(
+            metrics.add_opensearch_seconds.call_count,
+            1,
+        )
+
+        self.assertEqual(
+            rerank_call_count["count"],
+            1,
+        )
+
+        self.assertEqual(
+            metrics.add_rerank_seconds.call_count,
+            1,
+        )
+
+    def test_all_topics_empty_fallback_metrics(
+        self,
+    ) -> None:
+        search_call_count = {
+            "count": 0,
+        }
+
+        rerank_call_count = {
+            "count": 0,
+        }
+
+        class _CountingRerankClient:
+            model = "test-model"
+
+            def generate(
+                self,
+                instructions: str,
+                input_text: str,
+            ) -> GeneratedText:
+                rerank_call_count["count"] += 1
+
+                return GeneratedText(
+                    text="not valid json",
+                    model=self.model,
+                )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            search_call_count["count"] += 1
+
+            if len(
+                request.legal_topics
+            ) == 1:
+                hits: list[LegalSearchHit] = []
+            else:
+                hits = [
+                    _build_hit(
+                        chunk_id="broad-hit-1",
+                    ),
+                    _build_hit(
+                        chunk_id="broad-hit-2",
+                    ),
+                ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        metrics = mock.Mock()
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=_CountingRerankClient(),
+            rerank_enabled=True,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            search_call_count["count"],
+            3,
+        )
+
+        self.assertEqual(
+            metrics.add_opensearch_seconds.call_count,
+            3,
+        )
+
+        self.assertEqual(
+            rerank_call_count["count"],
+            1,
+        )
+
+        self.assertEqual(
+            metrics.add_rerank_seconds.call_count,
+            1,
+        )
+
+    def test_partial_topic_result_has_no_fallback_metric(
+        self,
+    ) -> None:
+        search_call_count = {
+            "count": 0,
+        }
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            search_call_count["count"] += 1
+
+            topic = (
+                request.legal_topics[0]
+            )
+
+            if topic == "Employment Contracts":
+                hits = [
+                    _build_hit(
+                        chunk_id="employment-a",
+                        legal_topic="Employment Contracts",
+                    )
+                ]
+            else:
+                hits = []
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        metrics = mock.Mock()
+
+        _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice and termination rules "
+                    "in the UK."
+                ),
+                country_codes=["GB"],
+                legal_topics=[
+                    "Employment Contracts",
+                    "Termination of Employment Contracts",
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            rerank_enabled=False,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            search_call_count["count"],
+            2,
+        )
+
+        self.assertEqual(
+            metrics.add_opensearch_seconds.call_count,
+            2,
+        )
+
+        metrics.add_rerank_seconds.assert_not_called()
+
+
+class FalseAbsencePrecisionAndStructureRepairTests(unittest.TestCase):
+    """
+    false_absence_claim must ignore ordinary contractual/statutory
+    wording and only flag genuine unavailable-information claims;
+    the structure repair prompt must explicitly state the bullet
+    limits so the model actually consolidates excess bullets.
+    """
+
+    def test_false_absence_ignores_contract_does_not_specify(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to 1 week's notice.",
+            answer=(
+                "If the employment contract does not specify "
+                "the notice period, the statutory defaults "
+                "apply [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_no_contractual_notice_provision(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of notice.",
+            answer=(
+                "Employees with no contractual notice provision "
+                "may be entitled to a reasonable period of "
+                "notice [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_less_than_service_condition(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to two weeks of annual leave.",
+            answer=(
+                "An employee with not less than three months "
+                "of service is entitled to annual leave [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_carryover_prohibition(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to two weeks of annual leave.",
+            answer="Statutory leave cannot normally be carried over [1].",
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_detects_no_information_available(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to one week's notice.",
+            answer=(
+                "No information is available on the statutory "
+                "notice period."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_detects_definitive_answer_unavailable(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of notice.",
+            answer=(
+                "A definitive answer cannot be provided for "
+                "the statutory notice period."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_requires_concrete_duration_in_context(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="The applicable rules are described in general terms.",
+            answer=(
+                "No information is available on the statutory "
+                "notice period."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_available_in_time_condition(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer="The benefit is not available in the first year [1].",
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_available_in_legal_instrument(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer=(
+                "The option is not available in collective "
+                "agreements [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_not_provided_in_contract(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer=(
+                "The payment date is not provided in the "
+                "employment contract [1]."
+            ),
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_ignores_missing_from_agreement(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of leave.",
+            answer="The clause is missing from the agreement [1].",
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+    def test_false_absence_detects_not_available_in_supplied_sources(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to one week's notice.",
+            answer=(
+                "The statutory notice period is not available "
+                "in the supplied sources."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_detects_not_provided_in_documents(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to four weeks of notice.",
+            answer=(
+                "The statutory duration is not provided in "
+                "the documents."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_false_absence_detects_missing_from_provided_materials(
+        self,
+    ) -> None:
+        errors = _validate_no_false_absence_claims(
+            context="Employees are entitled to 14 days of notice.",
+            answer=(
+                "The relevant information is missing from "
+                "the provided materials."
+            ),
+        )
+
+        self.assertTrue(
+            errors
+        )
+
+        self.assertTrue(
+            all(
+                error.error_type == "false_absence_claim"
+                for error in errors
+            )
+        )
+
+    def test_structure_repair_instructions_include_exact_limits(
+        self,
+    ) -> None:
+        instructions = _build_repair_instructions(
+            errors=[
+                QualityError(
+                    error_type="structure",
+                    message="Australia contains more than four bullets.",
+                )
+            ]
+        )
+
+        self.assertIn(
+            "no more than four concise bullets",
+            instructions,
+        )
+
+        self.assertIn(
+            "no more than two bullets",
+            instructions,
+        )
+
+        self.assertIn(
+            "no more than six bullets",
+            instructions,
+        )
+
+        self.assertIn(
+            "Merge closely related points",
+            instructions,
+        )
+
+    def test_non_structure_repair_does_not_add_bullet_limit_instruction(
+        self,
+    ) -> None:
+        instructions = _build_repair_instructions(
+            errors=[
+                QualityError(
+                    error_type="internal_reference",
+                    message="The answer references internal mechanics.",
+                )
+            ]
+        )
+
+        self.assertNotIn(
+            "consolidate each country section",
+            instructions,
+        )
+
+        self.assertNotIn(
+            "Merge closely related points",
+            instructions,
+        )
+
+    def test_structure_repair_succeeds_after_consolidation(
+        self,
+    ) -> None:
+        first_answer = (
+            "United Kingdom\n"
+            "- UK point 1 [1].\n"
+            "Australia\n"
+            "- AU point 1 [2].\n"
+            "- AU point 2 [2].\n"
+            "- AU point 3 [2].\n"
+            "- AU point 4 [2].\n"
+            "- AU point 5 [2].\n"
+            "- AU point 6 [2].\n"
+            "Singapore\n"
+            "- SG point 1 [3].\n"
+            "Comparison\n"
+            "- Comparison point 1 [1, 2]."
+        )
+
+        repaired_answer = (
+            "United Kingdom\n"
+            "- UK point 1 [1].\n"
+            "Australia\n"
+            "- AU point 1 [2].\n"
+            "- AU point 2 [2].\n"
+            "- AU point 3 [2].\n"
+            "- AU point 4 [2].\n"
+            "Singapore\n"
+            "- SG point 1 [3].\n"
+            "Comparison\n"
+            "- Comparison point 1 [1, 2]."
+        )
+
+        client = FakeGenerationClient(
+            answer=first_answer,
+            repair_answer=repaired_answer,
+        )
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            country_code = request.country_codes[0]
+
+            hit = {
+                "GB": _build_hit(
+                    chunk_id="chunk-gb",
+                    country="United Kingdom",
+                    country_code="GB",
+                ),
+                "AU": _build_hit(
+                    chunk_id="chunk-au",
+                    country="Australia",
+                    country_code="AU",
+                ),
+                "SG": _build_hit(
+                    chunk_id="chunk-sg",
+                    country="Singapore",
+                    country_code="SG",
+                ),
+            }[country_code]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    hit,
+                ],
+            )
+
+        metrics = _build_metrics(
+            "test-structure-repair-consolidation"
+        )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Compare annual leave rules in the UK, "
+                    "Australia and Singapore."
+                ),
+                country_codes=[
+                    "GB",
+                    "AU",
+                    "SG",
+                ],
+            ),
+            search_function=fake_search,
+            generation_client=client,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            2,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            True,
+        )
+
+        self.assertIs(
+            metrics.repair_answer_returned,
+            True,
+        )
+
+        self.assertIs(
+            metrics.repair_success,
+            True,
+        )
+
+        self.assertEqual(
+            metrics.final_soft_error_types,
+            [],
+        )
+
+        self.assertEqual(
+            response.answer,
+            repaired_answer,
+        )
+
+    def test_false_absence_remains_non_repairing(
+        self,
+    ) -> None:
+        initial_answer = (
+            "United Kingdom\n"
+            "- No information is available on the "
+            "statutory notice period [1]."
+        )
+
+        client = FakeGenerationClient(
+            answer=initial_answer,
+        )
+
+        metrics = _build_metrics(
+            "test-false-absence-remains-non-repairing"
+        )
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question="What is the statutory notice period in the UK?",
+                country_codes=[
+                    "GB",
+                ],
+            ),
+            search_function=_make_search_function(
+                hits=[
+                    _build_hit(
+                        content=(
+                            "Employees are entitled to "
+                            "one week's notice."
+                        ),
+                    )
+                ]
+            ),
+            generation_client=client,
+            metrics=metrics,
+        )
+
+        self.assertEqual(
+            response.answer,
+            initial_answer,
+        )
+
+        self.assertEqual(
+            metrics.generation_attempts,
+            1,
+        )
+
+        self.assertIs(
+            metrics.repair_triggered,
+            False,
+        )
+
+        self.assertIn(
+            "false_absence_claim",
+            metrics.initial_soft_error_types,
         )
 
 
