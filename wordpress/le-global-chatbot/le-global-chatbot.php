@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.4.0
+ * Version: 0.4.1
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.4.0';
+    private const VERSION = '0.4.1';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -35,11 +35,15 @@ final class LE_Global_Chatbot_Plugin
 
     private const MAX_SOURCES_MAX = 10;
 
-    private const HISTORY_MAX_MESSAGES = 6;
+    private const HISTORY_MAX_MESSAGES = 20;
 
     private const HISTORY_MESSAGE_MAX_CHARACTERS = 4000;
 
-    private const HISTORY_TOTAL_MAX_CHARACTERS = 10000;
+    // Scaled proportionally with HISTORY_MAX_MESSAGES (previously
+    // 10000 for 6 messages), matching the backend's
+    // HISTORY_TOTAL_MAX_CHARACTERS exactly - the per-message limit
+    // above is unchanged.
+    private const HISTORY_TOTAL_MAX_CHARACTERS = 33333;
 
     private const HISTORY_ALLOWED_ROLES = [
         'user',

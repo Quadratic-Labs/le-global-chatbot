@@ -5,9 +5,13 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-HISTORY_MAX_MESSAGES = 6
+HISTORY_MAX_MESSAGES = 20
 HISTORY_MESSAGE_MAX_CHARACTERS = 4000
-HISTORY_TOTAL_MAX_CHARACTERS = 10000
+# Scaled proportionally with HISTORY_MAX_MESSAGES (previously 10000 for
+# 6 messages) - the per-message limit above is unchanged.
+HISTORY_TOTAL_MAX_CHARACTERS = (
+    HISTORY_MAX_MESSAGES * 10000 // 6
+)
 
 
 class LegalChatHistoryMessage(BaseModel):

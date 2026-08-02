@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Final
 
 from app.models.catalog import LegalCatalogResponse
+from app.models.chat import HISTORY_MAX_MESSAGES
 from app.models.frontend import (
     FrontendConfigResponse,
     FrontendLimits,
@@ -66,6 +67,7 @@ def get_frontend_config(
             max_sources_default=MAX_SOURCES_DEFAULT,
             max_sources_min=MAX_SOURCES_MIN,
             max_sources_max=MAX_SOURCES_MAX,
+            max_history_messages=HISTORY_MAX_MESSAGES,
         ),
         catalog=catalog,
     )

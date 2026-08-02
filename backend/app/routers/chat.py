@@ -18,6 +18,7 @@ from fastapi import (
 
 from app.clients.openai_responses import (
     OpenAIConfigurationError,
+    OpenAIResponsesClient,
 )
 from app.core.config import get_settings
 from app.models.chat import (
@@ -45,17 +46,25 @@ from app.services.legal_search import (
     search_legal_documents,
 )
 from app.services.legal_topic_detection import (
+    CANONICAL_LEGAL_TOPICS,
+    LegalScope,
+    detect_legal_topics,
     resolve_legal_scope,
 )
 from app.services.rag_answer import (
     DEFAULT_MAX_CONTEXT_CHARACTERS,
     DEFAULT_MAX_SOURCE_CHARACTERS,
-    NO_INFORMATION_ANSWER,
     InvalidLegalChatRequestError,
     RagAnswerError,
     SearchFunction,
     TextGenerationClient,
     answer_legal_question,
+)
+from app.services.request_understanding import (
+    DeterministicHints,
+    HistoryTurn,
+    RequestUnderstandingResult,
+    understand_request,
 )
 
 
@@ -72,61 +81,30 @@ UNAVAILABLE_COUNTRIES_ANSWER_TEMPLATE: Final[str] = (
     "country-specific legal advice."
 )
 
-
-# Maximum characters of a previous user question folded into a
-# contextualized search question, and how many distinct previous
-# questions may be folded in at once - kept short/few since this only
-# needs to disambiguate a follow-up, not restate prior turns.
-MAX_CONTEXTUAL_PREVIOUS_QUESTION_CHARACTERS: Final[int] = 500
-MAX_CONTEXTUAL_PREVIOUS_QUESTIONS: Final[int] = 2
+MISSING_COUNTRY_ANSWER: Final[str] = (
+    "Please select or name at least one country so I can answer "
+    "from the relevant validated L&E Global documents."
+)
 
 
-# Contact-intent detection is split into three categories, per the
-# mission's own naming:
+# ---------------------------------------------------------------------
+# STRONG_CONTACT_INTENT / COUNTRY_SCOPED_REACH_INTENT
 #
-# STRONG_CONTACT_INTENT (see _detect_contact_intent) - precise enough
-# to route to the deterministic contact path from the question text
-# alone, with no country/topic context needed:
-#   - precise_le_global_identification: a direct identification
-#     question ("what/which/who/where is/are the L&E Global ...") -
-#     never a loose "L&E Global ... appears somewhere with a
-#     structure noun" co-occurrence, which used to fire even for
-#     "Can the L&E Global member firm terminate an employee?".
-#   - professional_acquisition_request: a professional/firm is the
-#     actual grammatical object of an explicit acquisition phrasing
-#     ("find me AN EMPLOYMENT LAWYER", "I need AN EMPLOYMENT LAWYER")
-#     - never merely mentioned alongside it ("find me CASES ABOUT law
-#       firms", "I need INFORMATION ABOUT employment lawyers"), and
-#     never in possessive form ("an ATTORNEY'S rights").
-#   - explicit_contact_data_request: a contact-data expression
-#     explicitly linked (via "of"/"for", or as "<office> <data
-#     term>") to a professional/firm/L&E-Global/office target - never
-#     a bare data expression, and never merely co-occurring anywhere
-#     in the sentence with a professional noun (which used to fire
-#     for "Show me the law firm's OBLIGATIONS" just because "law
-#     firm" and an acquisition verb both appeared somewhere).
-#
-# COUNTRY_SCOPED_REACH_INTENT (see _has_direct_who_to_reach_form,
-# combined by the router with a resolved country and the absence of a
-# supported legal topic on the current question) - a direct "who/how
-# can I reach ..." form names no professional at all, so it is only
-# contact intent when the question is not really about a legal topic
-# and a country is otherwise identified ("Who should I email in
-# Peru?"), never when a legal topic is also present ("Who should I
-# contact regarding dismissal procedure in Australia?" stays legal).
+# These regexes are kept exactly as before, but no longer decide
+# anything on their own: RequestUnderstanding is now the primary
+# router for every free-text request, and these only ever feed it a
+# `strong_contact_signal` hint (see _build_deterministic_hints). A
+# country and a legal topic being deterministically resolvable on the
+# current question is never, by itself, proof that the whole request
+# is understood - that decision is RequestUnderstanding's alone.
+# ---------------------------------------------------------------------
 
 # precise_le_global_identification: an identification question,
 # anchored at the very start of the (normalized) question AND
 # validated all the way to the end - never a general co-occurrence
-# anywhere in the sentence (which used to also fire for "Can the L&E
-# Global member firm terminate an employee?"), and never a structure
-# noun followed by anything other than a location clause or the end of
-# the question (which used to also fire for "What is the L&E Global
-# member firm's obligation regarding dismissal?" or "What is the L&E
-# Global office policy on overtime?" - both continue past the
-# structure noun into unrelated legal content). After the structure
-# noun, only end-of-question, or "in"/"for"/"covers(ing)"/"serves(ing)"
-# followed by a place and then the end of the question, are accepted.
+# anywhere in the sentence. After the structure noun, only end-of-
+# question, or "in"/"for"/"covers(ing)"/"serves(ing)" followed by a
+# place and then the end of the question, are accepted.
 _PRECISE_LE_GLOBAL_IDENTIFICATION_PATTERN: Final[
     re.Pattern[str]
 ] = re.compile(
@@ -140,14 +118,7 @@ _PRECISE_LE_GLOBAL_IDENTIFICATION_PATTERN: Final[
 )
 
 # professional_acquisition_request: a professional/firm/legal-counsel
-# noun as the immediate object of an explicit acquisition phrasing -
-# an optional article, then the noun, then either nothing more, a
-# sentence-ending punctuation mark, or a location phrase ("in Peru",
-# "there"). Excludes a possessive ("an attorney's ...") and excludes
-# the noun being followed by anything else ("cases about ...",
-# "information about ...", "'s obligations ...", "policy on ..."),
-# since those mean the professional is merely mentioned, not the thing
-# being requested.
+# noun as the immediate object of an explicit acquisition phrasing.
 _PROFESSIONAL_ACQUISITION_VERB_PATTERN: Final[str] = (
     r"(?:find\s+me|find\s+us|give\s+me|give\s+us"
     r"|send\s+me|send\s+us"
@@ -176,10 +147,7 @@ _PROFESSIONAL_ACQUISITION_REQUEST_PATTERN: Final[
 
 # Shared verb-phrase alternation for every "explicit request" pattern
 # below - reused by form 1 (data + of/for + target), form 2 (office +
-# data suffix), and form 3 (target + contact as a noun). Only these
-# phrasings ever introduce a request; a bare mention of a data
-# expression or a professional noun elsewhere in the sentence never
-# does, regardless of what verb happens to appear nearby.
+# data suffix), and form 3 (target + contact as a noun).
 _EXPLICIT_REQUEST_VERB_PATTERN: Final[str] = (
     r"(?:give\s+me|send\s+me|provide\s+me\s+with|show\s+me"
     r"|(?:can|could|would)\s+you\s+give\s+me"
@@ -193,11 +161,7 @@ _EXPLICIT_REQUEST_VERB_PATTERN: Final[str] = (
 # explicit_contact_data_request, form 1: one of the phrasings above,
 # directly followed (only an article/preposition in between) by a
 # contact-data expression explicitly linked via "of"/"for" to a
-# professional/firm/L&E-Global target. Never a bare data+target
-# co-occurrence with no request phrasing at all (which used to also
-# fire for "Is the email address of a lawyer personal data?" or "Can
-# an employer disclose the phone number of an attorney?" - neither
-# contains any of these phrasings).
+# professional/firm/L&E-Global target.
 _EXPLICIT_CONTACT_DATA_TARGET_PATTERN: Final[str] = (
     r"(?:employment\s+lawyers?|legal\s+counsels?|member\s+firms?"
     r"|law\s+firms?|lawyers?|attorneys?|l&e\s+global\s+offices?"
@@ -224,14 +188,9 @@ _EXPLICIT_CONTACT_DATA_REQUEST_PATTERN: Final[
 )
 
 # explicit_contact_data_request, form 1b: the one interrogative
-# exception ("What is the phone number for the L&E Global office in
-# Peru?") that never contains an "explicit request" verb phrase at
+# exception that never contains an "explicit request" verb phrase at
 # all - validated as its own complete structure, anchored from the
-# very start of the question to its end (an optional trailing "in"/
-# "for" + place), exactly like precise_le_global_identification. This
-# is what tells it apart from "What rules govern the email address of
-# an attorney?", which does not open with "what is the" immediately
-# followed by a data term.
+# very start of the question to its end.
 _INTERROGATIVE_CONTACT_DATA_REQUEST_PATTERN: Final[
     re.Pattern[str]
 ] = re.compile(
@@ -244,17 +203,7 @@ _INTERROGATIVE_CONTACT_DATA_REQUEST_PATTERN: Final[
 
 # explicit_contact_data_request, form 2: one of the request phrasings
 # above, followed anywhere later in the question by "<office> <data
-# term>" as its final phrase ("the Peru office email", "the Australia
-# office phone number") - a genuine bureau's own coordinates. The
-# request phrasing is what tells "Can I have the Peru office email?"
-# apart from "Who may access the Peru office email?" or "What policy
-# governs the Peru office address?", neither of which asks to be given
-# anything. The grammatical possessive immediately before "office"
-# ('s / s' / their / his / her, never an enumerated list of which
-# possessor is disallowed) still excludes someone's own workplace
-# ("the employee's office address"), and the data term must still end
-# the question, excluding a requirement/policy statement ("the office
-# address requirement for employment contracts").
+# term>" as its final phrase - a genuine bureau's own coordinates.
 _OFFICE_CONTACT_DATA_SUFFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\b"
     + _EXPLICIT_REQUEST_VERB_PATTERN
@@ -266,16 +215,7 @@ _OFFICE_CONTACT_DATA_SUFFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
 
 # explicit_contact_data_request, form 3: one of the request phrasings
 # above, immediately followed (only an article in between) by a
-# professional/firm noun and "contact" used as a noun ("a lawyer
-# contact", "an employment lawyer contact") - the professional+contact
-# phrase must be the direct object of the request, exactly like
-# professional_acquisition_request, never merely co-occurring anywhere
-# else in the sentence. This is what tells "Can you give me a lawyer
-# contact there?" apart from "Can you show me whether a lawyer contact
-# is personal data?" (the object of "show me" is "whether ...", not
-# "a lawyer contact") or "Can you provide information about a lawyer
-# contact policy?" (the object of "provide" is "information", and the
-# noun phrase itself continues into "policy").
+# professional/firm noun and "contact" used as a noun.
 _LAWYER_CONTACT_TARGET_PATTERN: Final[str] = (
     r"(?:employment\s+lawyers?|legal\s+counsels?|member\s+firms?"
     r"|law\s+firms?|lawyers?|attorneys?|l&e\s+global)"
@@ -305,17 +245,17 @@ _LAWYER_CONTACT_ACQUISITION_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 
 # country_scoped_reach_intent's phrasing half: a direct first-person
-# "who/how can I reach ..." form. Its own grammatical object already
-# is the professional/office to reach, but unlike the phrasings above
-# it names no professional at all - so it is never sufficient by
-# itself. The router (resolve_legal_chat_response) only treats it as
-# contact intent once a country is resolved AND the current question
-# carries no supported legal topic.
+# "who/how can I reach ..." form.
 _DIRECT_WHO_TO_REACH_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\bwho\s+(?:can|should)\s+i\s+"
     r"(?:contact|speak\s+to|email|call)\b"
     r"|\bhow\s+(?:can|do|should)\s+i\s+"
     r"(?:contact|reach|email|call|speak\s+to)\b"
+)
+
+_COMPARISON_SIGNAL_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\bcompar\w*\b|\bversus\b|\bvs\.?\b|\brather\s+than\b"
+    r"|\bdiffer\w*\b|\bbetween\b.*\band\b"
 )
 
 _CONTACT_TYPOGRAPHIC_APOSTROPHE_PATTERN: Final[
@@ -335,6 +275,43 @@ CONTACT_CLARIFICATION_ANSWER: Final[str] = (
 CONTACT_NOT_FOUND_ANSWER_TEMPLATE: Final[str] = (
     "I could not find a validated L&E Global contact for "
     "{country} in the available documents."
+)
+
+CLARIFICATION_LEGAL_MISSING_COUNTRY_ANSWER: Final[str] = (
+    "Which country would you like information about?"
+)
+
+CLARIFICATION_MISSING_COMPARISON_COUNTRIES_ANSWER: Final[str] = (
+    "Which countries would you like to compare?"
+)
+
+CLARIFICATION_MISSING_COMPARISON_TOPIC_ANSWER: Final[str] = (
+    "Which employment law topic would you like to compare? For "
+    "example, termination, working time, leave, remuneration or "
+    "employment contracts."
+)
+
+CLARIFICATION_AMBIGUOUS_WITH_COUNTRY_TEMPLATE: Final[str] = (
+    "Are you looking for employment law information about "
+    "{country}, or would you like the contact details of the L&E "
+    "Global member firm in {country}?"
+)
+
+CLARIFICATION_AMBIGUOUS_REQUEST_ANSWER: Final[str] = (
+    "Could you clarify your question? Please specify the country and "
+    "the employment law topic - or the contact - you are asking about."
+)
+
+CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER: Final[str] = (
+    "This assistant can only answer employment law questions, and "
+    "related L&E Global contacts, covered by the validated documents. "
+    "Please rephrase your question within that scope."
+)
+
+CLARIFICATION_EXPLICIT_FILTER_CONFLICT_ANSWER: Final[str] = (
+    "Your question appears to concern a different country than the "
+    "one specified in this request's country filter. Please clarify "
+    "which country you would like this answer for."
 )
 
 
@@ -382,10 +359,7 @@ def _iter_recent_user_questions(
 
     Never yields an assistant turn - a historical answer is
     conversational context only, never a source of country or topic
-    information. Entries whose content is empty after stripping are
-    skipped. History already holds at most the three most recently
-    validated user turns, so this naturally yields at most three
-    questions.
+    information.
     """
 
     for message in reversed(history):
@@ -398,48 +372,6 @@ def _iter_recent_user_questions(
             continue
 
         yield stripped_content
-
-
-def _build_contextual_question(
-    previous_questions: list[str],
-    current_question: str,
-) -> str:
-    """
-    Build a short, explicitly-labeled disambiguation string.
-
-    Folds in only the previous user question(s) actually needed to
-    resolve a country or topic gap - never an assistant turn, never
-    the full history - each capped at
-    MAX_CONTEXTUAL_PREVIOUS_QUESTION_CHARACTERS. Used both to try one
-    candidate previous question during fallback resolution (called
-    with a single-item list) and to build the question actually sent
-    to retrieval once the one or two necessary previous questions are
-    known.
-    """
-
-    clipped_questions = [
-        previous_question[
-            :MAX_CONTEXTUAL_PREVIOUS_QUESTION_CHARACTERS
-        ]
-        for previous_question in previous_questions
-    ]
-
-    if len(clipped_questions) == 1:
-        return (
-            "Relevant previous user question:\n"
-            f"{clipped_questions[0]}\n\n"
-            f"Current question:\n{current_question}"
-        )
-
-    bullet_lines = "\n".join(
-        f"- {question}" for question in clipped_questions
-    )
-
-    return (
-        "Relevant previous user questions:\n"
-        f"{bullet_lines}\n\n"
-        f"Current question:\n{current_question}"
-    )
 
 
 def _normalize_contact_question(
@@ -464,22 +396,8 @@ def _detect_contact_intent(
     question: str,
 ) -> bool:
     """
-    Detect STRONG_CONTACT_INTENT - precise enough to route to the
-    deterministic contact path from the question text alone, with no
-    country/topic context needed.
-
-    return (
-        precise_le_global_identification
-        or professional_acquisition_request
-        or explicit_contact_data_request
-    )
-
-    Deliberately excludes the bare "who/how can I contact/reach ..."
-    phrasing (see _has_direct_who_to_reach_form): that one names no
-    professional at all, so on its own it is never precise enough -
-    the router only treats it as contact intent once combined with a
-    resolved country and the absence of a supported legal topic on the
-    current question.
+    Detect STRONG_CONTACT_INTENT - a hint only (see module docstring),
+    never a gate deciding whether RequestUnderstanding runs.
     """
 
     normalized_question = _normalize_contact_question(
@@ -524,11 +442,8 @@ def _has_direct_who_to_reach_form(
     question: str,
 ) -> bool:
     """
-    Detect COUNTRY_SCOPED_REACH_INTENT's phrasing half only - never
-    sufficient by itself. See _DIRECT_WHO_TO_REACH_PATTERN and
-    resolve_legal_chat_response, which combines this with a resolved
-    country and the absence of a supported legal topic on the current
-    question before treating it as contact intent.
+    Detect COUNTRY_SCOPED_REACH_INTENT's phrasing - a hint only (see
+    module docstring), never a gate.
     """
 
     normalized_question = _normalize_contact_question(
@@ -542,108 +457,134 @@ def _has_direct_who_to_reach_form(
     )
 
 
-def _resolve_contact_country_codes(
+def _has_comparison_signal(
+    question: str,
+) -> bool:
+    """
+    Cheap, generic, informational-only signal that a question might be
+    a comparison - never a gate. Used purely to populate one
+    deterministic hint field; RequestUnderstanding decides the actual
+    routing.
+    """
+
+    return bool(
+        _COMPARISON_SIGNAL_PATTERN.search(
+            question.casefold()
+        )
+    )
+
+
+def _build_deterministic_hints(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider,
-) -> tuple[CountryAvailability, bool]:
+) -> tuple[DeterministicHints, CountryAvailability, LegalScope]:
     """
-    Resolve the country/countries a contact request concerns.
+    Build the deterministic hints passed to RequestUnderstanding.
 
-    Always prefers the current question (or explicit country_codes)
-    over the conversation history. Only when the current question
-    alone names no country at all does it try each previous user
-    question in turn, most recent first, stopping at the first one
-    that - combined with the current question - resolves any
-    available or unavailable country. Returns whether that history
-    fallback was actually used.
+    None of these signals decide anything here - they are computed
+    once, attached to the model call as context, and kept available so
+    a conservative fallback route remains possible if the model call
+    itself fails (see _resolve_conservative_fallback).
     """
 
-    country_scope = resolve_country_availability(
+    current_country_scope = resolve_country_availability(
         request=request,
         catalog_provider=catalog_provider,
     )
 
-    if (
-        country_scope.available_codes
-        or country_scope.unavailable_codes
-    ):
-        return country_scope, False
+    current_legal_scope = resolve_legal_scope(request)
 
-    for previous_question in _iter_recent_user_questions(
-        request.history
-    ):
-        contextual_request = request.model_copy(
-            update={
-                "question": _build_contextual_question(
-                    previous_questions=[
-                        previous_question,
-                    ],
-                    current_question=request.question,
-                ),
-            }
-        )
+    recent_user_questions = list(
+        _iter_recent_user_questions(request.history)
+    )[:3]
 
-        fallback_scope = resolve_country_availability(
-            request=contextual_request,
+    if recent_user_questions:
+        combined_history_text = " ".join(recent_user_questions)
+
+        history_country_scope = resolve_country_availability(
+            request=request.model_copy(
+                update={"question": combined_history_text}
+            ),
             catalog_provider=catalog_provider,
         )
 
-        if (
-            fallback_scope.available_codes
-            or fallback_scope.unavailable_codes
-        ):
-            return fallback_scope, True
+        history_country_codes = history_country_scope.available_codes
+        history_unavailable_country_codes = (
+            history_country_scope.unavailable_codes
+        )
+        history_legal_topics = detect_legal_topics(
+            combined_history_text
+        )
+    else:
+        history_country_codes = []
+        history_unavailable_country_codes = []
+        history_legal_topics = []
 
-    return country_scope, False
+    hints = DeterministicHints(
+        current_country_codes=current_country_scope.available_codes,
+        current_unavailable_country_codes=(
+            current_country_scope.unavailable_codes
+        ),
+        current_legal_topics=current_legal_scope.legal_topics,
+        strong_contact_signal=(
+            _detect_contact_intent(request.question)
+            or _has_direct_who_to_reach_form(request.question)
+        ),
+        comparison_signal=_has_comparison_signal(request.question),
+        history_country_codes=history_country_codes,
+        history_unavailable_country_codes=(
+            history_unavailable_country_codes
+        ),
+        history_legal_topics=history_legal_topics,
+        explicit_country_codes=list(request.country_codes),
+        explicit_legal_topics=list(request.legal_topics),
+        explicit_subsections=list(request.subsections),
+    )
+
+    return hints, current_country_scope, current_legal_scope
 
 
-def _build_contact_response(
+def _build_contact_section(
     country_codes: list[str],
     unavailable_country_codes: list[str],
-    metrics: LegalChatMetrics,
-) -> LegalChatResponse:
+    citation_offset: int,
+) -> tuple[str, list[LegalAnswerSource], int, float]:
     """
-    Build one deterministic contact answer, never calling OpenAI.
+    Build one deterministic contact answer section, never calling
+    OpenAI. Citations continue from citation_offset + 1, so a contact
+    section appended after a legal answer never collides with the
+    legal answer's own citations.
 
-    Every requested country either contributes its validated contact
-    card (with its own source citation) or an explicit "not found"
-    line - never a contact borrowed from a different country, and
-    never an invented field.
+    Returns (answer_text, sources, retrieval_total, took_ms) - the
+    caller updates shared metrics itself, since this function may be
+    invoked once per contact action.
     """
 
     sources: list[LegalAnswerSource] = []
     answer_sections: list[str] = []
     retrieval_total = 0
+    took_ms = 0.0
 
     if country_codes:
         try:
             contact_response = search_contact_chunks(
                 country_codes=country_codes
             )
-
         except LegalSearchError as error:
             raise RagAnswerError(
                 "Legal document retrieval failed."
             ) from error
 
-        metrics.opensearch_ms += float(
-            contact_response.took_ms
-        )
-
+        took_ms = float(contact_response.took_ms)
         retrieval_total += contact_response.total
 
-        hits_by_country_code: dict[
-            str,
-            list,
-        ] = {}
+        hits_by_country_code: dict[str, list] = {}
 
         for hit in contact_response.hits:
             hits_by_country_code.setdefault(
                 hit.country_code.upper(),
                 [],
-            ).append(
-                hit
-            )
+            ).append(hit)
 
         for country_code in country_codes:
             country_hits = hits_by_country_code.get(
@@ -665,7 +606,7 @@ def _build_contact_response(
                 continue
 
             for hit in country_hits:
-                citation = len(sources) + 1
+                citation = citation_offset + len(sources) + 1
 
                 sources.append(
                     LegalAnswerSource(
@@ -684,8 +625,7 @@ def _build_contact_response(
                 )
 
                 answer_sections.append(
-                    f"{display_name}\n"
-                    f"{hit.content} [{citation}]"
+                    f"{display_name}\n{hit.content} [{citation}]"
                 )
 
     for country_code in unavailable_country_codes:
@@ -700,30 +640,499 @@ def _build_contact_response(
             )
         )
 
-    metrics.outcome = (
-        "contact_resolved"
-        if sources
-        else "contact_not_found"
+    return (
+        "\n\n".join(answer_sections),
+        sources,
+        retrieval_total,
+        took_ms,
     )
-    metrics.retrieval_total = retrieval_total
-    metrics.selected_sources = len(
-        sources
+
+
+def _clarification_answer_for(
+    result: RequestUnderstandingResult,
+) -> str:
+    """Map one clarification result to its user-facing answer text."""
+
+    hint_action = result.actions[0] if result.actions else None
+    reason = result.clarification_reason
+
+    if reason == "missing_country":
+        if hint_action is not None and hint_action.type == "contact":
+            return CONTACT_CLARIFICATION_ANSWER
+
+        return CLARIFICATION_LEGAL_MISSING_COUNTRY_ANSWER
+
+    if reason == "missing_comparison_countries":
+        return CLARIFICATION_MISSING_COMPARISON_COUNTRIES_ANSWER
+
+    if reason == "missing_comparison_topic":
+        return CLARIFICATION_MISSING_COMPARISON_TOPIC_ANSWER
+
+    if reason == "ambiguous_request":
+        hint_country_code = (
+            hint_action.country_codes[0]
+            if hint_action is not None and hint_action.country_codes
+            else None
+        )
+
+        if hint_country_code:
+            return CLARIFICATION_AMBIGUOUS_WITH_COUNTRY_TEMPLATE.format(
+                country=resolve_country_display_name(
+                    hint_country_code
+                )
+            )
+
+        return CLARIFICATION_AMBIGUOUS_REQUEST_ANSWER
+
+    return CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER
+
+
+def _check_explicit_filter_conflict(
+    request: LegalChatRequest,
+    result: RequestUnderstandingResult,
+) -> bool:
+    """
+    True when the request carried explicit country_codes and the
+    understood result names a country outside that explicit set -
+    a genuine conflict between text and filter that must be surfaced,
+    never silently resolved by picking either side.
+    """
+
+    explicit_codes = {
+        code.strip().upper()
+        for code in request.country_codes
+        if code.strip()
+    }
+
+    if not explicit_codes:
+        return False
+
+    for action in result.actions:
+        action_codes = {
+            code.upper() for code in action.country_codes
+        }
+
+        if action_codes and not action_codes <= explicit_codes:
+            return True
+
+    return False
+
+
+def _resolve_conservative_fallback(
+    request: LegalChatRequest,
+    hints: DeterministicHints,
+    current_country_scope: CountryAvailability,
+    current_legal_scope: LegalScope,
+    metrics: LegalChatMetrics,
+    search_function: SearchFunction,
+    generation_client: TextGenerationClient | None,
+    rerank_enabled: bool,
+    rerank_pool_multiplier: int,
+    max_context_characters: int,
+    max_source_characters: int,
+) -> LegalChatResponse:
+    """
+    Resolve one request whose understanding call failed entirely -
+    using only the deterministic hints, and only when they clearly
+    describe a complete, single-intention request. Anything less than
+    fully clear degrades to a safe clarification - never a partial
+    answer presented as complete, never a crash, never the
+    documentary-insufficiency message.
+    """
+
+    country_resolved = bool(
+        current_country_scope.available_codes
+        or current_country_scope.unavailable_codes
     )
-    metrics.model = None
-    metrics.generation_attempts = 0
-    metrics.repair_triggered = False
-    metrics.repair_success = False
-    metrics.repair_answer_returned = False
+
+    unambiguous_single_intent = not (
+        hints.strong_contact_signal
+        and current_legal_scope.is_supported
+    )
+
+    if (
+        hints.strong_contact_signal
+        and country_resolved
+        and not current_legal_scope.is_supported
+        and not hints.comparison_signal
+    ):
+        (
+            contact_answer,
+            sources,
+            retrieval_total,
+            took_ms,
+        ) = _build_contact_section(
+            country_codes=current_country_scope.available_codes,
+            unavailable_country_codes=(
+                current_country_scope.unavailable_codes
+            ),
+            citation_offset=0,
+        )
+
+        metrics.opensearch_ms += took_ms
+        metrics.retrieval_total = retrieval_total
+        metrics.selected_sources = len(sources)
+        metrics.model = None
+        metrics.generation_attempts = 0
+        metrics.outcome = (
+            "contact_resolved" if sources else "contact_not_found"
+        )
+        metrics.request_actions = ["contact"]
+        metrics.resolved_action_countries = [
+            {
+                "type": "contact",
+                "country_codes": (
+                    current_country_scope.available_codes
+                ),
+            }
+        ]
+        metrics.resolved_country_codes = (
+            current_country_scope.available_codes
+        )
+
+        return LegalChatResponse(
+            question=request.question.strip(),
+            answer=contact_answer,
+            grounded=bool(sources),
+            model=None,
+            retrieval_total=retrieval_total,
+            sources=sources,
+        )
+
+    if (
+        unambiguous_single_intent
+        and current_country_scope.available_codes
+        and current_legal_scope.is_supported
+    ):
+        is_comparison = (
+            len(current_country_scope.available_codes) >= 2
+        )
+
+        prepared_request = request.model_copy(
+            update={
+                "country_codes": (
+                    current_country_scope.available_codes
+                ),
+                "legal_topics": current_legal_scope.legal_topics,
+            }
+        )
+
+        response = answer_legal_question(
+            prepared_request,
+            search_function=search_function,
+            generation_client=generation_client,
+            rerank_enabled=rerank_enabled,
+            rerank_pool_multiplier=rerank_pool_multiplier,
+            max_context_characters=max_context_characters,
+            max_source_characters=max_source_characters,
+            metrics=metrics,
+        )
+
+        if current_country_scope.unavailable_codes:
+            response = response.model_copy(
+                update={
+                    "answer": (
+                        response.answer
+                        + "\n\nNote: "
+                        + _unavailable_countries_answer(
+                            current_country_scope.unavailable_codes
+                        )
+                    ),
+                }
+            )
+
+        metrics.request_actions = [
+            "comparison" if is_comparison else "legal_information"
+        ]
+        metrics.resolved_action_countries = [
+            {
+                "type": (
+                    "comparison" if is_comparison else "legal_information"
+                ),
+                "country_codes": (
+                    current_country_scope.available_codes
+                ),
+            }
+        ]
+        metrics.resolved_country_codes = (
+            current_country_scope.available_codes
+        )
+        metrics.resolved_legal_topics = (
+            current_legal_scope.legal_topics
+        )
+
+        return response
+
+    metrics.clarification_reason = "ambiguous_request"
+    metrics.outcome = "clarification_ambiguous_request"
 
     return LegalChatResponse(
-        question="",
-        answer="\n\n".join(
-            answer_sections
-        ),
-        grounded=bool(
-            sources
-        ),
+        question=request.question.strip(),
+        answer=CLARIFICATION_AMBIGUOUS_REQUEST_ANSWER,
+        grounded=False,
         model=None,
+        retrieval_total=0,
+        sources=[],
+    )
+
+
+def _aggregate_action_country_codes(
+    resolved_action_countries: list[dict[str, object]],
+) -> list[str]:
+    """
+    Union, in order, of every action's own resolved country codes -
+    kept only for backward compatibility with log consumers reading
+    the older flat `resolved_country_codes` field. The per-action
+    field is the source of truth for a mixed request.
+    """
+
+    aggregated: list[str] = []
+
+    for entry in resolved_action_countries:
+        for code in entry.get("country_codes", []):
+            if code not in aggregated:
+                aggregated.append(code)
+
+    return aggregated
+
+
+def _aggregate_action_legal_topics(
+    resolved_action_topics: list[dict[str, object]],
+) -> list[str]:
+    """Union, in order, of every action's own resolved legal topics."""
+
+    aggregated: list[str] = []
+
+    for entry in resolved_action_topics:
+        for topic in entry.get("legal_topics", []):
+            if topic not in aggregated:
+                aggregated.append(topic)
+
+    return aggregated
+
+
+def _execute_resolved_plan(
+    request: LegalChatRequest,
+    result: RequestUnderstandingResult,
+    metrics: LegalChatMetrics,
+    catalog_provider: CountryCatalogProvider,
+    search_function: SearchFunction,
+    generation_client: TextGenerationClient | None,
+    rerank_enabled: bool,
+    rerank_pool_multiplier: int,
+    max_context_characters: int,
+    max_source_characters: int,
+) -> LegalChatResponse:
+    """
+    Execute every action RequestUnderstanding resolved.
+
+    Every action keeps its own country/topic scope - a contact
+    action's country is never widened to a comparison action's
+    countries, and vice versa. Exactly one legal generation call
+    covers every legal_information/comparison action combined; every
+    contact action is resolved deterministically and appended, in
+    order, after the legal answer.
+    """
+
+    contact_actions = result.actions_of_type("contact")
+    legal_type_actions = [
+        action
+        for action in result.actions
+        if action.type in ("legal_information", "comparison")
+    ]
+
+    resolved_action_countries: list[dict[str, object]] = []
+    resolved_action_topics: list[dict[str, object]] = []
+
+    answer_parts: list[str] = []
+    sources: list[LegalAnswerSource] = []
+    grounded = False
+    model_used: str | None = None
+    retrieval_total = 0
+
+    if legal_type_actions:
+        merged_available_codes: list[str] = []
+        merged_unavailable_codes: list[str] = []
+        merged_legal_topics: list[str] = []
+        merged_question_parts: list[str] = []
+
+        for action in legal_type_actions:
+            action_scope = resolve_country_availability(
+                request=request.model_copy(
+                    update={"country_codes": action.country_codes}
+                ),
+                catalog_provider=catalog_provider,
+            )
+
+            for code in action_scope.available_codes:
+                if code not in merged_available_codes:
+                    merged_available_codes.append(code)
+
+            for code in action_scope.unavailable_codes:
+                if code not in merged_unavailable_codes:
+                    merged_unavailable_codes.append(code)
+
+            validated_topics = [
+                topic
+                for topic in action.legal_topics
+                if topic in CANONICAL_LEGAL_TOPICS
+            ]
+
+            for topic in validated_topics:
+                if topic not in merged_legal_topics:
+                    merged_legal_topics.append(topic)
+
+            resolved_action_countries.append(
+                {
+                    "type": action.type,
+                    "country_codes": action_scope.available_codes,
+                }
+            )
+            resolved_action_topics.append(
+                {
+                    "type": action.type,
+                    "legal_topics": validated_topics,
+                    "topic_text": action.topic_text,
+                }
+            )
+
+            question_part = (
+                action.resolved_question
+                if action.resolved_question
+                else request.question
+            )
+
+            if question_part not in merged_question_parts:
+                merged_question_parts.append(question_part)
+
+        # Explicit legal_topics on the original request are a binding
+        # retrieval constraint - they override whatever the model
+        # inferred for this call.
+        effective_legal_topics = (
+            list(request.legal_topics)
+            if request.legal_topics
+            else merged_legal_topics
+        )
+
+        merged_question = (
+            merged_question_parts[0]
+            if len(merged_question_parts) == 1
+            else "\n\n".join(merged_question_parts)
+        )
+
+        if merged_available_codes:
+            prepared_request = request.model_copy(
+                update={
+                    "country_codes": merged_available_codes,
+                    "legal_topics": effective_legal_topics,
+                    "question": merged_question,
+                }
+            )
+
+            legal_response = answer_legal_question(
+                prepared_request,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                max_context_characters=max_context_characters,
+                max_source_characters=max_source_characters,
+                metrics=metrics,
+            )
+
+            answer_parts.append(legal_response.answer)
+            sources.extend(legal_response.sources)
+            grounded = legal_response.grounded
+            model_used = legal_response.model
+            retrieval_total += legal_response.retrieval_total
+
+            if merged_unavailable_codes:
+                answer_parts.append(
+                    "Note: "
+                    + _unavailable_countries_answer(
+                        merged_unavailable_codes
+                    )
+                )
+        elif merged_unavailable_codes:
+            metrics.outcome = "fallback_unavailable_country"
+            answer_parts.append(
+                _unavailable_countries_answer(
+                    merged_unavailable_codes
+                )
+            )
+        else:
+            metrics.outcome = "fallback_missing_country"
+            answer_parts.append(MISSING_COUNTRY_ANSWER)
+
+    for action in contact_actions:
+        action_scope = resolve_country_availability(
+            request=request.model_copy(
+                update={"country_codes": action.country_codes}
+            ),
+            catalog_provider=catalog_provider,
+        )
+
+        (
+            contact_answer,
+            contact_sources,
+            contact_retrieval_total,
+            took_ms,
+        ) = _build_contact_section(
+            country_codes=action_scope.available_codes,
+            unavailable_country_codes=action_scope.unavailable_codes,
+            citation_offset=len(sources),
+        )
+
+        metrics.opensearch_ms += took_ms
+        retrieval_total += contact_retrieval_total
+
+        if contact_answer:
+            answer_parts.append(contact_answer)
+
+        sources.extend(contact_sources)
+
+        resolved_action_countries.append(
+            {
+                "type": "contact",
+                "country_codes": action_scope.available_codes,
+            }
+        )
+
+        if contact_sources:
+            grounded = True
+
+    metrics.request_actions = result.action_types
+    metrics.resolved_action_countries = resolved_action_countries
+    metrics.resolved_action_topics = resolved_action_topics
+    metrics.selected_sources = len(sources)
+    metrics.retrieval_total = retrieval_total
+
+    # Backward-compatible flat aggregates (see chat_metrics.py).
+    metrics.resolved_country_codes = _aggregate_action_country_codes(
+        resolved_action_countries
+    )
+    metrics.resolved_legal_topics = _aggregate_action_legal_topics(
+        resolved_action_topics
+    )
+
+    if not legal_type_actions:
+        # Pure contact request(s): never any legal generation.
+        metrics.model = None
+        metrics.generation_attempts = 0
+        metrics.repair_triggered = False
+        metrics.repair_success = False
+        metrics.repair_answer_returned = False
+        metrics.outcome = (
+            "contact_resolved" if grounded else "contact_not_found"
+        )
+
+    return LegalChatResponse(
+        question=request.question.strip(),
+        answer="\n\n".join(
+            part for part in answer_parts if part
+        ),
+        grounded=grounded,
+        model=model_used,
         retrieval_total=retrieval_total,
         sources=sources,
     )
@@ -741,6 +1150,9 @@ def resolve_legal_chat_response(
     generation_client: (
         TextGenerationClient | None
     ) = None,
+    understanding_client: (
+        OpenAIResponsesClient | None
+    ) = None,
     rerank_enabled: bool = False,
     rerank_pool_multiplier: int = 1,
     max_context_characters: int = (
@@ -751,16 +1163,16 @@ def resolve_legal_chat_response(
     ),
 ) -> LegalChatResponse:
     """
-    Resolve one legal-chat request, applying scope checks first.
+    Resolve one legal-chat request.
 
-    Retrieval and generation are skipped entirely when every
-    mentioned country is outside the corpus, or when the question
-    carries no recognized legal topic and is not a general overview
-    request. This avoids searching without a meaningful filter and
-    citing unrelated passages.
+    RequestUnderstanding is the primary router for every free-text
+    request: deterministic country/topic detection and the
+    STRONG_CONTACT_INTENT / COUNTRY_SCOPED_REACH_INTENT regexes only
+    ever feed it hints (see _build_deterministic_hints) - they never
+    again decide, on their own, that a request is fully understood.
 
     Exactly one "legal_chat_performance" log event is emitted per
-    call, on every path (fallback, success, or error).
+    call, on every path (clarification, resolved, fallback, or error).
     """
 
     total_started_at = perf_counter()
@@ -787,222 +1199,134 @@ def resolve_legal_chat_response(
     )
 
     try:
-        if _detect_contact_intent(
-            request.question
-        ):
-            (
-                contact_country_scope,
-                contact_contextual_question_used,
-            ) = _resolve_contact_country_codes(
-                request=request,
-                catalog_provider=catalog_provider,
-            )
-
-            metrics.country_codes = list(
-                contact_country_scope.available_codes
-            )
-            metrics.unavailable_country_codes = list(
-                contact_country_scope.unavailable_codes
-            )
-            metrics.contextual_question_used = (
-                contact_contextual_question_used
-            )
-
-            if (
-                not contact_country_scope.available_codes
-                and not contact_country_scope.unavailable_codes
-            ):
-                metrics.outcome = "contact_clarification"
-
-                metrics.total_ms = (
-                    perf_counter() - total_started_at
-                ) * 1000
-
-                metrics.log()
-
-                return LegalChatResponse(
-                    question=request.question.strip(),
-                    answer=CONTACT_CLARIFICATION_ANSWER,
-                    grounded=False,
-                    model=None,
-                    retrieval_total=0,
-                    sources=[],
-                )
-
-            contact_response = _build_contact_response(
-                country_codes=(
-                    contact_country_scope.available_codes
-                ),
-                unavailable_country_codes=(
-                    contact_country_scope.unavailable_codes
-                ),
-                metrics=metrics,
-            )
-
-            contact_response = contact_response.model_copy(
-                update={
-                    "question": request.question.strip(),
-                }
-            )
-
-            metrics.total_ms = (
-                perf_counter() - total_started_at
-            ) * 1000
-
-            metrics.log()
-
-            return contact_response
-
-        detection_started_at = perf_counter()
-
-        country_scope = resolve_country_availability(
+        (
+            hints,
+            current_country_scope,
+            current_legal_scope,
+        ) = _build_deterministic_hints(
             request=request,
             catalog_provider=catalog_provider,
         )
 
-        contextual_question_used = False
-        necessary_previous_questions: list[str] = []
+        history_turns = [
+            HistoryTurn(role=message.role, content=message.content)
+            for message in request.history
+        ]
 
-        if (
-            not country_scope.available_codes
-            and not country_scope.unavailable_codes
-        ):
-            for previous_question in (
-                _iter_recent_user_questions(
-                    request.history
-                )
-            ):
-                contextual_country_request = (
-                    request.model_copy(
-                        update={
-                            "question": (
-                                _build_contextual_question(
-                                    previous_questions=[
-                                        previous_question,
-                                    ],
-                                    current_question=(
-                                        request.question
-                                    ),
-                                )
-                            ),
-                        }
-                    )
-                )
-
-                fallback_country_scope = (
-                    resolve_country_availability(
-                        request=contextual_country_request,
-                        catalog_provider=catalog_provider,
-                    )
-                )
-
-                if (
-                    fallback_country_scope.available_codes
-                    or fallback_country_scope.unavailable_codes
-                ):
-                    country_scope = fallback_country_scope
-                    contextual_question_used = True
-                    necessary_previous_questions.append(
-                        previous_question
-                    )
-                    break
-
-        metrics.country_detection_ms = (
-            perf_counter() - detection_started_at
-        ) * 1000
-
-        metrics.country_codes = list(
-            country_scope.available_codes
-        )
-        metrics.unavailable_country_codes = list(
-            country_scope.unavailable_codes
+        outcome = understand_request(
+            current_question=request.question,
+            history=history_turns,
+            hints=hints,
+            catalog_provider=catalog_provider,
+            generation_client=understanding_client,
         )
 
-        # COUNTRY_SCOPED_REACH_INTENT: a direct "who/how can I reach
-        # ..." form names no professional at all, so on its own
-        # (_has_direct_who_to_reach_form) it is never precise enough -
-        # it only becomes contact intent once a country is resolved
-        # (available or unavailable; already computed just above,
-        # including any history fallback) AND the current question
-        # carries no supported legal topic. The topic check below
-        # deliberately reuses the conversation-history-based topic
-        # detector reserved for that one purpose: it must reflect the
-        # CURRENT question alone, never a contextualized one, since a
-        # supported topic on the current question ("Who should I
-        # contact regarding dismissal procedure in Australia?") must
-        # always stay legal RAG regardless of history. Its result is
-        # reused below as the seed for the normal flow's own topic
-        # resolution when this branch does not route to Contact, so
-        # resolve_legal_scope is never called twice for the same
-        # input.
-        precomputed_legal_scope = None
-        precomputed_topic_detection_ms = 0.0
+        metrics.request_understanding_ms = outcome.elapsed_ms
+        metrics.request_understanding_openai_ms = outcome.openai_ms
+        metrics.request_understanding_attempts = outcome.attempts
+        metrics.request_understanding_retry_triggered = (
+            outcome.retry_triggered
+        )
+        metrics.request_understanding_retry_reason = (
+            outcome.retry_reason
+        )
+        metrics.openai_ms += outcome.openai_ms
 
-        if _has_direct_who_to_reach_form(
-            request.question
-        ):
-            topic_detection_started_at = perf_counter()
+        if outcome.result is None:
+            metrics.request_understanding_method = "fallback"
+            metrics.request_understanding_error = outcome.error
 
-            precomputed_legal_scope = resolve_legal_scope(
-                request
+            response = _resolve_conservative_fallback(
+                request=request,
+                hints=hints,
+                current_country_scope=current_country_scope,
+                current_legal_scope=current_legal_scope,
+                metrics=metrics,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                max_context_characters=max_context_characters,
+                max_source_characters=max_source_characters,
             )
 
-            precomputed_topic_detection_ms = (
-                perf_counter()
-                - topic_detection_started_at
+            metrics.total_ms = (
+                perf_counter() - total_started_at
             ) * 1000
 
-            country_resolved = bool(
-                country_scope.available_codes
-                or country_scope.unavailable_codes
+            metrics.log()
+
+            return response
+
+        result = outcome.result
+
+        metrics.request_understanding_method = "semantic"
+        metrics.request_understanding_confidence = result.confidence
+        metrics.request_status = result.status
+        metrics.contextual_question_used = result.is_follow_up
+
+        if _check_explicit_filter_conflict(request, result):
+            metrics.clarification_reason = "ambiguous_request"
+            metrics.request_status = "clarification"
+            metrics.outcome = "clarification_ambiguous_request"
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+
+            metrics.log()
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=(
+                    CLARIFICATION_EXPLICIT_FILTER_CONFLICT_ANSWER
+                ),
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+            )
+
+        if result.status == "unsupported":
+            metrics.clarification_reason = "unsupported_request"
+            metrics.outcome = "clarification_unsupported_request"
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+
+            metrics.log()
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+            )
+
+        if result.status == "clarification":
+            metrics.clarification_reason = result.clarification_reason
+
+            unavailable_hint = (
+                hints.current_unavailable_country_codes
+                or hints.history_unavailable_country_codes
             )
 
             if (
-                country_resolved
-                and not precomputed_legal_scope.is_supported
+                result.clarification_reason == "missing_country"
+                and unavailable_hint
             ):
-                metrics.contextual_question_used = (
-                    contextual_question_used
+                answer_text = _unavailable_countries_answer(
+                    unavailable_hint
                 )
-
-                contact_response = _build_contact_response(
-                    country_codes=(
-                        country_scope.available_codes
-                    ),
-                    unavailable_country_codes=(
-                        country_scope.unavailable_codes
-                    ),
-                    metrics=metrics,
+                metrics.outcome = "fallback_unavailable_country"
+            else:
+                answer_text = _clarification_answer_for(result)
+                metrics.outcome = (
+                    f"clarification_{result.clarification_reason}"
                 )
-
-                contact_response = (
-                    contact_response.model_copy(
-                        update={
-                            "question": (
-                                request.question.strip()
-                            ),
-                        }
-                    )
-                )
-
-                metrics.total_ms = (
-                    perf_counter() - total_started_at
-                ) * 1000
-
-                metrics.log()
-
-                return contact_response
-
-        if (
-            country_scope.unavailable_codes
-            and not country_scope.available_codes
-        ):
-            metrics.outcome = (
-                "fallback_unavailable_country"
-            )
-            metrics.contextual_question_used = (
-                contextual_question_used
-            )
 
             metrics.total_ms = (
                 perf_counter() - total_started_at
@@ -1012,168 +1336,24 @@ def resolve_legal_chat_response(
 
             return LegalChatResponse(
                 question=request.question.strip(),
-                answer=_unavailable_countries_answer(
-                    country_scope.unavailable_codes
-                ),
+                answer=answer_text,
                 grounded=False,
                 model=None,
                 retrieval_total=0,
                 sources=[],
             )
 
-        detection_started_at = perf_counter()
-
-        legal_scope = (
-            precomputed_legal_scope
-            if precomputed_legal_scope is not None
-            else resolve_legal_scope(
-                request
-            )
-        )
-
-        if not legal_scope.is_supported:
-            for previous_question in (
-                _iter_recent_user_questions(
-                    request.history
-                )
-            ):
-                contextual_topic_request = (
-                    request.model_copy(
-                        update={
-                            "question": (
-                                _build_contextual_question(
-                                    previous_questions=[
-                                        previous_question,
-                                    ],
-                                    current_question=(
-                                        request.question
-                                    ),
-                                )
-                            ),
-                            "country_codes": (
-                                country_scope.available_codes
-                            ),
-                        }
-                    )
-                )
-
-                fallback_legal_scope = resolve_legal_scope(
-                    contextual_topic_request
-                )
-
-                if fallback_legal_scope.is_supported:
-                    legal_scope = fallback_legal_scope
-                    contextual_question_used = True
-
-                    if (
-                        previous_question
-                        not in necessary_previous_questions
-                    ):
-                        necessary_previous_questions.append(
-                            previous_question
-                        )
-
-                    break
-
-        metrics.topic_detection_ms = (
-            precomputed_topic_detection_ms
-            + (perf_counter() - detection_started_at) * 1000
-        )
-
-        metrics.legal_topics = list(
-            legal_scope.legal_topics
-        )
-
-        if not legal_scope.is_supported:
-            metrics.outcome = (
-                "fallback_unsupported_topic"
-            )
-            metrics.contextual_question_used = (
-                contextual_question_used
-            )
-
-            metrics.total_ms = (
-                perf_counter() - total_started_at
-            ) * 1000
-
-            metrics.log()
-
-            return LegalChatResponse(
-                question=request.question.strip(),
-                answer=NO_INFORMATION_ANSWER,
-                grounded=False,
-                model=None,
-                retrieval_total=0,
-                sources=[],
-            )
-
-        final_contextual_question = (
-            _build_contextual_question(
-                previous_questions=(
-                    necessary_previous_questions[
-                        :MAX_CONTEXTUAL_PREVIOUS_QUESTIONS
-                    ]
-                ),
-                current_question=request.question,
-            )
-            if necessary_previous_questions
-            else None
-        )
-
-        prepared_request = request.model_copy(
-            update={
-                "country_codes": (
-                    country_scope.available_codes
-                ),
-                "legal_topics": (
-                    legal_scope.legal_topics
-                ),
-                "question": (
-                    final_contextual_question
-                    if contextual_question_used
-                    and final_contextual_question
-                    else request.question
-                ),
-            }
-        )
-
-        response = answer_legal_question(
-            prepared_request,
+        response = _execute_resolved_plan(
+            request=request,
+            result=result,
+            metrics=metrics,
+            catalog_provider=catalog_provider,
             search_function=search_function,
             generation_client=generation_client,
             rerank_enabled=rerank_enabled,
             rerank_pool_multiplier=rerank_pool_multiplier,
             max_context_characters=max_context_characters,
             max_source_characters=max_source_characters,
-            metrics=metrics,
-        )
-
-        # The retrieval/generation input above may have used a
-        # contextualized question to resolve a follow-up - the
-        # response always echoes the user's real original question,
-        # never that internal representation.
-        response = response.model_copy(
-            update={
-                "question": request.question.strip(),
-            }
-        )
-
-        if country_scope.unavailable_codes:
-            note = (
-                "\n\nNote: "
-                + _unavailable_countries_answer(
-                    country_scope.unavailable_codes
-                )
-            )
-
-            response = response.model_copy(
-                update={
-                    "answer": response.answer + note,
-                }
-            )
-
-        metrics.contextual_question_used = (
-            contextual_question_used
         )
 
         metrics.total_ms = (

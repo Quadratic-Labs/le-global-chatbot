@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from app.clients.openai_responses import (
     OpenAIResponsesClient,
     get_openai_answer_client,
     get_openai_rerank_client,
+    get_openai_understanding_client,
 )
 from app.core.config import Settings
 
@@ -38,6 +41,8 @@ def _build_settings(**overrides: Any) -> Settings:
         "openai_answer_max_output_tokens": 2000,
         "openai_rerank_reasoning_effort": "low",
         "openai_rerank_max_output_tokens": 500,
+        "openai_understanding_reasoning_effort": "low",
+        "openai_understanding_max_output_tokens": 400,
         "api_access_key": None,
         "admin_api_key": None,
         "cors_allowed_origins": (),
@@ -239,6 +244,21 @@ class OpenAIClientFactoryTests(unittest.TestCase):
         self.assertEqual(answer_client.max_output_tokens, 2500)
         self.assertEqual(rerank_client.max_output_tokens, 300)
 
+    def test_understanding_client_uses_understanding_budget(self) -> None:
+        settings = _build_settings(
+            openai_understanding_reasoning_effort="minimal",
+            openai_understanding_max_output_tokens=400,
+        )
+
+        with patch(
+            "app.clients.openai_responses.get_settings",
+            return_value=settings,
+        ):
+            client = get_openai_understanding_client()
+
+        self.assertEqual(client.reasoning_effort, "minimal")
+        self.assertEqual(client.max_output_tokens, 400)
+
     def test_missing_api_key_raises_configuration_error(self) -> None:
         settings = _build_settings(openai_api_key=None)
 
@@ -248,6 +268,158 @@ class OpenAIClientFactoryTests(unittest.TestCase):
         ):
             with self.assertRaises(OpenAIConfigurationError):
                 get_openai_answer_client()
+
+
+def _build_http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        url="https://api.openai.com/v1/responses",
+        code=code,
+        msg="error",
+        hdrs=None,
+        fp=io.BytesIO(json.dumps({"error": {"message": "boom"}}).encode()),
+    )
+
+
+class OpenAIResponseErrorClassificationTests(unittest.TestCase):
+    """
+    Tests that generate() classifies each failure as retryable or not,
+    matching the mission's retry-eligibility table: HTTP
+    429/500/502/503/504 and any connection-level failure are
+    retryable; HTTP 400/401/403 are not.
+    """
+
+    def _generate_with_http_error(self, code: int) -> OpenAIResponseError:
+        client = _build_client()
+
+        def fake_urlopen(request: Any, timeout: float) -> Any:
+            raise _build_http_error(code)
+
+        with patch(
+            "app.clients.openai_responses.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with self.assertRaises(OpenAIResponseError) as context:
+                client.generate(
+                    instructions="Instructions",
+                    input_text="Input",
+                )
+
+        return context.exception
+
+    def test_http_429_is_retryable(self) -> None:
+        error = self._generate_with_http_error(429)
+
+        self.assertTrue(error.retryable)
+        self.assertEqual(error.status_code, 429)
+
+    def test_http_500_502_503_504_are_retryable(self) -> None:
+        for code in (500, 502, 503, 504):
+            with self.subTest(code=code):
+                error = self._generate_with_http_error(code)
+
+                self.assertTrue(error.retryable)
+                self.assertEqual(error.status_code, code)
+
+    def test_http_400_401_403_are_not_retryable(self) -> None:
+        for code in (400, 401, 403):
+            with self.subTest(code=code):
+                error = self._generate_with_http_error(code)
+
+                self.assertFalse(error.retryable)
+                self.assertEqual(error.status_code, code)
+
+    def test_connection_level_failure_is_retryable(self) -> None:
+        client = _build_client()
+
+        def fake_urlopen(request: Any, timeout: float) -> Any:
+            raise urllib.error.URLError("connection refused")
+
+        with patch(
+            "app.clients.openai_responses.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with self.assertRaises(OpenAIResponseError) as context:
+                client.generate(
+                    instructions="Instructions",
+                    input_text="Input",
+                )
+
+        self.assertTrue(context.exception.retryable)
+        self.assertIsNone(context.exception.status_code)
+
+    def test_invalid_json_after_success_is_not_retryable(self) -> None:
+        client = _build_client()
+
+        class _BadResponse:
+            def read(self) -> bytes:
+                return b"not json"
+
+            def __enter__(self) -> "_BadResponse":
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                return None
+
+        def fake_urlopen(request: Any, timeout: float) -> Any:
+            return _BadResponse()
+
+        with patch(
+            "app.clients.openai_responses.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with self.assertRaises(OpenAIResponseError) as context:
+                client.generate(
+                    instructions="Instructions",
+                    input_text="Input",
+                )
+
+        self.assertFalse(context.exception.retryable)
+
+    def test_default_retryable_is_false(self) -> None:
+        error = OpenAIResponseError("boom")
+
+        self.assertFalse(error.retryable)
+        self.assertIsNone(error.status_code)
+
+
+class OpenAITextFormatTests(unittest.TestCase):
+    """Tests that an optional text_format is sent through as-is."""
+
+    def test_text_format_is_included_when_provided(self) -> None:
+        client = _build_client()
+        schema = {
+            "type": "json_schema",
+            "name": "example",
+            "schema": {"type": "object"},
+            "strict": True,
+        }
+
+        captured: dict[str, Any] = {}
+
+        def fake_urlopen(request: Any, timeout: float) -> _FakeHTTPResponse:
+            captured["body"] = json.loads(
+                request.data.decode("utf-8")
+            )
+            return _FakeHTTPResponse(
+                {"output_text": "Answer.", "model": "test-model"}
+            )
+
+        with patch(
+            "app.clients.openai_responses.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            client.generate(
+                instructions="Instructions",
+                input_text="Input",
+                text_format=schema,
+            )
+
+        self.assertEqual(captured["body"]["text"], {"format": schema})
+
+    def test_text_format_omitted_by_default(self) -> None:
+        body = _generate_and_capture_request(_build_client())
+
+        self.assertNotIn("text", body)
 
 
 if __name__ == "__main__":

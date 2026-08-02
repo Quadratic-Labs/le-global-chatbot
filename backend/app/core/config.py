@@ -155,6 +155,9 @@ class Settings:
     openai_rerank_reasoning_effort: str
     openai_rerank_max_output_tokens: int
 
+    openai_understanding_reasoning_effort: str
+    openai_understanding_max_output_tokens: int
+
     api_access_key: str | None
     admin_api_key: str | None
 
@@ -233,6 +236,14 @@ def get_settings() -> Settings:
         openai_rerank_max_output_tokens=env_int(
             "OPENAI_RERANK_MAX_OUTPUT_TOKENS",
             500,
+        ),
+        openai_understanding_reasoning_effort=os.getenv(
+            "OPENAI_UNDERSTANDING_REASONING_EFFORT",
+            "low",
+        ),
+        openai_understanding_max_output_tokens=env_int(
+            "OPENAI_UNDERSTANDING_MAX_OUTPUT_TOKENS",
+            400,
         ),
         api_access_key=optional_secret(
             "API_ACCESS_KEY"

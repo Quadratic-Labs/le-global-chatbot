@@ -179,6 +179,17 @@ TOPIC_RULES: Final[
 )
 
 
+CANONICAL_LEGAL_TOPICS: Final[tuple[str, ...]] = tuple(
+    sorted(
+        {
+            legal_topic
+            for _, legal_topics in TOPIC_RULES
+            for legal_topic in legal_topics
+        }
+    )
+)
+
+
 OVERVIEW_PHRASES: Final[tuple[str, ...]] = (
     "employment law overview",
     "labour law overview",

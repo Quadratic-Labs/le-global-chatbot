@@ -1,9 +1,11 @@
 (() => {
     "use strict";
 
-    const MAX_CONVERSATION_TURNS = 3;
-
-    const MAX_HISTORY_MESSAGES = MAX_CONVERSATION_TURNS * 2;
+    // Default cap on total conversation messages (user + assistant
+    // turns combined) kept in memory, persisted to sessionStorage, and
+    // sent to the backend as history - overridden by the backend's own
+    // frontend-config limit when available (see loadConfiguration()).
+    const DEFAULT_MAX_HISTORY_MESSAGES = 20;
 
     const DISCLAIMER_TEXT = (
         "This information is based on the available L&E "
@@ -16,7 +18,22 @@
 
     const HISTORY_QUESTION_MAX_CHARACTERS = 2000;
     const HISTORY_ANSWER_MAX_CHARACTERS = 3000;
-    const HISTORY_TOTAL_MAX_CHARACTERS = 10000;
+
+    // Scaled proportionally with DEFAULT_MAX_HISTORY_MESSAGES
+    // (previously 10000 for 6 messages), matching the backend's own
+    // HISTORY_TOTAL_MAX_CHARACTERS exactly - the per-message limits
+    // above are unchanged.
+    const HISTORY_TOTAL_MAX_CHARACTERS = 33333;
+
+    // sessionStorage only - never localStorage/cookies/IndexedDB - so
+    // the conversation never survives beyond the browser session. The
+    // version segment lets a future format change discard older data
+    // safely instead of misreading it.
+    const CONVERSATION_STORAGE_KEY = (
+        "le_global_chatbot_conversation_v1"
+    );
+
+    const CONVERSATION_STORAGE_VERSION = 1;
 
     /**
      * Build the history payload sent alongside a new question, from
@@ -34,7 +51,10 @@
      * rather than skipping it and considering even older ones. The
      * result is returned in chronological order.
      */
-    function buildBoundedHistoryPayload(turns) {
+    function buildBoundedHistoryPayload(
+        turns,
+        maxHistoryMessages
+    ) {
         const successTurns = turns.filter(
             (turn) => turn.status === "success"
         );
@@ -82,7 +102,7 @@
 
             if (
                 selectedPairs.length * 2
-                >= MAX_HISTORY_MESSAGES
+                >= maxHistoryMessages
             ) {
                 break;
             }
@@ -107,6 +127,314 @@
         });
 
         return history;
+    }
+
+    /**
+     * Validate one parsed sessionStorage payload and return a flat,
+     * cleaned message list - never the raw value itself.
+     *
+     * Returns null - never throws, never returns a partially-trusted
+     * object - whenever the top-level shape is wrong (not a plain
+     * object, wrong version, "messages" not an array). Within an
+     * otherwise valid payload, individual malformed entries (wrong
+     * role, non-string or empty content) are dropped rather than
+     * invalidating the whole conversation - trimConversationToPairs()
+     * is what reduces the remaining entries to a safely alternating,
+     * complete-pairs-only list.
+     */
+    function normalizeStoredConversation(rawValue) {
+        if (
+            !rawValue
+            || typeof rawValue !== "object"
+            || Array.isArray(rawValue)
+        ) {
+            return null;
+        }
+
+        if (
+            rawValue.version
+            !== CONVERSATION_STORAGE_VERSION
+        ) {
+            return null;
+        }
+
+        if (!Array.isArray(rawValue.messages)) {
+            return null;
+        }
+
+        const normalizedMessages = [];
+
+        rawValue.messages.forEach((entry) => {
+            if (!entry || typeof entry !== "object") {
+                return;
+            }
+
+            const role = entry.role;
+
+            if (
+                role !== "user"
+                && role !== "assistant"
+            ) {
+                return;
+            }
+
+            if (typeof entry.content !== "string") {
+                return;
+            }
+
+            const content = entry.content.trim();
+
+            if (!content) {
+                return;
+            }
+
+            const message = {
+                role,
+                content,
+            };
+
+            if (
+                role === "assistant"
+                && Array.isArray(entry.sources)
+            ) {
+                message.sources = entry.sources.filter(
+                    (source) => (
+                        source
+                        && typeof source === "object"
+                    )
+                );
+            }
+
+            normalizedMessages.push(message);
+        });
+
+        return normalizedMessages;
+    }
+
+    /**
+     * Reduce a flat message list to complete, alternating
+     * user-then-assistant pairs only, most recent pairs kept first.
+     *
+     * Walks from the start expecting strict user/assistant
+     * alternation - stops at the first break (a wrong role, or a
+     * trailing question with no answer yet) rather than trying to
+     * resynchronize, since a broken pairing this deep is never
+     * trustworthy. The result is capped to at most
+     * floor(maxHistoryMessages / 2) pairs, dropping the oldest ones
+     * first.
+     */
+    function trimConversationToCompletePairs(
+        messages,
+        maxHistoryMessages
+    ) {
+        const pairs = [];
+        let index = 0;
+
+        while (index + 1 < messages.length) {
+            const userMessage = messages[index];
+            const assistantMessage = messages[index + 1];
+
+            if (
+                userMessage.role !== "user"
+                || assistantMessage.role !== "assistant"
+            ) {
+                break;
+            }
+
+            pairs.push(
+                [
+                    userMessage,
+                    assistantMessage,
+                ]
+            );
+
+            index += 2;
+        }
+
+        const maxPairs = Math.max(
+            0,
+            Math.floor(
+                maxHistoryMessages / 2
+            )
+        );
+
+        return pairs.slice(-maxPairs).flat();
+    }
+
+    /**
+     * Read and validate the persisted conversation, if any.
+     *
+     * Any corruption at all - invalid JSON, wrong version, a
+     * non-object payload, or a message list that normalizes/trims
+     * down to nothing - deletes the stored key and returns an empty
+     * list, so the widget always starts normally rather than ever
+     * failing to open over bad storage content.
+     */
+    function loadStoredConversation(maxHistoryMessages) {
+        let rawText;
+
+        try {
+            rawText = window.sessionStorage.getItem(
+                CONVERSATION_STORAGE_KEY
+            );
+        } catch {
+            return [];
+        }
+
+        if (!rawText) {
+            return [];
+        }
+
+        let parsedValue;
+
+        try {
+            parsedValue = JSON.parse(rawText);
+        } catch {
+            clearStoredConversation();
+            return [];
+        }
+
+        const normalizedMessages = (
+            normalizeStoredConversation(parsedValue)
+        );
+
+        if (normalizedMessages === null) {
+            clearStoredConversation();
+            return [];
+        }
+
+        const trimmedMessages = (
+            trimConversationToCompletePairs(
+                normalizedMessages,
+                maxHistoryMessages
+            )
+        );
+
+        if (trimmedMessages.length === 0) {
+            clearStoredConversation();
+            return [];
+        }
+
+        return trimmedMessages;
+    }
+
+    /**
+     * Persist only the complete, successful turns - never a pending
+     * question awaiting its answer, never an error turn - capped to
+     * the same complete-pairs limit used everywhere else. Silently
+     * gives up on any storage failure (quota exceeded, storage
+     * disabled in private browsing): persistence is a convenience,
+     * never a requirement for the widget to keep working.
+     */
+    function saveConversation(turns, maxHistoryMessages) {
+        const messages = [];
+
+        turns
+            .filter(
+                (turn) => turn.status === "success"
+            )
+            .forEach((turn) => {
+                messages.push(
+                    {
+                        role: "user",
+                        content: turn.question,
+                    }
+                );
+
+                messages.push(
+                    {
+                        role: "assistant",
+                        content: turn.answer || "",
+                        sources: Array.isArray(turn.sources)
+                            ? turn.sources
+                            : [],
+                    }
+                );
+            });
+
+        const trimmedMessages = (
+            trimConversationToCompletePairs(
+                messages,
+                maxHistoryMessages
+            )
+        );
+
+        if (trimmedMessages.length === 0) {
+            clearStoredConversation();
+            return;
+        }
+
+        try {
+            window.sessionStorage.setItem(
+                CONVERSATION_STORAGE_KEY,
+                JSON.stringify(
+                    {
+                        version: CONVERSATION_STORAGE_VERSION,
+                        messages: trimmedMessages,
+                    }
+                )
+            );
+        } catch {
+            // Storage may be full or unavailable - never break the
+            // widget over a persistence failure.
+        }
+    }
+
+    /** Delete the persisted conversation, if any. */
+    function clearStoredConversation() {
+        try {
+            window.sessionStorage.removeItem(
+                CONVERSATION_STORAGE_KEY
+            );
+        } catch {
+            // sessionStorage may be unavailable (private browsing,
+            // disabled storage) - nothing to clean up in that case.
+        }
+    }
+
+    /**
+     * Rebuild in-memory turns (the widget's own rendering/history
+     * model) from a validated, complete-pairs-only message list -
+     * every restored turn is already "success", since only successful
+     * turns are ever persisted.
+     */
+    function rebuildTurnsFromMessages(
+        messages,
+        nextTurnId
+    ) {
+        const turns = [];
+        let currentId = nextTurnId;
+
+        for (
+            let index = 0;
+            index + 1 < messages.length;
+            index += 2
+        ) {
+            const userMessage = messages[index];
+            const assistantMessage = messages[index + 1];
+
+            turns.push(
+                {
+                    id: currentId,
+                    question: userMessage.content,
+                    status: "success",
+                    answer: assistantMessage.content,
+                    sources: Array.isArray(
+                        assistantMessage.sources
+                    )
+                        ? assistantMessage.sources
+                        : [],
+                    errorMessage: null,
+                }
+            );
+
+            currentId += 1;
+        }
+
+        return {
+            turns,
+            nextTurnId: currentId,
+        };
     }
 
     const widgets = document.querySelectorAll(
@@ -178,6 +506,7 @@
 
         let maximumQuestionLength = 2000;
         let defaultMaximumSources = 6;
+        let maxHistoryMessages = DEFAULT_MAX_HISTORY_MESSAGES;
         let requestInFlight = false;
         let configurationInFlight = false;
 
@@ -195,8 +524,8 @@
 
         /**
          * Conversation turns, oldest first. At most
-         * MAX_CONVERSATION_TURNS are ever kept - adding a fourth
-         * removes the oldest one, whole, before it is rendered.
+         * floor(maxHistoryMessages / 2) are ever kept - adding one
+         * more removes the oldest one, whole, before it is rendered.
          * A turn is one of:
          * { id, question, status: "pending", answer: null,
          *   sources: [], errorMessage: null }
@@ -209,6 +538,28 @@
          */
         let turns = [];
         let nextTurnId = 1;
+
+        // Restore any conversation persisted earlier in this same
+        // browser session (survives a reload, never a full browser
+        // session close, since sessionStorage is used - never
+        // localStorage). Corrupted or unreadable storage silently
+        // yields an empty list, so the widget always opens normally.
+        const restoredMessages = loadStoredConversation(
+            maxHistoryMessages
+        );
+
+        if (restoredMessages.length > 0) {
+            const rebuilt = rebuildTurnsFromMessages(
+                restoredMessages,
+                nextTurnId
+            );
+
+            turns = rebuilt.turns;
+            nextTurnId = rebuilt.nextTurnId;
+
+            renderMessageList();
+            scrollConversationToBottom();
+        }
 
         questionInput.addEventListener(
             "input",
@@ -269,7 +620,8 @@
                 clearError();
 
                 const historyPayload = buildBoundedHistoryPayload(
-                    turns
+                    turns,
+                    maxHistoryMessages
                 );
 
                 const turn = {
@@ -287,7 +639,14 @@
                     turn
                 );
 
-                if (turns.length > MAX_CONVERSATION_TURNS) {
+                const maxConversationPairs = Math.max(
+                    1,
+                    Math.floor(
+                        maxHistoryMessages / 2
+                    )
+                );
+
+                if (turns.length > maxConversationPairs) {
                     turns.shift();
                 }
 
@@ -389,6 +748,15 @@
 
                         renderMessageList();
                         scrollConversationToBottom();
+
+                        // Persists only the turns that reached
+                        // "success" - an error turn, or the pending
+                        // turn of a request that is still in flight,
+                        // is never written to storage.
+                        saveConversation(
+                            turns,
+                            maxHistoryMessages
+                        );
                     }
                 }
             }
@@ -568,6 +936,17 @@
                     );
                 }
 
+                if (
+                    Number.isInteger(
+                        limits.max_history_messages
+                    )
+                    && limits.max_history_messages > 0
+                ) {
+                    maxHistoryMessages = (
+                        limits.max_history_messages
+                    );
+                }
+
                 return true;
             } catch (error) {
                 showError(
@@ -604,6 +983,8 @@
 
             turns = [];
             renderMessageList();
+
+            clearStoredConversation();
 
             questionInput.value = "";
             characterCount.textContent = "0";

@@ -71,6 +71,51 @@ class LegalChatMetrics:
     history_characters: int = 0
     contextual_question_used: bool = False
 
+    # Request-understanding observability - labels and durations only,
+    # never the question/answer text. RequestUnderstanding is the
+    # primary router for every free-text request now, so
+    # request_understanding_method only ever takes two values:
+    # "semantic" (the understanding call succeeded and was used) or
+    # "fallback" (every attempt failed/was unparsable, and a
+    # conservative deterministic fallback route or safe clarification
+    # was used instead - see request_understanding_error).
+    request_actions: list[str] = field(
+        default_factory=list
+    )
+    request_status: str | None = None
+    request_understanding_method: str = "fallback"
+    request_understanding_confidence: float | None = None
+    request_understanding_ms: float = 0.0
+    # OpenAI call time only, across every attempt - distinct from the
+    # legal-generation call's own openai_ms, though both add into the
+    # shared, backward-compatible openai_ms total below.
+    request_understanding_openai_ms: float = 0.0
+    request_understanding_attempts: int = 0
+    request_understanding_retry_triggered: bool = False
+    request_understanding_retry_reason: str | None = None
+    request_understanding_error: str | None = None
+    clarification_reason: str | None = None
+    # Kept for backward compatibility with earlier log consumers - an
+    # aggregate view (union across every action) of the per-action
+    # fields below, which are the source of truth for a mixed request.
+    resolved_country_codes: list[str] = field(
+        default_factory=list
+    )
+    resolved_legal_topics: list[str] = field(
+        default_factory=list
+    )
+    # Per-action country codes for a mixed request, e.g.
+    # [{"type": "comparison", "country_codes": ["ES", "AU"]},
+    #  {"type": "contact", "country_codes": ["ES"]}] - makes each
+    # action's own country scope observable without ambiguity, since
+    # a mixed request's actions never share one flat country list.
+    resolved_action_countries: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    resolved_action_topics: list[dict[str, object]] = field(
+        default_factory=list
+    )
+
     def add_opensearch_seconds(
         self,
         elapsed_seconds: float,
@@ -151,6 +196,47 @@ class LegalChatMetrics:
             "history_characters": self.history_characters,
             "contextual_question_used": (
                 self.contextual_question_used
+            ),
+            "request_actions": self.request_actions,
+            "request_status": self.request_status,
+            "request_understanding_method": (
+                self.request_understanding_method
+            ),
+            "request_understanding_confidence": (
+                self.request_understanding_confidence
+            ),
+            "request_understanding_ms": round(
+                self.request_understanding_ms,
+                2,
+            ),
+            "request_understanding_openai_ms": round(
+                self.request_understanding_openai_ms,
+                2,
+            ),
+            "request_understanding_attempts": (
+                self.request_understanding_attempts
+            ),
+            "request_understanding_retry_triggered": (
+                self.request_understanding_retry_triggered
+            ),
+            "request_understanding_retry_reason": (
+                self.request_understanding_retry_reason
+            ),
+            "request_understanding_error": (
+                self.request_understanding_error
+            ),
+            "clarification_reason": self.clarification_reason,
+            "resolved_country_codes": (
+                self.resolved_country_codes
+            ),
+            "resolved_legal_topics": (
+                self.resolved_legal_topics
+            ),
+            "resolved_action_countries": (
+                self.resolved_action_countries
+            ),
+            "resolved_action_topics": (
+                self.resolved_action_topics
             ),
         }
 
