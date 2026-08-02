@@ -181,6 +181,23 @@ def build_legal_search_body(
         or request.subsections
     )
 
+    # Contact-card chunks (subsection "Contact") are looked up through
+    # their own dedicated search, never through this general-purpose
+    # legal search - so they are excluded here by default to keep them
+    # from surfacing in normal legal answers. The one exception is a
+    # caller that explicitly filtered on the "Contact" subsection
+    # itself, which would otherwise contradict this exclusion.
+    must_not: list[dict[str, Any]] = []
+
+    if "Contact" not in subsections:
+        must_not.append(
+            {
+                "term": {
+                    "subsection.keyword": "Contact",
+                }
+            }
+        )
+
     return {
         "from": request.offset,
         "size": request.limit,
@@ -208,6 +225,7 @@ def build_legal_search_body(
                     }
                 ],
                 "filter": filters,
+                "must_not": must_not,
             }
         },
     }
@@ -379,6 +397,129 @@ def search_legal_documents(
         ),
         limit=request.limit,
         offset=request.offset,
+        took_ms=int(
+            response.get(
+                "took",
+                0,
+            )
+        ),
+        hits=_extract_search_hits(
+            response
+        ),
+    )
+
+
+CONTACT_SUBSECTION: Final[str] = "Contact"
+
+MAX_CONTACT_CHUNKS_PER_LOOKUP: Final[int] = 20
+
+
+def build_contact_lookup_body(
+    country_codes: Sequence[str],
+) -> dict[str, Any]:
+    """
+    Build an exact-filter OpenSearch body for one contact lookup.
+
+    This is a metadata lookup, not a relevance search: it never runs
+    the BM25 "must" clause used by build_legal_search_body, and it
+    deliberately targets only the "Contact" subsection that normal
+    legal search excludes.
+    """
+
+    normalized_codes = _normalize_filter_values(
+        country_codes,
+        uppercase=True,
+    )
+
+    return {
+        "from": 0,
+        "size": MAX_CONTACT_CHUNKS_PER_LOOKUP,
+        "track_total_hits": True,
+        "_source": SEARCH_SOURCE_FIELDS,
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "terms": {
+                            "country_code": normalized_codes,
+                        }
+                    },
+                    {
+                        "term": {
+                            "subsection.keyword": (
+                                CONTACT_SUBSECTION
+                            ),
+                        }
+                    },
+                ],
+            }
+        },
+    }
+
+
+def search_contact_chunks(
+    country_codes: Sequence[str],
+    client: OpenSearch | None = None,
+) -> LegalSearchResponse:
+    """
+    Look up validated L&E Global contact chunks for given countries.
+
+    Deterministic metadata lookup: no relevance scoring, no reranking,
+    no OpenAI call. Returns at most one response covering every
+    requested country in a single round trip.
+    """
+
+    normalized_codes = _normalize_filter_values(
+        country_codes,
+        uppercase=True,
+    )
+
+    if not normalized_codes:
+        return LegalSearchResponse(
+            query="",
+            total=0,
+            limit=MAX_CONTACT_CHUNKS_PER_LOOKUP,
+            offset=0,
+            took_ms=0,
+            hits=[],
+        )
+
+    search_body = build_contact_lookup_body(
+        normalized_codes
+    )
+
+    opensearch_client = (
+        client
+        if client is not None
+        else get_opensearch_client()
+    )
+
+    try:
+        response = opensearch_client.search(
+            index=LEGAL_DOCUMENTS_ALIAS,
+            body=search_body,
+        )
+
+    except OpenSearchException as error:
+        raise LegalSearchError(
+            "OpenSearch contact lookup failed."
+        ) from error
+
+    if not isinstance(
+        response,
+        dict,
+    ):
+        raise LegalSearchError(
+            "OpenSearch returned an invalid response."
+        )
+
+    return LegalSearchResponse(
+        query="",
+        total=_extract_total_hits(
+            response
+        ),
+        limit=MAX_CONTACT_CHUNKS_PER_LOOKUP,
+        offset=0,
         took_ms=int(
             response.get(
                 "took",

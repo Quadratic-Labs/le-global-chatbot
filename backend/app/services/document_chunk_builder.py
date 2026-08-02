@@ -21,8 +21,13 @@ from app.core.subsection_taxonomy import (
 from app.models.document import DocumentChunk
 from app.services.docx_parser import (
     ParsedSection,
+    build_contact_chunk_content,
+    extract_contacts_from_docx,
     parse_docx_sections,
 )
+
+
+CONTACT_SUBSECTION: Final[str] = "Contact"
 
 
 _FILENAME_PATTERNS: Final[
@@ -467,6 +472,75 @@ def build_document_chunks(
     return chunks
 
 
+def _build_contact_chunk(
+    file_path: Path,
+    metadata: DocumentMetadata,
+) -> DocumentChunk | None:
+    """
+    Build one Contact-subsection chunk from a source DOCX, if it has
+    a validated contact card.
+
+    Reuses the same document_id/chunk_id scheme as every other chunk
+    of this document, so it lives in the same OpenSearch mapping with
+    no new field. Returns None when no contact could be extracted,
+    rather than indexing an empty placeholder.
+    """
+
+    contacts = extract_contacts_from_docx(
+        file_path,
+        country=metadata.country,
+    )
+
+    if not contacts:
+        return None
+
+    content = build_contact_chunk_content(
+        contacts
+    )
+
+    if not content:
+        return None
+
+    country = metadata.country.strip()
+    country_code = metadata.country_code.strip().upper()
+
+    document_id = _build_document_id(
+        metadata
+    )
+
+    section = (
+        f"Employment Law Overview {country}"
+    )
+
+    chunk_id = _build_chunk_id(
+        document_id=document_id,
+        document_type="overview",
+        legal_topic=None,
+        section=section,
+        subsection=CONTACT_SUBSECTION,
+        occurrence=1,
+    )
+
+    return DocumentChunk(
+        document_id=document_id,
+        chunk_id=chunk_id,
+        country=country,
+        country_code=country_code,
+        legal_topic=None,
+        document_type="overview",
+        language=metadata.language.strip().lower(),
+        section=section,
+        subsection=CONTACT_SUBSECTION,
+        content=content,
+        source_filename=metadata.source_filename.strip(),
+        source_format=metadata.source_format.strip().lower(),
+        content_hash=_sha256(
+            content
+        ),
+        reference_year=metadata.reference_year,
+    )
+
+
 def build_document_chunks_from_docx(
     file_path: Path,
     country_code: str | None = None,
@@ -488,7 +562,19 @@ def build_document_chunks_from_docx(
         max_chars=6000,
     )
 
-    return build_document_chunks(
+    chunks = build_document_chunks(
         parsed_sections=parsed_sections,
         metadata=metadata,
     )
+
+    contact_chunk = _build_contact_chunk(
+        file_path=file_path,
+        metadata=metadata,
+    )
+
+    if contact_chunk is not None:
+        chunks.append(
+            contact_chunk
+        )
+
+    return chunks

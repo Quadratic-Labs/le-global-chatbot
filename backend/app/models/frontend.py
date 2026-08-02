@@ -17,6 +17,8 @@ class FrontendLimits(BaseModel):
     max_sources_min: int
     max_sources_max: int
 
+    max_history_messages: int
+
     class Config:
         extra = "forbid"
 

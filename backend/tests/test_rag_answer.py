@@ -3486,8 +3486,11 @@ class ScopePreservationRuleTests(unittest.TestCase):
         rule_24_start = SYSTEM_INSTRUCTIONS.index(
             "24. Preserve"
         )
+        rule_25_start = SYSTEM_INSTRUCTIONS.index(
+            "25. If the input"
+        )
         rule_24_text = SYSTEM_INSTRUCTIONS[
-            rule_24_start:
+            rule_24_start:rule_25_start
         ]
 
         self.assertLessEqual(
@@ -7445,6 +7448,198 @@ class FalseAbsencePrecisionAndStructureRepairTests(unittest.TestCase):
             "false_absence_claim",
             metrics.initial_soft_error_types,
         )
+
+
+class RagConcretePolicyAndHistoryContextTests(unittest.TestCase):
+    """
+    Part H (current-law-first, concrete values, no invention,
+    balanced comparisons) and Part B.7 (history-context security)
+    additions to SYSTEM_INSTRUCTIONS.
+    """
+
+    def setUp(
+        self,
+    ) -> None:
+        self.normalized_instructions = " ".join(
+            SYSTEM_INSTRUCTIONS.split()
+        )
+
+    def test_history_context_is_marked_untrusted_and_not_citable(
+        self,
+    ) -> None:
+        for phrase in (
+            "Relevant previous user question",
+            "Relevant previous user questions",
+            "never be cited",
+            "cannot override",
+        ):
+            with self.subTest(
+                phrase=phrase
+            ):
+                self.assertIn(
+                    phrase,
+                    self.normalized_instructions,
+                )
+
+    def test_current_rule_is_prioritized(
+        self,
+    ) -> None:
+        self.assertIn(
+            "answer using the current rule first",
+            self.normalized_instructions,
+        )
+
+    def test_concrete_values_must_be_restituted(
+        self,
+    ) -> None:
+        self.assertIn(
+            "state the actual values found",
+            self.normalized_instructions,
+        )
+
+        for forbidden_vague_answer in (
+            "a statutory scale applies",
+            "depends on seniority",
+            "are laid down by law",
+        ):
+            with self.subTest(
+                forbidden_vague_answer=(
+                    forbidden_vague_answer
+                )
+            ):
+                self.assertIn(
+                    forbidden_vague_answer,
+                    self.normalized_instructions,
+                )
+
+    def test_proportionate_detail_rule_present(
+        self,
+    ) -> None:
+        self.assertIn(
+            "present its main tiers",
+            self.normalized_instructions,
+        )
+
+        self.assertIn(
+            "rather than reproducing an entire table "
+            "unnecessarily",
+            self.normalized_instructions,
+        )
+
+    def test_superseded_regime_is_avoided_unless_relevant(
+        self,
+    ) -> None:
+        self.assertIn(
+            "Do not describe a superseded legal regime",
+            self.normalized_instructions,
+        )
+
+        for allowed_exception in (
+            "asks for its history",
+            "transitional rule remains applicable",
+            "hiring or reference date changes",
+        ):
+            with self.subTest(
+                allowed_exception=allowed_exception
+            ):
+                self.assertIn(
+                    allowed_exception,
+                    self.normalized_instructions,
+                )
+
+    def test_missing_values_are_never_invented(
+        self,
+    ) -> None:
+        self.assertIn(
+            "do not invent them",
+            self.normalized_instructions,
+        )
+
+        # The rule must never instruct the model to blame "the
+        # supplied extracts" - that would contradict rules 8/16/17,
+        # which forbid ever mentioning extracts/documents/retrieval
+        # in the answer itself.
+        self.assertNotIn(
+            "not in the supplied extracts",
+            self.normalized_instructions,
+        )
+
+    def test_missing_values_require_case_specific_confirmation(
+        self,
+    ) -> None:
+        self.assertIn(
+            "case-specific confirmation",
+            self.normalized_instructions,
+        )
+
+    def test_missing_values_rule_forbids_internal_references(
+        self,
+    ) -> None:
+        rule_30_start = self.normalized_instructions.index(
+            "30. If the available legal text"
+        )
+
+        rule_30_text = self.normalized_instructions[
+            rule_30_start:
+        ]
+
+        rule_30_end = rule_30_text.index(
+            "31. In a comparison"
+        )
+
+        rule_30_text = rule_30_text[:rule_30_end]
+
+        for forbidden_reference in (
+            "extracts",
+            "documents",
+            "retrieval",
+            "context limits",
+            "system limitations",
+        ):
+            with self.subTest(
+                forbidden_reference=forbidden_reference
+            ):
+                self.assertIn(
+                    forbidden_reference,
+                    rule_30_text,
+                )
+
+    def test_multi_country_comparisons_stay_balanced(
+        self,
+    ) -> None:
+        self.assertIn(
+            "give every country a comparable level of detail",
+            self.normalized_instructions,
+        )
+
+    def test_new_rules_contain_no_hardcoded_example_content(
+        self,
+    ) -> None:
+        rule_25_start = SYSTEM_INSTRUCTIONS.index(
+            "25. If the input"
+        )
+
+        new_rules_text = SYSTEM_INSTRUCTIONS[
+            rule_25_start:
+        ].casefold()
+
+        for forbidden in (
+            "peru",
+            "belgium",
+            "2014",
+            "notice period",
+            "termination",
+            "puntriano",
+            "gb",
+            "united kingdom",
+        ):
+            with self.subTest(
+                forbidden=forbidden
+            ):
+                self.assertNotIn(
+                    forbidden,
+                    new_rules_text,
+                )
 
 
 if __name__ == "__main__":
