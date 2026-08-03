@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import time
 import unittest
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from fastapi import HTTPException, Response
 from pydantic import ValidationError
 
 from app.clients.openai_responses import (
@@ -33,8 +35,11 @@ from app.routers.chat import (
     _detect_contact_intent,
     _has_direct_who_to_reach_form,
     _iter_recent_user_questions,
+    _sanitize_contact_content,
+    legal_chat,
     resolve_legal_chat_response,
 )
+from app.services.conversation_transition import ConversationTransitionError
 from app.services.legal_search import LegalSearchError
 from app.services.rag_answer import (
     InvalidLegalChatRequestError,
@@ -147,13 +152,19 @@ def _understanding_action(
     legal_topics: list[str] | None = None,
     topic_text: str | None = None,
     resolved_question: str | None = None,
+    subject_text: str | None = None,
+    search_concepts: list[dict[str, Any]] | None = None,
+    subject_specificity: str | None = None,
+    evidence_mode: str | None = None,
 ) -> dict[str, Any]:
     """
     Build one RequestUnderstandingAction JSON payload.
 
     Mirrors app.services.request_understanding.RequestUnderstandingAction
     exactly - see that module's model_validator for which fields are
-    required for which type/status combination.
+    required for which type/status combination. subject_text/
+    search_concepts/subject_specificity/evidence_mode default to the
+    same absent values every pre-existing call site already relied on.
     """
 
     return {
@@ -162,6 +173,29 @@ def _understanding_action(
         "legal_topics": legal_topics or [],
         "topic_text": topic_text,
         "resolved_question": resolved_question,
+        "subject_text": subject_text,
+        "search_concepts": search_concepts or [],
+        "subject_specificity": subject_specificity,
+        "evidence_mode": evidence_mode,
+    }
+
+
+def _current_message_delta(
+    *,
+    explicit_action_types: list[str] | None = None,
+    explicit_country_codes: list[str] | None = None,
+    explicit_legal_topics: list[str] | None = None,
+    explicit_subject_text: str | None = None,
+    context_operation: str = "independent",
+) -> dict[str, Any]:
+    """Build one CurrentMessageDelta JSON payload."""
+
+    return {
+        "explicit_action_types": explicit_action_types or [],
+        "explicit_country_codes": explicit_country_codes or [],
+        "explicit_legal_topics": explicit_legal_topics or [],
+        "explicit_subject_text": explicit_subject_text,
+        "context_operation": context_operation,
     }
 
 
@@ -172,6 +206,7 @@ def _understanding_result(
     is_follow_up: bool = False,
     confidence: float = 0.9,
     clarification_reason: str | None = None,
+    current_message_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build one RequestUnderstandingResult JSON payload.
@@ -186,6 +221,15 @@ def _understanding_result(
         "actions": actions or [],
         "is_follow_up": is_follow_up,
         "confidence": confidence,
+        "current_message_delta": (
+            current_message_delta
+            if current_message_delta is not None
+            else _current_message_delta(
+                context_operation=(
+                    "continue" if is_follow_up else "independent"
+                ),
+            )
+        ),
         "clarification_reason": clarification_reason,
     }
 
@@ -1468,6 +1512,69 @@ class ChatMetricsTests(unittest.TestCase):
             "RagAnswerError",
         )
 
+    def test_transition_error_never_reaches_search_or_generation(
+        self,
+    ) -> None:
+        # 0.4.2 durcissement (Phase 5): an unexpected error inside the
+        # deterministic transition engine must be raised as a
+        # controlled ConversationTransitionError - never silently
+        # passed through to the classifier's own raw result, and
+        # never allowed to reach OpenSearch or OpenAI generation for
+        # this request at all.
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["ES"],
+                        topic_text="employment law overview",
+                    )
+                ],
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.apply_conversation_transition",
+            side_effect=ConversationTransitionError(
+                "unexpected transition failure"
+            ),
+        ):
+            with self.assertLogs(
+                self.LOGGER_NAME,
+                level="INFO",
+            ) as log_context:
+                with self.assertRaises(
+                    ConversationTransitionError
+                ):
+                    resolve_legal_chat_response(
+                        request=LegalChatRequest(
+                            question="Employment law overview Spain",
+                            country_codes=["ES"],
+                        ),
+                        catalog_provider=_catalog_provider,
+                        search_function=_unexpected_search,
+                        generation_client=NoCallGenerationClient(),
+                        understanding_client=understanding_client,
+                    )
+
+        payload = self._single_log_payload(
+            log_context
+        )
+
+        self.assertEqual(
+            payload["outcome"],
+            "error",
+        )
+
+        self.assertEqual(
+            payload["error_type"],
+            "ConversationTransitionError",
+        )
+
+        self.assertTrue(
+            payload["transition_error"]
+        )
+
     def test_log_never_contains_question_or_answer_text(
         self,
     ) -> None:
@@ -1656,6 +1763,66 @@ class NoCallGenerationClient:
         raise AssertionError(
             "OpenAI must not be called for a "
             "deterministic contact response."
+        )
+
+
+class LegalChatRouteTransitionErrorTests(unittest.TestCase):
+    """
+    0.4.2 durcissement (Phase 5): the actual FastAPI route function -
+    not just resolve_legal_chat_response - must convert an unexpected
+    ConversationTransitionError into a controlled 502, preserving
+    X-Request-ID and never exposing the internal cause.
+    """
+
+    def test_unexpected_transition_error_becomes_a_controlled_502(
+        self,
+    ) -> None:
+        fake_settings = SimpleNamespace(
+            rerank_enabled=False,
+            rerank_pool_multiplier=1,
+            rag_max_context_characters=8000,
+            rag_max_source_characters=2000,
+        )
+
+        with mock.patch(
+            "app.routers.chat.get_settings",
+            return_value=fake_settings,
+        ), mock.patch(
+            "app.routers.chat.resolve_legal_chat_response",
+            side_effect=ConversationTransitionError(
+                "unexpected transition failure - internal detail "
+                "that must never reach the client"
+            ),
+        ):
+            response = Response()
+
+            with self.assertRaises(HTTPException) as raised:
+                legal_chat(
+                    request=LegalChatRequest(
+                        question="What are the overtime rules in Spain?",
+                        country_codes=["ES"],
+                    ),
+                    response=response,
+                    x_request_id="client-supplied-request-id",
+                )
+
+        error = raised.exception
+
+        self.assertEqual(
+            error.status_code,
+            502,
+        )
+        self.assertNotIn(
+            "internal detail",
+            error.detail,
+        )
+        self.assertEqual(
+            error.headers["X-Request-ID"],
+            "client-supplied-request-id",
+        )
+        self.assertEqual(
+            response.headers["X-Request-ID"],
+            "client-supplied-request-id",
         )
 
 
@@ -3950,6 +4117,157 @@ class ContactIntentTests(unittest.TestCase):
             response.answer,
             CONTACT_CLARIFICATION_ANSWER,
         )
+
+
+class ContactContentSanitizationTests(unittest.TestCase):
+    """
+    Tests for _sanitize_contact_content (defect I: the UK contact's
+    Address field has its own Phone value duplicated at the end).
+
+    Display-time only, and narrowly scoped: strips exactly a trailing
+    Phone-value duplicate from the Address line, never anything else -
+    in particular, the UK's own known postcode oddity ("EC3 A 7 AR")
+    must never be touched, guessed, or "corrected" (rectificatif M).
+    """
+
+    def test_strips_a_phone_value_duplicated_at_the_end_of_the_address(
+        self,
+    ) -> None:
+        content = (
+            "Member firm: Test Firm UK\n"
+            "Address: 1 Bishops Square, London EC3 A 7 AR, "
+            "+44 20 1234 5678\n"
+            "Phone: +44 20 1234 5678\n"
+            "Email: contact@test-firm.example"
+        )
+
+        sanitized = _sanitize_contact_content(content)
+
+        self.assertEqual(
+            sanitized,
+            (
+                "Member firm: Test Firm UK\n"
+                "Address: 1 Bishops Square, London EC3 A 7 AR\n"
+                "Phone: +44 20 1234 5678\n"
+                "Email: contact@test-firm.example"
+            ),
+        )
+
+    def test_the_uk_postcode_oddity_is_never_touched_on_its_own(
+        self,
+    ) -> None:
+        # No phone duplication here at all - the address must come
+        # back byte-for-byte identical, oddity included.
+        content = (
+            "Member firm: Test Firm UK\n"
+            "Address: 1 Bishops Square, London EC3 A 7 AR\n"
+            "Phone: +44 20 1234 5678\n"
+            "Email: contact@test-firm.example"
+        )
+
+        self.assertEqual(
+            _sanitize_contact_content(content),
+            content,
+        )
+
+    def test_the_postcode_oddity_survives_when_phone_is_also_stripped(
+        self,
+    ) -> None:
+        content = (
+            "Member firm: Test Firm UK\n"
+            "Address: 1 Bishops Square, London EC3 A 7 AR, "
+            "+44 20 1234 5678\n"
+            "Phone: +44 20 1234 5678\n"
+            "Email: contact@test-firm.example"
+        )
+
+        sanitized = _sanitize_contact_content(content)
+
+        self.assertIn("EC3 A 7 AR", sanitized)
+        self.assertNotIn("EC3 A 7 AR,", sanitized)
+
+    def test_no_phone_line_leaves_content_unchanged(self) -> None:
+        content = (
+            "Member firm: Test Firm UK\n"
+            "Address: 1 Bishops Square, London EC3 A 7 AR\n"
+            "Email: contact@test-firm.example"
+        )
+
+        self.assertEqual(
+            _sanitize_contact_content(content),
+            content,
+        )
+
+    def test_no_address_line_leaves_content_unchanged(self) -> None:
+        content = (
+            "Member firm: Test Firm UK\n"
+            "Phone: +44 20 1234 5678\n"
+            "Email: contact@test-firm.example"
+        )
+
+        self.assertEqual(
+            _sanitize_contact_content(content),
+            content,
+        )
+
+    def test_a_normal_non_duplicated_contact_is_left_untouched(
+        self,
+    ) -> None:
+        content = (
+            "Member firm: Test Firm Spain\n"
+            "Address: Calle Mayor 1, Madrid 28001\n"
+            "Phone: +34 91 123 4567\n"
+            "Email: contact@test-firm.example"
+        )
+
+        self.assertEqual(
+            _sanitize_contact_content(content),
+            content,
+        )
+
+    def test_wired_into_the_full_contact_answer_via_search(
+        self,
+    ) -> None:
+        # End-to-end through _build_contact_section itself, not just
+        # the pure sanitizer function directly.
+        def fake_contact_search(
+            country_codes: list[str],
+            client: Any = None,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query="",
+                total=1,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_contact_hit(
+                        country_code="GB",
+                        country="United Kingdom",
+                        content=(
+                            "Member firm: Test Firm UK\n"
+                            "Address: 1 Bishops Square, London "
+                            "EC3 A 7 AR, +44 20 1234 5678\n"
+                            "Phone: +44 20 1234 5678\n"
+                            "Email: contact@test-firm.example"
+                        ),
+                    )
+                ],
+            )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=fake_contact_search,
+        ):
+            answer_text, sources, _, _ = _build_contact_section(
+                country_codes=["GB"],
+                unavailable_country_codes=[],
+                citation_offset=0,
+            )
+
+        self.assertIn("EC3 A 7 AR", answer_text)
+        self.assertNotIn("EC3 A 7 AR,", answer_text)
+        self.assertEqual(answer_text.count("+44 20 1234 5678"), 1)
 
 
 if __name__ == "__main__":

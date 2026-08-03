@@ -42,7 +42,7 @@ def _build_settings(**overrides: Any) -> Settings:
         "openai_rerank_reasoning_effort": "low",
         "openai_rerank_max_output_tokens": 500,
         "openai_understanding_reasoning_effort": "low",
-        "openai_understanding_max_output_tokens": 400,
+        "openai_understanding_max_output_tokens": 1200,
         "api_access_key": None,
         "admin_api_key": None,
         "cors_allowed_origins": (),

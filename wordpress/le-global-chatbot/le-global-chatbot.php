@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.4.1
+ * Version: 0.4.2
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.4.1';
+    private const VERSION = '0.4.2';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -49,6 +49,13 @@ final class LE_Global_Chatbot_Plugin
         'user',
         'assistant',
     ];
+
+    // Coarse defense-in-depth ceiling only, mirroring the backend's
+    // own authoritative limit (app/models/conversation_state.py,
+    // MAX_CONVERSATION_STATE_JSON_CHARACTERS). The backend's Pydantic
+    // model (extra="forbid") remains the sole source of truth for
+    // conversation_state's shape and content.
+    private const CONVERSATION_STATE_MAX_JSON_CHARACTERS = 8000;
 
     public static function init(): void
     {
@@ -129,6 +136,10 @@ final class LE_Global_Chatbot_Plugin
                     'history' => [
                         'required' => false,
                         'type' => 'array',
+                    ],
+                    'conversation_state' => [
+                        'required' => false,
+                        'type' => 'object',
                     ],
                 ],
             ]
@@ -492,6 +503,14 @@ final class LE_Global_Chatbot_Plugin
             return $history;
         }
 
+        $conversation_state = self::sanitize_conversation_state(
+            $parameters['conversation_state'] ?? null
+        );
+
+        if (is_wp_error($conversation_state)) {
+            return $conversation_state;
+        }
+
         $payload = [
             'question' => $question,
             'history' => $history,
@@ -536,6 +555,10 @@ final class LE_Global_Chatbot_Plugin
             $payload['reference_year'] = absint(
                 $parameters['reference_year']
             );
+        }
+
+        if ($conversation_state !== null) {
+            $payload['conversation_state'] = $conversation_state;
         }
 
         return self::proxy_backend_request(
@@ -787,6 +810,56 @@ final class LE_Global_Chatbot_Plugin
         }
 
         return $sanitized_history;
+    }
+
+    /**
+     * Validates the client-supplied conversation_state envelope
+     * before it is forwarded to the backend. This is a coarse,
+     * defense-in-depth check only: the proxy never inspects,
+     * rewrites, or injects any of its inner fields - it either
+     * forwards the object exactly as received or rejects it
+     * outright. The backend's Pydantic model (extra="forbid") is
+     * the sole authority on conversation_state's shape and content,
+     * and a 422 it raises is relayed back to the client unchanged
+     * via proxy_backend_request().
+     */
+    private static function sanitize_conversation_state(
+        mixed $raw_conversation_state
+    ) {
+        if ($raw_conversation_state === null) {
+            return null;
+        }
+
+        if (!is_array($raw_conversation_state)) {
+            return new WP_Error(
+                'le_global_invalid_conversation_state',
+                'conversation_state must be an object.',
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        $encoded_conversation_state = wp_json_encode(
+            $raw_conversation_state
+        );
+
+        if (
+            $encoded_conversation_state === false
+            || self::string_length(
+                $encoded_conversation_state
+            ) > self::CONVERSATION_STATE_MAX_JSON_CHARACTERS
+        ) {
+            return new WP_Error(
+                'le_global_invalid_conversation_state',
+                'conversation_state is too large.',
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        return $raw_conversation_state;
     }
 
     private static function proxy_backend_request(

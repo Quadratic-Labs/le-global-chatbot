@@ -101,6 +101,25 @@ def _understanding_action(
     }
 
 
+def _current_message_delta(
+    *,
+    explicit_action_types: list[str] | None = None,
+    explicit_country_codes: list[str] | None = None,
+    explicit_legal_topics: list[str] | None = None,
+    explicit_subject_text: str | None = None,
+    context_operation: str = "independent",
+) -> dict[str, Any]:
+    """Build one CurrentMessageDelta JSON payload."""
+
+    return {
+        "explicit_action_types": explicit_action_types or [],
+        "explicit_country_codes": explicit_country_codes or [],
+        "explicit_legal_topics": explicit_legal_topics or [],
+        "explicit_subject_text": explicit_subject_text,
+        "context_operation": context_operation,
+    }
+
+
 def _understanding_result(
     *,
     status: str = "resolved",
@@ -108,6 +127,7 @@ def _understanding_result(
     is_follow_up: bool = False,
     confidence: float = 0.9,
     clarification_reason: str | None = None,
+    current_message_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -115,6 +135,15 @@ def _understanding_result(
         "is_follow_up": is_follow_up,
         "confidence": confidence,
         "clarification_reason": clarification_reason,
+        "current_message_delta": (
+            current_message_delta
+            if current_message_delta is not None
+            else _current_message_delta(
+                context_operation=(
+                    "continue" if is_follow_up else "independent"
+                ),
+            )
+        ),
     }
 
 

@@ -80,6 +80,21 @@ def _comparison_action(**overrides: object) -> dict[str, object]:
     return action
 
 
+def _delta(**overrides: object) -> dict[str, object]:
+    """Build one minimal, valid CurrentMessageDelta payload."""
+
+    payload: dict[str, object] = {
+        "explicit_action_types": [],
+        "explicit_country_codes": [],
+        "explicit_legal_topics": [],
+        "explicit_subject_text": None,
+        "context_operation": "independent",
+    }
+    payload.update(overrides)
+
+    return payload
+
+
 def _resolved_result(**overrides: object) -> dict[str, object]:
     """Build one minimal, valid 'resolved' RequestUnderstandingResult payload."""
 
@@ -89,6 +104,7 @@ def _resolved_result(**overrides: object) -> dict[str, object]:
         "is_follow_up": False,
         "confidence": 0.9,
         "clarification_reason": None,
+        "current_message_delta": _delta(),
     }
     payload.update(overrides)
 
@@ -452,6 +468,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.4,
             clarification_reason="ambiguous_request",
+            current_message_delta=_delta(),
         )
 
         self.assertEqual(result.actions, [])
@@ -471,6 +488,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.4,
             clarification_reason="missing_country",
+            current_message_delta=_delta(),
         )
 
         self.assertEqual(result.action_hint_type(), "contact")
@@ -483,6 +501,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.4,
                 clarification_reason=None,
+                current_message_delta=_delta(),
             )
 
     def test_clarification_with_two_or_more_actions_is_rejected(
@@ -498,6 +517,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.4,
                 clarification_reason="ambiguous_request",
+                current_message_delta=_delta(),
             )
 
     def test_clarification_with_unsupported_request_reason_is_rejected(
@@ -515,6 +535,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.4,
                 clarification_reason="unsupported_request",
+                current_message_delta=_delta(),
             )
 
     def test_valid_unsupported_result_is_accepted(self) -> None:
@@ -524,6 +545,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.95,
             clarification_reason="unsupported_request",
+            current_message_delta=_delta(),
         )
 
         self.assertEqual(result.status, "unsupported")
@@ -539,6 +561,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                         is_follow_up=False,
                         confidence=0.5,
                         clarification_reason=reason,
+                        current_message_delta=_delta(),
                     )
 
     def test_unsupported_carrying_an_action_is_rejected(self) -> None:
@@ -549,6 +572,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.5,
                 clarification_reason="unsupported_request",
+                current_message_delta=_delta(),
             )
 
     def test_confidence_below_zero_is_rejected(self) -> None:
@@ -613,6 +637,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.4,
             clarification_reason="missing_country",
+            current_message_delta=_delta(),
         )
 
         self.assertIsNone(result.action_hint_type())
