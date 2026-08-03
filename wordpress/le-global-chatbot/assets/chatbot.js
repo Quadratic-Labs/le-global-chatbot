@@ -1,6 +1,488 @@
 (() => {
     "use strict";
 
+    // Default cap on total conversation messages (user + assistant
+    // turns combined) kept in memory, persisted to sessionStorage, and
+    // sent to the backend as history - overridden by the backend's own
+    // frontend-config limit when available (see loadConfiguration()).
+    const DEFAULT_MAX_HISTORY_MESSAGES = 20;
+
+    const DISCLAIMER_TEXT = (
+        "This information is based on the available L&E "
+        + "Global documents and does not constitute legal advice."
+    );
+
+    const CITATION_GROUP_PATTERN = (
+        /\[(\d+(?:\s*,\s*\d+)*)\]/g
+    );
+
+    const HISTORY_QUESTION_MAX_CHARACTERS = 2000;
+    const HISTORY_ANSWER_MAX_CHARACTERS = 3000;
+
+    // Scaled proportionally with DEFAULT_MAX_HISTORY_MESSAGES
+    // (previously 10000 for 6 messages), matching the backend's own
+    // HISTORY_TOTAL_MAX_CHARACTERS exactly - the per-message limits
+    // above are unchanged.
+    const HISTORY_TOTAL_MAX_CHARACTERS = 33333;
+
+    // sessionStorage only - never localStorage/cookies/IndexedDB - so
+    // the conversation never survives beyond the browser session. The
+    // version segment lets a future format change discard older data
+    // safely instead of misreading it.
+    const CONVERSATION_STORAGE_KEY = (
+        "le_global_chatbot_conversation_v1"
+    );
+
+    // Version 2 adds conversationState (structured routing context
+    // for the next turn) and a per-message hasDisclaimer flag
+    // alongside the existing messages array - a version 1 payload
+    // (messages only) is detected by normalizeStoredConversation()
+    // and discarded rather than misread.
+    const CONVERSATION_STORAGE_VERSION = 2;
+
+    /**
+     * Build the history payload sent alongside a new question, from
+     * this widget's own turns array - a pure function of its input so
+     * it can be exercised directly, without any DOM.
+     *
+     * Only "success" turns are eligible (a pending or error turn is
+     * never included). Turns are walked from the most recent to the
+     * oldest, each contributing one complete user+assistant pair -
+     * never just one side of it - clipped to
+     * HISTORY_QUESTION_MAX_CHARACTERS / HISTORY_ANSWER_MAX_CHARACTERS
+     * first. A pair is kept only while the running total of the kept
+     * pairs' characters stays within HISTORY_TOTAL_MAX_CHARACTERS;
+     * the walk stops at the first older pair that would not fit,
+     * rather than skipping it and considering even older ones. The
+     * result is returned in chronological order.
+     */
+    function buildBoundedHistoryPayload(
+        turns,
+        maxHistoryMessages
+    ) {
+        const successTurns = turns.filter(
+            (turn) => turn.status === "success"
+        );
+
+        const selectedPairs = [];
+        let totalCharacters = 0;
+
+        for (
+            let index = successTurns.length - 1;
+            index >= 0;
+            index -= 1
+        ) {
+            const turn = successTurns[index];
+
+            const questionContent = turn.question.slice(
+                0,
+                HISTORY_QUESTION_MAX_CHARACTERS
+            );
+
+            const answerContent = (turn.answer || "").slice(
+                0,
+                HISTORY_ANSWER_MAX_CHARACTERS
+            );
+
+            const pairCharacters = (
+                questionContent.length
+                + answerContent.length
+            );
+
+            if (
+                totalCharacters + pairCharacters
+                > HISTORY_TOTAL_MAX_CHARACTERS
+            ) {
+                break;
+            }
+
+            totalCharacters += pairCharacters;
+
+            selectedPairs.unshift(
+                {
+                    question: questionContent,
+                    answer: answerContent,
+                }
+            );
+
+            if (
+                selectedPairs.length * 2
+                >= maxHistoryMessages
+            ) {
+                break;
+            }
+        }
+
+        const history = [];
+
+        selectedPairs.forEach((pair) => {
+            history.push(
+                {
+                    role: "user",
+                    content: pair.question,
+                }
+            );
+
+            history.push(
+                {
+                    role: "assistant",
+                    content: pair.answer,
+                }
+            );
+        });
+
+        return history;
+    }
+
+    /**
+     * Validate one parsed sessionStorage payload and return a flat,
+     * cleaned message list - never the raw value itself.
+     *
+     * Returns null - never throws, never returns a partially-trusted
+     * object - whenever the top-level shape is wrong (not a plain
+     * object, wrong version, "messages" not an array). Within an
+     * otherwise valid payload, individual malformed entries (wrong
+     * role, non-string or empty content) are dropped rather than
+     * invalidating the whole conversation - trimConversationToPairs()
+     * is what reduces the remaining entries to a safely alternating,
+     * complete-pairs-only list.
+     */
+    function normalizeStoredConversationState(rawConversationState) {
+        if (
+            !rawConversationState
+            || typeof rawConversationState !== "object"
+            || Array.isArray(rawConversationState)
+        ) {
+            return null;
+        }
+
+        return rawConversationState;
+    }
+
+    function normalizeStoredConversation(rawValue) {
+        if (
+            !rawValue
+            || typeof rawValue !== "object"
+            || Array.isArray(rawValue)
+        ) {
+            return null;
+        }
+
+        if (
+            rawValue.version
+            !== CONVERSATION_STORAGE_VERSION
+        ) {
+            return null;
+        }
+
+        if (!Array.isArray(rawValue.messages)) {
+            return null;
+        }
+
+        const normalizedMessages = [];
+
+        rawValue.messages.forEach((entry) => {
+            if (!entry || typeof entry !== "object") {
+                return;
+            }
+
+            const role = entry.role;
+
+            if (
+                role !== "user"
+                && role !== "assistant"
+            ) {
+                return;
+            }
+
+            if (typeof entry.content !== "string") {
+                return;
+            }
+
+            const content = entry.content.trim();
+
+            if (!content) {
+                return;
+            }
+
+            const message = {
+                role,
+                content,
+            };
+
+            if (role === "assistant") {
+                if (Array.isArray(entry.sources)) {
+                    message.sources = entry.sources.filter(
+                        (source) => (
+                            source
+                            && typeof source === "object"
+                        )
+                    );
+                }
+
+                message.hasDisclaimer = Boolean(
+                    entry.hasDisclaimer
+                );
+            }
+
+            normalizedMessages.push(message);
+        });
+
+        return {
+            messages: normalizedMessages,
+            conversationState: normalizeStoredConversationState(
+                rawValue.conversationState
+            ),
+        };
+    }
+
+    /**
+     * Reduce a flat message list to complete, alternating
+     * user-then-assistant pairs only, most recent pairs kept first.
+     *
+     * Walks from the start expecting strict user/assistant
+     * alternation - stops at the first break (a wrong role, or a
+     * trailing question with no answer yet) rather than trying to
+     * resynchronize, since a broken pairing this deep is never
+     * trustworthy. The result is capped to at most
+     * floor(maxHistoryMessages / 2) pairs, dropping the oldest ones
+     * first.
+     */
+    function trimConversationToCompletePairs(
+        messages,
+        maxHistoryMessages
+    ) {
+        const pairs = [];
+        let index = 0;
+
+        while (index + 1 < messages.length) {
+            const userMessage = messages[index];
+            const assistantMessage = messages[index + 1];
+
+            if (
+                userMessage.role !== "user"
+                || assistantMessage.role !== "assistant"
+            ) {
+                break;
+            }
+
+            pairs.push(
+                [
+                    userMessage,
+                    assistantMessage,
+                ]
+            );
+
+            index += 2;
+        }
+
+        const maxPairs = Math.max(
+            0,
+            Math.floor(
+                maxHistoryMessages / 2
+            )
+        );
+
+        return pairs.slice(-maxPairs).flat();
+    }
+
+    /**
+     * Read and validate the persisted conversation, if any.
+     *
+     * Any corruption at all - invalid JSON, wrong version, a
+     * non-object payload, or a message list that normalizes/trims
+     * down to nothing - deletes the stored key and returns an empty
+     * list, so the widget always starts normally rather than ever
+     * failing to open over bad storage content.
+     */
+    function loadStoredConversation(maxHistoryMessages) {
+        const empty = {
+            messages: [],
+            conversationState: null,
+        };
+
+        let rawText;
+
+        try {
+            rawText = window.sessionStorage.getItem(
+                CONVERSATION_STORAGE_KEY
+            );
+        } catch {
+            return empty;
+        }
+
+        if (!rawText) {
+            return empty;
+        }
+
+        let parsedValue;
+
+        try {
+            parsedValue = JSON.parse(rawText);
+        } catch {
+            clearStoredConversation();
+            return empty;
+        }
+
+        const normalized = (
+            normalizeStoredConversation(parsedValue)
+        );
+
+        if (normalized === null) {
+            clearStoredConversation();
+            return empty;
+        }
+
+        const trimmedMessages = (
+            trimConversationToCompletePairs(
+                normalized.messages,
+                maxHistoryMessages
+            )
+        );
+
+        if (trimmedMessages.length === 0) {
+            clearStoredConversation();
+            return empty;
+        }
+
+        return {
+            messages: trimmedMessages,
+            conversationState: normalized.conversationState,
+        };
+    }
+
+    /**
+     * Persist only the complete, successful turns - never a pending
+     * question awaiting its answer, never an error turn - capped to
+     * the same complete-pairs limit used everywhere else. Silently
+     * gives up on any storage failure (quota exceeded, storage
+     * disabled in private browsing): persistence is a convenience,
+     * never a requirement for the widget to keep working.
+     */
+    function saveConversation(
+        turns,
+        maxHistoryMessages,
+        conversationState
+    ) {
+        const messages = [];
+
+        turns
+            .filter(
+                (turn) => turn.status === "success"
+            )
+            .forEach((turn) => {
+                messages.push(
+                    {
+                        role: "user",
+                        content: turn.question,
+                    }
+                );
+
+                messages.push(
+                    {
+                        role: "assistant",
+                        content: turn.answer || "",
+                        sources: Array.isArray(turn.sources)
+                            ? turn.sources
+                            : [],
+                        hasDisclaimer: Boolean(
+                            turn.hasDisclaimer
+                        ),
+                    }
+                );
+            });
+
+        const trimmedMessages = (
+            trimConversationToCompletePairs(
+                messages,
+                maxHistoryMessages
+            )
+        );
+
+        if (trimmedMessages.length === 0) {
+            clearStoredConversation();
+            return;
+        }
+
+        try {
+            window.sessionStorage.setItem(
+                CONVERSATION_STORAGE_KEY,
+                JSON.stringify(
+                    {
+                        version: CONVERSATION_STORAGE_VERSION,
+                        messages: trimmedMessages,
+                        conversationState: (
+                            conversationState || null
+                        ),
+                    }
+                )
+            );
+        } catch {
+            // Storage may be full or unavailable - never break the
+            // widget over a persistence failure.
+        }
+    }
+
+    /** Delete the persisted conversation, if any. */
+    function clearStoredConversation() {
+        try {
+            window.sessionStorage.removeItem(
+                CONVERSATION_STORAGE_KEY
+            );
+        } catch {
+            // sessionStorage may be unavailable (private browsing,
+            // disabled storage) - nothing to clean up in that case.
+        }
+    }
+
+    /**
+     * Rebuild in-memory turns (the widget's own rendering/history
+     * model) from a validated, complete-pairs-only message list -
+     * every restored turn is already "success", since only successful
+     * turns are ever persisted.
+     */
+    function rebuildTurnsFromMessages(
+        messages,
+        nextTurnId
+    ) {
+        const turns = [];
+        let currentId = nextTurnId;
+
+        for (
+            let index = 0;
+            index + 1 < messages.length;
+            index += 2
+        ) {
+            const userMessage = messages[index];
+            const assistantMessage = messages[index + 1];
+
+            turns.push(
+                {
+                    id: currentId,
+                    question: userMessage.content,
+                    status: "success",
+                    answer: assistantMessage.content,
+                    sources: Array.isArray(
+                        assistantMessage.sources
+                    )
+                        ? assistantMessage.sources
+                        : [],
+                    hasDisclaimer: Boolean(
+                        assistantMessage.hasDisclaimer
+                    ),
+                    errorMessage: null,
+                }
+            );
+
+            currentId += 1;
+        }
+
+        return {
+            turns,
+            nextTurnId: currentId,
+        };
+    }
+
     const widgets = document.querySelectorAll(
         ".le-global-chatbot"
     );
@@ -29,6 +511,18 @@
             "[data-conversation]"
         );
 
+        const welcomeMessageElement = widget.querySelector(
+            "[data-welcome-message]"
+        );
+
+        const messageListElement = widget.querySelector(
+            "[data-message-list]"
+        );
+
+        const newConversationButton = widget.querySelector(
+            "[data-new-conversation]"
+        );
+
         const submitButton = widget.querySelector(
             ".le-global-chatbot__submit"
         );
@@ -41,50 +535,86 @@
             "[data-error]"
         );
 
-        const responseElement = widget.querySelector(
-            "[data-response]"
-        );
-
-        const userQuestionElement = widget.querySelector(
-            "[data-user-question]"
-        );
-
-        const assistantMessageElement = widget.querySelector(
-            "[data-assistant-message]"
-        );
-
-        const answerElement = widget.querySelector(
-            "[data-answer]"
-        );
-
-        const sourcesSection = widget.querySelector(
-            "[data-sources-section]"
-        );
-
-        const sourcesElement = widget.querySelector(
-            "[data-sources]"
-        );
-
         if (
             !form
             || !questionInput
             || !characterCount
             || !conversationElement
+            || !welcomeMessageElement
+            || !messageListElement
+            || !newConversationButton
             || !submitButton
             || !statusElement
             || !errorElement
-            || !responseElement
-            || !userQuestionElement
-            || !assistantMessageElement
-            || !answerElement
-            || !sourcesSection
-            || !sourcesElement
         ) {
             return;
         }
 
         let maximumQuestionLength = 2000;
         let defaultMaximumSources = 6;
+        let maxHistoryMessages = DEFAULT_MAX_HISTORY_MESSAGES;
+        let requestInFlight = false;
+        let configurationInFlight = false;
+
+        // Identifies which submit() call a still-pending /chat
+        // request belongs to, and which AbortController it used.
+        // startNewConversation() bumps the generation and clears the
+        // controller immediately - any mutation, error handling, or
+        // finally cleanup from an older request compares its own
+        // captured values against these before touching anything, so
+        // a request abandoned by "New conversation" can never affect
+        // the conversation the user is now looking at, whether or not
+        // the browser actually manages to cancel it in time.
+        let activeChatController = null;
+        let conversationGeneration = 0;
+
+        /**
+         * Conversation turns, oldest first. At most
+         * floor(maxHistoryMessages / 2) are ever kept - adding one
+         * more removes the oldest one, whole, before it is rendered.
+         * A turn is one of:
+         * { id, question, status: "pending", answer: null,
+         *   sources: [], errorMessage: null }
+         * { id, question, status: "success", answer, sources }
+         * { id, question, status: "error", answer: null,
+         *   sources: [], errorMessage }
+         * Once a turn reaches "success" or "error" it is never
+         * mutated again - a later render always reproduces the same
+         * markup for it.
+         */
+        let turns = [];
+        let nextTurnId = 1;
+
+        // Structured routing state returned with the most recent
+        // successful turn - sent back with the next question so the
+        // backend can resolve a follow-up ("Peru?", "the contact")
+        // without re-deriving it from raw history text alone. Never
+        // a legal source, never rendered - purely routing metadata
+        // the backend itself produced and validated.
+        let conversationState = null;
+
+        // Restore any conversation persisted earlier in this same
+        // browser session (survives a reload, never a full browser
+        // session close, since sessionStorage is used - never
+        // localStorage). Corrupted or unreadable storage silently
+        // yields an empty list, so the widget always opens normally.
+        const restored = loadStoredConversation(
+            maxHistoryMessages
+        );
+
+        if (restored.messages.length > 0) {
+            const rebuilt = rebuildTurnsFromMessages(
+                restored.messages,
+                nextTurnId
+            );
+
+            turns = rebuilt.turns;
+            nextTurnId = rebuilt.nextTurnId;
+            conversationState = restored.conversationState;
+
+            renderMessageList();
+            scrollConversationToBottom();
+        }
 
         questionInput.addEventListener(
             "input",
@@ -95,10 +625,41 @@
             }
         );
 
+        questionInput.addEventListener(
+            "keydown",
+            (event) => {
+                if (
+                    event.key !== "Enter"
+                    || event.shiftKey
+                    || event.isComposing
+                    || event.keyCode === 229
+                ) {
+                    return;
+                }
+
+                event.preventDefault();
+
+                if (requestInFlight || configurationInFlight) {
+                    return;
+                }
+
+                form.requestSubmit();
+            }
+        );
+
+        newConversationButton.addEventListener(
+            "click",
+            startNewConversation
+        );
+
         form.addEventListener(
             "submit",
             async (event) => {
                 event.preventDefault();
+
+                if (requestInFlight || configurationInFlight) {
+                    return;
+                }
 
                 const question = questionInput.value.trim();
 
@@ -113,48 +674,216 @@
 
                 clearError();
 
-                userQuestionElement.textContent = question;
-                assistantMessageElement.hidden = true;
-                answerElement.textContent = "";
-                sourcesElement.innerHTML = "";
-                sourcesSection.hidden = true;
-                responseElement.hidden = false;
-
-                scrollConversationToBottom();
-
-                setLoading(
-                    true,
-                    "Searching validated legal documents…"
+                const historyPayload = buildBoundedHistoryPayload(
+                    turns,
+                    maxHistoryMessages
                 );
 
-                try {
-                    const response = await requestJson(
-                        chatEndpoint,
-                        {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                            },
-                            credentials: "same-origin",
-                            body: JSON.stringify({
-                                question,
-                                language: "en",
-                                max_sources: defaultMaximumSources,
-                            }),
+                const turn = {
+                    id: nextTurnId,
+                    question,
+                    status: "pending",
+                    answer: null,
+                    sources: [],
+                    errorMessage: null,
+                };
+
+                nextTurnId += 1;
+
+                turns.push(
+                    turn
+                );
+
+                const maxConversationPairs = Math.max(
+                    1,
+                    Math.floor(
+                        maxHistoryMessages / 2
+                    )
+                );
+
+                if (turns.length > maxConversationPairs) {
+                    turns.shift();
+                }
+
+                questionInput.value = "";
+                characterCount.textContent = "0";
+                questionInput.focus();
+
+                renderMessageList();
+                scrollConversationToBottom();
+
+                const requestGeneration = conversationGeneration;
+                const controller = new AbortController();
+                activeChatController = controller;
+
+                function isStaleRequest() {
+                    return (
+                        requestGeneration !== conversationGeneration
+                        || activeChatController !== controller
+                    );
+                }
+
+                requestInFlight = true;
+                conversationElement.setAttribute(
+                    "aria-busy",
+                    "true"
+                );
+
+                refreshLoadingState();
+
+                async function submitChatRequest(
+                    includeConversationState
+                ) {
+                    const requestBody = {
+                        question,
+                        history: historyPayload,
+                        language: "en",
+                        max_sources: defaultMaximumSources,
+                    };
+
+                    if (
+                        includeConversationState
+                        && conversationState
+                    ) {
+                        requestBody.conversation_state = (
+                            conversationState
+                        );
+                    }
+
+                    try {
+                        return await requestJson(
+                            chatEndpoint,
+                            {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type":
+                                        "application/json",
+                                },
+                                credentials: "same-origin",
+                                signal: controller.signal,
+                                body: JSON.stringify(
+                                    requestBody
+                                ),
+                            }
+                        );
+                    } catch (error) {
+                        // Recover from a conversation_state the
+                        // backend rejected (RECTIFICATIF §D): drop
+                        // only conversationState, keep every
+                        // persisted message, and retry this exact
+                        // question exactly once without it - never
+                        // a second copy of the user's question, never
+                        // a retry loop.
+                        if (
+                            includeConversationState
+                            && isConversationStateValidationError(
+                                error
+                            )
+                        ) {
+                            conversationState = null;
+
+                            saveConversation(
+                                turns.filter(
+                                    (existingTurn) => (
+                                        existingTurn.id !== turn.id
+                                    )
+                                ),
+                                maxHistoryMessages,
+                                null
+                            );
+
+                            return submitChatRequest(false);
                         }
+
+                        throw error;
+                    }
+                }
+
+                try {
+                    const response = await submitChatRequest(
+                        true
                     );
 
-                    renderResponse(response);
+                    if (isStaleRequest()) {
+                        return;
+                    }
+
+                    const rawSources = Array.isArray(
+                        response.sources
+                    )
+                        ? response.sources
+                        : [];
+
+                    const renumbered = applyCitationRenumbering(
+                        response.answer || "",
+                        rawSources
+                    );
+
+                    conversationState = (
+                        response.conversation_state || null
+                    );
+
+                    turn.status = "success";
+                    turn.answer = renumbered.answer;
+                    turn.sources = renumbered.sources;
+                    // Only a genuine legal/contact/comparison/mixed
+                    // answer carries a conversation_state with at
+                    // least one resolved action - never a
+                    // clarification, an out-of-scope refusal, or any
+                    // other dead end (see buildAssistantBubble).
+                    turn.hasDisclaimer = Boolean(
+                        conversationState
+                        && Array.isArray(
+                            conversationState.actions
+                        )
+                        && conversationState.actions.length > 0
+                    );
                 } catch (error) {
-                    showError(
+                    if (
+                        error
+                        && error.name === "AbortError"
+                    ) {
+                        return;
+                    }
+
+                    if (isStaleRequest()) {
+                        return;
+                    }
+
+                    turn.status = "error";
+                    turn.errorMessage = (
                         error instanceof Error
                             ? error.message
-                            : "The legal assistant is unavailable."
+                            : (
+                                "The legal assistant is "
+                                + "unavailable."
+                            )
                     );
-
-                    scrollConversationToBottom();
                 } finally {
-                    setLoading(false);
+                    if (!isStaleRequest()) {
+                        requestInFlight = false;
+                        activeChatController = null;
+
+                        conversationElement.setAttribute(
+                            "aria-busy",
+                            "false"
+                        );
+
+                        refreshLoadingState();
+
+                        renderMessageList();
+                        scrollConversationToBottom();
+
+                        // Persists only the turns that reached
+                        // "success" - an error turn, or the pending
+                        // turn of a request that is still in flight,
+                        // is never written to storage.
+                        saveConversation(
+                            turns,
+                            maxHistoryMessages,
+                            conversationState
+                        );
+                    }
                 }
             }
         );
@@ -295,10 +1024,8 @@
         async function loadConfiguration() {
             clearError();
 
-            setLoading(
-                true,
-                "Loading the legal catalog…"
-            );
+            configurationInFlight = true;
+            refreshLoadingState();
 
             try {
                 const configuration = await requestJson(
@@ -335,6 +1062,17 @@
                     );
                 }
 
+                if (
+                    Number.isInteger(
+                        limits.max_history_messages
+                    )
+                    && limits.max_history_messages > 0
+                ) {
+                    maxHistoryMessages = (
+                        limits.max_history_messages
+                    );
+                }
+
                 return true;
             } catch (error) {
                 showError(
@@ -345,18 +1083,238 @@
 
                 return false;
             } finally {
-                setLoading(false);
+                configurationInFlight = false;
+                refreshLoadingState();
             }
         }
 
-        function renderResponse(response) {
-            answerElement.textContent = response.answer || "";
+        function startNewConversation() {
+            conversationGeneration += 1;
 
-            sourcesElement.innerHTML = "";
+            if (activeChatController) {
+                activeChatController.abort();
+            }
 
-            const sources = Array.isArray(response.sources)
-                ? response.sources
+            activeChatController = null;
+            requestInFlight = false;
+
+            conversationElement.setAttribute(
+                "aria-busy",
+                "false"
+            );
+
+            refreshLoadingState();
+
+            clearError();
+
+            turns = [];
+            conversationState = null;
+            renderMessageList();
+
+            clearStoredConversation();
+
+            questionInput.value = "";
+            characterCount.textContent = "0";
+            questionInput.focus();
+        }
+
+        function renderMessageList() {
+            welcomeMessageElement.hidden = (
+                turns.length > 0
+            );
+
+            const fragment = document.createDocumentFragment();
+
+            turns.forEach((turn) => {
+                fragment.appendChild(
+                    buildTurnElement(
+                        turn
+                    )
+                );
+            });
+
+            messageListElement.replaceChildren(
+                fragment
+            );
+        }
+
+        function buildTurnElement(turn) {
+            const turnElement = document.createElement(
+                "article"
+            );
+
+            turnElement.className = (
+                "le-global-chatbot__turn"
+            );
+
+            const userBubble = document.createElement(
+                "div"
+            );
+
+            userBubble.className = (
+                "le-global-chatbot__message "
+                + "le-global-chatbot__message--user"
+            );
+
+            const userText = document.createElement(
+                "p"
+            );
+
+            userText.textContent = turn.question;
+            userBubble.appendChild(
+                userText
+            );
+            turnElement.appendChild(
+                userBubble
+            );
+
+            if (turn.status === "pending") {
+                const pendingBubble = document.createElement(
+                    "div"
+                );
+
+                pendingBubble.className = (
+                    "le-global-chatbot__message "
+                    + "le-global-chatbot__message--assistant "
+                    + "le-global-chatbot__message--pending"
+                );
+
+                pendingBubble.setAttribute(
+                    "aria-live",
+                    "polite"
+                );
+
+                pendingBubble.textContent = (
+                    "Searching validated legal documents…"
+                );
+
+                turnElement.appendChild(
+                    pendingBubble
+                );
+            } else if (turn.status === "error") {
+                const errorBubble = document.createElement(
+                    "div"
+                );
+
+                errorBubble.className = (
+                    "le-global-chatbot__message "
+                    + "le-global-chatbot__message--assistant "
+                    + "le-global-chatbot__message--error"
+                );
+
+                errorBubble.setAttribute(
+                    "role",
+                    "alert"
+                );
+
+                errorBubble.textContent = (
+                    turn.errorMessage
+                    || "The legal assistant could not "
+                    + "process the request."
+                );
+
+                turnElement.appendChild(
+                    errorBubble
+                );
+            } else {
+                turnElement.appendChild(
+                    buildAssistantBubble(
+                        turn
+                    )
+                );
+            }
+
+            return turnElement;
+        }
+
+        function buildAssistantBubble(turn) {
+            const assistantBubble = document.createElement(
+                "div"
+            );
+
+            assistantBubble.className = (
+                "le-global-chatbot__message "
+                + "le-global-chatbot__message--assistant"
+            );
+
+            const answerElement = document.createElement(
+                "div"
+            );
+
+            answerElement.className = (
+                "le-global-chatbot__answer"
+            );
+
+            answerElement.textContent = turn.answer || "";
+            assistantBubble.appendChild(
+                answerElement
+            );
+
+            const sources = Array.isArray(turn.sources)
+                ? turn.sources
                 : [];
+
+            if (sources.length > 0) {
+                assistantBubble.appendChild(
+                    buildSourcesSection(
+                        sources
+                    )
+                );
+            }
+
+            // Never shown for a clarification, an out-of-scope
+            // refusal, or any other turn that resolved no real
+            // action - only for a genuine legal/contact/comparison/
+            // mixed answer (see hasDisclaimer, set from whether the
+            // response carried a conversation_state with at least
+            // one resolved action).
+            if (turn.hasDisclaimer) {
+                const disclaimer = document.createElement(
+                    "p"
+                );
+
+                disclaimer.className = (
+                    "le-global-chatbot__disclaimer"
+                );
+
+                disclaimer.textContent = DISCLAIMER_TEXT;
+                assistantBubble.appendChild(
+                    disclaimer
+                );
+            }
+
+            return assistantBubble;
+        }
+
+        function buildSourcesSection(sources) {
+            const sourcesSection = document.createElement(
+                "section"
+            );
+
+            sourcesSection.className = (
+                "le-global-chatbot__sources-section"
+            );
+
+            const sourcesTitle = document.createElement(
+                "h4"
+            );
+
+            sourcesTitle.className = (
+                "le-global-chatbot__sources-title"
+            );
+
+            sourcesTitle.textContent = "Sources";
+            sourcesSection.appendChild(
+                sourcesTitle
+            );
+
+            const sourcesList = document.createElement(
+                "ol"
+            );
+
+            sourcesList.className = (
+                "le-global-chatbot__sources"
+            );
 
             sources.forEach((source) => {
                 const item = document.createElement(
@@ -395,21 +1353,26 @@
                     .filter(Boolean)
                     .join(" · ");
 
-                item.appendChild(title);
+                item.appendChild(
+                    title
+                );
 
                 if (metadata.textContent) {
-                    item.appendChild(metadata);
+                    item.appendChild(
+                        metadata
+                    );
                 }
 
-                sourcesElement.appendChild(item);
+                sourcesList.appendChild(
+                    item
+                );
             });
 
-            sourcesSection.hidden = sources.length === 0;
-            responseElement.hidden = false;
+            sourcesSection.appendChild(
+                sourcesList
+            );
 
-            assistantMessageElement.hidden = false;
-
-            scrollConversationToBottom();
+            return sourcesSection;
         }
 
         function scrollConversationToBottom() {
@@ -429,14 +1392,207 @@
             errorElement.hidden = true;
         }
 
-        function setLoading(isLoading, message = "") {
-            submitButton.disabled = isLoading;
-            questionInput.disabled = isLoading;
+        function refreshLoadingState() {
+            const isBusy = (
+                requestInFlight
+                || configurationInFlight
+            );
 
-            statusElement.textContent = isLoading
-                ? message
-                : "";
+            submitButton.disabled = isBusy;
+
+            if (requestInFlight) {
+                statusElement.textContent = (
+                    "Searching validated legal documents…"
+                );
+            } else if (configurationInFlight) {
+                statusElement.textContent = (
+                    "Loading the legal catalog…"
+                );
+            } else {
+                statusElement.textContent = "";
+            }
         }
+    }
+
+    /**
+     * Build a table from each source's original backend citation
+     * number to a dense, sequential display number, in the order the
+     * sources were returned. Returns null - never renumber - unless
+     * every id is a unique positive integer.
+     */
+    function buildCitationDisplayMap(sources) {
+        const seenIds = new Set();
+        const displayNumberById = new Map();
+        let nextDisplayNumber = 1;
+
+        for (const source of sources) {
+            const originalId = source.citation;
+
+            if (
+                !Number.isInteger(originalId)
+                || originalId <= 0
+            ) {
+                return null;
+            }
+
+            if (seenIds.has(originalId)) {
+                return null;
+            }
+
+            seenIds.add(originalId);
+            displayNumberById.set(
+                originalId,
+                nextDisplayNumber
+            );
+            nextDisplayNumber += 1;
+        }
+
+        return displayNumberById;
+    }
+
+    /**
+     * Parse every "[n]" / "[n, m, ...]" citation group in one answer,
+     * in a single pass, without touching any other bracketed text
+     * (only digits and commas are ever treated as a citation group).
+     */
+    function findCitationGroups(answer) {
+        const groups = [];
+        const pattern = new RegExp(
+            CITATION_GROUP_PATTERN.source,
+            "g"
+        );
+
+        let match = pattern.exec(answer);
+
+        while (match !== null) {
+            groups.push(
+                {
+                    fullMatch: match[0],
+                    index: match.index,
+                    ids: match[1]
+                        .split(",")
+                        .map(
+                            (piece) => parseInt(
+                                piece.trim(),
+                                10
+                            )
+                        ),
+                }
+            );
+
+            match = pattern.exec(answer);
+        }
+
+        return groups;
+    }
+
+    /**
+     * Renumber every citation group in one answer using a display
+     * map already built for this response's sources.
+     *
+     * Validates every group against the map first, then rewrites the
+     * text in one reconstruction pass - never a naive sequence of
+     * String.replace calls, which could corrupt an already-rewritten
+     * number. If any group cites an id the map does not have, no
+     * group is renumbered: the answer and its sources are returned
+     * exactly as received.
+     */
+    function renumberCitationMarkers(answer, citationMap) {
+        const groups = findCitationGroups(
+            answer
+        );
+
+        const allGroupsKnown = groups.every(
+            (group) => group.ids.every(
+                (id) => citationMap.has(id)
+            )
+        );
+
+        if (!allGroupsKnown) {
+            return {
+                text: answer,
+                ok: false,
+            };
+        }
+
+        let rebuilt = "";
+        let cursor = 0;
+
+        groups.forEach((group) => {
+            rebuilt += answer.slice(
+                cursor,
+                group.index
+            );
+
+            const displayIds = group.ids.map(
+                (id) => citationMap.get(id)
+            );
+
+            rebuilt += `[${displayIds.join(", ")}]`;
+
+            cursor = (
+                group.index
+                + group.fullMatch.length
+            );
+        });
+
+        rebuilt += answer.slice(
+            cursor
+        );
+
+        return {
+            text: rebuilt,
+            ok: true,
+        };
+    }
+
+    /**
+     * Apply this response's own local citation renumbering.
+     *
+     * Falls back to the original answer and sources untouched -
+     * never a partial renumbering - whenever the sources carry
+     * invalid or duplicate ids, or the answer cites an id the
+     * sources do not have.
+     */
+    function applyCitationRenumbering(answer, sources) {
+        const citationMap = buildCitationDisplayMap(
+            sources
+        );
+
+        if (!citationMap) {
+            return {
+                answer,
+                sources,
+            };
+        }
+
+        const renumbered = renumberCitationMarkers(
+            answer,
+            citationMap
+        );
+
+        if (!renumbered.ok) {
+            return {
+                answer,
+                sources,
+            };
+        }
+
+        const renumberedSources = sources.map(
+            (source) => (
+                {
+                    ...source,
+                    citation: citationMap.get(
+                        source.citation
+                    ),
+                }
+            )
+        );
+
+        return {
+            answer: renumbered.text,
+            sources: renumberedSources,
+        };
     }
 
     async function requestJson(url, options) {
@@ -454,15 +1610,55 @@
         }
 
         if (!response.ok) {
-            throw new Error(
+            const error = new Error(
                 getErrorMessage(
                     payload,
                     response.status
                 )
             );
+
+            // Exposed only so a caller can react to a specific
+            // backend validation failure (see
+            // isConversationStateValidationError) - never displayed
+            // or logged as-is.
+            error.statusCode = response.status;
+            error.payload = payload;
+
+            throw error;
         }
 
         return payload || {};
+    }
+
+    /**
+     * True only for a 422 whose FastAPI validation detail names
+     * conversation_state - never for any other 422 (e.g. an invalid
+     * question), which must surface as a normal error instead.
+     */
+    function isConversationStateValidationError(error) {
+        if (
+            !error
+            || error.statusCode !== 422
+            || !error.payload
+        ) {
+            return false;
+        }
+
+        const detail = error.payload.detail;
+
+        if (!Array.isArray(detail)) {
+            return false;
+        }
+
+        return detail.some(
+            (item) => (
+                item
+                && Array.isArray(item.loc)
+                && item.loc.includes(
+                    "conversation_state"
+                )
+            )
+        );
     }
 
     function getErrorMessage(payload, statusCode) {
@@ -499,5 +1695,24 @@
             "The legal assistant could not process "
             + "the request."
         );
+    }
+
+    // Test-only hook: absent in the browser (module is never defined
+    // there), so this changes nothing about how the widget itself
+    // loads or runs. Exposes only the pure, DOM-free functions the
+    // test suite exercises directly - never the DOM-wired widget
+    // internals (initializeWidget's own event handlers), which are
+    // covered by node --check plus direct source review instead.
+    if (typeof module !== "undefined" && module.exports) {
+        module.exports = {
+            CONVERSATION_STORAGE_KEY,
+            CONVERSATION_STORAGE_VERSION,
+            normalizeStoredConversation,
+            loadStoredConversation,
+            saveConversation,
+            clearStoredConversation,
+            rebuildTurnsFromMessages,
+            isConversationStateValidationError,
+        };
     }
 })();

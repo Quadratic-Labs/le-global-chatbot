@@ -22,7 +22,27 @@ class OpenAIConfigurationError(RuntimeError):
 
 
 class OpenAIResponseError(RuntimeError):
-    """Raised when OpenAI text generation fails."""
+    """
+    Raised when OpenAI text generation fails.
+
+    `retryable` distinguishes a transient failure (timeout, connection
+    error, HTTP 429/500/502/503/504) - safe for a caller to retry once -
+    from a definitive one (HTTP 400/401/403, or any failure that happens
+    only after a response was already successfully received, such as
+    invalid JSON or an incomplete-status response) - never retried,
+    since retrying would not change the outcome.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,8 +201,17 @@ class OpenAIResponsesClient:
         self,
         instructions: str,
         input_text: str,
+        text_format: dict[str, Any] | None = None,
     ) -> GeneratedText:
-        """Generate one text response."""
+        """
+        Generate one text response.
+
+        `text_format` requests the Responses API's native structured-
+        output mode (a JSON Schema the model is constrained to conform
+        to) - passed through as-is as the request's "text.format"
+        field. Callers that don't need it (answer generation, rerank)
+        simply omit it, unaffected.
+        """
 
         request_body = {
             "model": self.model,
@@ -200,6 +229,11 @@ class OpenAIResponsesClient:
             request_body["max_output_tokens"] = (
                 self.max_output_tokens
             )
+
+        if text_format is not None:
+            request_body["text"] = {
+                "format": text_format,
+            }
 
         encoded_body = json.dumps(
             request_body
@@ -264,7 +298,9 @@ class OpenAIResponsesClient:
                 pass
 
             raise OpenAIResponseError(
-                error_message
+                error_message,
+                retryable=error.code in (429, 500, 502, 503, 504),
+                status_code=error.code,
             ) from error
 
         except (
@@ -273,7 +309,8 @@ class OpenAIResponsesClient:
             OSError,
         ) as error:
             raise OpenAIResponseError(
-                "OpenAI could not be reached."
+                "OpenAI could not be reached.",
+                retryable=True,
             ) from error
 
         try:
@@ -391,5 +428,20 @@ def get_openai_rerank_client() -> OpenAIResponsesClient:
         ),
         max_output_tokens=(
             settings.openai_rerank_max_output_tokens
+        ),
+    )
+
+
+def get_openai_understanding_client() -> OpenAIResponsesClient:
+    """Build the OpenAI client used for semantic request understanding."""
+
+    settings = get_settings()
+
+    return _get_configured_openai_client(
+        reasoning_effort=(
+            settings.openai_understanding_reasoning_effort
+        ),
+        max_output_tokens=(
+            settings.openai_understanding_max_output_tokens
         ),
     )

@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.models.conversation_state import ConversationState
 
-HISTORY_MAX_MESSAGES = 6
+
+HISTORY_MAX_MESSAGES = 20
 HISTORY_MESSAGE_MAX_CHARACTERS = 4000
-HISTORY_TOTAL_MAX_CHARACTERS = 10000
+# Scaled proportionally with HISTORY_MAX_MESSAGES (previously 10000 for
+# 6 messages) - the per-message limit above is unchanged.
+HISTORY_TOTAL_MAX_CHARACTERS = (
+    HISTORY_MAX_MESSAGES * 10000 // 6
+)
 
 
 class LegalChatHistoryMessage(BaseModel):
@@ -112,6 +118,18 @@ class LegalChatRequest(BaseModel):
         ),
     )
 
+    conversation_state: ConversationState | None = Field(
+        default=None,
+        description=(
+            "Structured routing state from the last successful turn, "
+            "as returned by that turn's own response. Untrusted "
+            "client-supplied data, used only to disambiguate a "
+            "follow-up's action/country/subject - never a legal "
+            "source. A client that omits it falls back to using "
+            "history alone, exactly as before this field existed."
+        ),
+    )
+
     class Config:
         extra = "forbid"
 
@@ -201,6 +219,8 @@ class LegalChatResponse(BaseModel):
 
     retrieval_total: int
     sources: list[LegalAnswerSource]
+
+    conversation_state: ConversationState | None = None
 
     class Config:
         extra = "forbid"

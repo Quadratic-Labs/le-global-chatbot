@@ -144,6 +144,177 @@ class LegalChatMetricsTests(unittest.TestCase):
             bool,
         )
 
+    def test_request_understanding_fields_default_safely(
+        self,
+    ) -> None:
+        metrics = _build_metrics()
+
+        payload = metrics.as_log_payload()
+
+        self.assertEqual(
+            payload["request_actions"],
+            [],
+        )
+
+        self.assertEqual(
+            payload["request_understanding_method"],
+            "fallback",
+        )
+
+        self.assertIsNone(
+            payload["request_understanding_confidence"],
+        )
+
+        self.assertEqual(
+            payload["request_understanding_ms"],
+            0,
+        )
+
+        self.assertIsNone(
+            payload["request_understanding_error"],
+        )
+
+        self.assertIsNone(
+            payload["clarification_reason"],
+        )
+
+        self.assertEqual(
+            payload["resolved_country_codes"],
+            [],
+        )
+
+        self.assertEqual(
+            payload["resolved_legal_topics"],
+            [],
+        )
+
+        self.assertIsNone(
+            payload["request_status"],
+        )
+
+        self.assertEqual(
+            payload["request_understanding_openai_ms"],
+            0,
+        )
+
+        self.assertEqual(
+            payload["request_understanding_attempts"],
+            0,
+        )
+
+        self.assertIs(
+            payload["request_understanding_retry_triggered"],
+            False,
+        )
+
+        self.assertIsNone(
+            payload["request_understanding_retry_reason"],
+        )
+
+        self.assertEqual(
+            payload["resolved_action_topics"],
+            [],
+        )
+
+    def test_request_understanding_fields_are_recorded(
+        self,
+    ) -> None:
+        metrics = _build_metrics()
+
+        metrics.request_actions = ["contact"]
+        metrics.request_status = "resolved"
+        metrics.request_understanding_method = "semantic"
+        metrics.request_understanding_confidence = 0.87
+        metrics.request_understanding_ms = 42.5
+        metrics.request_understanding_openai_ms = 40.1
+        metrics.request_understanding_attempts = 2
+        metrics.request_understanding_retry_triggered = True
+        metrics.request_understanding_retry_reason = "http_503"
+        metrics.request_understanding_error = None
+        metrics.clarification_reason = "missing_country"
+        metrics.resolved_country_codes = ["PE"]
+        metrics.resolved_legal_topics = ["Employee Benefits"]
+        metrics.resolved_action_topics = [
+            {
+                "type": "legal_information",
+                "legal_topics": ["Employee Benefits"],
+                "topic_text": None,
+            }
+        ]
+
+        payload = metrics.as_log_payload()
+
+        self.assertEqual(
+            payload["request_status"],
+            "resolved",
+        )
+
+        self.assertEqual(
+            payload["request_understanding_openai_ms"],
+            40.1,
+        )
+
+        self.assertEqual(
+            payload["request_understanding_attempts"],
+            2,
+        )
+
+        self.assertIs(
+            payload["request_understanding_retry_triggered"],
+            True,
+        )
+
+        self.assertEqual(
+            payload["request_understanding_retry_reason"],
+            "http_503",
+        )
+
+        self.assertEqual(
+            payload["resolved_action_topics"],
+            [
+                {
+                    "type": "legal_information",
+                    "legal_topics": ["Employee Benefits"],
+                    "topic_text": None,
+                }
+            ],
+        )
+
+        self.assertEqual(
+            payload["request_actions"],
+            ["contact"],
+        )
+
+        self.assertEqual(
+            payload["request_understanding_method"],
+            "semantic",
+        )
+
+        self.assertEqual(
+            payload["request_understanding_confidence"],
+            0.87,
+        )
+
+        self.assertEqual(
+            payload["request_understanding_ms"],
+            42.5,
+        )
+
+        self.assertEqual(
+            payload["clarification_reason"],
+            "missing_country",
+        )
+
+        self.assertEqual(
+            payload["resolved_country_codes"],
+            ["PE"],
+        )
+
+        self.assertEqual(
+            payload["resolved_legal_topics"],
+            ["Employee Benefits"],
+        )
+
     def test_log_emits_exactly_one_json_record(
         self,
     ) -> None:

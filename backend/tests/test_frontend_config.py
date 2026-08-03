@@ -9,6 +9,7 @@ from app.models.catalog import (
     LegalCatalogResponse,
     LegalCatalogValue,
 )
+from app.models.chat import HISTORY_MAX_MESSAGES
 from app.services.frontend_config import (
     API_VERSION,
     FrontendConfigError,
@@ -110,6 +111,11 @@ class FrontendConfigTests(unittest.TestCase):
         self.assertEqual(
             response.limits.max_sources_max,
             10,
+        )
+
+        self.assertEqual(
+            response.limits.max_history_messages,
+            HISTORY_MAX_MESSAGES,
         )
 
     def test_catalog_errors_are_wrapped(

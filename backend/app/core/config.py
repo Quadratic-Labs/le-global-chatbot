@@ -155,6 +155,9 @@ class Settings:
     openai_rerank_reasoning_effort: str
     openai_rerank_max_output_tokens: int
 
+    openai_understanding_reasoning_effort: str
+    openai_understanding_max_output_tokens: int
+
     api_access_key: str | None
     admin_api_key: str | None
 
@@ -233,6 +236,22 @@ def get_settings() -> Settings:
         openai_rerank_max_output_tokens=env_int(
             "OPENAI_RERANK_MAX_OUTPUT_TOKENS",
             500,
+        ),
+        openai_understanding_reasoning_effort=os.getenv(
+            "OPENAI_UNDERSTANDING_REASONING_EFFORT",
+            "low",
+        ),
+        # 0.4.2 raised this from 400: the schema now carries
+        # current_message_delta plus subject_text/search_concepts/
+        # subject_specificity/evidence_mode per action, and 400 was
+        # observed to consistently truncate a real multi-action
+        # request (OpenAI returns an incomplete response, degrading
+        # every such request to the conservative fallback). Verified
+        # against the real API at 1200 across single-action, 3-country
+        # comparison, and mixed 3-action requests.
+        openai_understanding_max_output_tokens=env_int(
+            "OPENAI_UNDERSTANDING_MAX_OUTPUT_TOKENS",
+            1200,
         ),
         api_access_key=optional_secret(
             "API_ACCESS_KEY"

@@ -7,7 +7,8 @@ import logging
 import math
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import dataclasses
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Final, Protocol
 
@@ -21,6 +22,9 @@ from app.clients.openai_responses import (
 from app.core.country_registry import (
     COUNTRIES,
 )
+from app.services.country_detection import (
+    resolve_country_display_name,
+)
 from app.services.chat_metrics import (
     LegalChatMetrics,
 )
@@ -33,6 +37,11 @@ from app.models.search import (
     LegalSearchHit,
     LegalSearchRequest,
     LegalSearchResponse,
+)
+from app.services.evidence_coverage import (
+    SearchConceptLike,
+    answer_mentions_concepts,
+    evaluate_evidence_status,
 )
 from app.services.legal_search import (
     LegalSearchError,
@@ -93,6 +102,19 @@ CITATION_LIKE_PATTERN: Final[re.Pattern[str]] = (
     )
 )
 
+# Two identical citation groups sitting right next to each other
+# (e.g. "[1, 2]. [1, 2]") - collapses to one, keeping whichever single
+# punctuation character (if any) separated them and never
+# renumbering. Applied repeatedly (see _deduplicate_adjacent_citations)
+# so three or more repeats collapse just as reliably as two.
+_DUPLICATE_ADJACENT_CITATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(\[\d+(?:\s*,\s*\d+)*\])((?:[.,;]?\s+\1)+)"
+)
+
+_FIRST_PUNCTUATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[.,;]"
+)
+
 RERANK_INSTRUCTIONS: Final[str] = """
 Return ONLY a JSON array of the candidate numbers, ordered from most
 to least relevant to the question, e.g. [3, 1, 2]. Include every
@@ -110,6 +132,44 @@ NO_INFORMATION_ANSWER: Final[str] = (
 MISSING_COUNTRY_ANSWER: Final[str] = (
     "Please select or name at least one country so I can answer "
     "from the relevant validated L&E Global documents."
+)
+
+INSUFFICIENT_EVIDENCE_ANSWER_TEMPLATE: Final[str] = (
+    "The available validated L&E Global documents do not contain "
+    "enough information to answer {subject} for {country}."
+)
+
+PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE: Final[str] = (
+    "For {country}, the supplied sources only partially address "
+    "{subject}. That country's section must still contain only "
+    "hyphen-prefixed bullet points, exactly like every other section -"
+    " never a plain-text sentence before or between them. Make the "
+    "FIRST bullet in that section exactly this sentence, unmodified: "
+    "\"- The available validated L&E Global documents only partially "
+    "address {subject} in {country}.\" Every other bullet in that "
+    "section must present only what the sources actually support - "
+    "never state or imply the sources answer the specific question "
+    "in full."
+)
+
+# 0.4.2 hardening: a country dropped from generation for insufficient
+# evidence (see the fully_insufficient_codes filtering below) is still
+# named in the question text itself, which the model never sees
+# modified - without this instruction it tries to address that country
+# anyway, producing a heading _validate_grounding_section_structure
+# does not recognize as one of the (now-narrower) requested countries,
+# which is invalid_grounding_structure on both the initial attempt and
+# the repair (repeating the same mistake, since the repair prompt
+# never said otherwise either). Reproduced and confirmed against the
+# real API before this fix existed.
+EXCLUDED_COUNTRY_HEADING_INSTRUCTION_TEMPLATE: Final[str] = (
+    "The question may name a country whose own answer is being "
+    "handled separately and is deliberately NOT included in the "
+    "sources below - do not address it, do not mention it, and do "
+    "not create any heading for it. Address only: {countries}. "
+    "Every heading in your answer must be exactly one of these "
+    "country names, or \"Comparison\" if the question asks for a "
+    "comparison between them - never any other country name."
 )
 
 SYSTEM_INSTRUCTIONS: Final[str] = """
@@ -244,6 +304,30 @@ class RagAnswerError(RuntimeError):
 
 class InvalidLegalChatRequestError(ValueError):
     """Raised when chat retrieval parameters are inconsistent."""
+
+
+@dataclass(frozen=True, slots=True)
+class LegalActionEvidenceSpec:
+    """
+    One legal-type action's own scope for retrieval and evidence-gating.
+
+    0.4.2 hardening: a mixed request naming more than one legal-type
+    action (e.g. "compare dismissal in Spain and Australia, and explain
+    overtime in Peru") used to let the *first* action's subject_text/
+    search_concepts/evidence_mode stand in for all of them - meaning a
+    second action's own country could be graded against the first
+    action's unrelated concepts. Each spec is now retrieved and graded
+    independently - no source retrieved for one action's own (country,
+    concept)-scoped query is ever evaluated against another action's
+    concepts - while generation itself stays a single combined call
+    (never one OpenAI call per action).
+    """
+
+    country_codes: list[str]
+    legal_topics: list[str] = field(default_factory=list)
+    subject_text: str | None = None
+    search_concepts: list[SearchConceptLike] | None = None
+    evidence_mode: str | None = None
 
 
 def _normalize_country_codes(
@@ -416,6 +500,7 @@ def _country_name_variants_for_codes(
 def _build_retrieval_query(
     question: str,
     country_name_variants: Sequence[str],
+    search_concepts: Sequence[SearchConceptLike] | None = None,
 ) -> str:
     """
     Build a BM25 query stripped of country names and generic filler.
@@ -425,6 +510,16 @@ def _build_retrieval_query(
     out the actual legal terms, especially for multi-country
     comparisons where the other country's name never appears in a
     given country's own content.
+
+    `search_concepts`, when given, appends every direct-synonym term
+    to the query text - a follow-up's own question text (e.g. a bare
+    "Peru?") may carry none of the subject's own vocabulary at all,
+    so this is what keeps retrieval anchored to the precise subject
+    rather than degrading to an unfiltered country-only search. Every
+    term already shares the existing per-field weights
+    (content/subsection/section) - no separate query clause, to avoid
+    restructuring the underlying OpenSearch query for a corpus this
+    change cannot exhaustively regression-test.
     """
 
     normalized_question = question
@@ -453,6 +548,15 @@ def _build_retrieval_query(
     cleaned_query = " ".join(
         words
     ).strip()
+
+    if search_concepts:
+        concept_terms = " ".join(
+            term
+            for concept in search_concepts
+            for term in concept.terms
+        )
+
+        cleaned_query = f"{cleaned_query} {concept_terms}".strip()
 
     if len(cleaned_query) < 2:
         return question.strip()
@@ -1007,6 +1111,7 @@ def _retrieve_search_hits(
     rerank_enabled: bool = False,
     rerank_pool_multiplier: int = 1,
     metrics: LegalChatMetrics | None = None,
+    search_concepts: Sequence[SearchConceptLike] | None = None,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve legal chunks.
@@ -1026,6 +1131,7 @@ def _retrieve_search_hits(
                 country_codes
             )
         ),
+        search_concepts=search_concepts,
     )
 
     if not country_codes:
@@ -1283,17 +1389,20 @@ SOFT_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
         "internal_reference",
         "false_absence_claim",
         "repetition",
+        "subject_drift",
     }
 )
 
-# Only structure is worth a second OpenAI call: it is cheap to fix and
-# the fix is reliable. The other soft warnings stay detected and
-# reported in metrics, but no longer trigger a repair generation - an
-# unrecognized future soft error type must not become repairable by
-# default, so this list is positive/explicit rather than derived.
+# Only structure and subject_drift are worth a second OpenAI call:
+# both are cheap to fix and the fix is reliable. The other soft
+# warnings stay detected and reported in metrics, but no longer
+# trigger a repair generation - an unrecognized future soft error type
+# must not become repairable by default, so this list is
+# positive/explicit rather than derived.
 REPAIR_TRIGGERING_SOFT_ERROR_TYPES: Final[frozenset[str]] = frozenset(
     {
         "structure",
+        "subject_drift",
     }
 )
 
@@ -2354,6 +2463,42 @@ def _validate_no_false_absence_claims(
     return []
 
 
+def _validate_no_subject_drift(
+    answer: str,
+    search_concepts: Sequence[SearchConceptLike],
+    evidence_mode: str,
+) -> list[QualityError]:
+    """
+    Reject an answer that abandons the precise subject asked about in
+    favor of its whole broad legal_topic/section - e.g. a general
+    termination-grounds answer to a question specifically about
+    dismissal during sick leave, or a general working-conditions
+    answer to a remote-work-specific question. Only ever checked when
+    the caller passed evidence_mode/search_concepts (never for a plain
+    call with neither, which behaves exactly as before this check
+    existed) - see evidence_coverage.answer_mentions_concepts.
+    """
+
+    if answer_mentions_concepts(
+        answer_text=answer,
+        search_concepts=search_concepts,
+        evidence_mode=evidence_mode,
+    ):
+        return []
+
+    return [
+        QualityError(
+            error_type="subject_drift",
+            message=(
+                "The answer does not engage the specific "
+                "subject asked about - it must address that "
+                "exact subject, not only its broader topic "
+                "area."
+            ),
+        )
+    ]
+
+
 def _validate_answer_quality(
     question: str,
     answer: str,
@@ -2620,6 +2765,45 @@ def _validate_citation_format(
     return []
 
 
+def _collapse_duplicate_citation_match(
+    match: re.Match[str],
+) -> str:
+    bracket = match.group(1)
+    repeated_span = match.group(2)
+
+    punctuation_match = _FIRST_PUNCTUATION_PATTERN.search(
+        repeated_span
+    )
+    punctuation = (
+        punctuation_match.group(0)
+        if punctuation_match is not None
+        else ""
+    )
+
+    return bracket + punctuation
+
+
+def _deduplicate_adjacent_citations(
+    answer: str,
+) -> str:
+    """
+    Collapse a citation group immediately repeated right after itself
+    (e.g. "[1, 2]. [1, 2]", or three or more repeats) down to one
+    occurrence, keeping a single punctuation character if the
+    original had one separating the repeats.
+
+    Never renumbers a citation, never touches two *different* groups,
+    and never touches two occurrences of the same group that are not
+    directly adjacent - a citation legitimately reappearing later in
+    the answer, separated by other text, is left untouched.
+    """
+
+    return _DUPLICATE_ADJACENT_CITATION_PATTERN.sub(
+        _collapse_duplicate_citation_match,
+        answer,
+    )
+
+
 def _find_citation_numbers(
     answer: str,
 ) -> list[int]:
@@ -2743,13 +2927,71 @@ def answer_legal_question(
         DEFAULT_MAX_SOURCE_CHARACTERS
     ),
     metrics: LegalChatMetrics | None = None,
+    subject_text: str | None = None,
+    search_concepts: list[SearchConceptLike] | None = None,
+    evidence_mode: str | None = None,
+    action_specs: list[LegalActionEvidenceSpec] | None = None,
+    known_excluded_country_codes: list[str] | None = None,
 ) -> LegalChatResponse:
-    """Retrieve legal chunks and generate one grounded answer."""
+    """
+    Retrieve legal chunks and generate one grounded answer.
 
-    if not any(
-        code.strip()
-        for code in request.country_codes
-    ):
+    `subject_text`/`search_concepts`/`evidence_mode` are optional and,
+    when omitted (the default), leave every existing caller's
+    behavior completely unchanged. When given, they gate generation on
+    whether the retrieved evidence actually supports the precise
+    subject asked about, not merely the right broad legal_topic/
+    section (see evidence_coverage.py) - a country with no direct or
+    partial evidence never reaches generation at all, and is instead
+    answered with a targeted insufficiency message naming that exact
+    subject, never a generic panorama of the whole topic.
+
+    `action_specs`, when given (a mixed request naming more than one
+    legal-type action), takes over from the three flat parameters
+    above: each spec is retrieved with its own query enrichment and
+    graded independently against only its own concepts, so one
+    action's evidence can never satisfy another's, even when two specs
+    share a country - see LegalActionEvidenceSpec. Generation is still
+    exactly one combined OpenAI call.
+
+    `known_excluded_country_codes` names countries the caller has
+    already excluded from `request.country_codes` for a reason other
+    than evidence insufficiency (0.4.2 hardening: the conservative
+    understanding-fallback and the main resolved-plan path both build
+    a post-hoc "Note: X is not covered" message for a country outside
+    the supported corpus - that note is appended after generation, so
+    without this the generation model, still seeing that country
+    named in the raw question text, may address it anyway and invent
+    a heading the structure validator does not recognize, exactly the
+    documented cause of the excluded-country class of 502). Passing
+    them here folds them into the same excluded-country instruction as
+    an evidence-insufficient country, with no other effect - they were
+    never part of `request.country_codes` to begin with.
+    """
+
+    specs = (
+        list(action_specs)
+        if action_specs
+        else [
+            LegalActionEvidenceSpec(
+                country_codes=list(request.country_codes),
+                legal_topics=list(request.legal_topics),
+                subject_text=subject_text,
+                search_concepts=search_concepts,
+                evidence_mode=evidence_mode,
+            )
+        ]
+    )
+
+    all_requested_codes = _normalize_country_codes(
+        [
+            code
+            for spec in specs
+            for code in spec.country_codes
+        ]
+    )
+
+    if not all_requested_codes:
         # No country to search or ground an answer against - detecting
         # or guessing one is the caller's responsibility, not this
         # function's. Skip retrieval and generation entirely rather
@@ -2774,31 +3016,48 @@ def answer_legal_question(
             sources=[],
         )
 
-    try:
-        (
-            retrieval_total,
-            retrieved_hits,
-        ) = _retrieve_search_hits(
-            request=request,
-            search_function=search_function,
-            generation_client=generation_client,
-            rerank_enabled=rerank_enabled,
-            rerank_pool_multiplier=rerank_pool_multiplier,
-            metrics=metrics,
+    retrieval_total = 0
+    hits_by_spec: list[list[LegalSearchHit]] = []
+
+    for spec in specs:
+        spec_request = request.model_copy(
+            update={
+                "country_codes": spec.country_codes,
+                "legal_topics": (
+                    spec.legal_topics or request.legal_topics
+                ),
+            }
         )
 
-    except LegalSearchError as error:
-        raise RagAnswerError(
-            "Legal document retrieval failed."
-        ) from error
+        try:
+            (
+                spec_retrieval_total,
+                spec_retrieved_hits,
+            ) = _retrieve_search_hits(
+                request=spec_request,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                metrics=metrics,
+                search_concepts=spec.search_concepts,
+            )
+        except LegalSearchError as error:
+            raise RagAnswerError(
+                "Legal document retrieval failed."
+            ) from error
 
-    selected_hits = _allocate_country_context_budgets(
-        hits=retrieved_hits,
-        maximum_characters=max_context_characters,
-        maximum_source_characters=max_source_characters,
-    )
+        retrieval_total += spec_retrieval_total
 
-    if not selected_hits:
+        hits_by_spec.append(
+            _allocate_country_context_budgets(
+                hits=spec_retrieved_hits,
+                maximum_characters=max_context_characters,
+                maximum_source_characters=max_source_characters,
+            )
+        )
+
+    if not any(hits_by_spec):
         if metrics is not None:
             metrics.outcome = "empty_retrieval"
             metrics.retrieval_total = retrieval_total
@@ -2811,6 +3070,183 @@ def answer_legal_question(
             model=None,
             retrieval_total=retrieval_total,
             sources=[],
+        )
+
+    # A country shared by two specs (e.g. a legal_information action and
+    # a comparison both naming the same country under different
+    # subjects) must keep two independent verdicts - never one flat
+    # per-country status silently overwritten by whichever spec runs
+    # last. Only country codes actually shared across specs get a
+    # qualified metrics key; the common single-spec/disjoint case keeps
+    # plain country codes, unchanged from before this hardening.
+    country_spec_counts: dict[str, int] = {}
+
+    for spec in specs:
+        for code in _normalize_country_codes(spec.country_codes):
+            country_spec_counts[code] = (
+                country_spec_counts.get(code, 0) + 1
+            )
+
+    insufficient_evidence_answer_parts: list[str] = []
+    partial_evidence_instruction = ""
+    evidence_status_by_key: dict[str, str] = {}
+    filtered_hits_by_spec: list[list[LegalSearchHit]] = []
+    gated_codes_by_spec: list[set[str]] = []
+    insufficient_codes_by_spec: list[set[str]] = []
+
+    for spec_index, (spec, spec_hits) in enumerate(
+        zip(specs, hits_by_spec)
+    ):
+        if not (
+            spec.evidence_mode is not None
+            and spec.search_concepts
+            and spec.subject_text
+        ):
+            filtered_hits_by_spec.append(spec_hits)
+            gated_codes_by_spec.append(set())
+            insufficient_codes_by_spec.append(set())
+            continue
+
+        spec_codes = _normalize_country_codes(spec.country_codes)
+
+        spec_hits_by_country: dict[str, list[LegalSearchHit]] = {}
+        for hit in spec_hits:
+            spec_hits_by_country.setdefault(
+                hit.country_code, []
+            ).append(hit)
+
+        spec_insufficient_codes: set[str] = set()
+        spec_partial_codes: list[str] = []
+
+        for code in spec_codes:
+            status = evaluate_evidence_status(
+                spec_hits_by_country.get(code, []),
+                spec.search_concepts,
+                spec.evidence_mode,
+            )
+
+            metric_key = (
+                code
+                if country_spec_counts.get(code, 0) <= 1
+                else f"{code}#{spec_index}"
+            )
+            evidence_status_by_key[metric_key] = status
+
+            if status == "insufficient":
+                spec_insufficient_codes.add(code)
+            elif status == "partial":
+                spec_partial_codes.append(code)
+
+        for code in spec_insufficient_codes:
+            insufficient_evidence_answer_parts.append(
+                INSUFFICIENT_EVIDENCE_ANSWER_TEMPLATE.format(
+                    subject=spec.subject_text,
+                    country=resolve_country_display_name(code),
+                )
+            )
+
+        for code in spec_partial_codes:
+            partial_evidence_instruction += (
+                "\n\n"
+                + PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE.format(
+                    subject=spec.subject_text,
+                    country=resolve_country_display_name(code),
+                )
+            )
+
+        filtered_hits_by_spec.append(
+            [
+                hit
+                for hit in spec_hits
+                if hit.country_code not in spec_insufficient_codes
+            ]
+        )
+        gated_codes_by_spec.append(set(spec_codes))
+        insufficient_codes_by_spec.append(spec_insufficient_codes)
+
+    if metrics is not None and evidence_status_by_key:
+        metrics.evidence_status_by_country = dict(
+            evidence_status_by_key
+        )
+
+    # A country is fully insufficient only when every spec that gates
+    # it (evidence_mode set) agrees - a country shared by a gated spec
+    # finding it insufficient and another spec finding it direct/
+    # partial (or not gating it at all) must still generate for the
+    # spec that can support it.
+    fully_insufficient_codes = [
+        code
+        for code in all_requested_codes
+        if any(
+            code in gated_codes_by_spec[i]
+            for i in range(len(specs))
+        )
+        and all(
+            code in insufficient_codes_by_spec[i]
+            for i in range(len(specs))
+            if code in gated_codes_by_spec[i]
+        )
+    ]
+
+    if fully_insufficient_codes and set(
+        fully_insufficient_codes
+    ) == set(all_requested_codes):
+        if metrics is not None:
+            metrics.outcome = "insufficient_evidence"
+            metrics.retrieval_total = retrieval_total
+            metrics.selected_sources = 0
+            metrics.model = None
+            metrics.generation_attempts = 0
+            metrics.repair_triggered = False
+            metrics.repair_success = False
+            metrics.repair_answer_returned = False
+
+        return LegalChatResponse(
+            question=request.question.strip(),
+            answer="\n\n".join(
+                insufficient_evidence_answer_parts
+            ),
+            grounded=False,
+            model=None,
+            retrieval_total=retrieval_total,
+            sources=[],
+        )
+
+    seen_chunk_ids: set[str] = set()
+    selected_hits: list[LegalSearchHit] = []
+
+    for spec_hits in filtered_hits_by_spec:
+        for hit in spec_hits:
+            if hit.chunk_id in seen_chunk_ids:
+                continue
+
+            seen_chunk_ids.add(hit.chunk_id)
+            selected_hits.append(hit)
+
+    excluded_country_instruction = ""
+    normalized_known_excluded_codes = _normalize_country_codes(
+        known_excluded_country_codes or []
+    )
+
+    if fully_insufficient_codes or normalized_known_excluded_codes:
+        remaining_codes = [
+            code
+            for code in all_requested_codes
+            if code not in fully_insufficient_codes
+        ]
+
+        request = request.model_copy(
+            update={"country_codes": remaining_codes}
+        )
+
+        excluded_country_instruction = (
+            "\n\n"
+            + EXCLUDED_COUNTRY_HEADING_INSTRUCTION_TEMPLATE.format(
+                countries=", ".join(
+                    resolve_country_display_name(code)
+                    for code in remaining_codes
+                )
+            )
         )
 
     client = (
@@ -2842,17 +3278,23 @@ def answer_legal_question(
                 input_text=model_input,
             )
 
+            elapsed_ms = (
+                perf_counter() - call_started_at
+            ) * 1000
+
             if metrics is not None:
-                metrics.openai_ms += (
-                    perf_counter() - call_started_at
-                ) * 1000
+                metrics.openai_ms += elapsed_ms
+                metrics.answer_generation_openai_ms += elapsed_ms
 
         except OpenAIResponseError as error:
             raise RagAnswerError(
                 "Grounded answer generation failed."
             ) from error
 
-        return result
+        return dataclasses.replace(
+            result,
+            text=_deduplicate_adjacent_citations(result.text),
+        )
 
     def _validate(
         answer: str,
@@ -2860,7 +3302,7 @@ def answer_legal_question(
         list[QualityError],
         list[QualityError],
     ]:
-        return _validate_answer_quality(
+        hard_errors, soft_errors = _validate_answer_quality(
             question=request.question,
             answer=answer,
             country_codes=request.country_codes,
@@ -2868,12 +3310,47 @@ def answer_legal_question(
             hits=selected_hits,
         )
 
+        for spec_index, spec in enumerate(specs):
+            if not (
+                spec.evidence_mode is not None
+                and spec.search_concepts
+            ):
+                continue
+
+            spec_codes = set(
+                _normalize_country_codes(spec.country_codes)
+            )
+            spec_own_insufficient = (
+                insufficient_codes_by_spec[spec_index]
+                if spec_index < len(insufficient_codes_by_spec)
+                else set()
+            )
+
+            if not (spec_codes - spec_own_insufficient):
+                # This exact spec's own countries were all excluded
+                # as insufficient FOR IT (even if another spec kept
+                # one of the same countries alive for its own,
+                # different subject) - nothing of this spec's subject
+                # is expected in the answer, so there is nothing to
+                # check for drift.
+                continue
+
+            soft_errors = list(soft_errors) + _validate_no_subject_drift(
+                answer=answer,
+                search_concepts=spec.search_concepts,
+                evidence_mode=spec.evidence_mode,
+            )
+
+        return hard_errors, soft_errors
+
     context_text = _build_context(
         selected_hits
     )
 
     first_generated_text = _generate_with_instructions(
         SYSTEM_INSTRUCTIONS
+        + partial_evidence_instruction
+        + excluded_country_instruction
     )
 
     first_hard_errors, first_soft_errors = _validate(
@@ -2904,6 +3381,8 @@ def answer_legal_question(
 
         repaired_generated_text = _generate_with_instructions(
             SYSTEM_INSTRUCTIONS
+            + partial_evidence_instruction
+            + excluded_country_instruction
             + "\n\n"
             + _build_repair_instructions(
                 list(first_hard_errors)
@@ -2999,9 +3478,18 @@ def answer_legal_question(
         metrics.outcome = "generated"
         metrics.model = generated_text.model
 
+    final_answer = "\n\n".join(
+        part
+        for part in (
+            generated_text.text,
+            *insufficient_evidence_answer_parts,
+        )
+        if part
+    )
+
     return LegalChatResponse(
         question=request.question.strip(),
-        answer=generated_text.text,
+        answer=final_answer,
         grounded=True,
         model=generated_text.model,
         retrieval_total=retrieval_total,
