@@ -16,6 +16,7 @@ from typing import (
 
 from opensearchpy import OpenSearch
 from opensearchpy.exceptions import (
+    NotFoundError,
     OpenSearchException,
 )
 
@@ -29,11 +30,17 @@ from app.models.admin_documents import (
 )
 from app.models.document import DocumentChunk
 from app.services.document_chunk_builder import (
+    DOCUMENT_FAMILY,
     build_document_chunks_from_docx,
+    storage_filename_for_country,
 )
 from app.services.document_indexer import (
     DocumentIndexingResult,
     replace_document_chunks,
+)
+from app.services.document_source_resolver import (
+    DocumentSourceConflictError,
+    resolve_document_source_path,
 )
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
@@ -42,6 +49,13 @@ from app.services.opensearch_index import (
 
 UPLOAD_READ_SIZE: Final[int] = 1024 * 1024
 MAX_ADMIN_DOCUMENTS: Final[int] = 1000
+
+# No project-wide filename length limit existed before this mission;
+# 255 is the conservative, standard filesystem-safe ceiling (the
+# common ext4/NTFS/APFS per-component limit), applied here since the
+# filename itself is now an arbitrary, safety-checked string rather
+# than a fixed business format (mission "CONTINUATION PATCH 0.4.3").
+MAX_FILENAME_LENGTH: Final[int] = 255
 
 
 ChunkBuilder = Callable[
@@ -52,6 +66,11 @@ ChunkBuilder = Callable[
 DocumentIndexer = Callable[
     ...,
     DocumentIndexingResult,
+]
+
+ExistingSourceLookup = Callable[
+    [str, "OpenSearch | None"],
+    "str | None",
 ]
 
 
@@ -70,13 +89,30 @@ class AdminDocumentCatalogError(RuntimeError):
 def _sanitize_filename(
     filename: str,
 ) -> str:
-    """Validate an uploaded source filename."""
+    """
+    Validate an uploaded source filename for safety only - never for
+    a business naming format (mission "CONTINUATION PATCH 0.4.3",
+    section 4). Any filename that is non-empty, ends in .docx, has no
+    null byte, no path component, and stays within a reasonable
+    length is accepted verbatim - spaces, accents, parentheses,
+    dashes, and underscores all included.
+    """
+
+    if "\x00" in filename:
+        raise InvalidDocumentUploadError(
+            "The uploaded filename must not contain a null byte."
+        )
 
     normalized_filename = filename.strip()
 
     if not normalized_filename:
         raise InvalidDocumentUploadError(
             "The uploaded document has no filename."
+        )
+
+    if len(normalized_filename) > MAX_FILENAME_LENGTH:
+        raise InvalidDocumentUploadError(
+            "The uploaded filename is too long."
         )
 
     basename = (
@@ -177,6 +213,80 @@ def _safe_unlink(
         pass
 
 
+def _lookup_existing_source_filename(
+    document_id: str,
+    client: OpenSearch | None,
+) -> str | None:
+    """
+    Return the source_filename of an already-indexed document sharing
+    this exact deterministic document_id, or None when no such
+    document exists yet.
+
+    This is the only way an upload can learn a pre-existing, possibly
+    legacy document's historical on-disk filename before writing a
+    replacement - source_directory is never scanned (mission "HOTFIX
+    0.4.4", section 4).
+    """
+
+    opensearch_client = (
+        client
+        if client is not None
+        else get_opensearch_client()
+    )
+
+    try:
+        response = opensearch_client.search(
+            index=LEGAL_DOCUMENTS_ALIAS,
+            body={
+                "size": 1,
+                "_source": ["source_filename"],
+                "query": {
+                    "term": {
+                        "document_id": document_id,
+                    }
+                },
+            },
+        )
+
+    except NotFoundError:
+        # The index itself does not exist yet - the ordinary state
+        # before the very first document is ever indexed
+        # (ensure_legal_documents_index creates it lazily, inside the
+        # document_indexer that runs after this lookup). No prior
+        # document can possibly exist yet either.
+        return None
+
+    if not isinstance(response, dict):
+        return None
+
+    hits_container = response.get("hits")
+
+    if not isinstance(hits_container, dict):
+        return None
+
+    hits = hits_container.get("hits")
+
+    if not isinstance(hits, list) or not hits:
+        return None
+
+    first_hit = hits[0]
+
+    if not isinstance(first_hit, dict):
+        return None
+
+    source = first_hit.get("_source")
+
+    if not isinstance(source, dict):
+        return None
+
+    value = source.get("source_filename")
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    return value.strip()
+
+
 def upload_and_index_document(
     *,
     filename: str,
@@ -190,6 +300,9 @@ def upload_and_index_document(
     ),
     document_indexer: DocumentIndexer = (
         replace_document_chunks
+    ),
+    existing_source_lookup: ExistingSourceLookup = (
+        _lookup_existing_source_filename
     ),
 ) -> AdminDocumentUploadResponse:
     """
@@ -244,31 +357,84 @@ def upload_and_index_document(
                     "The uploaded DOCX produced no legal chunks."
                 )
 
+            # Stored on disk under a name derived from the document's
+            # own detected country - never the user-supplied filename
+            # (mission "CONTINUATION PATCH 0.4.3", section 10). Two
+            # unrelated uploads that happen to share the exact same
+            # original filename (e.g. both "final.docx", one for
+            # Canada and one for Spain) must never overwrite each
+            # other's stored source file; keying storage by country
+            # also keeps it consistent with document identity itself
+            # (see document_chunk_builder._build_document_id), so a
+            # new upload for a country already active always lands
+            # on the exact same storage path it is meant to replace.
+            country_code = chunks[0].country_code
+            storage_filename = storage_filename_for_country(
+                country_code
+            )
+
+            # A country already active before country-keyed storage
+            # existed is still physically stored under its own
+            # historical filename (mission "HOTFIX 0.4.4") - looked up
+            # by this upload's own deterministic document_id (never by
+            # scanning source_directory), so the resolver finds that
+            # file too and replacing it backs up and restores the
+            # real active file, never just a {COUNTRY_CODE}.docx path
+            # that may not exist yet.
+            try:
+                existing_source_filename = existing_source_lookup(
+                    chunks[0].document_id,
+                    client,
+                )
+
+            except OpenSearchException as error:
+                raise AdminDocumentStorageError(
+                    "The existing document catalog could not be "
+                    "checked before upload."
+                ) from error
+
+            try:
+                existing_source = resolve_document_source_path(
+                    source_root=source_directory,
+                    country_code=country_code,
+                    source_filename=existing_source_filename,
+                )
+
+            except DocumentSourceConflictError as error:
+                raise InvalidDocumentUploadError(
+                    "Multiple distinct source files already exist "
+                    "for this country; resolve the conflict "
+                    "manually before uploading a replacement."
+                ) from error
+
+            existing_active_path = existing_source.path
+            replaced_source_file = existing_active_path is not None
+
             operation_id = uuid.uuid4().hex
 
             final_path = (
                 source_directory
-                / safe_filename
+                / storage_filename
             )
 
             incoming_path = (
                 source_directory
                 / (
                     f".{operation_id}."
-                    f"{safe_filename}.incoming"
+                    f"{storage_filename}.incoming"
                 )
             )
 
             backup_path = (
-                source_directory
-                / (
-                    f".{operation_id}."
-                    f"{safe_filename}.backup"
+                (
+                    existing_active_path.parent
+                    / (
+                        f".{operation_id}."
+                        f"{existing_active_path.name}.backup"
+                    )
                 )
-            )
-
-            replaced_source_file = (
-                final_path.exists()
+                if existing_active_path is not None
+                else None
             )
 
             shutil.copyfile(
@@ -277,9 +443,9 @@ def upload_and_index_document(
             )
 
             try:
-                if replaced_source_file:
+                if existing_active_path is not None:
                     os.replace(
-                        final_path,
+                        existing_active_path,
                         backup_path,
                     )
 
@@ -300,10 +466,13 @@ def upload_and_index_document(
                     final_path
                 )
 
-                if backup_path.exists():
+                if (
+                    backup_path is not None
+                    and backup_path.exists()
+                ):
                     os.replace(
                         backup_path,
-                        final_path,
+                        existing_active_path,
                     )
 
                 _safe_unlink(
@@ -312,9 +481,10 @@ def upload_and_index_document(
 
                 raise
 
-            _safe_unlink(
-                backup_path
-            )
+            if backup_path is not None:
+                _safe_unlink(
+                    backup_path
+                )
 
             first_chunk = chunks[0]
 
@@ -331,6 +501,7 @@ def upload_and_index_document(
                 reference_year=(
                     first_chunk.reference_year
                 ),
+                document_family=DOCUMENT_FAMILY,
                 uploaded_bytes=uploaded_bytes,
                 indexed_chunks=(
                     indexing_result.indexed_chunks
@@ -564,14 +735,37 @@ def list_indexed_documents(
             "source_filename",
         )
 
-        source_file_present = (
-            Path(source_filename).name
-            == source_filename
-            and (
-                source_directory
-                / source_filename
-            ).is_file()
+        country_code = _required_string(
+            source,
+            "country_code",
         )
+
+        # Resolved centrally (mission "HOTFIX 0.4.4"): a document
+        # indexed before country-keyed storage existed is still
+        # physically stored under its own historical source_filename,
+        # never under storage_filename_for_country's canonical name -
+        # the resolver checks both, so a legacy document is never
+        # reported as missing.
+        try:
+            resolved_source = resolve_document_source_path(
+                source_root=source_directory,
+                country_code=country_code,
+                source_filename=source_filename,
+            )
+
+            source_file_present = (
+                resolved_source.path is not None
+            )
+
+            document_status = (
+                "indexed"
+                if source_file_present
+                else "indexed_source_missing"
+            )
+
+        except DocumentSourceConflictError:
+            source_file_present = False
+            document_status = "indexed_source_conflict"
 
         reference_year = source.get(
             "reference_year"
@@ -615,11 +809,7 @@ def list_indexed_documents(
                 source_file_present=(
                     source_file_present
                 ),
-                status=(
-                    "indexed"
-                    if source_file_present
-                    else "indexed_source_missing"
-                ),
+                status=document_status,
             )
         )
 

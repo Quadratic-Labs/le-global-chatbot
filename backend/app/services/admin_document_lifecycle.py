@@ -29,6 +29,10 @@ from app.services.document_indexer import (
     DocumentIndexingResult,
     replace_document_chunks,
 )
+from app.services.document_source_resolver import (
+    DocumentSourceConflictError,
+    resolve_document_source_path,
+)
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
 )
@@ -73,6 +77,14 @@ class AdminDocumentNotFoundError(LookupError):
 
 class AdminDocumentSourceMissingError(FileNotFoundError):
     """Raised when the indexed source DOCX is missing."""
+
+
+class AdminDocumentSourceConflictError(RuntimeError):
+    """
+    Raised when two distinct metadata fields resolve to two distinct
+    real source files - Reindex and Delete both refuse to guess which
+    one is active (mission "HOTFIX 0.4.4", section 5).
+    """
 
 
 class AdminDocumentLifecycleError(RuntimeError):
@@ -238,40 +250,6 @@ def _get_document_metadata(
     return source
 
 
-def _resolve_source_path(
-    *,
-    source_directory: Path,
-    source_filename: str,
-) -> Path:
-    """Resolve a safe source file path."""
-
-    if Path(
-        source_filename
-    ).name != source_filename:
-        raise AdminDocumentLifecycleError(
-            "Indexed source filename is unsafe."
-        )
-
-    resolved_source_directory = (
-        source_directory.resolve()
-    )
-
-    source_path = (
-        resolved_source_directory
-        / source_filename
-    ).resolve()
-
-    if (
-        source_path.parent
-        != resolved_source_directory
-    ):
-        raise AdminDocumentLifecycleError(
-            "Indexed source path is unsafe."
-        )
-
-    return source_path
-
-
 def _delete_document_chunks(
     *,
     document_id: str,
@@ -365,15 +343,29 @@ def reindex_indexed_document(
         "source_filename",
     )
 
-    source_path = _resolve_source_path(
-        source_directory=source_directory,
-        source_filename=source_filename,
+    country_code = _required_string(
+        metadata,
+        "country_code",
     )
 
-    if not source_path.is_file():
+    try:
+        resolved_source = resolve_document_source_path(
+            source_root=source_directory,
+            country_code=country_code,
+            source_filename=source_filename,
+        )
+
+    except DocumentSourceConflictError as error:
+        raise AdminDocumentSourceConflictError(
+            str(error)
+        ) from error
+
+    if resolved_source.path is None:
         raise AdminDocumentSourceMissingError(
             "The source DOCX file is missing."
         )
+
+    source_path = resolved_source.path
 
     try:
         chunks = chunk_builder(
@@ -505,14 +497,25 @@ def delete_indexed_document(
         "source_filename",
     )
 
-    source_path = _resolve_source_path(
-        source_directory=source_directory,
-        source_filename=source_filename,
+    country_code = _required_string(
+        metadata,
+        "country_code",
     )
 
-    source_file_present = (
-        source_path.is_file()
-    )
+    try:
+        resolved_source = resolve_document_source_path(
+            source_root=source_directory,
+            country_code=country_code,
+            source_filename=source_filename,
+        )
+
+    except DocumentSourceConflictError as error:
+        raise AdminDocumentSourceConflictError(
+            str(error)
+        ) from error
+
+    source_path = resolved_source.path
+    source_file_present = source_path is not None
 
     backup_path: Path | None = None
 

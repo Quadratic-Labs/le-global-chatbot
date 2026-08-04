@@ -12,10 +12,6 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
-from app.core.country_registry import (
-    CountryRegistryError,
-    resolve_country,
-)
 from app.core.legal_taxonomy import (
     LEGAL_TOPICS,
     _TOPIC_ALIASES,
@@ -23,8 +19,7 @@ from app.core.legal_taxonomy import (
     _normalize_text,
 )
 from app.services.document_chunk_builder import (
-    _COPY_SUFFIX_PATTERN,
-    _FILENAME_PATTERNS,
+    metadata_from_content,
 )
 from app.services.docx_parser import parse_docx_sections
 
@@ -40,37 +35,33 @@ _FALSE_XML_VALUES: Final[frozenset[str]] = frozenset(
 )
 
 
-def _metadata_from_filename(file_path: Path) -> dict[str, Any]:
-    original_stem = file_path.stem.strip()
-    cleaned_stem = _COPY_SUFFIX_PATTERN.sub("", original_stem).strip()
+def _metadata_from_content(file_path: Path) -> dict[str, Any]:
+    """
+    Label each audit report with the same content-derived metadata the
+    real ingestion pipeline would extract - the filename is never
+    consulted (mission "CONTINUATION PATCH 0.4.3", section 5). Never
+    raises: a document this audit script cannot label is still worth
+    auditing for its structural issues, so failures degrade to
+    "unknown" fields rather than aborting the run.
+    """
 
-    for pattern in _FILENAME_PATTERNS:
-        match = pattern.fullmatch(cleaned_stem)
-        if match is None:
-            continue
-
-        raw_country = _normalize_text(match.group("country")).strip(" -_")
-        year = match.group("year")
-
-        try:
-            country, country_code = resolve_country(raw_country)
-        except CountryRegistryError:
-            country, country_code = raw_country, None
-
+    try:
+        metadata = metadata_from_content(file_path=file_path)
+    except Exception as error:
         return {
-            "country": country,
-            "country_code": country_code,
-            "reference_year": int(year) if year else None,
-            "filename_recognized": True,
-            "copy_suffix_detected": cleaned_stem != original_stem,
+            "country": None,
+            "country_code": None,
+            "reference_year": None,
+            "content_metadata_detected": False,
+            "content_metadata_error": f"{type(error).__name__}: {error}",
         }
 
     return {
-        "country": None,
-        "country_code": None,
-        "reference_year": None,
-        "filename_recognized": False,
-        "copy_suffix_detected": cleaned_stem != original_stem,
+        "country": metadata.country,
+        "country_code": metadata.country_code,
+        "reference_year": metadata.reference_year,
+        "content_metadata_detected": True,
+        "content_metadata_error": None,
     }
 
 
@@ -367,7 +358,7 @@ def _audit_current_parser(file_path: Path) -> dict[str, Any]:
 
 def _audit_file(file_path: Path) -> dict[str, Any]:
     document = Document(file_path)
-    metadata = _metadata_from_filename(file_path)
+    metadata = _metadata_from_content(file_path)
     selected_topics, duplicate_candidates = _find_topic_candidates(document)
     suspicious = _find_suspicious_paragraphs(document, selected_topics)
 
