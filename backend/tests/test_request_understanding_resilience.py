@@ -251,6 +251,13 @@ def _valid_resolved_payload(
         "is_follow_up": False,
         "confidence": 0.9,
         "clarification_reason": None,
+        "current_message_delta": {
+            "explicit_action_types": [],
+            "explicit_country_codes": [],
+            "explicit_legal_topics": [],
+            "explicit_subject_text": None,
+            "context_operation": "independent",
+        },
     }
 
 
@@ -490,6 +497,13 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
             "is_follow_up": False,
             "confidence": 0.9,
             "clarification_reason": None,
+            "current_message_delta": {
+                "explicit_action_types": [],
+                "explicit_country_codes": [],
+                "explicit_legal_topics": [],
+                "explicit_subject_text": None,
+                "context_operation": "independent",
+            },
         }
 
         response = resolve_legal_chat_response(
@@ -543,6 +557,13 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
             "is_follow_up": False,
             "confidence": 0.9,
             "clarification_reason": None,
+            "current_message_delta": {
+                "explicit_action_types": [],
+                "explicit_country_codes": [],
+                "explicit_legal_topics": [],
+                "explicit_subject_text": None,
+                "context_operation": "independent",
+            },
         }
 
         response = resolve_legal_chat_response(
@@ -579,6 +600,13 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
             "is_follow_up": False,
             "confidence": 0.9,
             "clarification_reason": None,
+            "current_message_delta": {
+                "explicit_action_types": [],
+                "explicit_country_codes": [],
+                "explicit_legal_topics": [],
+                "explicit_subject_text": None,
+                "context_operation": "independent",
+            },
         }
 
         with mock.patch(

@@ -12,6 +12,7 @@ from app.models.chat import LegalChatRequest
 from app.services.country_detection import (
     CountryDetectionError,
     detect_mentioned_country_codes,
+    is_country_only_followup,
     resolve_country_availability,
     resolve_country_display_name,
 )
@@ -124,6 +125,86 @@ class CountryDetectionTests(unittest.TestCase):
             [
                 "CA",
             ],
+        )
+
+
+class IsCountryOnlyFollowupTests(unittest.TestCase):
+    """
+    Mission "CORRECTION FINALE CIBLEE 0.4.2" - deterministic
+    classification of a bare country-only follow-up, distinct from a
+    message that also carries its own legal subject.
+    """
+
+    def test_bare_peru_with_question_mark(self) -> None:
+        self.assertEqual(is_country_only_followup("Peru?"), ["PE"])
+
+    def test_bare_australia_without_question_mark(self) -> None:
+        self.assertEqual(is_country_only_followup("Australia"), ["AU"])
+
+    def test_what_about_peru(self) -> None:
+        self.assertEqual(
+            is_country_only_followup("What about Peru?"), ["PE"]
+        )
+
+    def test_and_peru(self) -> None:
+        self.assertEqual(is_country_only_followup("And Peru?"), ["PE"])
+
+    def test_and_australia(self) -> None:
+        self.assertEqual(
+            is_country_only_followup("And Australia?"), ["AU"]
+        )
+
+    def test_how_about_the_united_kingdom(self) -> None:
+        self.assertEqual(
+            is_country_only_followup("How about the United Kingdom?"),
+            ["GB"],
+        )
+
+    def test_for_spain(self) -> None:
+        self.assertEqual(is_country_only_followup("For Spain?"), ["ES"])
+
+    def test_overtime_in_peru_is_not_country_only(self) -> None:
+        self.assertIsNone(is_country_only_followup("Overtime in Peru?"))
+
+    def test_sick_leave_in_peru_is_not_country_only(self) -> None:
+        self.assertIsNone(
+            is_country_only_followup("What about sick leave in Peru?")
+        )
+
+    def test_contacts_in_spain_is_not_country_only(self) -> None:
+        self.assertIsNone(
+            is_country_only_followup("Contacts in Spain")
+        )
+
+    def test_compare_spain_and_peru_is_not_country_only(self) -> None:
+        self.assertIsNone(
+            is_country_only_followup("Compare Spain and Peru")
+        )
+
+    def test_peru_working_conditions_is_not_country_only(self) -> None:
+        self.assertIsNone(
+            is_country_only_followup("Peru working conditions")
+        )
+
+    def test_dismissal_in_australia_is_not_country_only(self) -> None:
+        self.assertIsNone(
+            is_country_only_followup("Dismissal in Australia")
+        )
+
+    def test_no_country_mentioned_returns_none(self) -> None:
+        self.assertIsNone(
+            is_country_only_followup("Tell me about overtime rules.")
+        )
+
+    def test_general_question_naming_a_country_is_not_country_only(
+        self,
+    ) -> None:
+        # The mission's own explicit "must keep working" example - a
+        # genuine new question must never be misclassified as bare.
+        self.assertIsNone(
+            is_country_only_followup(
+                "Tell me about working conditions in Peru."
+            )
         )
 
 

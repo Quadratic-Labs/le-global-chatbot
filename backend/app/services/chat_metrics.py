@@ -48,6 +48,7 @@ class LegalChatMetrics:
     selected_sources: int = 0
     model: str | None = None
     error_type: str | None = None
+    transition_error: bool = False
 
     generation_attempts: int = 0
     repair_triggered: bool = False
@@ -116,6 +117,56 @@ class LegalChatMetrics:
         default_factory=list
     )
 
+    # Conversation-continuity observability (0.4.2) - labels and
+    # counts only, never the conversation_state content itself.
+    conversation_state_received: bool = False
+    conversation_state_version: int | None = None
+    previous_action_types: list[str] = field(default_factory=list)
+    previous_focus_action: str | None = None
+    current_message_operation: str | None = None
+    context_inheritance_applied: bool = False
+    inherited_action_type: str | None = None
+    inherited_country_replaced: bool = False
+    inherited_legal_topics: list[str] = field(default_factory=list)
+    inherited_subject_text: bool = False
+    semantic_result_overridden: bool = False
+    semantic_override_reason: str | None = None
+    final_subject_text: bool = False
+    search_concept_groups: int = 0
+    conversation_state_emitted: bool = False
+
+    # Evidence-fidelity observability (0.4.2).
+    evidence_status_by_country: dict[str, str] = field(
+        default_factory=dict
+    )
+    concept_coverage_by_country: dict[str, str] = field(
+        default_factory=dict
+    )
+    direct_source_count: int = 0
+    partial_source_count: int = 0
+    rejected_source_count: int = 0
+    subject_drift_detected: bool = False
+    clarification_options: list[str] = field(default_factory=list)
+
+    # Jurisdiction-neutral-subject observability ("DECOUPLAGE COMPLET
+    # DU SUJET JURIDIQUE ET DE LA JURIDICTION" mission) - never the
+    # subject_text itself, only whether/what canonicalization did.
+    subject_scope_canonicalization_applied: bool = False
+    subject_scope_removed_country_codes: list[str] = field(
+        default_factory=list
+    )
+    search_concepts_canonicalized: bool = False
+    subject_empty_after_canonicalization: bool = False
+    inherited_subject_canonicalized: bool = False
+    retrieval_subject_contains_old_country: bool = False
+    insufficient_country_duplication_detected: bool = False
+
+    # Additional latencies (0.4.2) - distinct phases of the same
+    # request, on top of the existing timers above.
+    conversation_transition_ms: float = 0.0
+    evidence_gate_ms: float = 0.0
+    answer_generation_openai_ms: float = 0.0
+
     def add_opensearch_seconds(
         self,
         elapsed_seconds: float,
@@ -172,6 +223,7 @@ class LegalChatMetrics:
             "max_sources": self.max_sources,
             "rerank_enabled": self.rerank_enabled,
             "error_type": self.error_type,
+            "transition_error": self.transition_error,
             "generation_attempts": (
                 self.generation_attempts
             ),
@@ -237,6 +289,76 @@ class LegalChatMetrics:
             ),
             "resolved_action_topics": (
                 self.resolved_action_topics
+            ),
+            "conversation_state_received": (
+                self.conversation_state_received
+            ),
+            "conversation_state_version": (
+                self.conversation_state_version
+            ),
+            "previous_action_types": self.previous_action_types,
+            "previous_focus_action": self.previous_focus_action,
+            "current_message_operation": (
+                self.current_message_operation
+            ),
+            "context_inheritance_applied": (
+                self.context_inheritance_applied
+            ),
+            "inherited_action_type": self.inherited_action_type,
+            "inherited_country_replaced": (
+                self.inherited_country_replaced
+            ),
+            "inherited_legal_topics": self.inherited_legal_topics,
+            "inherited_subject_text": self.inherited_subject_text,
+            "semantic_result_overridden": (
+                self.semantic_result_overridden
+            ),
+            "semantic_override_reason": (
+                self.semantic_override_reason
+            ),
+            "final_subject_text": self.final_subject_text,
+            "search_concept_groups": self.search_concept_groups,
+            "conversation_state_emitted": (
+                self.conversation_state_emitted
+            ),
+            "evidence_status_by_country": (
+                self.evidence_status_by_country
+            ),
+            "concept_coverage_by_country": (
+                self.concept_coverage_by_country
+            ),
+            "direct_source_count": self.direct_source_count,
+            "partial_source_count": self.partial_source_count,
+            "rejected_source_count": self.rejected_source_count,
+            "subject_drift_detected": self.subject_drift_detected,
+            "clarification_options": self.clarification_options,
+            "conversation_transition_ms": round(
+                self.conversation_transition_ms, 2
+            ),
+            "evidence_gate_ms": round(self.evidence_gate_ms, 2),
+            "answer_generation_openai_ms": round(
+                self.answer_generation_openai_ms, 2
+            ),
+            "subject_scope_canonicalization_applied": (
+                self.subject_scope_canonicalization_applied
+            ),
+            "subject_scope_removed_country_codes": (
+                self.subject_scope_removed_country_codes
+            ),
+            "search_concepts_canonicalized": (
+                self.search_concepts_canonicalized
+            ),
+            "subject_empty_after_canonicalization": (
+                self.subject_empty_after_canonicalization
+            ),
+            "inherited_subject_canonicalized": (
+                self.inherited_subject_canonicalized
+            ),
+            "retrieval_subject_contains_old_country": (
+                self.retrieval_subject_contains_old_country
+            ),
+            "insufficient_country_duplication_detected": (
+                self.insufficient_country_duplication_detected
             ),
         }
 

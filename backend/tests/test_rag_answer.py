@@ -3071,7 +3071,7 @@ class RagAnswerTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             REPAIR_TRIGGERING_SOFT_ERROR_TYPES,
-            frozenset({"structure"}),
+            frozenset({"structure", "subject_drift"}),
         )
 
         self.assertEqual(

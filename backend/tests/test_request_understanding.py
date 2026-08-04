@@ -80,6 +80,21 @@ def _comparison_action(**overrides: object) -> dict[str, object]:
     return action
 
 
+def _delta(**overrides: object) -> dict[str, object]:
+    """Build one minimal, valid CurrentMessageDelta payload."""
+
+    payload: dict[str, object] = {
+        "explicit_action_types": [],
+        "explicit_country_codes": [],
+        "explicit_legal_topics": [],
+        "explicit_subject_text": None,
+        "context_operation": "independent",
+    }
+    payload.update(overrides)
+
+    return payload
+
+
 def _resolved_result(**overrides: object) -> dict[str, object]:
     """Build one minimal, valid 'resolved' RequestUnderstandingResult payload."""
 
@@ -89,6 +104,7 @@ def _resolved_result(**overrides: object) -> dict[str, object]:
         "is_follow_up": False,
         "confidence": 0.9,
         "clarification_reason": None,
+        "current_message_delta": _delta(),
     }
     payload.update(overrides)
 
@@ -260,6 +276,136 @@ class RequestUnderstandingActionModelTests(unittest.TestCase):
                     topic_text="a" * (MAX_TOPIC_TEXT_CHARACTERS + 1)
                 )
             )
+
+
+class ResolvedSubjectPrecisionTests(unittest.TestCase):
+    """
+    resolved_subject_precision() reconciles subject_specificity/
+    evidence_mode against what search_concepts itself proves - never
+    trusting a broad/broad_topic label the model attached despite
+    real, distinct search_concepts, and never narrowing a genuinely
+    general question either (mission "MISSION EXPRESS BLOQUANTE
+    0.4.2", Regles A/C/D).
+    """
+
+    def test_1_real_remote_work_case_is_forced_to_specific_direct(
+        self,
+    ) -> None:
+        # TEST 1 - the exact real-world defect: the model itself
+        # mislabeled a precise remote-work question as broad/
+        # broad_topic despite carrying real, distinct search_concepts.
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="rules on remote work (telework)",
+                search_concepts=[
+                    {
+                        "terms": [
+                            "remote work",
+                            "telework",
+                            "working from home",
+                        ]
+                    }
+                ],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("specific", "direct_topic"),
+        )
+
+    def test_5_a_genuinely_general_question_keeps_broad_broad_topic(
+        self,
+    ) -> None:
+        # TEST 5 - "Tell me about working conditions in Peru." - no
+        # search_concepts distinct from the topic's own generic label,
+        # so broad/broad_topic must survive untouched.
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="working conditions",
+                search_concepts=[],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("broad", "broad_topic"),
+        )
+
+    def test_a_concept_repeating_only_the_topic_label_never_forces_specific(
+        self,
+    ) -> None:
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="working conditions",
+                search_concepts=[{"terms": ["working conditions"]}],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("broad", "broad_topic"),
+        )
+
+    def test_real_world_broad_paraphrases_never_force_specific(
+        self,
+    ) -> None:
+        # Real production output for "Tell me about working
+        # conditions in Peru." - the model still supplies several
+        # search_concepts terms, but every one is a paraphrase of the
+        # topic's own label ("workplace conditions" shares "conditions",
+        # "working environment" shares "working"), never a narrower
+        # legal concept - word overlap, not exact-string equality,
+        # is what must keep this broad/broad_topic.
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="working conditions",
+                search_concepts=[
+                    {
+                        "terms": [
+                            "working conditions",
+                            "workplace conditions",
+                            "working environment",
+                        ]
+                    }
+                ],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("broad", "broad_topic"),
+        )
+
+    def test_never_weakens_an_already_specific_direct_topic_action(
+        self,
+    ) -> None:
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="overtime rules",
+                search_concepts=[],
+                subject_specificity="specific",
+                evidence_mode="direct_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("specific", "direct_topic"),
+        )
 
 
 class RequestUnderstandingResultModelTests(unittest.TestCase):
@@ -452,6 +598,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.4,
             clarification_reason="ambiguous_request",
+            current_message_delta=_delta(),
         )
 
         self.assertEqual(result.actions, [])
@@ -471,6 +618,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.4,
             clarification_reason="missing_country",
+            current_message_delta=_delta(),
         )
 
         self.assertEqual(result.action_hint_type(), "contact")
@@ -483,6 +631,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.4,
                 clarification_reason=None,
+                current_message_delta=_delta(),
             )
 
     def test_clarification_with_two_or_more_actions_is_rejected(
@@ -498,6 +647,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.4,
                 clarification_reason="ambiguous_request",
+                current_message_delta=_delta(),
             )
 
     def test_clarification_with_unsupported_request_reason_is_rejected(
@@ -515,6 +665,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.4,
                 clarification_reason="unsupported_request",
+                current_message_delta=_delta(),
             )
 
     def test_valid_unsupported_result_is_accepted(self) -> None:
@@ -524,6 +675,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.95,
             clarification_reason="unsupported_request",
+            current_message_delta=_delta(),
         )
 
         self.assertEqual(result.status, "unsupported")
@@ -539,6 +691,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                         is_follow_up=False,
                         confidence=0.5,
                         clarification_reason=reason,
+                        current_message_delta=_delta(),
                     )
 
     def test_unsupported_carrying_an_action_is_rejected(self) -> None:
@@ -549,6 +702,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 is_follow_up=False,
                 confidence=0.5,
                 clarification_reason="unsupported_request",
+                current_message_delta=_delta(),
             )
 
     def test_confidence_below_zero_is_rejected(self) -> None:
@@ -613,6 +767,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             is_follow_up=False,
             confidence=0.4,
             clarification_reason="missing_country",
+            current_message_delta=_delta(),
         )
 
         self.assertIsNone(result.action_hint_type())

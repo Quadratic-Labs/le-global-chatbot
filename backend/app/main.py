@@ -1,8 +1,13 @@
+import json
 import logging
 import os
 import sys
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import (
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import (
     CORSMiddleware,
 )
@@ -128,6 +133,48 @@ app.include_router(
 app.include_router(
     admin_document_lifecycle_router
 )
+
+
+_conversation_state_rejection_logger = logging.getLogger(
+    "app.main"
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def _handle_request_validation_error(
+    request: Request,
+    exc: RequestValidationError,
+):
+    """
+    Delegates to FastAPI's own default handler unchanged (same 422
+    status and body shape the WordPress proxy already relays as-is),
+    but first logs a lightweight signal when the failure is on
+    /api/v1/chat's conversation_state: this is the one place that
+    rejection is observable at all, since a request failing Pydantic
+    validation never reaches legal_chat()/LegalChatMetrics.
+    """
+
+    if request.url.path == "/api/v1/chat" and any(
+        "conversation_state" in error.get("loc", ())
+        for error in exc.errors()
+    ):
+        _conversation_state_rejection_logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": (
+                        "conversation_state_recovery_retry"
+                    ),
+                    "path": request.url.path,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    return await request_validation_exception_handler(
+        request, exc
+    )
 
 
 @app.get("/")

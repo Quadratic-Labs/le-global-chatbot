@@ -33,7 +33,12 @@
         "le_global_chatbot_conversation_v1"
     );
 
-    const CONVERSATION_STORAGE_VERSION = 1;
+    // Version 2 adds conversationState (structured routing context
+    // for the next turn) and a per-message hasDisclaimer flag
+    // alongside the existing messages array - a version 1 payload
+    // (messages only) is detected by normalizeStoredConversation()
+    // and discarded rather than misread.
+    const CONVERSATION_STORAGE_VERSION = 2;
 
     /**
      * Build the history payload sent alongside a new question, from
@@ -142,6 +147,18 @@
      * is what reduces the remaining entries to a safely alternating,
      * complete-pairs-only list.
      */
+    function normalizeStoredConversationState(rawConversationState) {
+        if (
+            !rawConversationState
+            || typeof rawConversationState !== "object"
+            || Array.isArray(rawConversationState)
+        ) {
+            return null;
+        }
+
+        return rawConversationState;
+    }
+
     function normalizeStoredConversation(rawValue) {
         if (
             !rawValue
@@ -193,22 +210,30 @@
                 content,
             };
 
-            if (
-                role === "assistant"
-                && Array.isArray(entry.sources)
-            ) {
-                message.sources = entry.sources.filter(
-                    (source) => (
-                        source
-                        && typeof source === "object"
-                    )
+            if (role === "assistant") {
+                if (Array.isArray(entry.sources)) {
+                    message.sources = entry.sources.filter(
+                        (source) => (
+                            source
+                            && typeof source === "object"
+                        )
+                    );
+                }
+
+                message.hasDisclaimer = Boolean(
+                    entry.hasDisclaimer
                 );
             }
 
             normalizedMessages.push(message);
         });
 
-        return normalizedMessages;
+        return {
+            messages: normalizedMessages,
+            conversationState: normalizeStoredConversationState(
+                rawValue.conversationState
+            ),
+        };
     }
 
     /**
@@ -271,6 +296,11 @@
      * failing to open over bad storage content.
      */
     function loadStoredConversation(maxHistoryMessages) {
+        const empty = {
+            messages: [],
+            conversationState: null,
+        };
+
         let rawText;
 
         try {
@@ -278,11 +308,11 @@
                 CONVERSATION_STORAGE_KEY
             );
         } catch {
-            return [];
+            return empty;
         }
 
         if (!rawText) {
-            return [];
+            return empty;
         }
 
         let parsedValue;
@@ -291,31 +321,34 @@
             parsedValue = JSON.parse(rawText);
         } catch {
             clearStoredConversation();
-            return [];
+            return empty;
         }
 
-        const normalizedMessages = (
+        const normalized = (
             normalizeStoredConversation(parsedValue)
         );
 
-        if (normalizedMessages === null) {
+        if (normalized === null) {
             clearStoredConversation();
-            return [];
+            return empty;
         }
 
         const trimmedMessages = (
             trimConversationToCompletePairs(
-                normalizedMessages,
+                normalized.messages,
                 maxHistoryMessages
             )
         );
 
         if (trimmedMessages.length === 0) {
             clearStoredConversation();
-            return [];
+            return empty;
         }
 
-        return trimmedMessages;
+        return {
+            messages: trimmedMessages,
+            conversationState: normalized.conversationState,
+        };
     }
 
     /**
@@ -326,7 +359,11 @@
      * disabled in private browsing): persistence is a convenience,
      * never a requirement for the widget to keep working.
      */
-    function saveConversation(turns, maxHistoryMessages) {
+    function saveConversation(
+        turns,
+        maxHistoryMessages,
+        conversationState
+    ) {
         const messages = [];
 
         turns
@@ -348,6 +385,9 @@
                         sources: Array.isArray(turn.sources)
                             ? turn.sources
                             : [],
+                        hasDisclaimer: Boolean(
+                            turn.hasDisclaimer
+                        ),
                     }
                 );
             });
@@ -371,6 +411,9 @@
                     {
                         version: CONVERSATION_STORAGE_VERSION,
                         messages: trimmedMessages,
+                        conversationState: (
+                            conversationState || null
+                        ),
                     }
                 )
             );
@@ -424,6 +467,9 @@
                     )
                         ? assistantMessage.sources
                         : [],
+                    hasDisclaimer: Boolean(
+                        assistantMessage.hasDisclaimer
+                    ),
                     errorMessage: null,
                 }
             );
@@ -539,23 +585,32 @@
         let turns = [];
         let nextTurnId = 1;
 
+        // Structured routing state returned with the most recent
+        // successful turn - sent back with the next question so the
+        // backend can resolve a follow-up ("Peru?", "the contact")
+        // without re-deriving it from raw history text alone. Never
+        // a legal source, never rendered - purely routing metadata
+        // the backend itself produced and validated.
+        let conversationState = null;
+
         // Restore any conversation persisted earlier in this same
         // browser session (survives a reload, never a full browser
         // session close, since sessionStorage is used - never
         // localStorage). Corrupted or unreadable storage silently
         // yields an empty list, so the widget always opens normally.
-        const restoredMessages = loadStoredConversation(
+        const restored = loadStoredConversation(
             maxHistoryMessages
         );
 
-        if (restoredMessages.length > 0) {
+        if (restored.messages.length > 0) {
             const rebuilt = rebuildTurnsFromMessages(
-                restoredMessages,
+                restored.messages,
                 nextTurnId
             );
 
             turns = rebuilt.turns;
             nextTurnId = rebuilt.nextTurnId;
+            conversationState = restored.conversationState;
 
             renderMessageList();
             scrollConversationToBottom();
@@ -676,23 +731,77 @@
 
                 refreshLoadingState();
 
-                try {
-                    const response = await requestJson(
-                        chatEndpoint,
-                        {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                            },
-                            credentials: "same-origin",
-                            signal: controller.signal,
-                            body: JSON.stringify({
-                                question,
-                                history: historyPayload,
-                                language: "en",
-                                max_sources: defaultMaximumSources,
-                            }),
+                async function submitChatRequest(
+                    includeConversationState
+                ) {
+                    const requestBody = {
+                        question,
+                        history: historyPayload,
+                        language: "en",
+                        max_sources: defaultMaximumSources,
+                    };
+
+                    if (
+                        includeConversationState
+                        && conversationState
+                    ) {
+                        requestBody.conversation_state = (
+                            conversationState
+                        );
+                    }
+
+                    try {
+                        return await requestJson(
+                            chatEndpoint,
+                            {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type":
+                                        "application/json",
+                                },
+                                credentials: "same-origin",
+                                signal: controller.signal,
+                                body: JSON.stringify(
+                                    requestBody
+                                ),
+                            }
+                        );
+                    } catch (error) {
+                        // Recover from a conversation_state the
+                        // backend rejected (RECTIFICATIF §D): drop
+                        // only conversationState, keep every
+                        // persisted message, and retry this exact
+                        // question exactly once without it - never
+                        // a second copy of the user's question, never
+                        // a retry loop.
+                        if (
+                            includeConversationState
+                            && isConversationStateValidationError(
+                                error
+                            )
+                        ) {
+                            conversationState = null;
+
+                            saveConversation(
+                                turns.filter(
+                                    (existingTurn) => (
+                                        existingTurn.id !== turn.id
+                                    )
+                                ),
+                                maxHistoryMessages,
+                                null
+                            );
+
+                            return submitChatRequest(false);
                         }
+
+                        throw error;
+                    }
+                }
+
+                try {
+                    const response = await submitChatRequest(
+                        true
                     );
 
                     if (isStaleRequest()) {
@@ -710,9 +819,25 @@
                         rawSources
                     );
 
+                    conversationState = (
+                        response.conversation_state || null
+                    );
+
                     turn.status = "success";
                     turn.answer = renumbered.answer;
                     turn.sources = renumbered.sources;
+                    // Only a genuine legal/contact/comparison/mixed
+                    // answer carries a conversation_state with at
+                    // least one resolved action - never a
+                    // clarification, an out-of-scope refusal, or any
+                    // other dead end (see buildAssistantBubble).
+                    turn.hasDisclaimer = Boolean(
+                        conversationState
+                        && Array.isArray(
+                            conversationState.actions
+                        )
+                        && conversationState.actions.length > 0
+                    );
                 } catch (error) {
                     if (
                         error
@@ -755,7 +880,8 @@
                         // is never written to storage.
                         saveConversation(
                             turns,
-                            maxHistoryMessages
+                            maxHistoryMessages,
+                            conversationState
                         );
                     }
                 }
@@ -982,6 +1108,7 @@
             clearError();
 
             turns = [];
+            conversationState = null;
             renderMessageList();
 
             clearStoredConversation();
@@ -1135,18 +1262,26 @@
                 );
             }
 
-            const disclaimer = document.createElement(
-                "p"
-            );
+            // Never shown for a clarification, an out-of-scope
+            // refusal, or any other turn that resolved no real
+            // action - only for a genuine legal/contact/comparison/
+            // mixed answer (see hasDisclaimer, set from whether the
+            // response carried a conversation_state with at least
+            // one resolved action).
+            if (turn.hasDisclaimer) {
+                const disclaimer = document.createElement(
+                    "p"
+                );
 
-            disclaimer.className = (
-                "le-global-chatbot__disclaimer"
-            );
+                disclaimer.className = (
+                    "le-global-chatbot__disclaimer"
+                );
 
-            disclaimer.textContent = DISCLAIMER_TEXT;
-            assistantBubble.appendChild(
-                disclaimer
-            );
+                disclaimer.textContent = DISCLAIMER_TEXT;
+                assistantBubble.appendChild(
+                    disclaimer
+                );
+            }
 
             return assistantBubble;
         }
@@ -1475,15 +1610,55 @@
         }
 
         if (!response.ok) {
-            throw new Error(
+            const error = new Error(
                 getErrorMessage(
                     payload,
                     response.status
                 )
             );
+
+            // Exposed only so a caller can react to a specific
+            // backend validation failure (see
+            // isConversationStateValidationError) - never displayed
+            // or logged as-is.
+            error.statusCode = response.status;
+            error.payload = payload;
+
+            throw error;
         }
 
         return payload || {};
+    }
+
+    /**
+     * True only for a 422 whose FastAPI validation detail names
+     * conversation_state - never for any other 422 (e.g. an invalid
+     * question), which must surface as a normal error instead.
+     */
+    function isConversationStateValidationError(error) {
+        if (
+            !error
+            || error.statusCode !== 422
+            || !error.payload
+        ) {
+            return false;
+        }
+
+        const detail = error.payload.detail;
+
+        if (!Array.isArray(detail)) {
+            return false;
+        }
+
+        return detail.some(
+            (item) => (
+                item
+                && Array.isArray(item.loc)
+                && item.loc.includes(
+                    "conversation_state"
+                )
+            )
+        );
     }
 
     function getErrorMessage(payload, statusCode) {
@@ -1520,5 +1695,24 @@
             "The legal assistant could not process "
             + "the request."
         );
+    }
+
+    // Test-only hook: absent in the browser (module is never defined
+    // there), so this changes nothing about how the widget itself
+    // loads or runs. Exposes only the pure, DOM-free functions the
+    // test suite exercises directly - never the DOM-wired widget
+    // internals (initializeWidget's own event handlers), which are
+    // covered by node --check plus direct source review instead.
+    if (typeof module !== "undefined" && module.exports) {
+        module.exports = {
+            CONVERSATION_STORAGE_KEY,
+            CONVERSATION_STORAGE_VERSION,
+            normalizeStoredConversation,
+            loadStoredConversation,
+            saveConversation,
+            clearStoredConversation,
+            rebuildTurnsFromMessages,
+            isConversationStateValidationError,
+        };
     }
 })();
