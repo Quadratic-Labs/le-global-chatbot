@@ -21,6 +21,7 @@ from app.clients.openai_responses import (
     OpenAIResponsesClient,
 )
 from app.core.config import get_settings
+from app.core.country_registry import COUNTRIES
 from app.models.chat import (
     LegalAnswerSource,
     LegalChatHistoryMessage,
@@ -28,6 +29,10 @@ from app.models.chat import (
     LegalChatResponse,
 )
 from app.models.conversation_state import ConversationState
+from app.services.assistant_help import (
+    build_assistant_help_answer,
+    detect_assistant_help_intent,
+)
 from app.services.chat_metrics import (
     LegalChatMetrics,
 )
@@ -1501,6 +1506,40 @@ def resolve_legal_chat_response(
         len(message.content)
         for message in request.history
     )
+
+    # Assistant-help/meta-intent detection runs first, before any
+    # other check in this function - _build_deterministic_hints below
+    # already calls the OpenSearch-backed legal catalog (via
+    # resolve_country_availability), so this must come strictly
+    # earlier to guarantee zero OpenSearch calls for a help question
+    # (mission "PATCH PRODUIT 0.4.3"). Zero OpenAI calls either: no
+    # RequestUnderstanding, no retrieval, no generation on this path.
+    # The incoming conversation_state is returned completely
+    # unchanged - a help question must never advance, reset, or lose
+    # whatever legal action/focus a prior turn had (section 15).
+    help_intent = detect_assistant_help_intent(
+        request.question,
+        tuple(country.code for country in COUNTRIES),
+    )
+
+    if help_intent is not None:
+        metrics.outcome = f"assistant_help_{help_intent.intent_type}"
+        metrics.total_ms = (
+            perf_counter() - total_started_at
+        ) * 1000
+        metrics.log()
+
+        return LegalChatResponse(
+            question=request.question.strip(),
+            answer=build_assistant_help_answer(
+                help_intent, original_question=request.question
+            ),
+            grounded=False,
+            model=None,
+            retrieval_total=0,
+            sources=[],
+            conversation_state=request.conversation_state,
+        )
 
     try:
         (
