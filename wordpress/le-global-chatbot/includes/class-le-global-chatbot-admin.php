@@ -743,15 +743,11 @@ final class LE_Global_Chatbot_Admin
             ? (string) $file['name']
             : '';
 
-        $filename = sanitize_file_name(
-            $original_filename
-        );
-
         if (
-            $filename === ''
+            $original_filename === ''
             || strtolower(
                 pathinfo(
-                    $filename,
+                    $original_filename,
                     PATHINFO_EXTENSION
                 )
             ) !== 'docx'
@@ -796,6 +792,16 @@ final class LE_Global_Chatbot_Admin
 
         $line_break = "\r\n";
 
+        // The arbitrary original filename (accents, spaces, parentheses,
+        // dashes, underscores all included) is sent to the backend
+        // exactly as received - never WordPress's own sanitize_file_name(),
+        // which would strip parentheses and collapse spaces into hyphens.
+        // The backend is the sole authority on filename safety and on
+        // country/year/document identity, all derived from the DOCX
+        // content itself (mission "CONTINUATION PATCH 0.4.3"). Only the
+        // three characters that would break this HTTP header's own
+        // syntax are removed here - a transport-encoding concern, not a
+        // business-format one.
         $header_filename = str_replace(
             [
                 '"',
@@ -803,7 +809,7 @@ final class LE_Global_Chatbot_Admin
                 "\n",
             ],
             '',
-            $filename
+            $original_filename
         );
 
         $multipart_body = (
@@ -876,7 +882,7 @@ final class LE_Global_Chatbot_Admin
             ? (string) (
                 $result['body']['source_filename']
             )
-            : $filename;
+            : $original_filename;
 
         $indexed_chunks = isset(
             $result['body']['indexed_chunks']

@@ -12,9 +12,11 @@ from app.models.document import DocumentChunk
 from app.security.admin import admin_key_matches
 from app.services.admin_documents import (
     InvalidDocumentUploadError,
+    _sanitize_filename,
     list_indexed_documents,
     upload_and_index_document,
 )
+from app.services.document_chunk_builder import DOCUMENT_FAMILY
 from app.services.document_indexer import (
     DocumentIndexingError,
     DocumentIndexingResult,
@@ -140,6 +142,35 @@ class AdminDocumentTests(unittest.TestCase):
                     maximum_bytes=1000,
                 )
 
+    def test_invalid_docx_content_is_rejected_before_any_storage(
+        self,
+    ) -> None:
+        # Mission "CONTINUATION PATCH 0.4.3", section 16/19 - the real
+        # upload path (default chunk_builder, i.e. the actual DOCX
+        # format validation), never a fake/stubbed one. A .docx
+        # extension with non-DOCX bytes must be refused, and nothing
+        # may be left behind in source_directory.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+
+            with self.assertRaises(InvalidDocumentUploadError):
+                upload_and_index_document(
+                    filename="renamed.docx",
+                    file_stream=BytesIO(
+                        b"This is plain text, not a real DOCX."
+                    ),
+                    source_directory=source_directory,
+                    processed_directory=Path(root) / "processed",
+                    maximum_bytes=1000,
+                )
+
+            self.assertEqual(
+                list(source_directory.iterdir())
+                if source_directory.exists()
+                else [],
+                [],
+            )
+
     def test_oversized_upload_is_rejected(
         self,
     ) -> None:
@@ -228,12 +259,26 @@ class AdminDocumentTests(unittest.TestCase):
                 response.replaced_source_file
             )
 
+            # Stored under a country-derived name, never the
+            # original filename (mission "CONTINUATION PATCH 0.4.3",
+            # section 10) - the original name survives only as
+            # response.source_filename, checked separately below.
             self.assertEqual(
                 (
                     source_directory
-                    / "UK 2026.docx"
+                    / "GB.docx"
                 ).read_bytes(),
                 b"uploaded-docx",
+            )
+
+            self.assertEqual(
+                response.source_filename,
+                "UK 2026.docx",
+            )
+
+            self.assertEqual(
+                response.document_family,
+                DOCUMENT_FAMILY,
             )
 
     def test_previous_source_is_restored_on_index_failure(
@@ -252,9 +297,11 @@ class AdminDocumentTests(unittest.TestCase):
                 parents=True
             )
 
+            # Storage is keyed by the detected country_code ("GB",
+            # from _build_chunk), never by the original filename.
             final_path = (
                 source_directory
-                / "UK 2026.docx"
+                / "GB.docx"
             )
 
             final_path.write_bytes(
@@ -308,9 +355,14 @@ class AdminDocumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
 
+            # The stored OpenSearch metadata's source_filename is
+            # display-only ("UK 2026.docx") and deliberately does NOT
+            # match the on-disk storage filename ("GB.docx", keyed by
+            # country_code) - proving presence detection uses the
+            # country-derived storage path, never source_filename.
             (
                 source_directory
-                / "UK 2026.docx"
+                / "GB.docx"
             ).write_bytes(
                 b"document"
             )
@@ -331,6 +383,11 @@ class AdminDocumentTests(unittest.TestCase):
             )
 
             self.assertEqual(
+                response.documents[0].source_filename,
+                "UK 2026.docx",
+            )
+
+            self.assertEqual(
                 response.documents[0].chunk_count,
                 41,
             )
@@ -338,6 +395,354 @@ class AdminDocumentTests(unittest.TestCase):
             self.assertEqual(
                 response.documents[0].status,
                 "indexed",
+            )
+
+    def test_indexed_document_missing_from_disk_is_flagged(
+        self,
+    ) -> None:
+        # No file at all is written to source_directory here - proves
+        # the presence check is genuinely tied to storage_filename_for_
+        # country, not merely always True.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            response = list_indexed_documents(
+                source_directory=source_directory,
+                client=FakeOpenSearchClient(),
+            )
+
+            self.assertEqual(
+                response.documents[0].status,
+                "indexed_source_missing",
+            )
+
+
+class FilenameAcceptanceTests(unittest.TestCase):
+    """
+    Mission "CONTINUATION PATCH 0.4.3", section 14 - arbitrary safe
+    DOCX filenames are accepted verbatim: no business naming format
+    is required at all, only the safety checks listed in section 4.
+    """
+
+    ACCEPTED_FILENAMES = (
+        "Canada_2026-04-15-Employment-Law-Overview-EDITED.docx",
+        "final.docx",
+        "Canada final version.docx",
+        "document_received_from_client.docx",
+        "Version corrigée (3).DOCX",
+        "fichier client été 2026.docx",
+        "Spain-template-used-for-Canada.docx",
+    )
+
+    def test_all_example_filenames_are_accepted_verbatim(self) -> None:
+        for filename in self.ACCEPTED_FILENAMES:
+            with self.subTest(filename=filename):
+                self.assertEqual(
+                    _sanitize_filename(filename),
+                    filename,
+                )
+
+    def test_upload_preserves_the_arbitrary_filename_exactly(self) -> None:
+        # End-to-end proof through the real upload path: the response's
+        # source_filename is exactly the uploaded name, never rewritten,
+        # truncated, or accent/space/parenthesis-stripped.
+        for filename in self.ACCEPTED_FILENAMES:
+            with self.subTest(filename=filename):
+                with tempfile.TemporaryDirectory() as root:
+
+                    def chunk_builder(
+                        path: Path,
+                    ) -> list[DocumentChunk]:
+                        return [_build_chunk(path.name)]
+
+                    def document_indexer(
+                        *,
+                        chunks,
+                        client=None,
+                    ) -> DocumentIndexingResult:
+                        del client
+                        return DocumentIndexingResult(
+                            index_alias="legal-documents",
+                            document_id=chunks[0].document_id,
+                            source_filename=chunks[0].source_filename,
+                            requested_chunks=1,
+                            indexed_chunks=1,
+                            stale_chunks_deleted=0,
+                        )
+
+                    response = upload_and_index_document(
+                        filename=filename,
+                        file_stream=BytesIO(b"uploaded-docx"),
+                        source_directory=Path(root) / "source",
+                        processed_directory=Path(root) / "processed",
+                        maximum_bytes=1000,
+                        chunk_builder=chunk_builder,
+                        document_indexer=document_indexer,
+                    )
+
+                    self.assertEqual(
+                        response.source_filename,
+                        filename,
+                    )
+
+
+class FilenameRejectionTests(unittest.TestCase):
+    """
+    Mission "CONTINUATION PATCH 0.4.3", section 14 - only safety
+    properties are checked, never a business naming format: these
+    filenames must still be rejected for the reasons in section 4
+    (path traversal, wrong extension, null byte, empty name).
+    """
+
+    REJECTED_FILENAMES = (
+        "../../document.docx",
+        "../document.docx",
+        "folder/document.docx",
+        "folder\\document.docx",
+        "document.pdf",
+        "document.docx.exe",
+        "document.docm",
+        "",
+        "document\x00.docx",
+    )
+
+    def test_all_example_filenames_are_rejected(self) -> None:
+        for filename in self.REJECTED_FILENAMES:
+            with self.subTest(filename=filename):
+                with self.assertRaises(InvalidDocumentUploadError):
+                    _sanitize_filename(filename)
+
+    def test_case_insensitive_docx_extension_is_still_accepted(
+        self,
+    ) -> None:
+        # Not a rejection case - proves the extension check is
+        # genuinely case-insensitive (section 4), independent from
+        # the rejection cases above.
+        self.assertEqual(
+            _sanitize_filename("Report.DOCX"),
+            "Report.DOCX",
+        )
+
+
+CANADA_DOCUMENT_ID = "doc_" + "d" * 64
+
+
+def _build_canada_chunk(
+    *,
+    filename: str,
+    reference_year: int,
+) -> DocumentChunk:
+    """
+    One Canada/employment-law-overview chunk carrying the same fixed
+    document_id regardless of year or filename - exactly how the real
+    country_code+family identity scheme (document_chunk_builder.
+    _build_document_id) behaves once a country is already active.
+    """
+
+    return DocumentChunk(
+        document_id=CANADA_DOCUMENT_ID,
+        chunk_id="chunk-ca-1",
+        country="Canada",
+        country_code="CA",
+        legal_topic="Employment Contracts",
+        document_type="comparator",
+        language="en",
+        section="Employment Contracts",
+        subsection="Notice Period",
+        content="Notice content.",
+        source_filename=filename,
+        source_format="docx",
+        content_hash="content-hash",
+        reference_year=reference_year,
+    )
+
+
+class ReplacingDocumentIndexer:
+    """
+    A stateful document_indexer double simulating OpenSearch's own
+    replace-by-document_id behaviour: the first call for a document_id
+    indexes fresh chunks, every later call for the same document_id
+    reports the previous chunks as stale/deleted - exactly the
+    signal upload_and_index_document's own response surfaces to the
+    admin API (mission "CONTINUATION PATCH 0.4.3", section 17).
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.indexed_document_ids: set[str] = set()
+        self.call_count = 0
+
+    def __call__(
+        self,
+        *,
+        chunks: list[DocumentChunk],
+        client: Any = None,
+    ) -> DocumentIndexingResult:
+        del client
+        self.call_count += 1
+
+        if self.fail:
+            raise DocumentIndexingError(
+                "Simulated indexing failure."
+            )
+
+        document_id = chunks[0].document_id
+        stale_chunks_deleted = (
+            1 if document_id in self.indexed_document_ids else 0
+        )
+        self.indexed_document_ids.add(document_id)
+
+        return DocumentIndexingResult(
+            index_alias="legal-documents",
+            document_id=document_id,
+            source_filename=chunks[0].source_filename,
+            requested_chunks=len(chunks),
+            indexed_chunks=len(chunks),
+            stale_chunks_deleted=stale_chunks_deleted,
+        )
+
+
+class ReplacementAndRollbackTests(unittest.TestCase):
+    """
+    Mission "CONTINUATION PATCH 0.4.3", section 17 - the mandatory
+    Canada 2025 -> 2026 replacement scenario, plus its mid-indexing
+    failure/rollback variant.
+    """
+
+    def test_canada_2026_upload_replaces_the_2025_version(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            indexer = ReplacingDocumentIndexer()
+
+            first_response = upload_and_index_document(
+                filename="Employment Law Overview - Canada 2025.docx",
+                file_stream=BytesIO(b"canada-2025-bytes"),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1000,
+                chunk_builder=lambda path: [
+                    _build_canada_chunk(
+                        filename=path.name,
+                        reference_year=2025,
+                    )
+                ],
+                document_indexer=indexer,
+            )
+
+            self.assertEqual(first_response.status, "indexed")
+            self.assertFalse(first_response.replaced_source_file)
+            self.assertEqual(first_response.reference_year, 2025)
+
+            second_response = upload_and_index_document(
+                filename=(
+                    "Canada_2026-04-15-Employment-Law-"
+                    "Overview-EDITED.docx"
+                ),
+                file_stream=BytesIO(b"canada-2026-bytes"),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1000,
+                chunk_builder=lambda path: [
+                    _build_canada_chunk(
+                        filename=path.name,
+                        reference_year=2026,
+                    )
+                ],
+                document_indexer=indexer,
+            )
+
+            # Same country -> same document_id -> the second upload
+            # replaces the first, never creates a second document.
+            self.assertEqual(
+                second_response.document_id,
+                first_response.document_id,
+            )
+            self.assertEqual(second_response.country_code, "CA")
+            self.assertEqual(second_response.country, "Canada")
+            self.assertEqual(second_response.reference_year, 2026)
+            self.assertTrue(second_response.replaced_source_file)
+            self.assertEqual(
+                second_response.source_filename,
+                (
+                    "Canada_2026-04-15-Employment-Law-"
+                    "Overview-EDITED.docx"
+                ),
+            )
+
+            # The OpenSearch double reports the old chunks as stale/
+            # deleted on this second call for the same document_id.
+            self.assertEqual(indexer.call_count, 2)
+
+            # Exactly one physical file for Canada, holding the NEW
+            # content, no leftover backup/incoming temp files.
+            entries = list(source_directory.iterdir())
+            self.assertEqual(
+                [entry.name for entry in entries],
+                ["CA.docx"],
+            )
+            self.assertEqual(
+                (source_directory / "CA.docx").read_bytes(),
+                b"canada-2026-bytes",
+            )
+
+    def test_failed_2026_reindex_restores_the_2025_version(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            indexer = ReplacingDocumentIndexer()
+
+            upload_and_index_document(
+                filename="Employment Law Overview - Canada 2025.docx",
+                file_stream=BytesIO(b"canada-2025-bytes"),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1000,
+                chunk_builder=lambda path: [
+                    _build_canada_chunk(
+                        filename=path.name,
+                        reference_year=2025,
+                    )
+                ],
+                document_indexer=indexer,
+            )
+
+            failing_indexer = ReplacingDocumentIndexer(fail=True)
+            failing_indexer.indexed_document_ids = set(
+                indexer.indexed_document_ids
+            )
+
+            with self.assertRaises(DocumentIndexingError):
+                upload_and_index_document(
+                    filename=(
+                        "Canada_2026-04-15-Employment-Law-"
+                        "Overview-EDITED.docx"
+                    ),
+                    file_stream=BytesIO(b"canada-2026-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    chunk_builder=lambda path: [
+                        _build_canada_chunk(
+                            filename=path.name,
+                            reference_year=2026,
+                        )
+                    ],
+                    document_indexer=failing_indexer,
+                )
+
+            # The 2025 version is restored exactly - no partial 2026
+            # file, no leftover backup/incoming temp files.
+            entries = list(source_directory.iterdir())
+            self.assertEqual(
+                [entry.name for entry in entries],
+                ["CA.docx"],
+            )
+            self.assertEqual(
+                (source_directory / "CA.docx").read_bytes(),
+                b"canada-2025-bytes",
             )
 
 

@@ -60,6 +60,10 @@ COUNTRIES: Final[
         display_name="Brazil",
     ),
     CountryDefinition(
+        code="CA",
+        display_name="Canada",
+    ),
+    CountryDefinition(
         code="CZ",
         display_name="Czech Republic",
         aliases=(

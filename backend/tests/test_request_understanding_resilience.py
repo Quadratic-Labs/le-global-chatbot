@@ -295,7 +295,7 @@ class ConservativeFallbackForClearCutCasesTests(unittest.TestCase):
         response = resolve_legal_chat_response(
             request=LegalChatRequest(
                 question=(
-                    "What are the overtime rules in Spain and Canada?"
+                    "What are the overtime rules in Spain and France?"
                 )
             ),
             catalog_provider=_catalog_provider,
@@ -308,7 +308,7 @@ class ConservativeFallbackForClearCutCasesTests(unittest.TestCase):
 
         self.assertTrue(response.grounded)
         self.assertIn("Overtime content", response.answer)
-        self.assertIn("Canada", response.answer)
+        self.assertIn("France", response.answer)
 
     def test_ambiguous_signal_combination_degrades_to_clarification(
         self,

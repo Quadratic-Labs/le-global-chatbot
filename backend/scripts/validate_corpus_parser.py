@@ -9,7 +9,7 @@ from app.core.legal_taxonomy import (
 )
 from app.services.document_chunk_builder import (
     build_document_chunks_from_docx,
-    metadata_from_filename,
+    metadata_from_content,
 )
 
 
@@ -19,11 +19,13 @@ def _validate_file(
     """
     Run the real production ingestion path on one DOCX.
 
-    The validation uses the same filename parser, country registry,
-    DOCX parser, taxonomy, and chunk builder as production ingestion.
+    The validation uses the same content-based metadata detection,
+    country registry, DOCX parser, taxonomy, and chunk builder as
+    production ingestion (mission "CONTINUATION PATCH 0.4.3" - the
+    filename is no longer a metadata source at all).
     """
 
-    metadata = metadata_from_filename(
+    metadata = metadata_from_content(
         file_path=file_path
     )
 

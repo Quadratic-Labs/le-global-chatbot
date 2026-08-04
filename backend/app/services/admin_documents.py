@@ -29,7 +29,9 @@ from app.models.admin_documents import (
 )
 from app.models.document import DocumentChunk
 from app.services.document_chunk_builder import (
+    DOCUMENT_FAMILY,
     build_document_chunks_from_docx,
+    storage_filename_for_country,
 )
 from app.services.document_indexer import (
     DocumentIndexingResult,
@@ -42,6 +44,13 @@ from app.services.opensearch_index import (
 
 UPLOAD_READ_SIZE: Final[int] = 1024 * 1024
 MAX_ADMIN_DOCUMENTS: Final[int] = 1000
+
+# No project-wide filename length limit existed before this mission;
+# 255 is the conservative, standard filesystem-safe ceiling (the
+# common ext4/NTFS/APFS per-component limit), applied here since the
+# filename itself is now an arbitrary, safety-checked string rather
+# than a fixed business format (mission "CONTINUATION PATCH 0.4.3").
+MAX_FILENAME_LENGTH: Final[int] = 255
 
 
 ChunkBuilder = Callable[
@@ -70,13 +79,30 @@ class AdminDocumentCatalogError(RuntimeError):
 def _sanitize_filename(
     filename: str,
 ) -> str:
-    """Validate an uploaded source filename."""
+    """
+    Validate an uploaded source filename for safety only - never for
+    a business naming format (mission "CONTINUATION PATCH 0.4.3",
+    section 4). Any filename that is non-empty, ends in .docx, has no
+    null byte, no path component, and stays within a reasonable
+    length is accepted verbatim - spaces, accents, parentheses,
+    dashes, and underscores all included.
+    """
+
+    if "\x00" in filename:
+        raise InvalidDocumentUploadError(
+            "The uploaded filename must not contain a null byte."
+        )
 
     normalized_filename = filename.strip()
 
     if not normalized_filename:
         raise InvalidDocumentUploadError(
             "The uploaded document has no filename."
+        )
+
+    if len(normalized_filename) > MAX_FILENAME_LENGTH:
+        raise InvalidDocumentUploadError(
+            "The uploaded filename is too long."
         )
 
     basename = (
@@ -244,18 +270,33 @@ def upload_and_index_document(
                     "The uploaded DOCX produced no legal chunks."
                 )
 
+            # Stored on disk under a name derived from the document's
+            # own detected country - never the user-supplied filename
+            # (mission "CONTINUATION PATCH 0.4.3", section 10). Two
+            # unrelated uploads that happen to share the exact same
+            # original filename (e.g. both "final.docx", one for
+            # Canada and one for Spain) must never overwrite each
+            # other's stored source file; keying storage by country
+            # also keeps it consistent with document identity itself
+            # (see document_chunk_builder._build_document_id), so a
+            # new upload for a country already active always lands
+            # on the exact same storage path it is meant to replace.
+            storage_filename = storage_filename_for_country(
+                chunks[0].country_code
+            )
+
             operation_id = uuid.uuid4().hex
 
             final_path = (
                 source_directory
-                / safe_filename
+                / storage_filename
             )
 
             incoming_path = (
                 source_directory
                 / (
                     f".{operation_id}."
-                    f"{safe_filename}.incoming"
+                    f"{storage_filename}.incoming"
                 )
             )
 
@@ -263,7 +304,7 @@ def upload_and_index_document(
                 source_directory
                 / (
                     f".{operation_id}."
-                    f"{safe_filename}.backup"
+                    f"{storage_filename}.backup"
                 )
             )
 
@@ -331,6 +372,7 @@ def upload_and_index_document(
                 reference_year=(
                     first_chunk.reference_year
                 ),
+                document_family=DOCUMENT_FAMILY,
                 uploaded_bytes=uploaded_bytes,
                 indexed_chunks=(
                     indexing_result.indexed_chunks
@@ -564,14 +606,20 @@ def list_indexed_documents(
             "source_filename",
         )
 
-        source_file_present = (
-            Path(source_filename).name
-            == source_filename
-            and (
-                source_directory
-                / source_filename
-            ).is_file()
+        country_code = _required_string(
+            source,
+            "country_code",
         )
+
+        # The on-disk file is stored under storage_filename_for_country
+        # (mission "CONTINUATION PATCH 0.4.3", section 10), never under
+        # source_filename - which is display/audit metadata only and
+        # may no longer correspond to any real path on disk (e.g. it
+        # can carry accents, spaces, or another country's name).
+        source_file_present = (
+            source_directory
+            / storage_filename_for_country(country_code)
+        ).is_file()
 
         reference_year = source.get(
             "reference_year"

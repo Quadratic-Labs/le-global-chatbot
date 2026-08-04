@@ -11,17 +11,12 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
-from app.core.country_registry import (
-    CountryRegistryError,
-    resolve_country,
-)
 from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
     is_overview_section,
 )
 from app.services.document_chunk_builder import (
-    _COPY_SUFFIX_PATTERN,
-    _FILENAME_PATTERNS,
+    metadata_from_content,
 )
 
 
@@ -68,43 +63,19 @@ def _label_key(value: str) -> str:
     return normalized.casefold()
 
 
-def _country_from_filename(
+def _country_from_content(
     file_path: Path,
 ) -> str:
-    """Extract the country from the supported L&E filenames."""
+    """
+    Detect the country from the document's own title/cover content -
+    the filename is never consulted (mission "CONTINUATION PATCH
+    0.4.3", section 5), so this audit tool stays consistent with the
+    real ingestion pipeline's own detection.
+    """
 
-    original_stem = file_path.stem.strip()
-
-    cleaned_stem = _COPY_SUFFIX_PATTERN.sub(
-        "",
-        original_stem,
-    ).strip()
-
-    for pattern in _FILENAME_PATTERNS:
-        match = pattern.fullmatch(
-            cleaned_stem
-        )
-
-        if match is None:
-            continue
-
-        raw_country = _normalize_text(
-            match.group(
-                "country"
-            )
-        ).strip(" -_")
-
-        try:
-            country, _country_code = resolve_country(raw_country)
-        except CountryRegistryError:
-            country = raw_country
-
-        return country
-
-    raise ValueError(
-        "Unable to detect country from filename: "
-        f"{file_path.name}"
-    )
+    return metadata_from_content(
+        file_path=file_path
+    ).country
 
 
 def _get_heading_level(
@@ -596,7 +567,7 @@ def main() -> None:
         ),
         key=lambda path: path.name.casefold(),
     ):
-        country = _country_from_filename(
+        country = _country_from_content(
             file_path
         )
 

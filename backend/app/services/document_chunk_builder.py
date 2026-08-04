@@ -1,15 +1,22 @@
 import hashlib
 import re
+import zipfile
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+
+from docx import Document
+
 from app.services.section_splitter import (
     split_parsed_sections,
 )
 from app.core.country_registry import (
     resolve_country,
+)
+from app.core.country_registry import (
+    UnknownCountryNameError,
 )
 from app.core.legal_taxonomy import (
     get_canonical_legal_topic,
@@ -29,8 +36,21 @@ from app.services.docx_parser import (
 
 CONTACT_SUBSECTION: Final[str] = "Contact"
 
+# The one document family/type this pipeline currently supports - see
+# metadata_from_content's own docstring. A constant, not a taxonomy:
+# document identity/storage keys off it precisely so a future second
+# family would need one deliberate new constant here, never a
+# per-document guess. Public (no leading underscore) because the
+# admin upload response also surfaces it for traceability.
+DOCUMENT_FAMILY: Final[str] = "employment-law-overview"
 
-_FILENAME_PATTERNS: Final[
+# Title/cover structures this pipeline recognizes as *this* document
+# family - reused from the filename-naming convention this same
+# product has always used, now matched against the document's own
+# content instead of its filename (mission "CONTINUATION PATCH
+# 0.4.3"): the filename itself no longer determines country, year,
+# document type, or replacement - see metadata_from_content.
+_TITLE_LINE_PATTERNS: Final[
     tuple[re.Pattern[str], ...]
 ] = (
     re.compile(
@@ -48,20 +68,38 @@ _FILENAME_PATTERNS: Final[
     ),
 )
 
-
-_COPY_SUFFIX_PATTERN: Final[
-    re.Pattern[str]
-] = re.compile(
-    r"\s*\(\d+\)$"
+# The bare document-family heading, with no country yet - the first
+# line of a two-line cover ("Labour and Employment Law" \n "Canada",
+# or "... / Canada" on one line) that _match_title_line's two-line
+# fallback pairs with the following line.
+_BARE_FAMILY_HEADING_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(?:Labour and Employment Law|Employment Law Overview)\s*/?\s*$",
+    re.IGNORECASE,
 )
+
+_TITLE_SCAN_LIMIT: Final[int] = 20
 
 
 class UnknownLegalTopicError(ValueError):
     """Raised when a section is outside the approved taxonomy."""
 
 
-class InvalidSourceFilenameError(ValueError):
-    """Raised when a DOCX filename has an unsupported format."""
+class InvalidDocxFormatError(ValueError):
+    """Raised when a file is not a genuinely valid, parseable DOCX."""
+
+
+class UndeterminableDocumentCountryError(ValueError):
+    """
+    Raised when no supported country can be identified from the
+    document's own title/cover content - never from its filename.
+    """
+
+
+class AmbiguousDocumentCountryError(ValueError):
+    """
+    Raised when more than one distinct country is found in the
+    document's title/cover content, with no clear primary one.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,76 +124,214 @@ def _sha256(
     ).hexdigest()
 
 
-def _normalize_filename_stem(
-    file_path: Path,
+def storage_filename_for_country(
+    country_code: str,
 ) -> str:
     """
-    Normalize supported filename variations.
+    The internal, collision-free on-disk storage name for one
+    country's active document under this pipeline's one document
+    family - never the user-supplied filename.
 
-    Supported variations include:
-
-    - spaces;
-    - underscores;
-    - final copy suffixes such as "(1)".
+    Keying storage by this instead of the original filename (mission
+    "CONTINUATION PATCH 0.4.3", section 10) is what makes two
+    completely unrelated uploads that happen to share a filename
+    (e.g. both named "final.docx") safe: each country still gets its
+    own, stable storage path, so neither can silently overwrite the
+    other's stored source file on disk. The user's own original
+    filename is preserved separately, purely as display/audit
+    metadata (DocumentChunk.source_filename) - never as a path.
     """
 
-    stem_without_copy_suffix = (
-        _COPY_SUFFIX_PATTERN.sub(
-            "",
-            file_path.stem.strip(),
-        )
-    )
-
-    return " ".join(
-        stem_without_copy_suffix
-        .replace("_", " ")
-        .split()
-    )
+    return f"{country_code.strip().upper()}.docx"
 
 
-def _extract_filename_metadata(
+def validate_docx_format(
     file_path: Path,
-) -> tuple[str, int | None]:
-    """Return the raw country token and optional year."""
+) -> None:
+    """
+    Confirm a file is a genuinely valid, parseable DOCX archive -
+    the .docx extension alone proves nothing (mission "CONTINUATION
+    PATCH 0.4.3", section 6). Never proceeds to content parsing,
+    OpenSearch, or any storage change when this fails.
+    """
 
-    normalized_stem = _normalize_filename_stem(
-        file_path
-    )
-
-    for pattern in _FILENAME_PATTERNS:
-        match = pattern.fullmatch(
-            normalized_stem
+    if not zipfile.is_zipfile(file_path):
+        raise InvalidDocxFormatError(
+            "The uploaded file is not a valid DOCX document."
         )
+
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            names = set(archive.namelist())
+
+    except zipfile.BadZipFile as error:
+        raise InvalidDocxFormatError(
+            "The uploaded file is not a valid DOCX document."
+        ) from error
+
+    if (
+        "[Content_Types].xml" not in names
+        or "word/document.xml" not in names
+    ):
+        raise InvalidDocxFormatError(
+            "The uploaded file is not a valid DOCX document."
+        )
+
+    try:
+        Document(file_path)
+
+    except Exception as error:
+        raise InvalidDocxFormatError(
+            "The uploaded file is not a valid DOCX document."
+        ) from error
+
+
+def _leading_paragraph_texts(
+    file_path: Path,
+    limit: int = _TITLE_SCAN_LIMIT,
+) -> list[str]:
+    """
+    The first `limit` non-empty paragraph texts, in document order -
+    the title/cover area a reader would actually see first, never
+    the full document body (mission section 7: legal documents may
+    name many other countries deep in their own text, which must
+    never be mistaken for the document's own country).
+    """
+
+    document = Document(file_path)
+    texts: list[str] = []
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+
+        if not text:
+            continue
+
+        texts.append(text)
+
+        if len(texts) >= limit:
+            break
+
+    return texts
+
+
+def _match_title_line(
+    line: str,
+    next_line: str | None,
+) -> tuple[str, int | None] | None:
+    """
+    One candidate (raw country token, optional year) from a single
+    title/cover line, or from that line paired with the one right
+    after it - covers both a one-line cover ("Employment Law
+    Overview Canada 2026", "Labour and Employment Law / Canada") and
+    a two-line cover (a bare "Labour and Employment Law" heading
+    immediately followed by a "Canada" line).
+    """
+
+    for pattern in _TITLE_LINE_PATTERNS:
+        match = pattern.fullmatch(line)
 
         if match is None:
             continue
 
-        year_value = match.group(
-            "year"
-        )
+        year_value = match.group("year")
 
         return (
-            match.group(
-                "country"
-            ).strip(),
-            (
-                int(year_value)
-                if year_value is not None
-                else None
-            ),
+            match.group("country").strip(),
+            (int(year_value) if year_value is not None else None),
         )
 
-    raise InvalidSourceFilenameError(
-        "Unexpected DOCX filename. "
-        "Supported formats are: "
-        "'Labour and Employment Law in "
-        "<Country> [Year].docx' and "
-        "'Employment Law Overview [-] "
-        "<Country> [Year].docx'. "
-        "Spaces, underscores, and a final copy suffix "
-        "such as '(1)' are accepted. "
-        f"Received: {file_path.name}"
+    if "/" in line:
+        prefix, _, suffix = line.rpartition("/")
+
+        if _BARE_FAMILY_HEADING_PATTERN.fullmatch(
+            f"{prefix.strip()} /"
+        ):
+            candidate = suffix.strip()
+
+            if candidate:
+                return candidate, None
+
+    if (
+        _BARE_FAMILY_HEADING_PATTERN.fullmatch(line)
+        and next_line
+        and not _BARE_FAMILY_HEADING_PATTERN.fullmatch(next_line)
+    ):
+        return next_line.strip(), None
+
+    return None
+
+
+def _detect_country_and_year_from_content(
+    file_path: Path,
+    country_code: str | None = None,
+) -> tuple[str, str, int | None]:
+    """
+    Resolve (country, country_code, reference_year) from the
+    document's own title/cover content - never from its filename.
+
+    Only the leading title/cover area is scanned (see
+    _leading_paragraph_texts). Candidates are deduplicated by
+    resolved country *code*, not raw text, so trivially different
+    phrasings of the same country never look ambiguous. More than
+    one distinct country code found there - a genuinely ambiguous
+    cover - is refused rather than guessed at (section 7).
+    """
+
+    lines = _leading_paragraph_texts(file_path)
+
+    resolved: list[tuple[str, str, int | None]] = []
+
+    for index, line in enumerate(lines):
+        next_line = (
+            lines[index + 1] if index + 1 < len(lines) else None
+        )
+        candidate = _match_title_line(line, next_line)
+
+        if candidate is None:
+            continue
+
+        raw_country, year = candidate
+
+        try:
+            country, resolved_code = resolve_country(
+                raw_country=raw_country,
+                country_code=country_code,
+            )
+
+        except UnknownCountryNameError:
+            # This title-shaped line simply isn't a real country
+            # name - keep scanning the rest of the title area. A
+            # CountryMetadataMismatchError, in contrast, means a real
+            # country *was* found in the content but conflicts with
+            # the caller's explicit country_code - that is always a
+            # genuine, actionable error, never silently skipped.
+            continue
+
+        resolved.append((country, resolved_code, year))
+
+    if not resolved:
+        raise UndeterminableDocumentCountryError(
+            "Unable to identify a supported country from the "
+            "document content."
+        )
+
+    distinct_codes = {code for _, code, _ in resolved}
+
+    if len(distinct_codes) > 1:
+        raise AmbiguousDocumentCountryError(
+            "Unable to determine a unique document country from "
+            "the document content."
+        )
+
+    country, resolved_code, _ = resolved[0]
+
+    reference_year = next(
+        (year for _, _, year in resolved if year is not None),
+        None,
     )
+
+    return country, resolved_code, reference_year
 
 
 def _validate_metadata(
@@ -212,19 +388,27 @@ def _validate_metadata(
 def _build_document_id(
     metadata: DocumentMetadata,
 ) -> str:
-    """Build a stable identifier for one source document."""
+    """
+    Build a stable identifier for one source document.
+
+    Identity is country_code + document family + language only -
+    never reference_year, never source_filename (mission
+    "CONTINUATION PATCH 0.4.3", section 11). A new upload for a
+    country that is already active, of any year and under any
+    filename, resolves to this exact same document_id, so it
+    replaces the previous version through the existing replace
+    mechanism instead of creating a second, parallel document.
+    reference_year and source_filename remain per-chunk *version*
+    metadata (see DocumentChunk) - they simply never affect which
+    document a chunk belongs to.
+    """
 
     identity = "\x1f".join(
         (
-            "document-v1",
-            metadata.country.strip().casefold(),
+            "document-v2",
+            DOCUMENT_FAMILY,
             metadata.country_code.strip().upper(),
-            str(
-                metadata.reference_year
-                or ""
-            ),
             metadata.language.strip().casefold(),
-            metadata.source_filename.strip().casefold(),
         )
     )
 
@@ -263,30 +447,29 @@ def _build_chunk_id(
     )
 
 
-def metadata_from_filename(
+def metadata_from_content(
     file_path: Path,
     country_code: str | None = None,
     language: str = "en",
 ) -> DocumentMetadata:
     """
-    Extract canonical metadata from a supported filename.
+    Extract canonical metadata from the document's own content - the
+    filename is never consulted for country, year, or document type
+    (mission "CONTINUATION PATCH 0.4.3", section 5): it is preserved
+    only as source_filename, for display/audit, never as a source of
+    truth for anything else.
 
     The country token is resolved through the central country
-    registry.
+    registry, exactly as before - only *where* it is read from has
+    changed, from the filename to the document's title/cover content.
 
     An explicit country code is optional. When supplied, it must
-    correspond to the country found in the filename.
+    correspond to the country found in the document's own content.
     """
 
-    raw_country, reference_year = (
-        _extract_filename_metadata(
-            file_path
-        )
-    )
-
-    country, resolved_country_code = (
-        resolve_country(
-            raw_country=raw_country,
+    country, resolved_country_code, reference_year = (
+        _detect_country_and_year_from_content(
+            file_path,
             country_code=country_code,
         )
     )
@@ -548,7 +731,9 @@ def build_document_chunks_from_docx(
 ) -> list[DocumentChunk]:
     """Parse and enrich one L&E DOCX document."""
 
-    metadata = metadata_from_filename(
+    validate_docx_format(file_path)
+
+    metadata = metadata_from_content(
         file_path=file_path,
         country_code=country_code,
         language=language,

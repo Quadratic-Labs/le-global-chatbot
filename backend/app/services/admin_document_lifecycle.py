@@ -24,6 +24,7 @@ from app.models.admin_document_lifecycle import (
 from app.models.document import DocumentChunk
 from app.services.document_chunk_builder import (
     build_document_chunks_from_docx,
+    storage_filename_for_country,
 )
 from app.services.document_indexer import (
     DocumentIndexingResult,
@@ -241,13 +242,23 @@ def _get_document_metadata(
 def _resolve_source_path(
     *,
     source_directory: Path,
-    source_filename: str,
+    storage_filename: str,
 ) -> Path:
-    """Resolve a safe source file path."""
+    """
+    Resolve a safe on-disk source file path.
+
+    Keyed by the country-derived storage_filename (see
+    document_chunk_builder.storage_filename_for_country), never by
+    the indexed document's own source_filename metadata - that field
+    is the user's original, arbitrary filename, preserved purely for
+    display/audit, and was never guaranteed to be a safe or
+    collision-free on-disk name (mission "CONTINUATION PATCH 0.4.3",
+    section 10).
+    """
 
     if Path(
-        source_filename
-    ).name != source_filename:
+        storage_filename
+    ).name != storage_filename:
         raise AdminDocumentLifecycleError(
             "Indexed source filename is unsafe."
         )
@@ -258,7 +269,7 @@ def _resolve_source_path(
 
     source_path = (
         resolved_source_directory
-        / source_filename
+        / storage_filename
     ).resolve()
 
     if (
@@ -365,9 +376,16 @@ def reindex_indexed_document(
         "source_filename",
     )
 
+    country_code = _required_string(
+        metadata,
+        "country_code",
+    )
+
     source_path = _resolve_source_path(
         source_directory=source_directory,
-        source_filename=source_filename,
+        storage_filename=storage_filename_for_country(
+            country_code
+        ),
     )
 
     if not source_path.is_file():
@@ -505,9 +523,16 @@ def delete_indexed_document(
         "source_filename",
     )
 
+    country_code = _required_string(
+        metadata,
+        "country_code",
+    )
+
     source_path = _resolve_source_path(
         source_directory=source_directory,
-        source_filename=source_filename,
+        storage_filename=storage_filename_for_country(
+            country_code
+        ),
     )
 
     source_file_present = (

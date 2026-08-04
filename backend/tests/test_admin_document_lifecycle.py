@@ -224,9 +224,13 @@ class AdminDocumentLifecycleTests(
 
             source_filename = "UK 2026.docx"
 
+            # Stored on disk under the country-derived name ("GB",
+            # matching FakeOpenSearchClient's own country_code),
+            # never source_filename itself - mission "CONTINUATION
+            # PATCH 0.4.3", section 10.
             (
                 source_directory
-                / source_filename
+                / "GB.docx"
             ).write_bytes(
                 b"docx"
             )
@@ -302,7 +306,7 @@ class AdminDocumentLifecycleTests(
 
             (
                 source_directory
-                / source_filename
+                / "GB.docx"
             ).write_bytes(
                 b"docx"
             )
@@ -403,7 +407,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             source_path.write_bytes(
@@ -475,7 +479,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             source_path.write_bytes(
@@ -529,7 +533,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             source_path.write_bytes(
@@ -579,7 +583,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             original_bytes = b"original-docx-bytes"
