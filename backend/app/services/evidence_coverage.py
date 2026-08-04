@@ -170,16 +170,40 @@ def _hit_covers_relation(
     return True
 
 
+class _SubjectTextConcept:
+    """A single-term SearchConceptLike built from an action's own
+    canonical subject_text - the fallback direct concept used below
+    when no search_concepts were supplied, never an invented
+    synonym."""
+
+    __slots__ = ("terms",)
+
+    def __init__(self, subject_text: str) -> None:
+        self.terms = [subject_text]
+
+
 def evaluate_evidence_status(
     hits: list[LegalSearchHit],
     search_concepts: list[SearchConceptLike],
     evidence_mode: str,
     *,
+    subject_text: str | None = None,
     reranked_direct_chunk_ids: frozenset[str] = frozenset(),
 ) -> EvidenceStatus:
     """
     Evaluate one country's retrieved hits against one action's
     subject.
+
+    `subject_text`, when given, is the fallback direct concept used
+    whenever search_concepts is empty - "no concepts were supplied"
+    must never be treated as automatic proof for direct_topic/
+    relation_required (a general chunk on working hours or health and
+    safety must not count as direct evidence for a remote-work
+    question just because no search_concepts happened to be carried
+    on the action); every hit must still actually contain the
+    subject's own words to count as direct. broad_topic's own
+    semantics (any hit in the section counts, by design) are
+    untouched either way.
 
     `reranked_direct_chunk_ids` lets an already-active LLM reranker
     (see rag_answer.py's existing _rerank_hits, only ever run when
@@ -192,15 +216,26 @@ def evaluate_evidence_status(
     if not hits:
         return "insufficient"
 
-    if evidence_mode == "broad_topic" or not search_concepts:
+    if evidence_mode == "broad_topic":
         return "direct"
+
+    effective_concepts: list[SearchConceptLike] = (
+        search_concepts
+        if search_concepts
+        else (
+            [_SubjectTextConcept(subject_text)] if subject_text else []
+        )
+    )
+
+    if not effective_concepts:
+        return "insufficient"
 
     if evidence_mode == "relation_required":
         for hit in hits:
             if hit.chunk_id in reranked_direct_chunk_ids:
                 return "direct"
 
-            if _hit_covers_relation(hit, search_concepts):
+            if _hit_covers_relation(hit, effective_concepts):
                 return "direct"
 
         # No single hit establishes the full relation - but if every
@@ -209,7 +244,7 @@ def evaluate_evidence_status(
         # answer, never silently promoted to direct.
         any_group_covered = any(
             any(_hit_covers_concept(hit, concept) for hit in hits)
-            for concept in search_concepts
+            for concept in effective_concepts
         )
 
         return "partial" if any_group_covered else "insufficient"
@@ -221,7 +256,7 @@ def evaluate_evidence_status(
 
         if any(
             _hit_covers_concept(hit, concept)
-            for concept in search_concepts
+            for concept in effective_concepts
         ):
             return "direct"
 

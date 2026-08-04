@@ -89,18 +89,66 @@ class BroadTopicEvidenceTests(unittest.TestCase):
             "direct",
         )
 
-    def test_empty_concepts_defaults_to_direct(self) -> None:
-        hit = _hit("Anything at all.")
-
-        self.assertEqual(
-            evaluate_evidence_status([hit], [], "direct_topic"),
-            "direct",
-        )
-
     def test_no_hits_is_insufficient(self) -> None:
         self.assertEqual(
             evaluate_evidence_status(
                 [], [_Concept(["remote work"])], "broad_topic"
+            ),
+            "insufficient",
+        )
+
+
+class SubjectTextFallbackEvidenceTests(unittest.TestCase):
+    """
+    "No search_concepts were supplied" must never be treated as
+    automatic proof for direct_topic/relation_required - a general
+    chunk on working hours or health-and-safety must not count as
+    direct evidence for a precise question just because the action
+    carried no search_concepts (mission "MISSION EXPRESS BLOQUANTE
+    0.4.2", section 4). subject_text, when given, is the fallback
+    direct concept instead - still requiring an actual match.
+    """
+
+    def test_empty_concepts_and_no_subject_text_is_insufficient(
+        self,
+    ) -> None:
+        hit = _hit("Anything at all.")
+
+        self.assertEqual(
+            evaluate_evidence_status([hit], [], "direct_topic"),
+            "insufficient",
+        )
+
+    def test_subject_text_fallback_matches_a_direct_hit(self) -> None:
+        hit = _hit(
+            "The overtime rules require payment at 1.25 times the "
+            "ordinary hourly rate for the first two hours.",
+            subsection="Overtime",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [],
+                "direct_topic",
+                subject_text="overtime rules",
+            ),
+            "direct",
+        )
+
+    def test_subject_text_fallback_rejects_an_adjacent_hit(self) -> None:
+        hit = _hit(
+            "Employers must assess workplace risks and provide "
+            "personal protective equipment where required.",
+            subsection="Health and Safety",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [],
+                "direct_topic",
+                subject_text="overtime rules",
             ),
             "insufficient",
         )

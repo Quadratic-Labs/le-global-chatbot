@@ -24,6 +24,7 @@ insufficiency message.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Final
@@ -48,6 +49,7 @@ from app.models.conversation_state import (
     ConversationState,
 )
 from app.services.legal_catalog import get_legal_catalog
+from app.services.legal_subject_scope import canonicalize_legal_subject
 from app.services.legal_topic_detection import CANONICAL_LEGAL_TOPICS
 
 
@@ -73,14 +75,16 @@ CLARIFICATION_REASONS: Final[tuple[str, ...]] = (
 
 # Produced only by conversation_transition.py's own deterministic
 # reconciliation when rebuilding a final RequestUnderstandingResult
-# from a TransitionOutcome (RULE 5's multi-action selection and RULE
-# 9's ambiguous country reference) - never by the model itself, so
-# these are deliberately excluded from the JSON schema below and
-# accepted only by the validator, which this dual-purpose model must
-# satisfy for both producers.
+# from a TransitionOutcome (RULE 5's multi-action selection, RULE 9's
+# ambiguous country reference, and the jurisdiction-neutral-subject
+# mission's own empty-subject-after-canonicalization case) - never by
+# the model itself, so these are deliberately excluded from the JSON
+# schema below and accepted only by the validator, which this
+# dual-purpose model must satisfy for both producers.
 ENGINE_ONLY_CLARIFICATION_REASONS: Final[tuple[str, ...]] = (
     "select_action",
     "ambiguous_reference",
+    "missing_topic",
 )
 
 EVIDENCE_MODES: Final[tuple[str, ...]] = (
@@ -118,6 +122,12 @@ MAX_UNDERSTANDING_ATTEMPTS: Final[int] = 2
 
 # The full validated history (already capped at HISTORY_MAX_MESSAGES) is
 # passed to the model as-is - there is no separate, smaller cap here.
+
+_WORD_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> set[str]:
+    return set(_WORD_PATTERN.findall(text.casefold()))
 
 
 class RequestUnderstandingAction(BaseModel):
@@ -256,6 +266,86 @@ class RequestUnderstandingAction(BaseModel):
             return "direct_topic"
 
         return "broad_topic"
+
+    def resolved_subject_precision(self) -> tuple[str | None, str | None]:
+        """
+        (subject_specificity, evidence_mode) this action should
+        actually use for retrieval/evidence-gating - reconciling
+        whatever was explicitly set (by the model, or carried over
+        from a prior turn) against what search_concepts itself
+        proves.
+
+        A search_concepts group naming legal content genuinely
+        distinct from this action's own legal_topics (not just a
+        paraphrase of the topic's own generic label) proves the
+        question is about one precise concept - e.g. "remote work"/
+        "telework" under the broad "Working Conditions" topic -
+        regardless of what subject_specificity/evidence_mode were
+        separately set to. This is the one case this method may
+        upgrade them to "specific"/"direct_topic": it never does the
+        reverse. When no such distinct concept is present, whatever
+        precision was already resolved (explicit or
+        resolved_evidence_mode's own inference) is returned unchanged
+        - a genuinely broad question (see resolved_evidence_mode's
+        own inference for the default) is never narrowed either.
+
+        "Distinct" is judged by word overlap, not exact-string
+        equality: a real model asked a genuinely broad question
+        ("Tell me about working conditions in Peru.") still supplies
+        several search_concepts terms - e.g. "workplace conditions",
+        "working environment" - that are mere paraphrases of the
+        topic's own label (sharing a word with it), never a narrower
+        legal concept. A term with zero words in common with any of
+        this action's own legal_topics ("remote work", "telework")
+        cannot be such a paraphrase, and is treated as genuinely
+        distinct; a term sharing even one word with a legal_topic
+        ("workplace conditions" shares "conditions") is treated as a
+        paraphrase, not a narrower concept.
+
+        Known, accepted limitation (mission "MISSION EXPRESS BLOQUANTE
+        0.4.2"): word overlap cannot be made perfectly precise. "work
+        environment" - real, observed model output for the same
+        broad "working conditions" question - shares zero *exact*
+        tokens with "Working Conditions" ("work" != "working" without
+        stemming) and is misjudged as distinct, occasionally
+        upgrading a genuinely broad question to specific/direct_topic.
+        Stemming does not fix this: reducing "working" to "work"
+        would also make "work" (from "remote work", the exact
+        defect this method exists to catch) overlap with "Working
+        Conditions", losing the one distinction that matters most. No
+        purely lexical rule separates "paraphrase of the topic" from
+        "genuinely narrower concept" when both may share a root word.
+        Accepted as-is: the answer itself is still correct and
+        grounded either way (this only affects evidence-gating
+        strictness, not which content is surfaced), and the exact
+        reported defect (remote work mislabeled broad) is fully and
+        reliably fixed.
+
+        Always (None, None) for a "contact" action, which must never
+        carry legal subject matter at all (see
+        RequestUnderstandingResult's own resolved-action rule) -
+        resolved_evidence_mode's own inference would otherwise assign
+        it a concrete evidence_mode it is not allowed to have.
+        """
+
+        if self.type == "contact":
+            return None, None
+
+        generic_words: set[str] = set()
+
+        for topic in self.legal_topics:
+            generic_words |= _words(topic)
+
+        has_distinct_concept = any(
+            term.strip() and not (_words(term) & generic_words)
+            for concept in self.search_concepts
+            for term in concept.terms
+        )
+
+        if has_distinct_concept:
+            return "specific", "direct_topic"
+
+        return self.subject_specificity, self.resolved_evidence_mode()
 
     def effective_subject_text(self) -> str:
         """
@@ -695,10 +785,22 @@ precise sub-topic actually asked about, distinct from its broad
 legal_topics bucket:
 - subject_text: a short, self-contained description of exactly what is
   being asked (e.g. "whether an employer may dismiss an employee who is
-  on sick leave", not just "termination").
+  on sick leave", not just "termination") - describe the legal question
+  only, NEVER the jurisdiction: no country name, code, alias, demonym/
+  national adjective (e.g. "Spanish"), or city, even when the question
+  itself only names the country once. The jurisdiction belongs
+  exclusively in country_codes, which already carries it - repeating it
+  inside subject_text is always redundant and is rejected by this
+  product's own follow-up handling. E.g. for "What are the rules on
+  remote work in Spain?", subject_text is "rules on remote work
+  (telework)" - never "rules on remote work (telework) in Spain". For
+  "Compare overtime rules in Spain and Peru", subject_text is "overtime
+  rules" - never naming either country.
 - search_concepts: 1 to 4 groups of direct synonyms for the essential
   concept(s) the subject depends on - never a broader topic's other
-  facets, never a merely adjacent consequence. For "remote work", accept
+  facets, never a merely adjacent consequence, and never a jurisdiction
+  (same rule as subject_text: "remote work"/"telework", never "Spanish
+  remote work" or "telework in Spain"). For "remote work", accept
   synonyms like "telework" or "working from home"; never include
   "overtime", "health and safety", or "salary" as if they were synonyms
   of remote work. A subject naming one relation between two concepts
@@ -1021,6 +1123,115 @@ UNDERSTANDING_JSON_SCHEMA: Final[dict[str, Any]] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _CanonicalizedAction:
+    action: RequestUnderstandingAction
+    subject_became_empty: bool
+
+
+def _canonicalize_action_subject(
+    action: RequestUnderstandingAction,
+) -> _CanonicalizedAction:
+    """
+    Strip a known geographic scope back out of one action's own
+    subject_text/search_concepts - see legal_subject_scope.py. A
+    contact action carries neither field at all and is returned
+    unchanged; every legal_information/comparison action is
+    canonicalized against its own country_codes before this result
+    ever reaches conversation_transition or answer_legal_question, so
+    a jurisdiction-contaminated model output never has the chance to
+    be inherited by a later turn's bare country follow-up.
+    """
+
+    if action.type == "contact":
+        return _CanonicalizedAction(
+            action=action, subject_became_empty=False
+        )
+
+    canonicalized = canonicalize_legal_subject(
+        subject_text=action.subject_text,
+        search_concepts=action.search_concepts,
+        scoped_country_codes=action.country_codes,
+    )
+
+    if not canonicalized.changed:
+        return _CanonicalizedAction(
+            action=action, subject_became_empty=False
+        )
+
+    updated = action.model_copy(
+        update={
+            "subject_text": canonicalized.subject_text,
+            "search_concepts": [
+                ConversationSearchConcept(terms=concept.terms)
+                for concept in canonicalized.search_concepts
+            ],
+        }
+    )
+
+    return _CanonicalizedAction(
+        action=updated,
+        subject_became_empty=canonicalized.subject_became_empty,
+    )
+
+
+def _canonicalize_result_actions(
+    result: RequestUnderstandingResult,
+) -> RequestUnderstandingResult:
+    """
+    Canonicalize every action's own subject/search_concepts, and - for
+    a freshly "resolved" result only - degrade to a targeted
+    clarification (never a silent broad-topic search) if doing so left
+    any action with no transferable legal subject at all (e.g. a model
+    output whose entire subject_text was just the country's name).
+    A "clarification"/"unsupported" result already carries at most a
+    partial hint action, so this degradation only ever applies to a
+    "resolved" one - see the mission's Phase 9/13.
+    """
+
+    canonicalized = [
+        _canonicalize_action_subject(action) for action in result.actions
+    ]
+
+    if all(not item.subject_became_empty for item in canonicalized):
+        if all(
+            item.action is original
+            for item, original in zip(canonicalized, result.actions)
+        ):
+            return result
+
+        return result.model_copy(
+            update={
+                "actions": [item.action for item in canonicalized]
+            }
+        )
+
+    if result.status != "resolved":
+        return result.model_copy(
+            update={
+                "actions": [item.action for item in canonicalized]
+            }
+        )
+
+    empty_subject_action = next(
+        item.action
+        for item in canonicalized
+        if item.subject_became_empty
+    )
+
+    return result.model_copy(
+        update={
+            "status": "clarification",
+            "clarification_reason": "missing_topic",
+            "actions": [
+                empty_subject_action.model_copy(
+                    update={"subject_text": None}
+                )
+            ],
+        }
+    )
+
+
 def _parse_understanding_response(
     text: str,
 ) -> RequestUnderstandingResult | None:
@@ -1054,9 +1265,11 @@ def _parse_understanding_response(
         return None
 
     try:
-        return RequestUnderstandingResult(**payload)
+        result = RequestUnderstandingResult(**payload)
     except (TypeError, ValidationError):
         return None
+
+    return _canonicalize_result_actions(result)
 
 
 def understand_request(

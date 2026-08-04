@@ -17,6 +17,7 @@ from unittest import mock
 from app.models.conversation_state import (
     ConversationActionState,
     ConversationPendingClarification,
+    ConversationSearchConcept,
     ConversationState,
 )
 from app.services.conversation_transition import (
@@ -1217,6 +1218,369 @@ class BuildNextConversationStateTests(unittest.TestCase):
         )
 
         self.assertEqual(state.actions[0].country_codes, ["PE"])
+
+
+class JurisdictionNeutralInheritanceTests(unittest.TestCase):
+    """
+    Mission "DECOUPLAGE COMPLET DU SUJET JURIDIQUE ET DE LA
+    JURIDICTION", Phase 17: CAS 1-8. Each reproduces the exact prior-
+    state/message pair the mission specifies and checks the inherited
+    action's subject_text is fully jurisdiction-neutral - the old
+    country never survives into the new country's action.
+    """
+
+    def test_cas1_remote_work_spain_to_peru(self) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text="rules on remote work in Spain",
+            legal_topics=["Working Conditions"],
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["PE"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["PE"])
+        self.assertEqual(action.subject_text, "rules on remote work")
+        self.assertNotIn("Spain", action.subject_text)
+
+    def test_cas2_notice_spain_to_australia(self) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text=(
+                "notice an employer must give when dismissing an "
+                "employee in Spain"
+            ),
+            legal_topics=["Termination of Employment Contracts"],
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["AU"],
+                        legal_topics=[
+                            "Termination of Employment Contracts"
+                        ],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["AU"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["AU"])
+        self.assertEqual(
+            action.subject_text,
+            "notice an employer must give when dismissing an employee",
+        )
+
+    def test_cas3_sick_leave_dismissal_spain_to_peru_same_relation(
+        self,
+    ) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text=(
+                "whether an employer may dismiss an employee on sick "
+                "leave in Spain"
+            ),
+            legal_topics=["Termination of Employment Contracts"],
+            evidence_mode="relation_required",
+            search_concepts=[
+                {"terms": ["dismiss", "dismissal"]},
+                {"terms": ["sick leave"]},
+            ],
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["PE"],
+                        legal_topics=[
+                            "Termination of Employment Contracts"
+                        ],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["PE"])
+        self.assertEqual(
+            action.subject_text,
+            "whether an employer may dismiss an employee on sick leave",
+        )
+        self.assertEqual(action.evidence_mode, "relation_required")
+
+    def test_cas4_fixed_term_uk_to_australia(self) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["GB"],
+            subject_text=(
+                "fixed-term employment contracts in the United Kingdom"
+            ),
+            legal_topics=["Employment Contracts"],
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["AU"],
+                        legal_topics=["Employment Contracts"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["AU"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["AU"])
+        self.assertEqual(
+            action.subject_text, "fixed-term employment contracts"
+        )
+
+    def test_cas5_overtime_spain_to_peru(self) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text="overtime rules in Spain",
+            legal_topics=["Working Conditions"],
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["PE"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["PE"])
+        self.assertEqual(action.subject_text, "overtime rules")
+
+    def test_cas6_contact_spain_to_peru_no_regression(self) -> None:
+        previous = _action_state("contact", ["ES"])
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[_ru_action("contact", ["PE"])],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.type, "contact")
+        self.assertEqual(action.country_codes, ["PE"])
+        self.assertIsNone(action.subject_text)
+
+    def test_cas7_comparison_add_australia(self) -> None:
+        previous = _action_state(
+            "comparison",
+            ["ES", "PE"],
+            subject_text="overtime rules in Spain and Peru",
+            legal_topics=["Working Conditions"],
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "comparison",
+                        ["ES", "PE", "AU"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="add_country",
+                    explicit_country_codes=["AU"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state(
+                [previous],
+                focus_action_index=0,
+                ordered_country_codes=["ES", "PE"],
+            ),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["ES", "PE", "AU"])
+        self.assertEqual(action.subject_text, "overtime rules")
+
+    def test_cas8_multi_action_state_country_only_never_contaminates(
+        self,
+    ) -> None:
+        legal_action = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text="overtime rules in Spain",
+            legal_topics=["Working Conditions"],
+        )
+        contact_action = _action_state("contact", ["ES", "PE"])
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["AU"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["AU"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state(
+                [legal_action, contact_action],
+                focus_action_index=None,
+            ),
+            hints=_hints(),
+        )
+
+        # More than one prior action and no explicit action type named
+        # in this message - the engine must never guess which action a
+        # bare country belongs to (RULE 5) - but whatever it does
+        # decide, no action's subject_text may ever contain "Spain".
+        for action in outcome.final_actions:
+            self.assertNotIn("Spain", action.subject_text or "")
+
+    def test_cas9_country_swap_emptying_all_concepts_rebuilds_from_subject(
+        self,
+    ) -> None:
+        # A concept group whose every term is purely geographic (the
+        # country's own name, no other legal content) is dropped
+        # entirely during canonicalization even though subject_text
+        # itself survives untouched. A precise subject must never be
+        # broadened just because its concepts disappeared here -
+        # search_concepts is rebuilt directly from the surviving
+        # canonical subject_text, and subject_specificity/
+        # evidence_mode stay exactly as they were (mission "MISSION
+        # EXPRESS BLOQUANTE 0.4.2", Regle B).
+        previous = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text="overtime rules",
+            legal_topics=["Working Conditions"],
+            search_concepts=[ConversationSearchConcept(terms=["Spain"])],
+            subject_specificity="specific",
+            evidence_mode="direct_topic",
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["PE"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["PE"])
+        self.assertEqual(action.subject_text, "overtime rules")
+        # The purely-geographic concept group is gone, but it is
+        # rebuilt from the surviving subject_text - never left empty,
+        # never invented as a new synonym.
+        self.assertEqual(
+            [concept.terms for concept in action.search_concepts],
+            [["overtime rules"]],
+        )
+        # Never weakened - the precise labeling survives untouched.
+        self.assertEqual(action.evidence_mode, "direct_topic")
+        self.assertEqual(action.subject_specificity, "specific")
 
 
 if __name__ == "__main__":
