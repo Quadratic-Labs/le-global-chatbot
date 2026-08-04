@@ -20,6 +20,7 @@ from app.security.admin import (
 from app.services.admin_document_lifecycle import (
     AdminDocumentLifecycleError,
     AdminDocumentNotFoundError,
+    AdminDocumentSourceConflictError,
     AdminDocumentSourceMissingError,
     InvalidAdminDocumentIdError,
     delete_indexed_document,
@@ -86,6 +87,14 @@ def reindex_admin_document(
             ),
         ) from error
 
+    except AdminDocumentSourceConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(
+                error
+            ),
+        ) from error
+
     except (
         DocumentIndexingError,
         AdminDocumentLifecycleError,
@@ -133,6 +142,14 @@ def delete_admin_document(
     except AdminDocumentNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(
+                error
+            ),
+        ) from error
+
+    except AdminDocumentSourceConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
             detail=str(
                 error
             ),

@@ -37,6 +37,10 @@ from app.services.document_indexer import (
     DocumentIndexingResult,
     replace_document_chunks,
 )
+from app.services.document_source_resolver import (
+    DocumentSourceConflictError,
+    resolve_document_source_path,
+)
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
 )
@@ -61,6 +65,11 @@ ChunkBuilder = Callable[
 DocumentIndexer = Callable[
     ...,
     DocumentIndexingResult,
+]
+
+ExistingSourceLookup = Callable[
+    [str, "OpenSearch | None"],
+    "str | None",
 ]
 
 
@@ -203,6 +212,71 @@ def _safe_unlink(
         pass
 
 
+def _lookup_existing_source_filename(
+    document_id: str,
+    client: OpenSearch | None,
+) -> str | None:
+    """
+    Return the source_filename of an already-indexed document sharing
+    this exact deterministic document_id, or None when no such
+    document exists yet.
+
+    This is the only way an upload can learn a pre-existing, possibly
+    legacy document's historical on-disk filename before writing a
+    replacement - source_directory is never scanned (mission "HOTFIX
+    0.4.4", section 4).
+    """
+
+    opensearch_client = (
+        client
+        if client is not None
+        else get_opensearch_client()
+    )
+
+    response = opensearch_client.search(
+        index=LEGAL_DOCUMENTS_ALIAS,
+        body={
+            "size": 1,
+            "_source": ["source_filename"],
+            "query": {
+                "term": {
+                    "document_id": document_id,
+                }
+            },
+        },
+    )
+
+    if not isinstance(response, dict):
+        return None
+
+    hits_container = response.get("hits")
+
+    if not isinstance(hits_container, dict):
+        return None
+
+    hits = hits_container.get("hits")
+
+    if not isinstance(hits, list) or not hits:
+        return None
+
+    first_hit = hits[0]
+
+    if not isinstance(first_hit, dict):
+        return None
+
+    source = first_hit.get("_source")
+
+    if not isinstance(source, dict):
+        return None
+
+    value = source.get("source_filename")
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    return value.strip()
+
+
 def upload_and_index_document(
     *,
     filename: str,
@@ -216,6 +290,9 @@ def upload_and_index_document(
     ),
     document_indexer: DocumentIndexer = (
         replace_document_chunks
+    ),
+    existing_source_lookup: ExistingSourceLookup = (
+        _lookup_existing_source_filename
     ),
 ) -> AdminDocumentUploadResponse:
     """
@@ -281,9 +358,47 @@ def upload_and_index_document(
             # (see document_chunk_builder._build_document_id), so a
             # new upload for a country already active always lands
             # on the exact same storage path it is meant to replace.
+            country_code = chunks[0].country_code
             storage_filename = storage_filename_for_country(
-                chunks[0].country_code
+                country_code
             )
+
+            # A country already active before country-keyed storage
+            # existed is still physically stored under its own
+            # historical filename (mission "HOTFIX 0.4.4") - looked up
+            # by this upload's own deterministic document_id (never by
+            # scanning source_directory), so the resolver finds that
+            # file too and replacing it backs up and restores the
+            # real active file, never just a {COUNTRY_CODE}.docx path
+            # that may not exist yet.
+            try:
+                existing_source_filename = existing_source_lookup(
+                    chunks[0].document_id,
+                    client,
+                )
+
+            except OpenSearchException as error:
+                raise AdminDocumentStorageError(
+                    "The existing document catalog could not be "
+                    "checked before upload."
+                ) from error
+
+            try:
+                existing_source = resolve_document_source_path(
+                    source_root=source_directory,
+                    country_code=country_code,
+                    source_filename=existing_source_filename,
+                )
+
+            except DocumentSourceConflictError as error:
+                raise InvalidDocumentUploadError(
+                    "Multiple distinct source files already exist "
+                    "for this country; resolve the conflict "
+                    "manually before uploading a replacement."
+                ) from error
+
+            existing_active_path = existing_source.path
+            replaced_source_file = existing_active_path is not None
 
             operation_id = uuid.uuid4().hex
 
@@ -301,15 +416,15 @@ def upload_and_index_document(
             )
 
             backup_path = (
-                source_directory
-                / (
-                    f".{operation_id}."
-                    f"{storage_filename}.backup"
+                (
+                    existing_active_path.parent
+                    / (
+                        f".{operation_id}."
+                        f"{existing_active_path.name}.backup"
+                    )
                 )
-            )
-
-            replaced_source_file = (
-                final_path.exists()
+                if existing_active_path is not None
+                else None
             )
 
             shutil.copyfile(
@@ -318,9 +433,9 @@ def upload_and_index_document(
             )
 
             try:
-                if replaced_source_file:
+                if existing_active_path is not None:
                     os.replace(
-                        final_path,
+                        existing_active_path,
                         backup_path,
                     )
 
@@ -341,10 +456,13 @@ def upload_and_index_document(
                     final_path
                 )
 
-                if backup_path.exists():
+                if (
+                    backup_path is not None
+                    and backup_path.exists()
+                ):
                     os.replace(
                         backup_path,
-                        final_path,
+                        existing_active_path,
                     )
 
                 _safe_unlink(
@@ -353,9 +471,10 @@ def upload_and_index_document(
 
                 raise
 
-            _safe_unlink(
-                backup_path
-            )
+            if backup_path is not None:
+                _safe_unlink(
+                    backup_path
+                )
 
             first_chunk = chunks[0]
 
@@ -611,15 +730,32 @@ def list_indexed_documents(
             "country_code",
         )
 
-        # The on-disk file is stored under storage_filename_for_country
-        # (mission "CONTINUATION PATCH 0.4.3", section 10), never under
-        # source_filename - which is display/audit metadata only and
-        # may no longer correspond to any real path on disk (e.g. it
-        # can carry accents, spaces, or another country's name).
-        source_file_present = (
-            source_directory
-            / storage_filename_for_country(country_code)
-        ).is_file()
+        # Resolved centrally (mission "HOTFIX 0.4.4"): a document
+        # indexed before country-keyed storage existed is still
+        # physically stored under its own historical source_filename,
+        # never under storage_filename_for_country's canonical name -
+        # the resolver checks both, so a legacy document is never
+        # reported as missing.
+        try:
+            resolved_source = resolve_document_source_path(
+                source_root=source_directory,
+                country_code=country_code,
+                source_filename=source_filename,
+            )
+
+            source_file_present = (
+                resolved_source.path is not None
+            )
+
+            document_status = (
+                "indexed"
+                if source_file_present
+                else "indexed_source_missing"
+            )
+
+        except DocumentSourceConflictError:
+            source_file_present = False
+            document_status = "indexed_source_conflict"
 
         reference_year = source.get(
             "reference_year"
@@ -663,11 +799,7 @@ def list_indexed_documents(
                 source_file_present=(
                     source_file_present
                 ),
-                status=(
-                    "indexed"
-                    if source_file_present
-                    else "indexed_source_missing"
-                ),
+                status=document_status,
             )
         )
 

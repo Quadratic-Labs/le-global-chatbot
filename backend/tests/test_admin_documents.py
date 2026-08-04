@@ -23,6 +23,24 @@ from app.services.document_indexer import (
 )
 
 
+def _no_existing_source(
+    document_id: str,
+    client: Any,
+) -> None:
+    """
+    Stub for upload_and_index_document's existing_source_lookup: no
+    prior document shares this document_id - the ordinary case for a
+    fresh temporary source_directory in these tests. Tests that need
+    to simulate a real pre-existing legacy document override this
+    explicitly instead.
+    """
+
+    del document_id
+    del client
+
+    return None
+
+
 def _build_chunk(
     filename: str,
 ) -> DocumentChunk:
@@ -243,6 +261,7 @@ class AdminDocumentTests(unittest.TestCase):
                 maximum_bytes=1000,
                 chunk_builder=chunk_builder,
                 document_indexer=document_indexer,
+                existing_source_lookup=_no_existing_source,
             )
 
             self.assertEqual(
@@ -342,6 +361,7 @@ class AdminDocumentTests(unittest.TestCase):
                     maximum_bytes=1000,
                     chunk_builder=chunk_builder,
                     document_indexer=failing_indexer,
+                    existing_source_lookup=_no_existing_source,
                 )
 
             self.assertEqual(
@@ -416,6 +436,69 @@ class AdminDocumentTests(unittest.TestCase):
                 "indexed_source_missing",
             )
 
+    def test_legacy_document_with_historical_filename_shows_source_available(
+        self,
+    ) -> None:
+        # Mission "HOTFIX 0.4.4", section 7.A - a document indexed
+        # before country-keyed storage existed: its historical
+        # source_filename is the exact, only physical file on disk;
+        # GB.docx (the canonical name) is deliberately absent. Must
+        # resolve as available, never "indexed_source_missing".
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            (
+                source_directory / "UK 2026.docx"
+            ).write_bytes(b"legacy-document-bytes")
+
+            response = list_indexed_documents(
+                source_directory=source_directory,
+                client=FakeOpenSearchClient(),
+            )
+
+            self.assertEqual(
+                response.documents[0].status,
+                "indexed",
+            )
+
+            self.assertTrue(
+                response.documents[0].source_file_present
+            )
+
+            self.assertFalse(
+                (source_directory / "GB.docx").exists()
+            )
+
+    def test_conflicting_sources_are_flagged_not_guessed(
+        self,
+    ) -> None:
+        # Both the historical filename and the canonical name exist as
+        # two distinct real files - never silently pick one.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            (
+                source_directory / "UK 2026.docx"
+            ).write_bytes(b"legacy-bytes")
+
+            (
+                source_directory / "GB.docx"
+            ).write_bytes(b"canonical-bytes")
+
+            response = list_indexed_documents(
+                source_directory=source_directory,
+                client=FakeOpenSearchClient(),
+            )
+
+            self.assertEqual(
+                response.documents[0].status,
+                "indexed_source_conflict",
+            )
+
+            self.assertFalse(
+                response.documents[0].source_file_present
+            )
+
 
 class FilenameAcceptanceTests(unittest.TestCase):
     """
@@ -478,6 +561,7 @@ class FilenameAcceptanceTests(unittest.TestCase):
                         maximum_bytes=1000,
                         chunk_builder=chunk_builder,
                         document_indexer=document_indexer,
+                        existing_source_lookup=_no_existing_source,
                     )
 
                     self.assertEqual(
@@ -628,6 +712,7 @@ class ReplacementAndRollbackTests(unittest.TestCase):
                     )
                 ],
                 document_indexer=indexer,
+                existing_source_lookup=_no_existing_source,
             )
 
             self.assertEqual(first_response.status, "indexed")
@@ -650,6 +735,7 @@ class ReplacementAndRollbackTests(unittest.TestCase):
                     )
                 ],
                 document_indexer=indexer,
+                existing_source_lookup=_no_existing_source,
             )
 
             # Same country -> same document_id -> the second upload
@@ -707,6 +793,7 @@ class ReplacementAndRollbackTests(unittest.TestCase):
                     )
                 ],
                 document_indexer=indexer,
+                existing_source_lookup=_no_existing_source,
             )
 
             failing_indexer = ReplacingDocumentIndexer(fail=True)
@@ -731,6 +818,7 @@ class ReplacementAndRollbackTests(unittest.TestCase):
                         )
                     ],
                     document_indexer=failing_indexer,
+                    existing_source_lookup=_no_existing_source,
                 )
 
             # The 2025 version is restored exactly - no partial 2026
@@ -743,6 +831,177 @@ class ReplacementAndRollbackTests(unittest.TestCase):
             self.assertEqual(
                 (source_directory / "CA.docx").read_bytes(),
                 b"canada-2025-bytes",
+            )
+
+
+SPAIN_DOCUMENT_ID = "doc_" + "e" * 64
+
+
+def _build_spain_chunk(
+    *,
+    filename: str,
+) -> DocumentChunk:
+    """One Spain/employment-law-overview chunk, fixed document_id."""
+
+    return DocumentChunk(
+        document_id=SPAIN_DOCUMENT_ID,
+        chunk_id="chunk-es-1",
+        country="Spain",
+        country_code="ES",
+        legal_topic="Employment Contracts",
+        document_type="comparator",
+        language="en",
+        section="Employment Contracts",
+        subsection="Notice Period",
+        content="Notice content.",
+        source_filename=filename,
+        source_format="docx",
+        content_hash="content-hash",
+        reference_year=2027,
+    )
+
+
+class LegacyReplacementAndRollbackTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4", section 7.C/D - Replace and Rollback for a
+    country whose currently active document is still stored under its
+    historical filename, never {COUNTRY_CODE}.docx.
+    """
+
+    LEGACY_FILENAME = "Labour and Employment Law in Spain 2026.docx"
+
+    def test_replace_upload_finds_and_retires_the_historical_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            legacy_path = source_directory / self.LEGACY_FILENAME
+            legacy_path.write_bytes(b"legacy-spain-bytes")
+
+            indexer = ReplacingDocumentIndexer()
+            indexer.indexed_document_ids.add(SPAIN_DOCUMENT_ID)
+
+            response = upload_and_index_document(
+                filename="Spain-2027-update.docx",
+                file_stream=BytesIO(b"new-spain-bytes"),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1000,
+                chunk_builder=lambda path: [
+                    _build_spain_chunk(filename=path.name)
+                ],
+                document_indexer=indexer,
+                existing_source_lookup=(
+                    lambda document_id, client: self.LEGACY_FILENAME
+                ),
+            )
+
+            self.assertTrue(response.replaced_source_file)
+            self.assertEqual(response.country_code, "ES")
+
+            # The historical file is retired - exactly one physical
+            # file remains, under the canonical name, with the new
+            # content. No renaming of the historical file occurred:
+            # it was replaced, not moved to a new name.
+            entries = list(source_directory.iterdir())
+            self.assertEqual(
+                [entry.name for entry in entries],
+                ["ES.docx"],
+            )
+            self.assertEqual(
+                (source_directory / "ES.docx").read_bytes(),
+                b"new-spain-bytes",
+            )
+
+    def test_failed_replace_upload_restores_the_historical_file_exactly(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            legacy_path = source_directory / self.LEGACY_FILENAME
+            original_bytes = b"legacy-spain-bytes"
+            legacy_path.write_bytes(original_bytes)
+
+            failing_indexer = ReplacingDocumentIndexer(fail=True)
+            failing_indexer.indexed_document_ids.add(
+                SPAIN_DOCUMENT_ID
+            )
+
+            with self.assertRaises(DocumentIndexingError):
+                upload_and_index_document(
+                    filename="Spain-2027-update.docx",
+                    file_stream=BytesIO(b"new-spain-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    chunk_builder=lambda path: [
+                        _build_spain_chunk(filename=path.name)
+                    ],
+                    document_indexer=failing_indexer,
+                    existing_source_lookup=(
+                        lambda document_id, client: self.LEGACY_FILENAME
+                    ),
+                )
+
+            # The historical file is restored exactly, at its own
+            # original name and path - never renamed, never left as
+            # a partial ES.docx.
+            entries = list(source_directory.iterdir())
+            self.assertEqual(
+                [entry.name for entry in entries],
+                [self.LEGACY_FILENAME],
+            )
+            self.assertEqual(
+                legacy_path.read_bytes(),
+                original_bytes,
+            )
+
+    def test_upload_refuses_when_source_conflict_exists(
+        self,
+    ) -> None:
+        # Both the historical file and a canonical ES.docx already
+        # exist - refuse the upload entirely rather than guess which
+        # one to replace; nothing on disk may change.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            legacy_path = source_directory / self.LEGACY_FILENAME
+            legacy_path.write_bytes(b"legacy-spain-bytes")
+
+            canonical_path = source_directory / "ES.docx"
+            canonical_path.write_bytes(b"canonical-spain-bytes")
+
+            with self.assertRaises(InvalidDocumentUploadError):
+                upload_and_index_document(
+                    filename="Spain-2027-update.docx",
+                    file_stream=BytesIO(b"new-spain-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    chunk_builder=lambda path: [
+                        _build_spain_chunk(filename=path.name)
+                    ],
+                    document_indexer=ReplacingDocumentIndexer(),
+                    existing_source_lookup=(
+                        lambda document_id, client: self.LEGACY_FILENAME
+                    ),
+                )
+
+            self.assertEqual(
+                legacy_path.read_bytes(),
+                b"legacy-spain-bytes",
+            )
+            self.assertEqual(
+                canonical_path.read_bytes(),
+                b"canonical-spain-bytes",
             )
 
 
