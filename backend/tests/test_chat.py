@@ -25,6 +25,11 @@ from app.models.chat import (
     LegalChatHistoryMessage,
     LegalChatRequest,
 )
+from app.models.conversation_state import (
+    ConversationActionState,
+    ConversationSearchConcept,
+    ConversationState,
+)
 from app.models.search import (
     LegalSearchHit,
     LegalSearchResponse,
@@ -4268,6 +4273,677 @@ class ContactContentSanitizationTests(unittest.TestCase):
         self.assertIn("EC3 A 7 AR", answer_text)
         self.assertNotIn("EC3 A 7 AR,", answer_text)
         self.assertEqual(answer_text.count("+44 20 1234 5678"), 1)
+
+
+class JurisdictionNeutralClientStateCompatibilityTests(unittest.TestCase):
+    """
+    Mission "DECOUPLAGE COMPLET DU SUJET JURIDIQUE ET DE LA
+    JURIDICTION", Phase 20/24: a client can only ever replay a
+    conversation_state this backend itself returned earlier - but it
+    is still never trusted for its *content*, only its *shape* (see
+    conversation_transition.py's own module docstring). This is the
+    exact literal contaminated ConversationState from the mission's
+    own Phase 24 scenario I.
+    """
+
+    def test_contaminated_client_state_is_cleaned_before_use(
+        self,
+    ) -> None:
+        contaminated_state = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=["Working Conditions"],
+                    subject_text="rules on remote work in Spain",
+                    search_concepts=[
+                        ConversationSearchConcept(
+                            terms=["remote work in Spain", "telework"]
+                        )
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        captured_requests: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+
+            hit = _build_hit(
+                country_code="PE",
+                country="Peru",
+                content=(
+                    "Employees may telework by written agreement "
+                    "with their employer."
+                ),
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        class _CapturingGenerationClient:
+            model = "test-model"
+
+            def __init__(self, answer: str) -> None:
+                self.answer = answer
+                self.calls: list[tuple[str, str]] = []
+
+            def generate(
+                self, instructions: str, input_text: str
+            ) -> GeneratedText:
+                self.calls.append((instructions, input_text))
+
+                return GeneratedText(text=self.answer, model=self.model)
+
+        client = _CapturingGenerationClient(
+            answer=(
+                "Peru\n- Telework is permitted subject to written "
+                "agreement. [1]"
+            )
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["PE"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                is_follow_up=True,
+                current_message_delta=_current_message_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=contaminated_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertNotIn("Spain", captured_requests[0].query)
+
+        self.assertEqual(len(client.calls), 1)
+        instructions_used, generation_input = client.calls[0]
+        self.assertNotIn("Spain", generation_input)
+        self.assertNotIn("Spain", instructions_used)
+
+        self.assertNotIn("Spain", response.answer)
+
+        next_state = response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["PE"])
+        self.assertNotIn(
+            "Spain", next_state.actions[0].subject_text or ""
+        )
+
+    def test_client_state_whose_subject_is_purely_geographic_asks_for_topic(
+        self,
+    ) -> None:
+        # State whose entire subject_text is just the old country's
+        # name (nothing transferable survives canonicalization) - must
+        # degrade to a targeted clarification, never a silent general
+        # search grounded in the broad legal_topics alone.
+        degenerate_state = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=["Working Conditions"],
+                    subject_text="Spain",
+                    search_concepts=[],
+                    subject_specificity="broad",
+                    evidence_mode=None,
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["PE"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                is_follow_up=True,
+                current_message_delta=_current_message_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=degenerate_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=understanding_client,
+        )
+
+        self.assertFalse(response.grounded)
+        self.assertIn("Peru", response.answer)
+        self.assertIn("topic", response.answer.lower())
+
+
+class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
+    """
+    Mission "CORRECTION FINALE CIBLEE 0.4.2" - the two remaining
+    functional gaps: an empty-after-canonicalization subject must
+    never be silently replaced by a broad legal_topics category, and a
+    bare country-only follow-up must resolve deterministically even
+    when RequestUnderstanding itself fails outright.
+    """
+
+    def _degenerate_spain_state(self) -> ConversationState:
+        return ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=["Working Conditions"],
+                    subject_text="Spain",
+                    search_concepts=[],
+                    subject_specificity="broad",
+                    evidence_mode=None,
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+    def test_1_empty_subject_never_becomes_working_conditions(
+        self,
+    ) -> None:
+        # The exact real-world failure mode this correction targets:
+        # the model reports a "resolved" action for Peru whose own
+        # explicit_subject_text is the prior action's broad
+        # legal_topics ("Working Conditions") - not anything actually
+        # present in the bare "Peru?" message itself.
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["PE"],
+                        legal_topics=["Working Conditions"],
+                        subject_text="working conditions",
+                    )
+                ],
+                is_follow_up=True,
+                current_message_delta=_current_message_delta(
+                    context_operation="replace_country",
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["PE"],
+                    explicit_legal_topics=["Working Conditions"],
+                    explicit_subject_text="Working Conditions",
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=self._degenerate_spain_state(),
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=understanding_client,
+        )
+
+        self.assertFalse(response.grounded)
+        self.assertEqual(response.sources, [])
+        self.assertIn("Peru", response.answer)
+        self.assertNotIn("Working Conditions", response.answer)
+        # No legal_information action stored with "Working Conditions"
+        # (or any other) subject_text - only the pending clarification
+        # itself survives for the next turn.
+        cs = response.conversation_state
+        self.assertIsNotNone(cs)
+        self.assertEqual(cs.actions, [])
+        self.assertIsNotNone(cs.pending_clarification)
+        self.assertEqual(
+            cs.pending_clarification.reason, "missing_topic"
+        )
+
+    def test_2_a_genuine_general_question_still_searches_normally(
+        self,
+    ) -> None:
+        hit = _build_hit(
+            country_code="PE",
+            country="Peru",
+            content=(
+                "Employers must ensure a safe working environment "
+                "and comply with maximum working time limits."
+            ),
+        )
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        client = FakeGenerationClient(
+            answer=(
+                "Peru\n- Employers must ensure a safe working "
+                "environment. [1]"
+            )
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["PE"],
+                        legal_topics=["Working Conditions"],
+                        subject_text="working conditions",
+                    )
+                ],
+                is_follow_up=False,
+                current_message_delta=_current_message_delta(
+                    context_operation="independent",
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["PE"],
+                    explicit_legal_topics=["Working Conditions"],
+                    explicit_subject_text="working conditions",
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Tell me about working conditions in Peru."
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertNotEqual(response.sources, [])
+        cs = response.conversation_state
+        self.assertIsNotNone(cs)
+        self.assertNotEqual(cs.pending_clarification, "missing_topic")
+
+    def test_3_invalid_response_resolves_locally_without_losing_subject(
+        self,
+    ) -> None:
+        captured_requests: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+
+            hit = _build_hit(
+                country_code="PE",
+                country="Peru",
+                content=(
+                    "Employees may telework by written agreement "
+                    "with their employer."
+                ),
+            )
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        client = FakeGenerationClient(
+            answer=(
+                "Peru\n- Telework is permitted subject to written "
+                "agreement. [1]"
+            )
+        )
+
+        clean_state = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=["Working Conditions"],
+                    subject_text="rules on remote work (telework)",
+                    search_concepts=[
+                        ConversationSearchConcept(
+                            terms=["remote work", "telework"]
+                        )
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=clean_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=_FailingUnderstandingClient(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(captured_requests), 1)
+        self.assertNotIn("Spain", captured_requests[0].query)
+        self.assertEqual(captured_requests[0].country_codes, ["PE"])
+
+        next_state = response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["PE"])
+        self.assertEqual(
+            next_state.actions[0].subject_text,
+            "rules on remote work (telework)",
+        )
+        self.assertEqual(
+            next_state.actions[0].search_concepts[0].terms,
+            ["remote work", "telework"],
+        )
+        self.assertEqual(
+            next_state.actions[0].evidence_mode, "direct_topic"
+        )
+
+    def test_4_invalid_response_and_empty_subject_still_clarifies(
+        self,
+    ) -> None:
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=self._degenerate_spain_state(),
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=_FailingUnderstandingClient(),
+        )
+
+        self.assertFalse(response.grounded)
+        self.assertEqual(response.sources, [])
+        self.assertIn("Peru", response.answer)
+
+    def test_5_multi_action_ambiguous_state_never_guesses(self) -> None:
+        multi_action_state = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=["Working Conditions"],
+                    subject_text="overtime rules",
+                ),
+                ConversationActionState(
+                    type="contact",
+                    country_codes=["ES", "PE"],
+                ),
+            ],
+            focus_action_index=None,
+            ordered_country_codes=[],
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["AU"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                is_follow_up=True,
+                current_message_delta=_current_message_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["AU"],
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Australia?",
+                conversation_state=multi_action_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=understanding_client,
+        )
+
+        # Ambiguous multi-action state: the existing conservative
+        # clarification must still apply - no action arbitrarily
+        # selected on this correction's account.
+        self.assertFalse(response.grounded)
+
+    def test_6_invalid_response_with_empty_legal_topics_still_resolves(
+        self,
+    ) -> None:
+        # Real-world condition that reached this test only after a
+        # candidate build was validated against a live model: a prior
+        # turn can legitimately resolve with legal_topics == [] (the
+        # model conveyed the subject only via topic_text, which
+        # ConversationActionState folds into subject_text and does
+        # not store separately). The local country-only fallback must
+        # not depend on legal_topics alone being non-empty.
+        captured_requests: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+
+            hit = _build_hit(
+                country_code="PE",
+                country="Peru",
+                content=(
+                    "Employees may telework by written agreement "
+                    "with their employer."
+                ),
+            )
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        client = FakeGenerationClient(
+            answer=(
+                "Peru\n- Telework is permitted subject to written "
+                "agreement. [1]"
+            )
+        )
+
+        state_with_empty_legal_topics = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=[],
+                    subject_text="remote work (telework)",
+                    search_concepts=[
+                        ConversationSearchConcept(
+                            terms=["remote work", "telework"]
+                        )
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=state_with_empty_legal_topics,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=_FailingUnderstandingClient(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(captured_requests), 1)
+        self.assertNotIn("Spain", captured_requests[0].query)
+        self.assertEqual(captured_requests[0].country_codes, ["PE"])
+
+        next_state = response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["PE"])
+        self.assertEqual(
+            next_state.actions[0].subject_text,
+            "remote work (telework)",
+        )
+
+    def test_7_semantic_path_also_tolerates_empty_legal_topics(
+        self,
+    ) -> None:
+        # Same prior-action shape as test_6 (legal_topics == []), but
+        # this time RequestUnderstanding itself succeeds and returns
+        # its own (independently valid) resolved action for "Peru?".
+        # _apply_transition's single-action inheritance branch
+        # discards that current-turn action entirely and rebuilds
+        # from the stored previous_action via _inherit_action - so
+        # this exercises the same _inherit_action completeness bug
+        # through the "semantic" path, independent of either
+        # correction's own new code.
+        captured_requests: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+
+            hit = _build_hit(
+                country_code="PE",
+                country="Peru",
+                content=(
+                    "Employees may telework by written agreement "
+                    "with their employer."
+                ),
+            )
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        client = FakeGenerationClient(
+            answer=(
+                "Peru\n- Telework is permitted subject to written "
+                "agreement. [1]"
+            )
+        )
+
+        state_with_empty_legal_topics = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=[],
+                    subject_text="remote work (telework)",
+                    search_concepts=[
+                        ConversationSearchConcept(
+                            terms=["remote work", "telework"]
+                        )
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["PE"],
+                        topic_text="remote work (telework)",
+                    )
+                ],
+                is_follow_up=True,
+                current_message_delta=_current_message_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=state_with_empty_legal_topics,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(captured_requests), 1)
+        self.assertNotIn("Spain", captured_requests[0].query)
+        self.assertEqual(captured_requests[0].country_codes, ["PE"])
+
+        next_state = response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["PE"])
+        self.assertEqual(
+            next_state.actions[0].subject_text,
+            "remote work (telework)",
+        )
 
 
 if __name__ == "__main__":

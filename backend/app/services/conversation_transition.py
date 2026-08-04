@@ -23,16 +23,22 @@ retrieval (see RULE 4 below, and the 0.4.2 mission's rectificatif C).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app.models.conversation_state import (
     MAX_COUNTRY_CODES_PER_ACTION,
     ConversationActionState,
     ConversationPendingClarification,
+    ConversationSearchConcept,
     ConversationState,
 )
-from app.services.country_detection import resolve_country_display_name
+from app.services.country_detection import (
+    is_country_only_followup,
+    resolve_country_display_name,
+)
+from app.services.legal_subject_scope import canonicalize_legal_subject
 from app.services.request_understanding import (
+    CurrentMessageDelta,
     DeterministicHints,
     RequestUnderstandingAction,
     RequestUnderstandingResult,
@@ -81,6 +87,12 @@ class TransitionOutcome:
     inherited_action_type: str | None
     inherited_country_replaced: bool
     contextual_clarification_answer: str | None = None
+    # Jurisdiction-neutral-subject observability - see chat_metrics.py.
+    subject_canonicalization_applied: bool = False
+    subject_scope_removed_country_codes: list[str] = field(
+        default_factory=list
+    )
+    inherited_subject_canonicalized: bool = False
 
 
 def _build_resolved_question(
@@ -117,18 +129,56 @@ def _build_resolved_question(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _InheritedAction:
+    action: RequestUnderstandingAction
+    subject_became_empty: bool
+    canonicalization_applied: bool
+    removed_country_codes: list[str]
+
+
 def _inherit_action(
     previous_action: ConversationActionState,
     *,
     country_codes: list[str],
-) -> RequestUnderstandingAction:
+) -> _InheritedAction:
     """
     Rebuild a full RequestUnderstandingAction from one prior
     conversation_state action, keeping its type/subject/topics intact
     and using only the given (possibly new) country_codes.
+
+    0.4.2 jurisdiction-neutral-subject hardening: a bare country
+    follow-up ("Peru?") only ever changes country_codes here - never
+    subject_text/search_concepts themselves - so if the OLD country
+    was ever baked into either (RequestUnderstanding's own output is
+    canonicalized at the source, but a state built before this
+    hardening existed, or a replayed/tampered client state, is not
+    trusted either), it would otherwise silently survive into the NEW
+    country's resolved_question, retrieval query, and insufficient/
+    partial message. Canonicalizing here against the union of the
+    previous action's own country_codes and the new ones is a second,
+    defensive pass - idempotent when the source was already clean.
+
+    `subject_became_empty` (always False for a contact action, which
+    never carries a subject) tells the caller the inherited subject
+    carried no transferable legal content at all once its geographic
+    scope was stripped out (e.g. a legacy or tampered state whose
+    entire subject_text was just the old country's name) - the caller
+    must turn this into a targeted clarification, never silently fall
+    back to the action's broad legal_topics as if that were the
+    subject the user actually asked about (RULE: never a silent
+    general search - see the mission's Phase 13).
     """
 
-    subject_text = previous_action.subject_text
+    canonicalized = canonicalize_legal_subject(
+        subject_text=previous_action.subject_text,
+        search_concepts=previous_action.search_concepts,
+        scoped_country_codes=previous_action.country_codes,
+        additional_country_codes=country_codes,
+    )
+
+    subject_text = canonicalized.subject_text
+    search_concepts = canonicalized.search_concepts
 
     resolved_question = (
         _build_resolved_question(
@@ -140,19 +190,84 @@ def _inherit_action(
         else None
     )
 
-    return RequestUnderstandingAction(
+    action = RequestUnderstandingAction(
         type=previous_action.type,
         country_codes=country_codes,
         legal_topics=list(previous_action.legal_topics),
-        topic_text=None,
+        # A prior turn can resolve with legal_topics == [] when the
+        # model conveyed the subject only via topic_text - a field
+        # ConversationActionState does not persist on its own,
+        # folding it into subject_text instead. Falling back to the
+        # (guaranteed non-empty here, since subject_became_empty is
+        # handled by the caller before this action is ever used)
+        # canonicalized subject_text keeps this inherited action
+        # complete per RequestUnderstandingResult's own resolved
+        # legal_information/comparison rule, without changing
+        # anything when legal_topics is already present.
+        topic_text=(
+            subject_text if not previous_action.legal_topics else None
+        ),
         resolved_question=resolved_question,
         subject_text=subject_text,
         search_concepts=[
             {"terms": list(concept.terms)}
-            for concept in previous_action.search_concepts
+            for concept in search_concepts
         ],
         subject_specificity=previous_action.subject_specificity,
         evidence_mode=previous_action.evidence_mode,
+    )
+
+    return _InheritedAction(
+        action=action,
+        subject_became_empty=canonicalized.subject_became_empty,
+        canonicalization_applied=canonicalized.changed,
+        removed_country_codes=canonicalized.removed_country_codes,
+    )
+
+
+def _missing_topic_clarification(
+    *,
+    action_type: str,
+    country_codes: list[str],
+) -> TransitionOutcome:
+    """
+    The inherited subject carried no transferable legal content once
+    its geographic scope was stripped - ask for the topic explicitly,
+    naming the new country, rather than silently answering the whole
+    broad topic area as if that were what was actually asked (see
+    _inherit_action's own docstring and the mission's Phase 13).
+    Never reaches OpenSearch or generation - this returns directly.
+    """
+
+    country_phrase = (
+        " and ".join(
+            resolve_country_display_name(code)
+            for code in country_codes
+        )
+        if country_codes
+        else "that country"
+    )
+
+    contextual_answer = (
+        "What employment law topic would you like information "
+        f"about for {country_phrase}?"
+    )
+
+    return TransitionOutcome(
+        final_status="clarification",
+        final_actions=[],
+        final_clarification_reason="missing_topic",
+        pending_clarification=ConversationPendingClarification(
+            reason="missing_topic",
+            candidate_action_types=[action_type],
+            candidate_country_codes=country_codes,
+        ),
+        semantic_result_overridden=True,
+        semantic_override_reason="inherited_subject_became_empty",
+        context_inheritance_applied=False,
+        inherited_action_type=None,
+        inherited_country_replaced=False,
+        contextual_clarification_answer=contextual_answer,
     )
 
 
@@ -340,11 +455,126 @@ def _country_reference_clarification(
     )
 
 
+def _canonicalize_conversation_state(
+    conversation_state: ConversationState,
+) -> ConversationState:
+    """
+    Canonicalize every action's subject_text/search_concepts against
+    its own country_codes, immediately after Pydantic validation and
+    before any of this module's own logic reads them.
+
+    conversation_state is client-supplied - never trusted for its
+    *content* even though FastAPI already validated its *shape* (see
+    the module docstring). Without this upfront pass, a jurisdiction
+    baked into subject_text by a state built before this hardening
+    existed (or a replayed/tampered client state) would still leak
+    into a clarification's own descriptive phrase (see
+    _describe_action_for_clarification) even on paths that never
+    reach _inherit_action's own defensive canonicalization at all.
+
+    Deliberately never collapses a subject to None here, even when
+    canonicalize_legal_subject reports subject_became_empty: doing so
+    would silently discard that signal before _inherit_action - the
+    only place that actually decides whether this action is being
+    inherited right now - gets a chance to turn it into a targeted
+    missing_topic clarification (Phase 13). Left as the original,
+    still-contaminated text in that one rare case instead, so the
+    later, authoritative canonicalization pass is what detects and
+    acts on the empty result, never this earlier defensive one.
+    """
+
+    canonicalized_actions: list[ConversationActionState] = []
+    any_changed = False
+
+    for action in conversation_state.actions:
+        canonicalized = canonicalize_legal_subject(
+            subject_text=action.subject_text,
+            search_concepts=action.search_concepts,
+            scoped_country_codes=action.country_codes,
+        )
+
+        if not canonicalized.changed or canonicalized.subject_became_empty:
+            canonicalized_actions.append(action)
+            continue
+
+        any_changed = True
+        canonicalized_actions.append(
+            action.model_copy(
+                update={
+                    "subject_text": canonicalized.subject_text,
+                    "search_concepts": [
+                        ConversationSearchConcept(terms=concept.terms)
+                        for concept in canonicalized.search_concepts
+                    ],
+                }
+            )
+        )
+
+    if not any_changed:
+        return conversation_state
+
+    return conversation_state.model_copy(
+        update={"actions": canonicalized_actions}
+    )
+
+
+def _correct_delta_for_country_only_followup(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """
+    A bare country-only follow-up ("Peru?", "What about Peru?") must
+    always be treated as a pure country replacement against a single
+    prior action - even when RequestUnderstanding's own delta claims
+    an explicit new subject/action for it, a real, observed model
+    behavior when the prior action's own subject was itself
+    uninformative (e.g. just the old country's name - see
+    legal_subject_scope.py). That claimed subject is not actually
+    present in the user's own current message, so it must never be
+    trusted over what the message deterministically is (mission
+    "CORRECTION FINALE CIBLEE 0.4.2", Correction 1).
+
+    Only ever corrects the delta - never result.actions, which
+    _apply_transition's own single-action branch does not consult for
+    this decision anyway (it is fully replaced by _inherit_action's
+    own output). Never touches a multi-action state (RULE 5/9's own
+    disambiguation already handles that case untouched) or a message
+    that also carries its own legal-subject content, which
+    is_country_only_followup already excludes.
+    """
+
+    if (
+        current_question is None
+        or len(conversation_state.actions) != 1
+    ):
+        return result
+
+    country_codes = is_country_only_followup(current_question)
+
+    if country_codes is None:
+        return result
+
+    return result.model_copy(
+        update={
+            "current_message_delta": CurrentMessageDelta(
+                explicit_action_types=[],
+                explicit_country_codes=country_codes,
+                explicit_legal_topics=[],
+                explicit_subject_text=None,
+                context_operation="replace_country",
+            )
+        }
+    )
+
+
 def apply_conversation_transition(
     *,
     result: RequestUnderstandingResult,
     conversation_state: ConversationState | None,
     hints: DeterministicHints,
+    current_question: str | None = None,
 ) -> TransitionOutcome:
     """
     Reconcile one validated RequestUnderstandingResult with the
@@ -360,16 +590,61 @@ def apply_conversation_transition(
     the primary router and this engine only ever corrects the one
     narrow class of transition it cannot reliably self-correct call to
     call (see the module docstring).
+
+    `current_question`, when given, additionally lets this engine
+    deterministically override a spurious explicit subject/action the
+    classifier claimed for what the raw message actually shows is a
+    bare country-only follow-up - see
+    _correct_delta_for_country_only_followup.
     """
 
     if conversation_state is None:
         return _passthrough(result)
 
+    canonicalized_state = _canonicalize_conversation_state(
+        conversation_state
+    )
+
+    result = _correct_delta_for_country_only_followup(
+        result=result,
+        conversation_state=canonicalized_state,
+        current_question=current_question,
+    )
+
     try:
-        return _apply_transition(
+        outcome = _apply_transition(
             result=result,
-            conversation_state=conversation_state,
+            conversation_state=canonicalized_state,
             hints=hints,
+        )
+
+        if canonicalized_state is conversation_state:
+            return outcome
+
+        client_state_removed_codes = {
+            code
+            for original, canonicalized in zip(
+                conversation_state.actions,
+                canonicalized_state.actions,
+            )
+            if original.subject_text != canonicalized.subject_text
+            for code in original.country_codes
+        }
+
+        if not client_state_removed_codes:
+            return replace(
+                outcome, subject_canonicalization_applied=True
+            )
+
+        return replace(
+            outcome,
+            subject_canonicalization_applied=True,
+            subject_scope_removed_country_codes=sorted(
+                {
+                    *outcome.subject_scope_removed_country_codes,
+                    *client_state_removed_codes,
+                }
+            ),
         )
     except Exception as error:
         # RULE 8, hardened: every explicitly modeled, safe case (no
@@ -459,9 +734,15 @@ def _apply_transition(
                 country_codes=final_country_codes,
             )
 
+            if inherited.subject_became_empty:
+                return _missing_topic_clarification(
+                    action_type=previous_action.type,
+                    country_codes=final_country_codes,
+                )
+
             return TransitionOutcome(
                 final_status="resolved",
-                final_actions=[inherited],
+                final_actions=[inherited.action],
                 final_clarification_reason=None,
                 pending_clarification=None,
                 semantic_result_overridden=True,
@@ -471,6 +752,15 @@ def _apply_transition(
                 context_inheritance_applied=True,
                 inherited_action_type=previous_action.type,
                 inherited_country_replaced=country_replaced,
+                subject_canonicalization_applied=(
+                    inherited.canonicalization_applied
+                ),
+                subject_scope_removed_country_codes=(
+                    inherited.removed_country_codes
+                ),
+                inherited_subject_canonicalized=(
+                    inherited.canonicalization_applied
+                ),
             )
 
         if (
@@ -491,9 +781,15 @@ def _apply_transition(
                 country_codes=final_country_codes,
             )
 
+            if inherited.subject_became_empty:
+                return _missing_topic_clarification(
+                    action_type=previous_action.type,
+                    country_codes=final_country_codes,
+                )
+
             return TransitionOutcome(
                 final_status="resolved",
-                final_actions=[inherited],
+                final_actions=[inherited.action],
                 final_clarification_reason=None,
                 pending_clarification=None,
                 semantic_result_overridden=True,
@@ -503,6 +799,15 @@ def _apply_transition(
                 context_inheritance_applied=True,
                 inherited_action_type=previous_action.type,
                 inherited_country_replaced=bool(explicit_country_codes),
+                subject_canonicalization_applied=(
+                    inherited.canonicalization_applied
+                ),
+                subject_scope_removed_country_codes=(
+                    inherited.removed_country_codes
+                ),
+                inherited_subject_canonicalized=(
+                    inherited.canonicalization_applied
+                ),
             )
 
         candidate_countries = (
@@ -567,9 +872,15 @@ def _apply_transition(
                 country_codes=final_country_codes,
             )
 
+            if inherited.subject_became_empty:
+                return _missing_topic_clarification(
+                    action_type=selected_action.type,
+                    country_codes=final_country_codes,
+                )
+
             return TransitionOutcome(
                 final_status="resolved",
-                final_actions=[inherited],
+                final_actions=[inherited.action],
                 final_clarification_reason=None,
                 pending_clarification=None,
                 semantic_result_overridden=True,
@@ -580,6 +891,15 @@ def _apply_transition(
                 inherited_action_type=selected_action.type,
                 inherited_country_replaced=bool(
                     explicit_country_codes
+                ),
+                subject_canonicalization_applied=(
+                    inherited.canonicalization_applied
+                ),
+                subject_scope_removed_country_codes=(
+                    inherited.removed_country_codes
+                ),
+                inherited_subject_canonicalized=(
+                    inherited.canonicalization_applied
                 ),
             )
 

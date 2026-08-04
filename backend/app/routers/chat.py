@@ -40,6 +40,7 @@ from app.services.country_detection import (
     CountryAvailability,
     CountryCatalogProvider,
     CountryDetectionError,
+    is_country_only_followup,
     resolve_country_availability,
     resolve_country_display_name,
 )
@@ -51,6 +52,7 @@ from app.services.legal_search import (
     search_contact_chunks,
     search_legal_documents,
 )
+from app.services.legal_subject_scope import canonicalize_legal_subject
 from app.services.legal_topic_detection import (
     CANONICAL_LEGAL_TOPICS,
     LegalScope,
@@ -68,6 +70,7 @@ from app.services.rag_answer import (
     answer_legal_question,
 )
 from app.services.request_understanding import (
+    CurrentMessageDelta,
     DeterministicHints,
     HistoryTurn,
     RequestUnderstandingAction,
@@ -387,6 +390,15 @@ CLARIFICATION_EXPLICIT_FILTER_CONFLICT_ANSWER: Final[str] = (
     "Your question appears to concern a different country than the "
     "one specified in this request's country filter. Please clarify "
     "which country you would like this answer for."
+)
+
+CLARIFICATION_MISSING_TOPIC_FOR_COUNTRY_TEMPLATE: Final[str] = (
+    "What employment law topic would you like information about for "
+    "{country}?"
+)
+
+CLARIFICATION_MISSING_TOPIC_ANSWER: Final[str] = (
+    "What employment law topic would you like information about?"
 )
 
 
@@ -747,6 +759,24 @@ def _clarification_answer_for(
     if reason == "missing_comparison_topic":
         return CLARIFICATION_MISSING_COMPARISON_TOPIC_ANSWER
 
+    if reason == "missing_topic":
+        hint_country_code = (
+            hint_action.country_codes[0]
+            if hint_action is not None and hint_action.country_codes
+            else None
+        )
+
+        if hint_country_code:
+            return (
+                CLARIFICATION_MISSING_TOPIC_FOR_COUNTRY_TEMPLATE.format(
+                    country=resolve_country_display_name(
+                        hint_country_code
+                    )
+                )
+            )
+
+        return CLARIFICATION_MISSING_TOPIC_ANSWER
+
     if reason == "ambiguous_request":
         hint_country_code = (
             hint_action.country_codes[0]
@@ -795,6 +825,81 @@ def _check_explicit_filter_conflict(
             return True
 
     return False
+
+
+def _try_local_country_only_followup_result(
+    *,
+    question: str,
+    conversation_state: ConversationState | None,
+) -> RequestUnderstandingResult | None:
+    """
+    When RequestUnderstanding fails outright (invalid_response,
+    timeout, parsing error, or any other transient failure), a bare
+    country-only follow-up ("Peru?") should never degrade to the
+    generic conservative fallback - it can be resolved deterministically
+    from conversation_state alone, with no further OpenAI call at all
+    (mission "CORRECTION FINALE CIBLEE 0.4.2", Correction 2).
+
+    Returns a synthetic, already-correct RequestUnderstandingResult
+    (a plain country replacement against the single prior action, with
+    every explicit-subject/action field clear) whenever that applies,
+    so the caller can treat it exactly like a normal successful
+    understanding result and let apply_conversation_transition's own
+    existing single-action inheritance handle the rest - never None
+    actions, is_follow_up, or current_message_delta invented beyond
+    what a country-only message deterministically supports.
+
+    Returns None (the caller must fall through to the existing
+    conservative fallback) for anything else: no conversation_state, a
+    multi-action state (RULE 5/9's own disambiguation is not
+    reproduced here - never guess which action a bare country belongs
+    to), a comparison that cannot be inherited below two countries, or
+    a message that is not purely a country reference.
+    """
+
+    if conversation_state is None or len(conversation_state.actions) != 1:
+        return None
+
+    country_codes = is_country_only_followup(question)
+
+    if country_codes is None:
+        return None
+
+    previous_action = conversation_state.actions[0]
+
+    if previous_action.type == "comparison" and len(country_codes) < 2:
+        return None
+
+    return RequestUnderstandingResult(
+        status="resolved",
+        actions=[
+            RequestUnderstandingAction(
+                type=previous_action.type,
+                country_codes=country_codes,
+                legal_topics=list(previous_action.legal_topics),
+                # previous_action.subject_text already folds in
+                # whichever of legal_topics/topic_text the original
+                # turn actually populated (ConversationActionState
+                # has no topic_text field of its own) - carrying it
+                # here as topic_text keeps this synthetic action
+                # complete per RequestUnderstandingResult's own
+                # resolved-action rule even when legal_topics alone
+                # is empty. None for a "contact" previous_action,
+                # matching that type's own no-subject-matter rule.
+                topic_text=previous_action.subject_text,
+            )
+        ],
+        is_follow_up=True,
+        confidence=1.0,
+        clarification_reason=None,
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=[],
+            explicit_country_codes=country_codes,
+            explicit_legal_topics=[],
+            explicit_subject_text=None,
+            context_operation="replace_country",
+        ),
+    )
 
 
 def _resolve_conservative_fallback(
@@ -1098,6 +1203,35 @@ def _execute_resolved_plan(
                 merged_question_parts.append(question_part)
 
             if action_scope.available_codes:
+                # Defensive re-canonicalization: action's own
+                # subject_text/search_concepts should already be
+                # jurisdiction-neutral by this point (canonicalized at
+                # RequestUnderstanding's own output, at the client-
+                # state boundary, and at conversation_transition's own
+                # inheritance step) - this is deliberate belt-and-
+                # suspenders, never the only place this is enforced,
+                # so the evidence spec that actually reaches retrieval
+                # and the insufficient/partial message is never built
+                # from an unchecked subject_text.
+                canonicalized_subject = canonicalize_legal_subject(
+                    subject_text=action.effective_subject_text() or None,
+                    search_concepts=action.search_concepts,
+                    scoped_country_codes=action_scope.available_codes,
+                )
+
+                if canonicalized_subject.changed:
+                    metrics.subject_scope_canonicalization_applied = True
+                    metrics.search_concepts_canonicalized = True
+                    metrics.subject_scope_removed_country_codes = sorted(
+                        {
+                            *metrics.subject_scope_removed_country_codes,
+                            *canonicalized_subject.removed_country_codes,
+                        }
+                    )
+
+                if canonicalized_subject.subject_became_empty:
+                    metrics.subject_empty_after_canonicalization = True
+
                 action_specs.append(
                     LegalActionEvidenceSpec(
                         country_codes=(
@@ -1113,12 +1247,10 @@ def _execute_resolved_plan(
                             if request.legal_topics
                             else validated_topics
                         ),
-                        subject_text=(
-                            action.effective_subject_text()
-                            or None
-                        ),
+                        subject_text=canonicalized_subject.subject_text,
                         search_concepts=(
-                            action.search_concepts or None
+                            canonicalized_subject.search_concepts
+                            or None
                         ),
                         evidence_mode=(
                             action.resolved_evidence_mode()
@@ -1407,34 +1539,50 @@ def resolve_legal_chat_response(
         metrics.openai_ms += outcome.openai_ms
 
         if outcome.result is None:
-            metrics.request_understanding_method = "fallback"
-            metrics.request_understanding_error = outcome.error
-
-            response = _resolve_conservative_fallback(
-                request=request,
-                hints=hints,
-                current_country_scope=current_country_scope,
-                current_legal_scope=current_legal_scope,
-                metrics=metrics,
-                search_function=search_function,
-                generation_client=generation_client,
-                rerank_enabled=rerank_enabled,
-                rerank_pool_multiplier=rerank_pool_multiplier,
-                max_context_characters=max_context_characters,
-                max_source_characters=max_source_characters,
+            local_result = _try_local_country_only_followup_result(
+                question=request.question,
+                conversation_state=previous_conversation_state,
             )
 
-            metrics.total_ms = (
-                perf_counter() - total_started_at
-            ) * 1000
+            if local_result is None:
+                metrics.request_understanding_method = "fallback"
+                metrics.request_understanding_error = outcome.error
 
-            metrics.log()
+                response = _resolve_conservative_fallback(
+                    request=request,
+                    hints=hints,
+                    current_country_scope=current_country_scope,
+                    current_legal_scope=current_legal_scope,
+                    metrics=metrics,
+                    search_function=search_function,
+                    generation_client=generation_client,
+                    rerank_enabled=rerank_enabled,
+                    rerank_pool_multiplier=rerank_pool_multiplier,
+                    max_context_characters=max_context_characters,
+                    max_source_characters=max_source_characters,
+                )
 
-            return response
+                metrics.total_ms = (
+                    perf_counter() - total_started_at
+                ) * 1000
 
-        result = outcome.result
+                metrics.log()
 
-        metrics.request_understanding_method = "semantic"
+                return response
+
+            # A bare country-only follow-up, resolved deterministically
+            # with no further OpenAI call - proceed exactly as if
+            # understanding had itself returned this result.
+            metrics.request_understanding_method = (
+                "local_deterministic"
+            )
+            metrics.request_understanding_error = outcome.error
+            result = local_result
+        else:
+            result = outcome.result
+
+            metrics.request_understanding_method = "semantic"
+
         metrics.request_understanding_confidence = result.confidence
         metrics.contextual_question_used = result.is_follow_up
         metrics.current_message_operation = (
@@ -1447,6 +1595,7 @@ def resolve_legal_chat_response(
             result=result,
             conversation_state=previous_conversation_state,
             hints=hints,
+            current_question=request.question,
         )
 
         metrics.conversation_transition_ms = (
@@ -1466,6 +1615,15 @@ def resolve_legal_chat_response(
         )
         metrics.inherited_country_replaced = (
             transition_outcome.inherited_country_replaced
+        )
+        metrics.subject_scope_canonicalization_applied = (
+            transition_outcome.subject_canonicalization_applied
+        )
+        metrics.subject_scope_removed_country_codes = (
+            transition_outcome.subject_scope_removed_country_codes
+        )
+        metrics.inherited_subject_canonicalized = (
+            transition_outcome.inherited_subject_canonicalized
         )
 
         final_result = RequestUnderstandingResult(

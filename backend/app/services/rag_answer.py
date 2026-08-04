@@ -47,6 +47,7 @@ from app.services.legal_search import (
     LegalSearchError,
     search_legal_documents,
 )
+from app.services.legal_subject_scope import canonicalize_legal_subject
 
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,45 @@ PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE: Final[str] = (
     "never state or imply the sources answer the specific question "
     "in full."
 )
+
+_GENERIC_SUBJECT_FALLBACK: Final[str] = "this question"
+
+
+def _safe_subject_for_country_message(
+    subject_text: str,
+    country_code: str,
+) -> str:
+    """
+    A last-line defense against ever showing "{subject} for {country}"
+    with the SAME country baked into both halves (e.g. "...in Spain
+    for Peru", or "...for Peru for Peru") - subject_text reaching here
+    should already be jurisdiction-neutral (canonicalized at
+    RequestUnderstanding's own output, at the client-state boundary,
+    at conversation_transition's inheritance step, and again at
+    LegalActionEvidenceSpec construction), so this is deliberately
+    redundant, not the only place this is enforced. Re-canonicalizing
+    one more time, scoped to just this one country, is idempotent when
+    the source was already clean; on the unanticipated chance that
+    some grammatical form still isn't recognized, falling back to a
+    generic, country-free subject phrase is always safer than risking
+    a nonsensical duplicated-country message reaching the user.
+    """
+
+    defensively_cleaned = canonicalize_legal_subject(
+        subject_text=subject_text,
+        search_concepts=[],
+        scoped_country_codes=[country_code],
+    ).subject_text
+
+    if not defensively_cleaned:
+        return _GENERIC_SUBJECT_FALLBACK
+
+    country_display_name = resolve_country_display_name(country_code)
+
+    if country_display_name.casefold() in defensively_cleaned.casefold():
+        return _GENERIC_SUBJECT_FALLBACK
+
+    return defensively_cleaned
 
 # 0.4.2 hardening: a country dropped from generation for insufficient
 # evidence (see the fully_insufficient_codes filtering below) is still
@@ -3138,18 +3178,40 @@ def answer_legal_question(
                 spec_partial_codes.append(code)
 
         for code in spec_insufficient_codes:
+            safe_subject = _safe_subject_for_country_message(
+                spec.subject_text, code
+            )
+
+            if (
+                safe_subject == _GENERIC_SUBJECT_FALLBACK
+                and spec.subject_text != _GENERIC_SUBJECT_FALLBACK
+                and metrics is not None
+            ):
+                metrics.insufficient_country_duplication_detected = True
+
             insufficient_evidence_answer_parts.append(
                 INSUFFICIENT_EVIDENCE_ANSWER_TEMPLATE.format(
-                    subject=spec.subject_text,
+                    subject=safe_subject,
                     country=resolve_country_display_name(code),
                 )
             )
 
         for code in spec_partial_codes:
+            safe_subject = _safe_subject_for_country_message(
+                spec.subject_text, code
+            )
+
+            if (
+                safe_subject == _GENERIC_SUBJECT_FALLBACK
+                and spec.subject_text != _GENERIC_SUBJECT_FALLBACK
+                and metrics is not None
+            ):
+                metrics.insufficient_country_duplication_detected = True
+
             partial_evidence_instruction += (
                 "\n\n"
                 + PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE.format(
-                    subject=spec.subject_text,
+                    subject=safe_subject,
                     country=resolve_country_display_name(code),
                 )
             )

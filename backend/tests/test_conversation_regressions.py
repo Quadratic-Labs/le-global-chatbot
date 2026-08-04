@@ -1097,5 +1097,223 @@ class EvidenceCoverageHasNoNetworkDependencyTests(unittest.TestCase):
         )
 
 
+class JurisdictionNeutralSubjectRegressionTests(unittest.TestCase):
+    """
+    Mission "DÉCOUPLAGE COMPLET DU SUJET JURIDIQUE ET DE LA JURIDICTION",
+    Phase 2: reproduces, end to end through resolve_legal_chat_response,
+    the exact reported defect - RequestUnderstanding sometimes bakes the
+    jurisdiction into subject_text itself (e.g. "rules on remote work
+    (telework) in Spain" instead of "rules on remote work (telework)"),
+    and a bare country follow-up ("Peru?") only ever replaces
+    country_codes (see conversation_transition._inherit_action) - so
+    the OLD country silently survives inside the inherited subject_text,
+    the retrieval query built from it, and the insufficient-evidence
+    message shown for the NEW country.
+
+    Zero hits for every country throughout, so both turns land on the
+    insufficient-evidence path (matching the exact bug report) without
+    needing a generation client at all.
+    """
+
+    def _off_topic_search_function(self):
+        """
+        One real hit per requested country, on an unrelated
+        subsection - forces a genuine content-mismatch "insufficient"
+        verdict (the per-subject/per-country message template) rather
+        than the unrelated all-countries-zero-hits NO_INFORMATION_
+        ANSWER short-circuit.
+        """
+
+        captured: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured.append(request)
+
+            code = (
+                request.country_codes[0]
+                if request.country_codes
+                else "XX"
+            )
+            hit = LegalSearchHit(
+                score=5.0,
+                document_id=f"document-{code.lower()}",
+                chunk_id=f"chunk-{code.lower()}",
+                country=code,
+                country_code=code,
+                legal_topic="Working Conditions",
+                document_type="comparator",
+                language="en",
+                section="Working Conditions",
+                subsection="Meal Breaks",
+                content=(
+                    "Employees are entitled to a 30-minute meal "
+                    "break after six hours of work."
+                ),
+                source_filename=f"Labour Law {code} 2026.docx",
+                source_format="docx",
+                reference_year=2026,
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        return fake_search, captured
+
+    def test_old_jurisdiction_never_survives_a_bare_country_follow_up(
+        self,
+    ) -> None:
+        turn_one_search, turn_one_requests = (
+            self._off_topic_search_function()
+        )
+
+        turn_one_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="resolved",
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["ES"],
+                        legal_topics=["Working Conditions"],
+                        # The exact contaminated shape from the bug
+                        # report - the jurisdiction is duplicated
+                        # inside subject_text, not just in
+                        # country_codes.
+                        subject_text=(
+                            "rules on remote work (telework) in Spain"
+                        ),
+                        search_concepts=[
+                            {
+                                "terms": [
+                                    "remote work",
+                                    "telework",
+                                    "telecommuting",
+                                    "working from home",
+                                ]
+                            }
+                        ],
+                        subject_specificity="specific",
+                        evidence_mode="direct_topic",
+                    )
+                ],
+                is_follow_up=False,
+                delta=_delta(
+                    context_operation="independent",
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["ES"],
+                    explicit_legal_topics=["Working Conditions"],
+                    explicit_subject_text=(
+                        "rules on remote work (telework) in Spain"
+                    ),
+                ),
+            )
+        )
+
+        turn_one_response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What are the rules on remote work in Spain?"
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=turn_one_search,
+            understanding_client=turn_one_client,
+        )
+
+        self.assertFalse(turn_one_response.grounded)
+
+        state = turn_one_response.conversation_state
+        self.assertIsNotNone(state)
+        self.assertEqual(state.actions[0].country_codes, ["ES"])
+
+        # Turn 2: a bare country follow-up - the classifier's own
+        # per-call action guess is deliberately imprecise (no subject
+        # of its own, matching how a bare "Peru?" naturally under-
+        # specifies) - context_operation="replace_country" is what
+        # makes conversation_transition override it with the
+        # deterministically inherited action, never the classifier's
+        # own re-derivation.
+        turn_two_search, turn_two_requests = (
+            self._off_topic_search_function()
+        )
+
+        turn_two_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="resolved",
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["PE"],
+                        legal_topics=["Working Conditions"],
+                        resolved_question=(
+                            "For Peru, answer this employment law "
+                            "question."
+                        ),
+                    )
+                ],
+                is_follow_up=True,
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+            )
+        )
+
+        turn_two_response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=turn_one_response.conversation_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=turn_two_search,
+            understanding_client=turn_two_client,
+        )
+
+        self.assertFalse(turn_two_response.grounded)
+
+        next_state = turn_two_response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["PE"])
+
+        # 1. Spain absent from the second turn's stored subject_text.
+        self.assertNotIn(
+            "Spain",
+            next_state.actions[0].subject_text or "",
+        )
+
+        # 2/3. Spain absent from the second turn's own retrieval
+        # query (the backend-reconstructed, self-contained question
+        # for this turn) - never leaked in from the inherited subject.
+        # Peru itself is correctly absent too: _build_retrieval_query
+        # always strips whichever country is currently being searched
+        # from the query text by design (it carries no BM25 signal),
+        # old or new - Peru's own scope is instead correctly carried
+        # as this request's country_codes filter, checked separately.
+        self.assertEqual(len(turn_two_requests), 1)
+        retrieval_query = turn_two_requests[0].query
+        self.assertNotIn("Spain", retrieval_query)
+        self.assertEqual(
+            turn_two_requests[0].country_codes, ["PE"]
+        )
+        self.assertTrue(
+            "remote work" in retrieval_query
+            or "telework" in retrieval_query
+        )
+
+        # 4. Spain absent from the second turn's insufficient-evidence
+        # answer.
+        self.assertNotIn("Spain", turn_two_response.answer)
+
+        # 5. Peru named exactly once in that answer - never duplicated
+        # (e.g. "for Peru for Peru") by a defensive fix gone wrong.
+        self.assertEqual(
+            turn_two_response.answer.count("Peru"),
+            1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -208,6 +208,73 @@ def get_country_name_variants(
     )
 
 
+# National adjectives/demonyms ("Spanish", "British") for the countries
+# this product's questions actually name - pycountry has no demonym
+# field at all, and this is not a re-derivation of the name/code
+# mappings above (those still come exclusively from pycountry): it is
+# new data this system did not have before, added specifically so
+# legal_subject_scope.py can recognize "under Spanish law" as the same
+# geographic-scope frame as "in Spain" (see the jurisdiction-neutral-
+# subject mission's Phase 12). Deliberately not exhaustive for every
+# ISO country - covers the corpus's own supported countries plus other
+# common ones a real question might name in a comparison. A country
+# missing here simply is not recognized in a demonym-based frame yet;
+# it is still recognized in every plain name-based frame above.
+_COUNTRY_DEMONYMS: Final[dict[str, list[str]]] = {
+    "AR": ["Argentine", "Argentinian"],
+    "AU": ["Australian"],
+    "BE": ["Belgian"],
+    "BR": ["Brazilian"],
+    "CA": ["Canadian"],
+    "CH": ["Swiss"],
+    "CL": ["Chilean"],
+    "CN": ["Chinese"],
+    "CO": ["Colombian"],
+    "CZ": ["Czech"],
+    "DE": ["German"],
+    "DK": ["Danish"],
+    "ES": ["Spanish"],
+    "FI": ["Finnish"],
+    "FR": ["French"],
+    "GB": ["British", "UK"],
+    "GR": ["Greek"],
+    "IE": ["Irish"],
+    "IN": ["Indian"],
+    "IT": ["Italian"],
+    "JP": ["Japanese"],
+    "KR": ["Korean", "South Korean"],
+    "MX": ["Mexican"],
+    "NL": ["Dutch"],
+    "NO": ["Norwegian"],
+    "NZ": ["New Zealand"],
+    "PE": ["Peruvian"],
+    "PL": ["Polish"],
+    "PT": ["Portuguese"],
+    "RO": ["Romanian"],
+    "SE": ["Swedish"],
+    "SG": ["Singaporean"],
+    "TH": ["Thai"],
+    "US": ["American"],
+    "VN": ["Vietnamese"],
+    "ZA": ["South African"],
+}
+
+
+def get_country_demonyms(
+    country_code: str,
+) -> list[str]:
+    """
+    Return the known national adjective(s)/demonym(s) for one country
+    code - e.g. ["Spanish"] for "ES" - or an empty list when this
+    country has none recorded yet (see _COUNTRY_DEMONYMS above).
+    """
+
+    return _COUNTRY_DEMONYMS.get(
+        country_code.upper(),
+        [],
+    )
+
+
 def resolve_country_display_name(
     country_code: str,
 ) -> str:
@@ -296,6 +363,79 @@ def detect_mentioned_country_codes(
         )
 
     return detected_codes
+
+
+# Connector/interrogative words that carry no legal-subject content of
+# their own - stripping them (alongside any detected country name) is
+# what tells "Peru?"/"What about Peru?"/"How about the United Kingdom?"
+# apart from a real new question like "Overtime in Peru?", without a
+# long enumerated list of full phrases (see the mission's own
+# "ne pas ajouter une longue liste de phrases completes").
+_COUNTRY_ONLY_FOLLOWUP_CONNECTOR_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "what",
+        "about",
+        "how",
+        "and",
+        "for",
+        "the",
+        "or",
+        "of",
+    }
+)
+
+
+def is_country_only_followup(
+    question: str,
+) -> list[str] | None:
+    """
+    Return the mentioned country code(s) when `question` names one or
+    more countries and nothing else of substance - "Peru?", "What
+    about Peru?", "How about the United Kingdom?", "For Spain?" - or
+    None when it also carries its own legal-subject content ("Overtime
+    in Peru?", "Contacts in Spain", "Compare Spain and Peru", "Peru
+    working conditions", "Dismissal in Australia") or names no country
+    at all.
+
+    Deterministic and local - reuses detect_mentioned_country_codes for
+    country recognition, never a separate list of countries. A message
+    naming zero countries is never country-only (there is nothing to
+    replace country_codes with).
+    """
+
+    country_codes = detect_mentioned_country_codes(question)
+
+    if not country_codes:
+        return None
+
+    working_text = question
+
+    for code in country_codes:
+        for variant in get_country_name_variants(
+            code
+        ) + get_country_demonyms(code):
+            working_text = re.sub(
+                rf"(?<!\w){re.escape(variant)}(?!\w)",
+                " ",
+                working_text,
+                flags=re.IGNORECASE,
+            )
+
+    remaining_words = re.findall(
+        r"[A-Za-z0-9']+",
+        working_text,
+    )
+    remaining_content_words = [
+        word
+        for word in remaining_words
+        if word.casefold()
+        not in _COUNTRY_ONLY_FOLLOWUP_CONNECTOR_WORDS
+    ]
+
+    if remaining_content_words:
+        return None
+
+    return country_codes
 
 
 def resolve_country_availability(

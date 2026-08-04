@@ -148,6 +148,19 @@ class LegalChatMetrics:
     subject_drift_detected: bool = False
     clarification_options: list[str] = field(default_factory=list)
 
+    # Jurisdiction-neutral-subject observability ("DECOUPLAGE COMPLET
+    # DU SUJET JURIDIQUE ET DE LA JURIDICTION" mission) - never the
+    # subject_text itself, only whether/what canonicalization did.
+    subject_scope_canonicalization_applied: bool = False
+    subject_scope_removed_country_codes: list[str] = field(
+        default_factory=list
+    )
+    search_concepts_canonicalized: bool = False
+    subject_empty_after_canonicalization: bool = False
+    inherited_subject_canonicalized: bool = False
+    retrieval_subject_contains_old_country: bool = False
+    insufficient_country_duplication_detected: bool = False
+
     # Additional latencies (0.4.2) - distinct phases of the same
     # request, on top of the existing timers above.
     conversation_transition_ms: float = 0.0
@@ -325,6 +338,27 @@ class LegalChatMetrics:
             "evidence_gate_ms": round(self.evidence_gate_ms, 2),
             "answer_generation_openai_ms": round(
                 self.answer_generation_openai_ms, 2
+            ),
+            "subject_scope_canonicalization_applied": (
+                self.subject_scope_canonicalization_applied
+            ),
+            "subject_scope_removed_country_codes": (
+                self.subject_scope_removed_country_codes
+            ),
+            "search_concepts_canonicalized": (
+                self.search_concepts_canonicalized
+            ),
+            "subject_empty_after_canonicalization": (
+                self.subject_empty_after_canonicalization
+            ),
+            "inherited_subject_canonicalized": (
+                self.inherited_subject_canonicalized
+            ),
+            "retrieval_subject_contains_old_country": (
+                self.retrieval_subject_contains_old_country
+            ),
+            "insufficient_country_duplication_detected": (
+                self.insufficient_country_duplication_detected
             ),
         }
 
