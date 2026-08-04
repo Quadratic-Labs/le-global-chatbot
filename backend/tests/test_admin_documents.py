@@ -8,10 +8,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from opensearchpy.exceptions import NotFoundError
+
 from app.models.document import DocumentChunk
 from app.security.admin import admin_key_matches
 from app.services.admin_documents import (
     InvalidDocumentUploadError,
+    _lookup_existing_source_filename,
     _sanitize_filename,
     list_indexed_documents,
     upload_and_index_document,
@@ -498,6 +501,89 @@ class AdminDocumentTests(unittest.TestCase):
             self.assertFalse(
                 response.documents[0].source_file_present
             )
+
+
+class FreshClusterOpenSearchClient:
+    """
+    Simulates a genuinely fresh OpenSearch cluster: the legal-documents
+    index does not exist yet, so any search against it raises
+    NotFoundError - the ordinary state before the very first document
+    is ever indexed.
+    """
+
+    def search(
+        self,
+        index: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        del index
+        del body
+
+        raise NotFoundError(
+            404,
+            "index_not_found_exception",
+            {"error": {"reason": "no such index"}},
+        )
+
+
+class ExistingSourceLookupTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4" - upload_and_index_document's own lookup
+    for a pre-existing document's historical filename must treat a
+    missing index as "no prior document", never as a hard failure.
+    """
+
+    def test_index_not_found_resolves_to_no_prior_document(
+        self,
+    ) -> None:
+        result = _lookup_existing_source_filename(
+            "doc_" + "a" * 64,
+            FreshClusterOpenSearchClient(),
+        )
+
+        self.assertIsNone(result)
+
+    def test_upload_succeeds_on_a_genuinely_fresh_cluster(
+        self,
+    ) -> None:
+        # End-to-end: the real (non-stubbed) existing_source_lookup,
+        # against a client that has no index yet at all - reproduces
+        # the exact first-upload-ever scenario a brand-new isolated
+        # environment starts from.
+        with tempfile.TemporaryDirectory() as root:
+
+            def chunk_builder(path: Path) -> list[DocumentChunk]:
+                return [_build_chunk(path.name)]
+
+            def document_indexer(
+                *,
+                chunks,
+                client=None,
+            ) -> DocumentIndexingResult:
+                del client
+
+                return DocumentIndexingResult(
+                    index_alias="legal-documents",
+                    document_id=chunks[0].document_id,
+                    source_filename=chunks[0].source_filename,
+                    requested_chunks=1,
+                    indexed_chunks=1,
+                    stale_chunks_deleted=0,
+                )
+
+            response = upload_and_index_document(
+                filename="UK 2026.docx",
+                file_stream=BytesIO(b"uploaded-docx"),
+                source_directory=Path(root) / "source",
+                processed_directory=Path(root) / "processed",
+                maximum_bytes=1000,
+                chunk_builder=chunk_builder,
+                document_indexer=document_indexer,
+                client=FreshClusterOpenSearchClient(),
+            )
+
+        self.assertEqual(response.status, "indexed")
+        self.assertFalse(response.replaced_source_file)
 
 
 class FilenameAcceptanceTests(unittest.TestCase):

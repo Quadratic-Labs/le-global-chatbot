@@ -19,6 +19,7 @@ from app.services.document_chunk_builder import (
     UndeterminableDocumentCountryError,
     UnknownLegalTopicError,
     build_document_chunks,
+    build_document_chunks_from_docx,
     metadata_from_content,
     validate_docx_format,
 )
@@ -44,6 +45,129 @@ def _build_docx(
         document.add_paragraph(line)
 
     for paragraph in body_paragraphs or []:
+        document.add_paragraph(paragraph)
+
+    file_path = directory / filename
+    document.save(file_path)
+
+    return file_path
+
+
+_DOCUMENT_XML_PATH = "word/document.xml"
+
+
+def _inject_body_xml_fragment(
+    file_path: Path,
+    xml_fragment: str,
+) -> None:
+    """
+    Insert a raw XML fragment as the first child of <w:body> in an
+    existing, already-saved DOCX - the only way to build a fixture
+    containing structures python-docx has no high-level API for
+    (a real Word text box's w:txbxContent, DrawingML a:t runs), since
+    both are anchored drawings rather than ordinary paragraph content.
+    """
+
+    with zipfile.ZipFile(file_path) as archive:
+        entries = {
+            name: archive.read(name)
+            for name in archive.namelist()
+        }
+
+    document_xml = entries[_DOCUMENT_XML_PATH].decode("utf-8")
+
+    marker = "<w:body>"
+    insertion_point = document_xml.index(marker) + len(marker)
+
+    entries[_DOCUMENT_XML_PATH] = (
+        document_xml[:insertion_point]
+        + xml_fragment
+        + document_xml[insertion_point:]
+    ).encode("utf-8")
+
+    with zipfile.ZipFile(file_path, "w") as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+
+
+def _build_docx_with_text_box_title(
+    directory: Path,
+    text_box_text: str,
+    body_paragraphs: list[str] | None = None,
+    filename: str = "document.docx",
+) -> Path:
+    """
+    A minimal real DOCX whose only title-shaped text lives inside a
+    Word text box (w:txbxContent) - invisible to python-docx's own
+    paragraph iteration, exactly like 8 of the 10 real production
+    documents this mission adds support for.
+    """
+
+    document = Document()
+
+    for paragraph in body_paragraphs or ["Introduction"]:
+        document.add_paragraph(paragraph)
+
+    file_path = directory / filename
+    document.save(file_path)
+
+    _inject_body_xml_fragment(
+        file_path,
+        (
+            "<w:p><w:txbxContent><w:p><w:r><w:t>"
+            f"{text_box_text}"
+            "</w:t></w:r></w:p></w:txbxContent></w:p>"
+        ),
+    )
+
+    return file_path
+
+
+def _build_docx_with_drawingml_title(
+    directory: Path,
+    drawingml_text: str,
+    body_paragraphs: list[str] | None = None,
+    filename: str = "document.docx",
+) -> Path:
+    """
+    A minimal real DOCX whose only title-shaped text is a DrawingML
+    (SmartArt/WordArt) a:t run - a third XML namespace, distinct from
+    both ordinary paragraphs and text boxes.
+    """
+
+    document = Document()
+
+    for paragraph in body_paragraphs or ["Introduction"]:
+        document.add_paragraph(paragraph)
+
+    file_path = directory / filename
+    document.save(file_path)
+
+    _inject_body_xml_fragment(
+        file_path,
+        (
+            '<w:p><w:r><a:t xmlns:a="http://schemas.openxmlformats.org'
+            '/drawingml/2006/main">'
+            f"{drawingml_text}"
+            "</a:t></w:r></w:p>"
+        ),
+    )
+
+    return file_path
+
+
+def _build_docx_with_header_title(
+    directory: Path,
+    header_text: str,
+    body_paragraphs: list[str] | None = None,
+    filename: str = "document.docx",
+) -> Path:
+    """A minimal real DOCX whose only title-shaped text is in a header."""
+
+    document = Document()
+    document.sections[0].header.paragraphs[0].text = header_text
+
+    for paragraph in body_paragraphs or ["Introduction"]:
         document.add_paragraph(paragraph)
 
     file_path = directory / filename
@@ -82,6 +206,41 @@ class LegalTaxonomyTests(unittest.TestCase):
                     "of Employment Contracts"
                 ),
                 country="Spain",
+            ),
+            "Termination of Employment Contracts",
+        )
+
+    def test_roman_numeral_prefix_is_stripped(self) -> None:
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="II.  Hiring Practices",
+                country="Taiwan",
+            ),
+            "Hiring Practices",
+        )
+
+    def test_wages_and_work_hours_is_a_working_conditions_alias(
+        self,
+    ) -> None:
+        # The real USA document's own section 3 heading - a genuine
+        # phrasing variant found in production content.
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="03. Wages and Work Hours",
+                country="United States",
+            ),
+            "Working Conditions",
+        )
+
+    def test_termination_of_employment_without_contracts_is_an_alias(
+        self,
+    ) -> None:
+        # The real Philippines document's own bold heading - "Contracts"
+        # is dropped.
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="Termination of Employment",
+                country="Philippines",
             ),
             "Termination of Employment Contracts",
         )
@@ -602,6 +761,235 @@ class InvalidDocxFormatTests(unittest.TestCase):
 
             with self.assertRaises(InvalidDocxFormatError):
                 validate_docx_format(file_path)
+
+
+class RealDocumentStructureTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4", Mission 2/2, section 11 - the real-world
+    document structures the original 17-document corpus never used:
+    title in a text box, DrawingML, header, a document with no
+    standard cover, roman-numeral topic headings, decomposed Unicode,
+    a law's own year ignored, filename ignored, and an ambiguous
+    cover - each proven with a minimal synthetic fixture, mirroring
+    the 10 real production documents this mission validates.
+    """
+
+    def test_title_in_a_text_box_is_found(self) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx_with_text_box_title(
+                Path(directory),
+                "Employment Law Overview Chile",
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Chile")
+        self.assertEqual(metadata.country_code, "CL")
+
+    def test_title_in_a_text_box_with_en_dash_separator(self) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx_with_text_box_title(
+                Path(directory),
+                "Employment Law Overview – Taiwan",
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Taiwan")
+        self.assertEqual(metadata.country_code, "TW")
+
+    def test_title_in_drawingml_is_found(self) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx_with_drawingml_title(
+                Path(directory),
+                "Employment Law Overview Ireland",
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Ireland")
+        self.assertEqual(metadata.country_code, "IE")
+
+    def test_title_in_a_header_is_found(self) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx_with_header_title(
+                Path(directory),
+                "Employment Law Overview Colombia",
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Colombia")
+        self.assertEqual(metadata.country_code, "CO")
+
+    def test_all_caps_title_with_no_separator_is_found(self) -> None:
+        # "EMPLOYMENT LAW OVERVIEW PHILIPPINES" - the real Philippines
+        # document's own exact cover-paragraph shape.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["EMPLOYMENT LAW OVERVIEW PHILIPPINES"],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Philippines")
+        self.assertEqual(metadata.country_code, "PH")
+
+    def test_document_with_no_standard_cover_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Table of Contents", "Some unrelated preamble text."],
+            )
+
+            with self.assertRaises(
+                UndeterminableDocumentCountryError
+            ):
+                metadata_from_content(file_path=file_path)
+
+    def test_decomposed_unicode_turkiye_is_recognized(self) -> None:
+        # "Turkiye" typed with a combining diaeresis (u + U+0308)
+        # instead of the precomposed "ü" (U+00FC) must still resolve,
+        # via NFKC normalization.
+        decomposed_turkiye = "Türkiye"
+
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                [f"Employment Law Overview {decomposed_turkiye}"],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Türkiye")
+        self.assertEqual(metadata.country_code, "TR")
+
+    def test_a_laws_own_year_is_never_used_as_reference_year(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Chile"],
+                body_paragraphs=[
+                    "The Labour Code was originally enacted in 1984 "
+                    "and has been amended many times since.",
+                ],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country_code, "CL")
+        self.assertIsNone(metadata.reference_year)
+
+    def test_filename_country_and_year_are_ignored(self) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Colombia"],
+                filename="Chile_2020_FINAL-EDITED.docx",
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Colombia")
+        self.assertEqual(metadata.country_code, "CO")
+        self.assertIsNone(metadata.reference_year)
+        self.assertEqual(
+            metadata.source_filename,
+            "Chile_2020_FINAL-EDITED.docx",
+        )
+
+    def test_ambiguous_cover_among_new_countries_is_refused(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                [
+                    "Employment Law Overview Chile",
+                    "Employment Law Overview Colombia",
+                ],
+            )
+
+            with self.assertRaises(
+                AmbiguousDocumentCountryError
+            ):
+                metadata_from_content(file_path=file_path)
+
+    def test_roman_numeral_topic_heading_is_recognized(self) -> None:
+        # Taiwan's own real structure: roman-numeral, all-caps main
+        # headings ("II.  HIRING PRACTICES") rather than the
+        # "01. Hiring Practices" convention the original corpus uses.
+        # ("I. GENERAL OVERVIEW" itself is exercised by the end-to-end
+        # test below instead: build_document_chunks validates every
+        # explicit ParsedSection strictly, while the real parser
+        # simply absorbs an unrecognized overview-shaped heading into
+        # whichever section is already open - never promoting it to
+        # its own ParsedSection at all.)
+        parsed_sections = [
+            ParsedSection(
+                section="II.  Hiring Practices",
+                subsection="1. Introduction",
+                content="Hiring content.",
+            ),
+        ]
+
+        metadata = DocumentMetadata(
+            country="Taiwan",
+            country_code="TW",
+            reference_year=None,
+            language="en",
+            source_filename="taiwan.docx",
+        )
+
+        chunks = build_document_chunks(
+            parsed_sections=parsed_sections,
+            metadata=metadata,
+        )
+
+        topics = {
+            chunk.legal_topic
+            for chunk in chunks
+            if chunk.legal_topic is not None
+        }
+
+        self.assertIn("Hiring Practices", topics)
+
+    def test_roman_numeral_heading_recognized_end_to_end_from_real_docx(
+        self,
+    ) -> None:
+        # Same Taiwan-shaped structure, this time parsed from an
+        # actual DOCX (plain, non-bold, non-heading-styled paragraphs,
+        # exactly like the real Taiwan document) through the full
+        # build_document_chunks_from_docx pipeline.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Taiwan"],
+                body_paragraphs=[
+                    "I. GENERAL OVERVIEW",
+                    "1. Introduction",
+                    "Some overview content.",
+                    "II.  Hiring Practices",
+                    "Hiring content for Taiwan.",
+                ],
+            )
+
+            chunks = build_document_chunks_from_docx(
+                file_path=file_path,
+                country_code="TW",
+                language="en",
+            )
+
+        topics = {
+            chunk.legal_topic
+            for chunk in chunks
+            if chunk.legal_topic is not None
+        }
+
+        self.assertIn("Hiring Practices", topics)
 
 
 if __name__ == "__main__":

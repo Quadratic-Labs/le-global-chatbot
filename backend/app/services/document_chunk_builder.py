@@ -30,6 +30,7 @@ from app.services.docx_parser import (
     ParsedSection,
     build_contact_chunk_content,
     extract_contacts_from_docx,
+    extract_text_box_blocks,
     parse_docx_sections,
 )
 
@@ -77,7 +78,29 @@ _BARE_FAMILY_HEADING_PATTERN: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
-_TITLE_SCAN_LIMIT: Final[int] = 20
+# Mission "HOTFIX 0.4.4": real L&E Global documents are longer and
+# less uniform than the original 17-document corpus, so the front-
+# matter scan window is widened from a plain paragraph count to
+# roughly 100 blocks or 12,000 characters, whichever is reached
+# first - never the whole document body.
+_TITLE_SCAN_LIMIT: Final[int] = 100
+_TITLE_SCAN_CHARACTER_LIMIT: Final[int] = 12_000
+
+# Dashes a real cover title may use before the country name ("Employment
+# Law Overview – Taiwan", "Employment Law Overview — Canada") are
+# normalized to a plain hyphen before matching, so _TITLE_LINE_PATTERNS
+# only ever needs to spell one separator form.
+_DASH_NORMALIZATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[‐‑‒–—―]"
+)
+
+
+def _normalize_front_matter_line(value: str) -> str:
+    """Normalize whitespace and dash variants in one front-matter line."""
+
+    return " ".join(
+        _DASH_NORMALIZATION_PATTERN.sub("-", value).split()
+    )
 
 
 class UnknownLegalTopicError(ValueError):
@@ -186,33 +209,151 @@ def validate_docx_format(
         ) from error
 
 
-def _leading_paragraph_texts(
+_DRAWINGML_TEXT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<a:t[^>]*>([^<]*)</a:t>"
+)
+
+_WORD_TEXT_RUN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<w:t[^>]*>([^<]*)</w:t>"
+)
+
+_HEADER_PART_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^word/header\d+\.xml$"
+)
+
+
+def _extract_drawingml_texts(
     file_path: Path,
-    limit: int = _TITLE_SCAN_LIMIT,
 ) -> list[str]:
     """
-    The first `limit` non-empty paragraph texts, in document order -
-    the title/cover area a reader would actually see first, never
-    the full document body (mission section 7: legal documents may
-    name many other countries deep in their own text, which must
-    never be mistaken for the document's own country).
+    Extract DrawingML (SmartArt/WordArt) run text from document.xml -
+    a:t elements live in a different XML namespace than a text box's
+    own w:t runs, and are otherwise invisible to python-docx and to
+    extract_text_box_blocks alike (mission "HOTFIX 0.4.4", section 3).
     """
 
-    document = Document(file_path)
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode("utf-8", errors="ignore")
+
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return []
+
+    return [
+        text
+        for text in _DRAWINGML_TEXT_PATTERN.findall(document_xml)
+        if text.strip()
+    ]
+
+
+def _extract_header_texts(
+    file_path: Path,
+) -> list[str]:
+    """
+    Extract each header part's own paragraph text, in file order -
+    some real documents carry the country name in a running header
+    rather than the document body (mission "HOTFIX 0.4.4", section 4).
+    """
+
     texts: list[str] = []
 
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            header_names = sorted(
+                name
+                for name in archive.namelist()
+                if _HEADER_PART_NAME_PATTERN.match(name)
+            )
 
-        if not text:
-            continue
+            for name in header_names:
+                header_xml = archive.read(name).decode(
+                    "utf-8", errors="ignore"
+                )
 
-        texts.append(text)
+                joined = "".join(
+                    _WORD_TEXT_RUN_PATTERN.findall(header_xml)
+                ).strip()
 
-        if len(texts) >= limit:
-            break
+                if joined:
+                    texts.append(joined)
+
+    except (OSError, zipfile.BadZipFile):
+        return []
 
     return texts
+
+
+def _leading_front_matter_blocks(
+    file_path: Path,
+    limit: int = _TITLE_SCAN_LIMIT,
+    character_limit: int = _TITLE_SCAN_CHARACTER_LIMIT,
+) -> list[str]:
+    """
+    The document's own front matter, never its full body (mission
+    "HOTFIX 0.4.4", section 4): legal documents may name many other
+    countries deep in their own text, which must never be mistaken
+    for the document's own country.
+
+    Word text boxes (cover-page titles, firm/contact cards) are
+    anchored drawings, invisible to python-docx's own paragraph
+    iteration - real L&E Global documents routinely put their actual
+    "Employment Law Overview <Country>" cover title there rather than
+    in a normal paragraph, so those lines are read first, followed by
+    the docProps title/subject (when set) and then the leading body
+    paragraphs. Capped at `limit` blocks or `character_limit`
+    cumulative characters, whichever is reached first.
+    """
+
+    blocks: list[str] = []
+    total_characters = 0
+
+    def add(text: str) -> bool:
+        """Append one candidate line; return False once capped."""
+
+        nonlocal total_characters
+
+        stripped = text.strip()
+
+        if not stripped:
+            return True
+
+        blocks.append(stripped)
+        total_characters += len(stripped)
+
+        return (
+            len(blocks) < limit
+            and total_characters < character_limit
+        )
+
+    for text_box_lines in extract_text_box_blocks(file_path):
+        for line in text_box_lines:
+            if not add(line):
+                return blocks
+
+    for header_text in _extract_header_texts(file_path):
+        if not add(header_text):
+            return blocks
+
+    for drawingml_text in _extract_drawingml_texts(file_path):
+        if not add(drawingml_text):
+            return blocks
+
+    document = Document(file_path)
+
+    for title_like in (
+        document.core_properties.title,
+        document.core_properties.subject,
+    ):
+        if title_like and not add(title_like):
+            return blocks
+
+    for paragraph in document.paragraphs:
+        if not add(paragraph.text):
+            return blocks
+
+    return blocks
 
 
 def _match_title_line(
@@ -227,6 +368,13 @@ def _match_title_line(
     a two-line cover (a bare "Labour and Employment Law" heading
     immediately followed by a "Canada" line).
     """
+
+    line = _normalize_front_matter_line(line)
+    next_line = (
+        _normalize_front_matter_line(next_line)
+        if next_line is not None
+        else None
+    )
 
     for pattern in _TITLE_LINE_PATTERNS:
         match = pattern.fullmatch(line)
@@ -270,15 +418,15 @@ def _detect_country_and_year_from_content(
     Resolve (country, country_code, reference_year) from the
     document's own title/cover content - never from its filename.
 
-    Only the leading title/cover area is scanned (see
-    _leading_paragraph_texts). Candidates are deduplicated by
+    Only the leading front matter is scanned (see
+    _leading_front_matter_blocks). Candidates are deduplicated by
     resolved country *code*, not raw text, so trivially different
     phrasings of the same country never look ambiguous. More than
     one distinct country code found there - a genuinely ambiguous
     cover - is refused rather than guessed at (section 7).
     """
 
-    lines = _leading_paragraph_texts(file_path)
+    lines = _leading_front_matter_blocks(file_path)
 
     resolved: list[tuple[str, str, int | None]] = []
 

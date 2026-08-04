@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import re
+import unicodedata
 from typing import Final, Iterable
 
 
@@ -62,6 +63,30 @@ COUNTRIES: Final[
     CountryDefinition(
         code="CA",
         display_name="Canada",
+        aliases=(
+            "Canadian",
+        ),
+    ),
+    CountryDefinition(
+        code="CL",
+        display_name="Chile",
+        aliases=(
+            "Chilean",
+        ),
+    ),
+    CountryDefinition(
+        code="CN",
+        display_name="China",
+        aliases=(
+            "Chinese",
+        ),
+    ),
+    CountryDefinition(
+        code="CO",
+        display_name="Colombia",
+        aliases=(
+            "Colombian",
+        ),
     ),
     CountryDefinition(
         code="CZ",
@@ -73,6 +98,13 @@ COUNTRIES: Final[
     CountryDefinition(
         code="GR",
         display_name="Greece",
+    ),
+    CountryDefinition(
+        code="IE",
+        display_name="Ireland",
+        aliases=(
+            "Irish",
+        ),
     ),
     CountryDefinition(
         code="IT",
@@ -87,8 +119,24 @@ COUNTRIES: Final[
         display_name="Mexico",
     ),
     CountryDefinition(
+        code="NL",
+        display_name="Netherlands",
+        aliases=(
+            "the Netherlands",
+            "Dutch",
+        ),
+    ),
+    CountryDefinition(
         code="PE",
         display_name="Peru",
+    ),
+    CountryDefinition(
+        code="PH",
+        display_name="Philippines",
+        aliases=(
+            "the Philippines",
+            "Philippine",
+        ),
     ),
     CountryDefinition(
         code="PL",
@@ -115,6 +163,21 @@ COUNTRIES: Final[
         display_name="Switzerland",
     ),
     CountryDefinition(
+        code="TW",
+        display_name="Taiwan",
+        aliases=(
+            "Taiwanese",
+        ),
+    ),
+    CountryDefinition(
+        code="TR",
+        display_name="Türkiye",
+        aliases=(
+            "Turkey",
+            "Turkish",
+        ),
+    ),
+    CountryDefinition(
         code="GB",
         display_name="United Kingdom",
         aliases=(
@@ -122,6 +185,16 @@ COUNTRIES: Final[
             "Great Britain",
             "Britain",
             "the United Kingdom",
+        ),
+    ),
+    CountryDefinition(
+        code="US",
+        display_name="United States",
+        aliases=(
+            "USA",
+            "U.S.",
+            "U.S.A.",
+            "the United States",
         ),
     ),
 )
@@ -143,10 +216,14 @@ def _normalize_country_token(
     Underscores are converted to spaces to support filenames such as:
 
         Labour_and_Employment_Law_in_Spain_2026.docx
+
+    Unicode NFKC normalization is applied first so a name typed with
+    combining diacritics (for example a decomposed "Turkiye") matches
+    the same registered token as its precomposed form ("Türkiye").
     """
 
     return " ".join(
-        value
+        unicodedata.normalize("NFKC", value)
         .replace("_", " ")
         .replace("\xa0", " ")
         .split()

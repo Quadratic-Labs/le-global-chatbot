@@ -16,6 +16,7 @@ from typing import (
 
 from opensearchpy import OpenSearch
 from opensearchpy.exceptions import (
+    NotFoundError,
     OpenSearchException,
 )
 
@@ -233,18 +234,27 @@ def _lookup_existing_source_filename(
         else get_opensearch_client()
     )
 
-    response = opensearch_client.search(
-        index=LEGAL_DOCUMENTS_ALIAS,
-        body={
-            "size": 1,
-            "_source": ["source_filename"],
-            "query": {
-                "term": {
-                    "document_id": document_id,
-                }
+    try:
+        response = opensearch_client.search(
+            index=LEGAL_DOCUMENTS_ALIAS,
+            body={
+                "size": 1,
+                "_source": ["source_filename"],
+                "query": {
+                    "term": {
+                        "document_id": document_id,
+                    }
+                },
             },
-        },
-    )
+        )
+
+    except NotFoundError:
+        # The index itself does not exist yet - the ordinary state
+        # before the very first document is ever indexed
+        # (ensure_legal_documents_index creates it lazily, inside the
+        # document_indexer that runs after this lookup). No prior
+        # document can possibly exist yet either.
+        return None
 
     if not isinstance(response, dict):
         return None
