@@ -1417,6 +1417,31 @@ def _execute_resolved_plan(
     )
 
 
+def _with_resolved_subject_precision(
+    action: RequestUnderstandingAction,
+) -> RequestUnderstandingAction:
+    """
+    Reconcile one action's subject_specificity/evidence_mode via its
+    own resolved_subject_precision() - applied once, here, to every
+    action (fresh or inherited) before retrieval/generation or
+    storage ever reads either field, so a model output that mislabels
+    a precise question as broad (real search_concepts like "remote
+    work"/"telework" alongside evidence_mode="broad_topic") is never
+    trusted over what its own search_concepts actually prove.
+    """
+
+    subject_specificity, evidence_mode = (
+        action.resolved_subject_precision()
+    )
+
+    return action.model_copy(
+        update={
+            "subject_specificity": subject_specificity,
+            "evidence_mode": evidence_mode,
+        }
+    )
+
+
 def resolve_legal_chat_response(
     request: LegalChatRequest,
     request_id: str | None = None,
@@ -1628,7 +1653,10 @@ def resolve_legal_chat_response(
 
         final_result = RequestUnderstandingResult(
             status=transition_outcome.final_status,
-            actions=transition_outcome.final_actions,
+            actions=[
+                _with_resolved_subject_precision(action)
+                for action in transition_outcome.final_actions
+            ],
             is_follow_up=result.is_follow_up,
             confidence=result.confidence,
             clarification_reason=(

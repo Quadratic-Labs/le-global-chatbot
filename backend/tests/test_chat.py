@@ -4945,6 +4945,247 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
             "remote work (telework)",
         )
 
+    def test_8_broad_topic_specificity_and_evidence_mode_survive(
+        self,
+    ) -> None:
+        # Distinct from _degenerate_spain_state (subject_specificity
+        # "broad" there too, but subject_text is just the country
+        # name itself, with evidence_mode None): this is a
+        # genuinely-broad but REAL topic ("working conditions" as a
+        # deliberate whole-topic-area question), with evidence_mode
+        # "broad_topic" reflecting that the evidence-gating system
+        # accepts any hit in the topic as direct. Correction 2 must
+        # carry subject_specificity/evidence_mode through a
+        # country-only follow-up unchanged, regardless of their
+        # value - never just for the "specific"/"direct_topic"
+        # combination the other tests happen to use.
+        captured_requests: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+
+            hit = _build_hit(
+                country_code="PE",
+                country="Peru",
+                content=(
+                    "Employers must provide safe working "
+                    "conditions and comply with maximum hours."
+                ),
+            )
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        client = FakeGenerationClient(
+            answer=(
+                "Peru\n- Employers must provide safe working "
+                "conditions. [1]"
+            )
+        )
+
+        broad_topic_state = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["ES"],
+                    legal_topics=["Working Conditions"],
+                    subject_text="working conditions",
+                    search_concepts=[],
+                    subject_specificity="broad",
+                    evidence_mode="broad_topic",
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=broad_topic_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=_FailingUnderstandingClient(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(captured_requests), 1)
+        self.assertNotIn("Spain", captured_requests[0].query)
+        self.assertEqual(captured_requests[0].country_codes, ["PE"])
+
+        next_state = response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["PE"])
+        self.assertEqual(
+            next_state.actions[0].subject_text, "working conditions"
+        )
+        self.assertEqual(
+            next_state.actions[0].legal_topics, ["Working Conditions"]
+        )
+        self.assertEqual(
+            next_state.actions[0].subject_specificity, "broad"
+        )
+        self.assertEqual(
+            next_state.actions[0].evidence_mode, "broad_topic"
+        )
+
+    def test_9_remote_work_follow_up_keeps_specific_direct_topic(
+        self,
+    ) -> None:
+        # TEST 6 - the real-world defect end to end across both
+        # turns: turn 1's own model output mislabels remote work as
+        # broad/broad_topic despite real, distinct search_concepts -
+        # Regle A must force specific/direct_topic there, and turn
+        # 2's country-only follow-up must preserve that corrected
+        # labeling, never silently reverting to what the model itself
+        # (wrongly) said.
+        turn1_understanding = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["ES"],
+                        legal_topics=["Working Conditions"],
+                        subject_text="rules on remote work (telework)",
+                        search_concepts=[
+                            {
+                                "terms": [
+                                    "remote work",
+                                    "telework",
+                                    "working from home",
+                                ]
+                            }
+                        ],
+                        subject_specificity="broad",
+                        evidence_mode="broad_topic",
+                    )
+                ],
+                is_follow_up=False,
+                current_message_delta=_current_message_delta(
+                    context_operation="independent",
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["ES"],
+                    explicit_legal_topics=["Working Conditions"],
+                    explicit_subject_text=(
+                        "rules on remote work (telework)"
+                    ),
+                ),
+            )
+        )
+
+        hit_es = _build_hit(
+            country_code="ES",
+            country="Spain",
+            content=(
+                "A telework agreement must specify the "
+                "employer-provided equipment and reimbursable "
+                "home-office expenses."
+            ),
+        )
+
+        def fake_search_turn1(request: Any) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit_es],
+            )
+
+        client1 = FakeGenerationClient(
+            answer=(
+                "Spain\n- Telework requires a written agreement "
+                "specifying equipment and expenses. [1]"
+            )
+        )
+
+        turn1 = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What are the rules on remote work in Spain?"
+                ),
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search_turn1,
+            generation_client=client1,
+            understanding_client=turn1_understanding,
+        )
+
+        turn1_state = turn1.conversation_state
+        self.assertIsNotNone(turn1_state)
+        self.assertEqual(
+            turn1_state.actions[0].subject_specificity, "specific"
+        )
+        self.assertEqual(
+            turn1_state.actions[0].evidence_mode, "direct_topic"
+        )
+
+        captured_requests: list[Any] = []
+
+        def fake_search_turn2(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+
+            hit_pe = _build_hit(
+                country_code="PE",
+                country="Peru",
+                content=(
+                    "Employees may telework by written agreement "
+                    "with their employer."
+                ),
+            )
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit_pe],
+            )
+
+        client2 = FakeGenerationClient(
+            answer=(
+                "Peru\n- Telework is permitted subject to written "
+                "agreement. [1]"
+            )
+        )
+
+        turn2 = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Peru?",
+                conversation_state=turn1_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search_turn2,
+            generation_client=client2,
+            understanding_client=_FailingUnderstandingClient(),
+        )
+
+        self.assertTrue(turn2.grounded)
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(
+            captured_requests[0].country_codes, ["PE"]
+        )
+
+        turn2_state = turn2.conversation_state
+        self.assertIsNotNone(turn2_state)
+        self.assertEqual(turn2_state.actions[0].country_codes, ["PE"])
+        self.assertNotIn("Spain", turn2_state.actions[0].subject_text)
+        self.assertEqual(
+            turn2_state.actions[0].subject_specificity, "specific"
+        )
+        self.assertEqual(
+            turn2_state.actions[0].evidence_mode, "direct_topic"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

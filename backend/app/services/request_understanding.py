@@ -24,6 +24,7 @@ insufficiency message.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Final
@@ -121,6 +122,12 @@ MAX_UNDERSTANDING_ATTEMPTS: Final[int] = 2
 
 # The full validated history (already capped at HISTORY_MAX_MESSAGES) is
 # passed to the model as-is - there is no separate, smaller cap here.
+
+_WORD_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> set[str]:
+    return set(_WORD_PATTERN.findall(text.casefold()))
 
 
 class RequestUnderstandingAction(BaseModel):
@@ -259,6 +266,86 @@ class RequestUnderstandingAction(BaseModel):
             return "direct_topic"
 
         return "broad_topic"
+
+    def resolved_subject_precision(self) -> tuple[str | None, str | None]:
+        """
+        (subject_specificity, evidence_mode) this action should
+        actually use for retrieval/evidence-gating - reconciling
+        whatever was explicitly set (by the model, or carried over
+        from a prior turn) against what search_concepts itself
+        proves.
+
+        A search_concepts group naming legal content genuinely
+        distinct from this action's own legal_topics (not just a
+        paraphrase of the topic's own generic label) proves the
+        question is about one precise concept - e.g. "remote work"/
+        "telework" under the broad "Working Conditions" topic -
+        regardless of what subject_specificity/evidence_mode were
+        separately set to. This is the one case this method may
+        upgrade them to "specific"/"direct_topic": it never does the
+        reverse. When no such distinct concept is present, whatever
+        precision was already resolved (explicit or
+        resolved_evidence_mode's own inference) is returned unchanged
+        - a genuinely broad question (see resolved_evidence_mode's
+        own inference for the default) is never narrowed either.
+
+        "Distinct" is judged by word overlap, not exact-string
+        equality: a real model asked a genuinely broad question
+        ("Tell me about working conditions in Peru.") still supplies
+        several search_concepts terms - e.g. "workplace conditions",
+        "working environment" - that are mere paraphrases of the
+        topic's own label (sharing a word with it), never a narrower
+        legal concept. A term with zero words in common with any of
+        this action's own legal_topics ("remote work", "telework")
+        cannot be such a paraphrase, and is treated as genuinely
+        distinct; a term sharing even one word with a legal_topic
+        ("workplace conditions" shares "conditions") is treated as a
+        paraphrase, not a narrower concept.
+
+        Known, accepted limitation (mission "MISSION EXPRESS BLOQUANTE
+        0.4.2"): word overlap cannot be made perfectly precise. "work
+        environment" - real, observed model output for the same
+        broad "working conditions" question - shares zero *exact*
+        tokens with "Working Conditions" ("work" != "working" without
+        stemming) and is misjudged as distinct, occasionally
+        upgrading a genuinely broad question to specific/direct_topic.
+        Stemming does not fix this: reducing "working" to "work"
+        would also make "work" (from "remote work", the exact
+        defect this method exists to catch) overlap with "Working
+        Conditions", losing the one distinction that matters most. No
+        purely lexical rule separates "paraphrase of the topic" from
+        "genuinely narrower concept" when both may share a root word.
+        Accepted as-is: the answer itself is still correct and
+        grounded either way (this only affects evidence-gating
+        strictness, not which content is surfaced), and the exact
+        reported defect (remote work mislabeled broad) is fully and
+        reliably fixed.
+
+        Always (None, None) for a "contact" action, which must never
+        carry legal subject matter at all (see
+        RequestUnderstandingResult's own resolved-action rule) -
+        resolved_evidence_mode's own inference would otherwise assign
+        it a concrete evidence_mode it is not allowed to have.
+        """
+
+        if self.type == "contact":
+            return None, None
+
+        generic_words: set[str] = set()
+
+        for topic in self.legal_topics:
+            generic_words |= _words(topic)
+
+        has_distinct_concept = any(
+            term.strip() and not (_words(term) & generic_words)
+            for concept in self.search_concepts
+            for term in concept.terms
+        )
+
+        if has_distinct_concept:
+            return "specific", "direct_topic"
+
+        return self.subject_specificity, self.resolved_evidence_mode()
 
     def effective_subject_text(self) -> str:
         """

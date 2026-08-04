@@ -17,6 +17,7 @@ from unittest import mock
 from app.models.conversation_state import (
     ConversationActionState,
     ConversationPendingClarification,
+    ConversationSearchConcept,
     ConversationState,
 )
 from app.services.conversation_transition import (
@@ -1523,6 +1524,63 @@ class JurisdictionNeutralInheritanceTests(unittest.TestCase):
         # decide, no action's subject_text may ever contain "Spain".
         for action in outcome.final_actions:
             self.assertNotIn("Spain", action.subject_text or "")
+
+    def test_cas9_country_swap_emptying_all_concepts_rebuilds_from_subject(
+        self,
+    ) -> None:
+        # A concept group whose every term is purely geographic (the
+        # country's own name, no other legal content) is dropped
+        # entirely during canonicalization even though subject_text
+        # itself survives untouched. A precise subject must never be
+        # broadened just because its concepts disappeared here -
+        # search_concepts is rebuilt directly from the surviving
+        # canonical subject_text, and subject_specificity/
+        # evidence_mode stay exactly as they were (mission "MISSION
+        # EXPRESS BLOQUANTE 0.4.2", Regle B).
+        previous = _action_state(
+            "legal_information",
+            ["ES"],
+            subject_text="overtime rules",
+            legal_topics=["Working Conditions"],
+            search_concepts=[ConversationSearchConcept(terms=["Spain"])],
+            subject_specificity="specific",
+            evidence_mode="direct_topic",
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                clarification_reason=None,
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["PE"],
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+                delta=_delta(
+                    context_operation="replace_country",
+                    explicit_country_codes=["PE"],
+                ),
+                is_follow_up=True,
+            ),
+            conversation_state=_state([previous], focus_action_index=0),
+            hints=_hints(),
+        )
+
+        action = outcome.final_actions[0]
+        self.assertEqual(action.country_codes, ["PE"])
+        self.assertEqual(action.subject_text, "overtime rules")
+        # The purely-geographic concept group is gone, but it is
+        # rebuilt from the surviving subject_text - never left empty,
+        # never invented as a new synonym.
+        self.assertEqual(
+            [concept.terms for concept in action.search_concepts],
+            [["overtime rules"]],
+        )
+        # Never weakened - the precise labeling survives untouched.
+        self.assertEqual(action.evidence_mode, "direct_topic")
+        self.assertEqual(action.subject_specificity, "specific")
 
 
 if __name__ == "__main__":

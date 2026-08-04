@@ -36,7 +36,10 @@ from app.services.country_detection import (
     is_country_only_followup,
     resolve_country_display_name,
 )
-from app.services.legal_subject_scope import canonicalize_legal_subject
+from app.services.legal_subject_scope import (
+    CanonicalSearchConcept,
+    canonicalize_legal_subject,
+)
 from app.services.request_understanding import (
     CurrentMessageDelta,
     DeterministicHints,
@@ -179,6 +182,18 @@ def _inherit_action(
 
     subject_text = canonicalized.subject_text
     search_concepts = canonicalized.search_concepts
+
+    # A concept group whose every term was purely geographic (e.g.
+    # the old country's own name, no other legal content) can be
+    # dropped entirely during canonicalization even though
+    # subject_text itself survives untouched. A precise subject must
+    # never be broadened just because its concepts disappeared here -
+    # rebuild a single concept group directly from the surviving
+    # canonical subject_text (the same precise wording already used
+    # for retrieval/generation, never an invented synonym), keeping
+    # subject_specificity/evidence_mode exactly as inherited.
+    if not search_concepts and subject_text:
+        search_concepts = [CanonicalSearchConcept(terms=[subject_text])]
 
     resolved_question = (
         _build_resolved_question(

@@ -278,6 +278,136 @@ class RequestUnderstandingActionModelTests(unittest.TestCase):
             )
 
 
+class ResolvedSubjectPrecisionTests(unittest.TestCase):
+    """
+    resolved_subject_precision() reconciles subject_specificity/
+    evidence_mode against what search_concepts itself proves - never
+    trusting a broad/broad_topic label the model attached despite
+    real, distinct search_concepts, and never narrowing a genuinely
+    general question either (mission "MISSION EXPRESS BLOQUANTE
+    0.4.2", Regles A/C/D).
+    """
+
+    def test_1_real_remote_work_case_is_forced_to_specific_direct(
+        self,
+    ) -> None:
+        # TEST 1 - the exact real-world defect: the model itself
+        # mislabeled a precise remote-work question as broad/
+        # broad_topic despite carrying real, distinct search_concepts.
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="rules on remote work (telework)",
+                search_concepts=[
+                    {
+                        "terms": [
+                            "remote work",
+                            "telework",
+                            "working from home",
+                        ]
+                    }
+                ],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("specific", "direct_topic"),
+        )
+
+    def test_5_a_genuinely_general_question_keeps_broad_broad_topic(
+        self,
+    ) -> None:
+        # TEST 5 - "Tell me about working conditions in Peru." - no
+        # search_concepts distinct from the topic's own generic label,
+        # so broad/broad_topic must survive untouched.
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="working conditions",
+                search_concepts=[],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("broad", "broad_topic"),
+        )
+
+    def test_a_concept_repeating_only_the_topic_label_never_forces_specific(
+        self,
+    ) -> None:
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="working conditions",
+                search_concepts=[{"terms": ["working conditions"]}],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("broad", "broad_topic"),
+        )
+
+    def test_real_world_broad_paraphrases_never_force_specific(
+        self,
+    ) -> None:
+        # Real production output for "Tell me about working
+        # conditions in Peru." - the model still supplies several
+        # search_concepts terms, but every one is a paraphrase of the
+        # topic's own label ("workplace conditions" shares "conditions",
+        # "working environment" shares "working"), never a narrower
+        # legal concept - word overlap, not exact-string equality,
+        # is what must keep this broad/broad_topic.
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="working conditions",
+                search_concepts=[
+                    {
+                        "terms": [
+                            "working conditions",
+                            "workplace conditions",
+                            "working environment",
+                        ]
+                    }
+                ],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("broad", "broad_topic"),
+        )
+
+    def test_never_weakens_an_already_specific_direct_topic_action(
+        self,
+    ) -> None:
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=["Working Conditions"],
+                subject_text="overtime rules",
+                search_concepts=[],
+                subject_specificity="specific",
+                evidence_mode="direct_topic",
+            )
+        )
+
+        self.assertEqual(
+            action.resolved_subject_precision(),
+            ("specific", "direct_topic"),
+        )
+
+
 class RequestUnderstandingResultModelTests(unittest.TestCase):
     """
     Tests for RequestUnderstandingResult's model_validator - the exact

@@ -3138,9 +3138,7 @@ def answer_legal_question(
         zip(specs, hits_by_spec)
     ):
         if not (
-            spec.evidence_mode is not None
-            and spec.search_concepts
-            and spec.subject_text
+            spec.evidence_mode is not None and spec.subject_text
         ):
             filtered_hits_by_spec.append(spec_hits)
             gated_codes_by_spec.append(set())
@@ -3161,8 +3159,9 @@ def answer_legal_question(
         for code in spec_codes:
             status = evaluate_evidence_status(
                 spec_hits_by_country.get(code, []),
-                spec.search_concepts,
+                spec.search_concepts or [],
                 spec.evidence_mode,
+                subject_text=spec.subject_text,
             )
 
             metric_key = (
