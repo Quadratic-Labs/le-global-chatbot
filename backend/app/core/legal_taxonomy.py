@@ -29,6 +29,7 @@ _TOPIC_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     ),
     "Working Conditions": (
         "working conditions",
+        "wages and work hours",
     ),
     "Anti-Discrimination Laws": (
         "anti-discrimination laws",
@@ -43,6 +44,7 @@ _TOPIC_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "Termination of Employment Contracts": (
         "termination of employment contracts",
         "termination of employment contract",
+        "termination of employment",
     ),
     "Restrictive Covenants": (
         "restrictive covenants",
@@ -66,7 +68,7 @@ _TOPIC_ALIASES: Final[dict[str, tuple[str, ...]]] = {
 _TOPIC_PREFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^\s*"
     r"(?:[|¦=]+\s*)?"
-    r"(?:\d{1,2}\s*[.)]\s*)?",
+    r"(?:(?:\d{1,2}|[IVX]{1,6})\s*[.)]\s*)?",
     re.IGNORECASE,
 )
 

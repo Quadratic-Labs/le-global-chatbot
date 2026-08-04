@@ -932,7 +932,7 @@ class DeterministicUnavailableCountryRefinementTests(unittest.TestCase):
     fact a routing gate.
     """
 
-    def test_canada_mentioned_in_current_question_is_named(
+    def test_france_mentioned_in_current_question_is_named(
         self,
     ) -> None:
         understanding_client = FakeUnderstandingClient(
@@ -950,7 +950,7 @@ class DeterministicUnavailableCountryRefinementTests(unittest.TestCase):
 
         response = resolve_legal_chat_response(
             request=LegalChatRequest(
-                question="What are the overtime rules in Canada?"
+                question="What are the overtime rules in France?"
             ),
             catalog_provider=_catalog_provider,
             search_function=_fail_if_called,
@@ -960,7 +960,7 @@ class DeterministicUnavailableCountryRefinementTests(unittest.TestCase):
         self.assertFalse(response.grounded)
         self.assertEqual(response.retrieval_total, 0)
         self.assertEqual(response.sources, [])
-        self.assertIn("Canada", response.answer)
+        self.assertIn("France", response.answer)
 
     def test_germany_mentioned_in_current_question_is_named(
         self,

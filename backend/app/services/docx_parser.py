@@ -34,7 +34,7 @@ _HEADING_STYLE_PATTERN = re.compile(
 _TOPIC_NUMBER_PREFIX_PATTERN = re.compile(
     r"^\s*"
     r"(?:[|¦=]+\s*)?"
-    r"\d{1,2}\s*[.)]\s*",
+    r"(?:\d{1,2}|[IVX]{1,6})\s*[.)]\s*",
 )
 
 _LEADING_DECORATION_PATTERN = re.compile(
@@ -838,7 +838,7 @@ def _clean_text_box_line(
     )
 
 
-def _extract_text_box_blocks(
+def extract_text_box_blocks(
     file_path: Path,
 ) -> list[list[str]]:
     """
@@ -1064,7 +1064,7 @@ def parse_contact_blocks(
         )
 
     # Collapse near-duplicate compatibility blocks that the raw-line
-    # dedup in _extract_text_box_blocks missed because they differ in
+    # dedup in extract_text_box_blocks missed because they differ in
     # some incidental XML detail (for example two different internal
     # hyperlink relationship ids for the same displayed email), so
     # they do not each consume a slot in the position-based pairing
@@ -1191,7 +1191,7 @@ def extract_contacts_from_docx(
     """Extract every validated contact card from one source DOCX."""
 
     return parse_contact_blocks(
-        _extract_text_box_blocks(
+        extract_text_box_blocks(
             file_path
         ),
         country=country,

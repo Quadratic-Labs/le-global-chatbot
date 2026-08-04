@@ -10,6 +10,7 @@ from typing import Any
 from app.models.document import DocumentChunk
 from app.services.admin_document_lifecycle import (
     AdminDocumentNotFoundError,
+    AdminDocumentSourceConflictError,
     AdminDocumentSourceMissingError,
     delete_indexed_document,
     reindex_indexed_document,
@@ -224,9 +225,13 @@ class AdminDocumentLifecycleTests(
 
             source_filename = "UK 2026.docx"
 
+            # Stored on disk under the country-derived name ("GB",
+            # matching FakeOpenSearchClient's own country_code),
+            # never source_filename itself - mission "CONTINUATION
+            # PATCH 0.4.3", section 10.
             (
                 source_directory
-                / source_filename
+                / "GB.docx"
             ).write_bytes(
                 b"docx"
             )
@@ -302,7 +307,7 @@ class AdminDocumentLifecycleTests(
 
             (
                 source_directory
-                / source_filename
+                / "GB.docx"
             ).write_bytes(
                 b"docx"
             )
@@ -403,7 +408,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             source_path.write_bytes(
@@ -475,7 +480,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             source_path.write_bytes(
@@ -529,7 +534,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             source_path.write_bytes(
@@ -579,7 +584,7 @@ class AdminDocumentLifecycleTests(
 
             source_path = (
                 source_directory
-                / source_filename
+                / "GB.docx"
             )
 
             original_bytes = b"original-docx-bytes"
@@ -639,6 +644,187 @@ class AdminDocumentLifecycleTests(
                         document_exists=False
                     ),
                 )
+
+
+class LegacySourceResolutionTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4", section 7.B/E/F - Reindex and Delete for a
+    document indexed before country-keyed storage existed, still
+    physically stored under its own historical filename.
+    """
+
+    LEGACY_FILENAME = "Labour and Employment Law in UK 2026.docx"
+
+    def test_reindex_opens_the_exact_historical_file(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            legacy_path = source_directory / self.LEGACY_FILENAME
+            legacy_path.write_bytes(b"legacy-docx-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename=self.LEGACY_FILENAME
+            )
+
+            opened_paths: list[Path] = []
+
+            def chunk_builder(path: Path) -> list[DocumentChunk]:
+                opened_paths.append(path)
+                return [
+                    _build_chunk(
+                        document_id=OLD_DOCUMENT_ID,
+                        source_filename=path.name,
+                    )
+                ]
+
+            def document_indexer(
+                *,
+                chunks,
+                client=None,
+            ) -> DocumentIndexingResult:
+                del client
+                return DocumentIndexingResult(
+                    index_alias="legal-documents",
+                    document_id=chunks[0].document_id,
+                    source_filename=chunks[0].source_filename,
+                    requested_chunks=1,
+                    indexed_chunks=1,
+                    stale_chunks_deleted=0,
+                )
+
+            response = reindex_indexed_document(
+                document_id=OLD_DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+                chunk_builder=chunk_builder,
+                document_indexer=document_indexer,
+            )
+
+            self.assertEqual(response.status, "reindexed")
+            self.assertEqual(opened_paths, [legacy_path])
+
+            # No CODE.docx was ever created or expected - the
+            # historical file was never renamed.
+            self.assertFalse(
+                (source_directory / "GB.docx").exists()
+            )
+
+    def test_reindex_refuses_on_source_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            (
+                source_directory / self.LEGACY_FILENAME
+            ).write_bytes(b"legacy-bytes")
+
+            (
+                source_directory / "GB.docx"
+            ).write_bytes(b"canonical-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename=self.LEGACY_FILENAME
+            )
+
+            with self.assertRaises(
+                AdminDocumentSourceConflictError
+            ):
+                reindex_indexed_document(
+                    document_id=OLD_DOCUMENT_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            # Nothing on disk changed.
+            self.assertEqual(
+                (
+                    source_directory / self.LEGACY_FILENAME
+                ).read_bytes(),
+                b"legacy-bytes",
+            )
+            self.assertEqual(
+                (source_directory / "GB.docx").read_bytes(),
+                b"canonical-bytes",
+            )
+
+    def test_delete_targets_only_the_historical_file(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir()
+
+            legacy_path = source_directory / self.LEGACY_FILENAME
+            legacy_path.write_bytes(b"legacy-docx-bytes")
+
+            # An unrelated file that must never be touched.
+            decoy_path = (
+                source_directory
+                / "Labour and Employment Law in Spain 2026.docx"
+            )
+            decoy_path.write_bytes(b"unrelated-spain-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename=self.LEGACY_FILENAME
+            )
+
+            response = delete_indexed_document(
+                document_id=OLD_DOCUMENT_ID,
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                client=client,
+            )
+
+            self.assertEqual(response.status, "deleted")
+            self.assertTrue(response.source_file_deleted)
+            self.assertFalse(legacy_path.exists())
+
+            # The decoy file survives untouched.
+            self.assertTrue(decoy_path.exists())
+            self.assertEqual(
+                decoy_path.read_bytes(),
+                b"unrelated-spain-bytes",
+            )
+
+    def test_delete_refuses_on_source_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir()
+
+            (
+                source_directory / self.LEGACY_FILENAME
+            ).write_bytes(b"legacy-bytes")
+
+            (
+                source_directory / "GB.docx"
+            ).write_bytes(b"canonical-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename=self.LEGACY_FILENAME
+            )
+
+            with self.assertRaises(
+                AdminDocumentSourceConflictError
+            ):
+                delete_indexed_document(
+                    document_id=OLD_DOCUMENT_ID,
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    client=client,
+                )
+
+            # Nothing on disk changed, and OpenSearch was never
+            # touched (no deleted_document_ids recorded).
+            self.assertEqual(client.deleted_document_ids, [])
+            self.assertEqual(
+                (
+                    source_directory / self.LEGACY_FILENAME
+                ).read_bytes(),
+                b"legacy-bytes",
+            )
+            self.assertEqual(
+                (source_directory / "GB.docx").read_bytes(),
+                b"canonical-bytes",
+            )
 
 
 if __name__ == "__main__":

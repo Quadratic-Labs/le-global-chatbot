@@ -46,6 +46,7 @@ class AdminDocumentUploadResponse(BaseModel):
     country: str
     country_code: str
     reference_year: int | None = None
+    document_family: str
 
     uploaded_bytes: int
     indexed_chunks: int

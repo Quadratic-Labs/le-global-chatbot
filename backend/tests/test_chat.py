@@ -311,7 +311,7 @@ class ChatScopeTests(unittest.TestCase):
     def test_country_outside_corpus_returns_fallback_without_search(
         self,
     ) -> None:
-        # Canada is recognized in the text but outside the supported
+        # France is recognized in the text but outside the supported
         # catalog, so a well-behaved model has no valid country to
         # resolve at all - it classifies this as a clarification for
         # a missing country, and the router itself (reading the
@@ -327,7 +327,7 @@ class ChatScopeTests(unittest.TestCase):
         response = resolve_legal_chat_response(
             request=LegalChatRequest(
                 question=(
-                    "What are the overtime rules in Canada?"
+                    "What are the overtime rules in France?"
                 )
             ),
             catalog_provider=_catalog_provider,
@@ -350,14 +350,14 @@ class ChatScopeTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Canada",
+            "France",
             response.answer,
         )
 
     def test_second_unavailable_country_returns_fallback(
         self,
     ) -> None:
-        # Same shape as the Canada case above, with a different
+        # Same shape as the France case above, with a different
         # unavailable country, to confirm this is not special-cased to
         # one country code.
         understanding_client = FakeUnderstandingClient(
@@ -398,12 +398,12 @@ class ChatScopeTests(unittest.TestCase):
         # This scenario cannot be expressed by a single resolved
         # RequestUnderstanding action: the model is instructed to only
         # ever output a country code from the supported list, so it
-        # would simply omit Canada from country_codes - there is no
+        # would simply omit France from country_codes - there is no
         # field on an action for "also note this other country has no
         # documents". Only the conservative deterministic fallback
         # (which recomputes country availability directly from the
         # whole question, independent of anything the model returns)
-        # can still combine a Spain answer with a Canada-unavailable
+        # can still combine a Spain answer with a France-unavailable
         # note, exactly as the pre-rewrite deterministic router did.
         # We force that fallback explicitly (rather than relying on
         # the absence of OPENAI_API_KEY) by making the one semantic
@@ -442,7 +442,7 @@ class ChatScopeTests(unittest.TestCase):
             request=LegalChatRequest(
                 question=(
                     "Compare overtime rules "
-                    "in Spain and Canada."
+                    "in Spain and France."
                 )
             ),
             catalog_provider=_catalog_provider,
@@ -474,7 +474,7 @@ class ChatScopeTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Canada",
+            "France",
             response.answer,
         )
 
@@ -1220,10 +1220,10 @@ class ChatMetricsTests(unittest.TestCase):
             0,
         )
 
-    def test_canada_fallback_records_zero_pipeline_cost(
+    def test_france_fallback_records_zero_pipeline_cost(
         self,
     ) -> None:
-        # Canada is unavailable, so a well-behaved model has no valid
+        # France is unavailable, so a well-behaved model has no valid
         # country to resolve and classifies this a "missing_country"
         # clarification - the router itself then renders the
         # unavailable-country note from its own deterministic hints.
@@ -1242,7 +1242,7 @@ class ChatMetricsTests(unittest.TestCase):
                 request=LegalChatRequest(
                     question=(
                         "What are the overtime "
-                        "rules in Canada?"
+                        "rules in France?"
                     )
                 ),
                 catalog_provider=_catalog_provider,
@@ -2910,7 +2910,7 @@ class ContactIntentTests(unittest.TestCase):
                 request=LegalChatRequest(
                     question=(
                         "Give me the contact details "
-                        "for a lawyer in Canada."
+                        "for a lawyer in France."
                     )
                 ),
                 catalog_provider=_catalog_provider,
@@ -2925,7 +2925,7 @@ class ContactIntentTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Canada",
+            "France",
             response.answer,
         )
 
@@ -5258,6 +5258,32 @@ class AssistantHelpRouteTests(unittest.TestCase):
         self._assert_clean_meta_response(response)
         self.assertIn("Spain", response.answer)
         self.assertIn("Peru", response.answer)
+
+    def test_countries_general_names_exactly_the_registry_no_more_no_less(
+        self,
+    ) -> None:
+        # Mission "CONTINUATION PATCH 0.4.3", section 2: proves the
+        # help layer's country coverage is genuinely sourced from
+        # app.core.country_registry.COUNTRIES - the single, real
+        # registry, never a second/parallel or narrower/broader list -
+        # by checking every registered country's display name is named
+        # and nothing outside the registry (e.g. a country only ever
+        # present in a live OpenSearch catalog) leaks in. Canada is
+        # included here precisely because it is now a genuine COUNTRIES
+        # entry (added by this mission), not a hardcoded assumption.
+        response = self._resolve("Which countries do you cover?")
+        self._assert_clean_meta_response(response)
+
+        for country in COUNTRIES:
+            with self.subTest(country=country.display_name):
+                self.assertIn(country.display_name, response.answer)
+
+        named_country_count = sum(
+            1
+            for country in COUNTRIES
+            if country.display_name in response.answer
+        )
+        self.assertEqual(named_country_count, len(COUNTRIES))
 
     def test_countries_targeted_supported(self) -> None:
         response = self._resolve("Do you cover Spain?")
