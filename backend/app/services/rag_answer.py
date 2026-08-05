@@ -3146,6 +3146,13 @@ def answer_legal_question(
             continue
 
         spec_codes = _normalize_country_codes(spec.country_codes)
+        spec_legal_topics = frozenset(
+            _normalize_requested_legal_topics(
+                spec.legal_topics
+                or request.legal_topics
+                or []
+            )
+        )
 
         spec_hits_by_country: dict[str, list[LegalSearchHit]] = {}
         for hit in spec_hits:
@@ -3162,6 +3169,8 @@ def answer_legal_question(
                 spec.search_concepts or [],
                 spec.evidence_mode,
                 subject_text=spec.subject_text,
+                expected_country_codes=frozenset(spec_codes),
+                expected_legal_topics=spec_legal_topics,
             )
 
             metric_key = (

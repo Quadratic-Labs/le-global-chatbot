@@ -5322,6 +5322,135 @@ class AssistantHelpRouteTests(unittest.TestCase):
         response = self._resolve("What are your limitations?")
         self._assert_clean_meta_response(response)
 
+    def test_how_can_u_help_typo_is_a_clean_capabilities_answer(
+        self,
+    ) -> None:
+        # Mission "HOTFIX 0.4.4" Step 4, test 3 - the "u" text-speak
+        # abbreviation must resolve exactly like "you", with zero
+        # OpenAI/OpenSearch calls (_unexpected_search/NoCallGeneration
+        # Client/NoCallUnderstandingClient all raise if reached).
+        response = self._resolve("How can u help?")
+        self._assert_clean_meta_response(response)
+        self.assertIn("compare", response.answer.casefold())
+        self.assertIn("contact", response.answer.casefold())
+
+    def test_how_can_you_help_me_with_spain_names_spain(self) -> None:
+        # Mission "HOTFIX 0.4.4" Step 4, test 4 - a country-linked
+        # capability question must name that country and never
+        # produce a documentary-absence message, with zero search.
+        response = self._resolve("How can you help me with Spain?")
+        self._assert_clean_meta_response(response)
+        self.assertIn("Spain", response.answer)
+        self.assertNotIn("do not currently have", response.answer)
+        self.assertNotIn("do not contain enough", response.answer)
+
+    def test_how_can_you_help_me_about_canada_names_canada(self) -> None:
+        # Mission "HOTFIX 0.4.4" Step 4, test 5 - same guarantee for a
+        # word-order variant ("How can you help me about Canada?").
+        response = self._resolve("How can you help me about Canada?")
+        self._assert_clean_meta_response(response)
+        self.assertIn("Canada", response.answer)
+        self.assertNotIn("do not currently have", response.answer)
+        self.assertNotIn("do not contain enough", response.answer)
+
+    def test_which_legal_topics_can_you_help_me_with_lists_topics(
+        self,
+    ) -> None:
+        # Mission "HOTFIX 0.4.4" Step 4, test 1.
+        response = self._resolve("Which legal topics can you help me with?")
+        self._assert_clean_meta_response(response)
+        for topic in CANONICAL_LEGAL_TOPICS:
+            with self.subTest(topic=topic):
+                self.assertIn(topic, response.answer)
+
+    def test_what_employment_law_topics_can_you_answer_lists_topics(
+        self,
+    ) -> None:
+        # Mission "HOTFIX 0.4.4" Step 4, test 2 - this phrasing also
+        # satisfies assistant_capabilities' own broad fallback check,
+        # so this proves the explicit "topics" wording still wins.
+        response = self._resolve(
+            "What employment law topics can you answer questions about?"
+        )
+        self._assert_clean_meta_response(response)
+        for topic in CANONICAL_LEGAL_TOPICS:
+            with self.subTest(topic=topic):
+                self.assertIn(topic, response.answer)
+
+
+class AssistantHelpRealQuestionBoundaryTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4" Step 4, test 6 - a real legal question that
+    merely contains the word "help" must never be captured as a
+    capabilities/meta request: it must reach RequestUnderstanding and
+    OpenSearch exactly like any other legal question.
+    """
+
+    def test_help_me_understand_termination_notice_reaches_legal_pipeline(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["ES"],
+                        legal_topics=["Termination of Employment Contracts"],
+                        subject_text="termination notice",
+                    )
+                ],
+                is_follow_up=False,
+                current_message_delta=_current_message_delta(
+                    context_operation="independent",
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["ES"],
+                    explicit_legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                    explicit_subject_text="termination notice",
+                ),
+            )
+        )
+
+        captured_requests: list[Any] = []
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country_code="ES",
+                        country="Spain",
+                        content="Notice periods depend on seniority. [1]",
+                    )
+                ],
+            )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "Can you help me understand termination notice "
+                    "in Spain?"
+                )
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search,
+            generation_client=FakeGenerationClient(
+                answer=(
+                    "Spain\n- Notice periods depend on seniority. [1]"
+                )
+            ),
+            understanding_client=understanding_client,
+        )
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertTrue(response.grounded)
+
 
 class AssistantHelpContinuityTests(unittest.TestCase):
     """
@@ -5704,6 +5833,120 @@ class AssistantHelpContinuityTests(unittest.TestCase):
         )
         self.assertFalse(follow_up.grounded)
         self.assertTrue(follow_up.answer)
+
+    def test_scenario_e_canada_capabilities_then_notice_requirements(
+        self,
+    ) -> None:
+        """
+        Mission "HOTFIX 0.4.4 - chat capabilities and evidence
+        stability", section 2 - proves the Canada country reference
+        made only inside a capabilities question survives into the
+        next turn through `history` alone: this help branch always
+        returns `conversation_state=request.conversation_state`
+        unchanged (chat.py), so a first-ever turn (no incoming state)
+        yields conversation_state=None - the exact "even if it is
+        null" case the mission calls out. No new ConversationState
+        field/model is introduced here: the second turn's
+        FakeUnderstandingClient stands in for the real OpenAI call,
+        which genuinely receives the full history text (see
+        HistoryContextTests) and is free to resolve Canada from it,
+        exactly like any other real follow-up in this suite
+        (LegalFollowUpTests, ContactFollowUpTests).
+        """
+
+        turn1 = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="How can you help me about Canada?"
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=NoCallUnderstandingClient(),
+        )
+        self.assertFalse(turn1.grounded)
+        self.assertEqual(turn1.retrieval_total, 0)
+        self.assertEqual(turn1.sources, [])
+        self.assertIn("Canada", turn1.answer)
+        self.assertIsNone(turn1.conversation_state)
+
+        turn2_understanding = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["CA"],
+                        legal_topics=["Termination of Employment Contracts"],
+                        subject_text="termination notice requirements",
+                    )
+                ],
+                is_follow_up=True,
+                current_message_delta=_current_message_delta(
+                    context_operation="continue",
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["CA"],
+                    explicit_legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                    explicit_subject_text="termination notice requirements",
+                ),
+            )
+        )
+
+        captured_requests: list[Any] = []
+
+        def fake_search_turn2(request: Any) -> LegalSearchResponse:
+            captured_requests.append(request)
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country_code="CA",
+                        country="Canada",
+                        content=(
+                            "Termination notice requirements depend "
+                            "on length of service. [1]"
+                        ),
+                    )
+                ],
+            )
+
+        turn2 = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What are the termination notice requirements?",
+                history=[
+                    {
+                        "role": "user",
+                        "content": "How can you help me about Canada?",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": turn1.answer,
+                    },
+                ],
+                conversation_state=turn1.conversation_state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=fake_search_turn2,
+            generation_client=FakeGenerationClient(
+                answer=(
+                    "Canada\n- Termination notice requirements depend "
+                    "on length of service. [1]"
+                )
+            ),
+            understanding_client=turn2_understanding,
+        )
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(captured_requests[0].country_codes, ["CA"])
+        self.assertTrue(turn2.grounded)
+        self.assertTrue(turn2.sources)
+        for source in turn2.sources:
+            with self.subTest(source=source):
+                self.assertEqual(source.country_code, "CA")
 
 
 if __name__ == "__main__":

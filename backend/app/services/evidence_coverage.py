@@ -170,6 +170,115 @@ def _hit_covers_relation(
     return True
 
 
+# Pure question-framing words - never a specific legal word, so
+# removing them before a subject_text overlap check (see
+# _hit_has_substantial_subject_overlap) cannot itself manufacture a
+# false match; it only stops framing words from either diluting a
+# real overlap count or, on their own, ever being mistaken for one.
+_SUBJECT_FRAMING_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "the", "a", "an", "in", "on", "at", "for", "to", "of", "and",
+        "or", "is", "are", "be", "been", "being", "do", "does", "did",
+        "can", "could", "should", "would", "will", "shall", "must",
+        "may", "might", "please", "tell", "me", "about", "you",
+        "what", "which", "how", "when", "where", "who", "whom", "why",
+        "summarise", "summarize", "summary", "explain", "describe",
+        # Generic legal-question framing words - describe the *shape*
+        # of the answer requested ("what rules apply", "what
+        # conditions must be satisfied", "what information do you
+        # have") rather than naming any specific legal subject. A
+        # subject_text built only from these (e.g. a resolved subject
+        # of literally "rules and conditions") must never, on its own,
+        # be treated as distinctive enough to trust a lexical overlap
+        # against - the same reasoning already applied above to
+        # "summarise"/"explain"/"describe".
+        "rules", "rule", "conditions", "condition", "information",
+        "requirements", "requirement",
+    }
+)
+
+def _significant_subject_tokens(subject_text: str) -> list[str]:
+    """
+    subject_text's own tokens with pure question-framing words
+    removed - the residue is whatever the question is actually
+    *about*, independent of how it happened to be phrased.
+    """
+
+    return [
+        token
+        for token in _tokenize(subject_text)
+        if token not in _SUBJECT_FRAMING_WORDS and len(token) > 2
+    ]
+
+
+def _hit_has_substantial_subject_overlap(
+    hit: LegalSearchHit,
+    subject_text: str,
+    *,
+    expected_country_codes: frozenset[str] = frozenset(),
+    expected_legal_topics: frozenset[str] = frozenset(),
+) -> bool:
+    """
+    A weaker, last-resort signal than an exact concept-phrase match:
+    true only when a genuine majority of subject_text's own
+    significant words appear anywhere in the hit (a single-word
+    subject, e.g. "notice", must match that one word - the same
+    resolved subject already trusted elsewhere by _SubjectTextConcept
+    for exact-phrase matching; this is the same trust, just applied
+    word-by-word instead of as one contiguous phrase).
+
+    This exists because a search_concepts group generated for one
+    phrasing of a question ("what conditions must a non-compete
+    clause satisfy") can fail to literally appear in a hit that a
+    differently-phrased but equivalent question ("is a non-compete
+    clause enforceable") would have matched, even though both target
+    the exact same retrieved content - a false negative in the exact-
+    phrase check, never a real absence of evidence (mission "HOTFIX
+    0.4.4 - chat capabilities and evidence stability"). Matching is by
+    exact token only, never a stem or substring (e.g. "work" does not
+    match "working"), which is what keeps this from ever re-admitting
+    the adjacent-topic false positives DirectTopicEvidenceTests/
+    RelationRequiredEvidenceTests already guard against.
+    """
+
+    normalized_hit_country = hit.country_code.strip().upper()
+
+    if (
+        expected_country_codes
+        and normalized_hit_country not in expected_country_codes
+    ):
+        return False
+
+    normalized_hit_topic = (
+        hit.legal_topic.strip()
+        if hit.legal_topic is not None
+        else ""
+    )
+
+    if (
+        expected_legal_topics
+        and normalized_hit_topic not in expected_legal_topics
+    ):
+        return False
+
+    subject_tokens = _significant_subject_tokens(subject_text)
+
+    if not subject_tokens:
+        # Nothing distinctive left to judge by once framing words are
+        # removed - falls through to the existing, stricter checks.
+        return False
+
+    hit_tokens = set(_tokenize(_hit_haystack(hit)))
+
+    overlap_count = sum(
+        1 for token in subject_tokens if token in hit_tokens
+    )
+
+    required_overlap = max(1, (len(subject_tokens) + 1) // 2)
+
+    return overlap_count >= required_overlap
+
+
 class _SubjectTextConcept:
     """A single-term SearchConceptLike built from an action's own
     canonical subject_text - the fallback direct concept used below
@@ -189,6 +298,8 @@ def evaluate_evidence_status(
     *,
     subject_text: str | None = None,
     reranked_direct_chunk_ids: frozenset[str] = frozenset(),
+    expected_country_codes: frozenset[str] = frozenset(),
+    expected_legal_topics: frozenset[str] = frozenset(),
 ) -> EvidenceStatus:
     """
     Evaluate one country's retrieved hits against one action's
@@ -247,7 +358,21 @@ def evaluate_evidence_status(
             for concept in effective_concepts
         )
 
-        return "partial" if any_group_covered else "insufficient"
+        if any_group_covered:
+            return "partial"
+
+        if subject_text and any(
+            _hit_has_substantial_subject_overlap(
+                hit,
+                subject_text,
+                expected_country_codes=expected_country_codes,
+                expected_legal_topics=expected_legal_topics,
+            )
+            for hit in hits
+        ):
+            return "partial"
+
+        return "insufficient"
 
     # direct_topic: one precise concept, one group is enough.
     for hit in hits:
@@ -259,6 +384,26 @@ def evaluate_evidence_status(
             for concept in effective_concepts
         ):
             return "direct"
+
+    # The exact search_concepts phrasing never matched - a real risk
+    # whenever a question is reworded ("what conditions must X
+    # satisfy" vs "is X enforceable") in a way the model's own
+    # synonym generation for *that* phrasing did not anticipate, even
+    # though retrieval already returned hits for the right country
+    # and canonical legal_topic. A genuine majority overlap with the
+    # resolved subject_text itself is enough to let those hits reach
+    # generation as partial evidence - never silently promoted to
+    # direct, and never granted from a single incidental shared word.
+    if subject_text and any(
+        _hit_has_substantial_subject_overlap(
+                hit,
+                subject_text,
+                expected_country_codes=expected_country_codes,
+                expected_legal_topics=expected_legal_topics,
+            )
+        for hit in hits
+    ):
+        return "partial"
 
     return "insufficient"
 
