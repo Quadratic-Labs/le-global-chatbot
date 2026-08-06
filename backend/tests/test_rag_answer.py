@@ -7642,5 +7642,53 @@ class RagConcretePolicyAndHistoryContextTests(unittest.TestCase):
                 )
 
 
+
+class InvalidRequestMetadataTests(unittest.TestCase):
+    def test_comparison_budget_error_has_metadata(
+        self,
+    ) -> None:
+        def unexpected_search(_request):
+            raise AssertionError(
+                "Search must not run when the source "
+                "budget is invalid."
+            )
+
+        with self.assertRaises(
+            InvalidLegalChatRequestError
+        ) as error_context:
+            _retrieve_search_hits(
+                request=LegalChatRequest(
+                    question=(
+                        "Compare notice periods in Spain "
+                        "and the United Kingdom."
+                    ),
+                    country_codes=["ES", "GB"],
+                    max_sources=1,
+                ),
+                search_function=unexpected_search,
+            )
+
+        error = error_context.exception
+
+        self.assertEqual(
+            type(error),
+            InvalidLegalChatRequestError,
+        )
+        self.assertEqual(
+            error.code,
+            "comparison_source_budget",
+        )
+        self.assertEqual(
+            error.details,
+            {
+                "country_count": 2,
+                "max_sources": 1,
+            },
+        )
+        self.assertIn(
+            "max_sources",
+            str(error),
+        )
+
 if __name__ == "__main__":
     unittest.main()

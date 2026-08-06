@@ -345,6 +345,17 @@ class RagAnswerError(RuntimeError):
 class InvalidLegalChatRequestError(ValueError):
     """Raised when chat retrieval parameters are inconsistent."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
+
 
 @dataclass(frozen=True, slots=True)
 class LegalActionEvidenceSpec:
@@ -1246,7 +1257,12 @@ def _retrieve_search_hits(
     ):
         raise InvalidLegalChatRequestError(
             "max_sources must be greater than or equal "
-            "to the number of requested countries."
+            "to the number of requested countries.",
+            code="comparison_source_budget",
+            details={
+                "country_count": len(country_codes),
+                "max_sources": request.max_sources,
+            },
         )
 
     country_limit = _candidate_limit_per_country(

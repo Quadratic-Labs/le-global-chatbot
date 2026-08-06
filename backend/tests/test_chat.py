@@ -5949,5 +5949,120 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 self.assertEqual(source.country_code, "CA")
 
 
+
+class FriendlyInvalidRequestHttpTests(unittest.TestCase):
+    @staticmethod
+    def _settings():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            rerank_enabled=False,
+            rerank_pool_multiplier=1,
+            rag_max_context_characters=12000,
+            rag_max_source_characters=6000,
+        )
+
+    def test_comparison_budget_is_a_friendly_response(
+        self,
+    ) -> None:
+        from fastapi import Response
+        from unittest import mock as local_mock
+
+        from app.routers.chat import legal_chat
+
+        error = InvalidLegalChatRequestError(
+            "max_sources must be greater than or equal "
+            "to the number of requested countries.",
+            code="comparison_source_budget",
+            details={
+                "country_count": 9,
+                "max_sources": 6,
+            },
+        )
+
+        request = LegalChatRequest(
+            question=(
+                "Compare all available countries on "
+                "termination notice."
+            ),
+            max_sources=6,
+        )
+        http_response = Response()
+
+        with (
+            local_mock.patch(
+                "app.routers.chat.get_settings",
+                return_value=self._settings(),
+            ),
+            local_mock.patch(
+                "app.routers.chat.resolve_legal_chat_response",
+                side_effect=error,
+            ),
+        ):
+            result = legal_chat(
+                request=request,
+                response=http_response,
+                x_request_id="budget-test",
+            )
+
+        self.assertFalse(result.grounded)
+        self.assertEqual(result.retrieval_total, 0)
+        self.assertEqual(result.sources, [])
+        self.assertIn("9 countries", result.answer)
+        self.assertIn(
+            "choose up to 6 countries",
+            result.answer,
+        )
+        self.assertNotIn(
+            "max_sources",
+            result.answer,
+        )
+        self.assertEqual(
+            http_response.headers["X-Request-ID"],
+            "budget-test",
+        )
+
+    def test_other_invalid_request_remains_422(
+        self,
+    ) -> None:
+        from fastapi import HTTPException, Response
+        from unittest import mock as local_mock
+
+        from app.routers.chat import legal_chat
+
+        error = InvalidLegalChatRequestError(
+            "Another invalid request."
+        )
+
+        with (
+            local_mock.patch(
+                "app.routers.chat.get_settings",
+                return_value=self._settings(),
+            ),
+            local_mock.patch(
+                "app.routers.chat.resolve_legal_chat_response",
+                side_effect=error,
+            ),
+        ):
+            with self.assertRaises(
+                HTTPException
+            ) as error_context:
+                legal_chat(
+                    request=LegalChatRequest(
+                        question="A valid-length question."
+                    ),
+                    response=Response(),
+                    x_request_id="invalid-test",
+                )
+
+        self.assertEqual(
+            error_context.exception.status_code,
+            422,
+        )
+        self.assertEqual(
+            error_context.exception.detail,
+            "Another invalid request.",
+        )
+
 if __name__ == "__main__":
     unittest.main()
