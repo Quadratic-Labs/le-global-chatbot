@@ -991,6 +991,41 @@ class RealDocumentStructureTests(unittest.TestCase):
 
         self.assertIn("Hiring Practices", topics)
 
+    def test_usa_jurisdiction_suffix_heading_text_is_unchanged(
+        self,
+    ) -> None:
+        # Mission "HOTFIX 0.4.4", final targeted correction, test 8:
+        # the topic-matching normalization used to recognize "in the
+        # USA" must never alter the section heading actually stored
+        # on the chunk.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview United States"],
+                body_paragraphs=[
+                    "06. Social Media and Data Privacy in the USA",
+                    "Content about social media rules.",
+                ],
+            )
+
+            chunks = build_document_chunks_from_docx(
+                file_path=file_path,
+                country_code="US",
+                language="en",
+            )
+
+        matching_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.legal_topic == "Social Media and Data Privacy"
+        ]
+
+        self.assertTrue(matching_chunks)
+        self.assertEqual(
+            matching_chunks[0].section,
+            "06. Social Media and Data Privacy in the USA",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

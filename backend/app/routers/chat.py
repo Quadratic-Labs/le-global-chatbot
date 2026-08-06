@@ -41,6 +41,12 @@ from app.services.conversation_transition import (
     apply_conversation_transition,
     build_next_conversation_state,
 )
+from app.services.conversation_meta import (
+    append_personalised_legal_caution,
+    requires_personalised_legal_caution,
+    resolve_conversation_meta,
+)
+
 from app.services.country_detection import (
     CountryAvailability,
     CountryCatalogProvider,
@@ -1507,6 +1513,39 @@ def resolve_legal_chat_response(
         for message in request.history
     )
 
+    meta_resolution = resolve_conversation_meta(
+        question=request.question,
+        history=request.history,
+        conversation_state=request.conversation_state,
+        catalog_provider=catalog_provider,
+    )
+
+    if meta_resolution is not None:
+        metrics.outcome = (
+            "conversation_meta_"
+            f"{meta_resolution.intent_type}"
+        )
+        metrics.total_ms = (
+            perf_counter() - total_started_at
+        ) * 1000
+        metrics.log()
+
+        response_state = (
+            request.conversation_state
+            if meta_resolution.preserve_conversation_state
+            else None
+        )
+
+        return LegalChatResponse(
+            question=request.question.strip(),
+            answer=meta_resolution.answer,
+            grounded=False,
+            model=None,
+            retrieval_total=0,
+            sources=[],
+            conversation_state=response_state,
+        )
+
     # Assistant-help/meta-intent detection runs first, before any
     # other check in this function - _build_deterministic_hints below
     # already calls the OpenSearch-backed legal catalog (via
@@ -1848,6 +1887,19 @@ def resolve_legal_chat_response(
             max_source_characters=max_source_characters,
         )
 
+        if requires_personalised_legal_caution(
+            request.question
+        ):
+            response = response.model_copy(
+                update={
+                    "answer": (
+                        append_personalised_legal_caution(
+                            response.answer
+                        )
+                    )
+                }
+            )
+
         metrics.total_ms = (
             perf_counter() - total_started_at
         ) * 1000
@@ -1914,6 +1966,50 @@ def legal_chat(
         )
 
     except InvalidLegalChatRequestError as error:
+        if error.code == "comparison_source_budget":
+            country_count = error.details.get(
+                "country_count"
+            )
+
+            if (
+                not isinstance(country_count, int)
+                or country_count <= 0
+            ):
+                country_count = request.max_sources + 1
+
+            source_word = (
+                "source"
+                if request.max_sources == 1
+                else "sources"
+            )
+            country_word = (
+                "country"
+                if request.max_sources == 1
+                else "countries"
+            )
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=(
+                    f"This comparison includes "
+                    f"{country_count} countries, but the "
+                    f"current response can cite up to "
+                    f"{request.max_sources} {source_word}. "
+                    "To keep at least one source for each "
+                    f"country, please choose up to "
+                    f"{request.max_sources} {country_word} "
+                    "or split the comparison into smaller "
+                    "groups."
+                ),
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+                conversation_state=(
+                    request.conversation_state
+                ),
+            )
+
         raise HTTPException(
             status_code=(
                 status.HTTP_422_UNPROCESSABLE_ENTITY

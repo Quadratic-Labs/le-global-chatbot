@@ -148,5 +148,92 @@ class LegalTaxonomyTests(unittest.TestCase):
         )
 
 
+class JurisdictionAliasSuffixTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4" - final targeted correction: a heading's
+    trailing "in <jurisdiction>" suffix must be recognized for every
+    safe alias the country registry itself already knows for that
+    country, not only its canonical display name.
+    """
+
+    def test_recognizes_in_the_usa(self) -> None:
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="Social Media and Data Privacy in the USA",
+                country="United States",
+            ),
+            "Social Media and Data Privacy",
+        )
+
+    def test_recognizes_in_the_u_s(self) -> None:
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="Social Media and Data Privacy in the U.S.",
+                country="United States",
+            ),
+            "Social Media and Data Privacy",
+        )
+
+    def test_recognizes_in_the_u_s_a(self) -> None:
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="Social Media and Data Privacy in the U.S.A.",
+                country="United States",
+            ),
+            "Social Media and Data Privacy",
+        )
+
+    def test_recognizes_in_the_united_states(self) -> None:
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section=(
+                    "Social Media and Data Privacy "
+                    "in the United States"
+                ),
+                country="United States",
+            ),
+            "Social Media and Data Privacy",
+        )
+
+    def test_unrelated_country_suffix_still_works(self) -> None:
+        # Proves the fix generalizes through the registry, not a
+        # USA-only special case.
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="Social Media and Data Privacy in Canada",
+                country="Canada",
+            ),
+            "Social Media and Data Privacy",
+        )
+
+    def test_the_pronoun_us_is_never_read_as_united_states(self) -> None:
+        self.assertIsNone(
+            get_canonical_legal_topic(
+                section="The employer told us about social media",
+                country="United States",
+            )
+        )
+
+    def test_a_non_canonical_heading_mentioning_usa_invents_nothing(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            get_canonical_legal_topic(
+                section="Recent Developments in the USA",
+                country="United States",
+            )
+        )
+
+    def test_a_jurisdiction_mid_title_is_not_stripped(self) -> None:
+        # The alias appears in the middle, not as a terminal suffix -
+        # this must not resolve to any of the 11 canonical topics.
+        self.assertIsNone(
+            get_canonical_legal_topic(
+                section="In the USA, social media laws are strict",
+                country="United States",
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

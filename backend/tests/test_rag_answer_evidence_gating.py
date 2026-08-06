@@ -1166,6 +1166,160 @@ class PerActionEvidenceGatingTests(unittest.TestCase):
         self.assertIn("overtime rules", response.answer)
 
 
+class WrongCountryAndWrongTopicNeverLaunderedTests(unittest.TestCase):
+    """
+    Regression coverage for the scoped subject-overlap fallback.
+
+    The fallback is intentionally weaker than exact concept matching,
+    so it must only consider hits belonging to the expected country
+    and canonical legal topic. These tests simulate non-compliant
+    search functions returning fully overlapping content from the
+    wrong country or topic and prove that lexical overlap can never
+    launder either result into usable evidence.
+    """
+
+    def test_wrong_country_hit_with_full_subject_overlap_is_never_selected(
+        self,
+    ) -> None:
+        # A deliberately non-compliant, "leaky" search_function that
+        # ignores request.country_codes and always returns every
+        # country's hits - the CH hit below contains every one of the
+        # subject's own significant words, a worst case for the new
+        # fallback - yet must still never count towards ES, which was
+        # never given any hit of its own at all.
+        ch_hit = _build_hit(
+            chunk_id="chunk-ch",
+            country="Switzerland",
+            country_code="CH",
+            subsection="Non-Compete Clauses",
+            content=(
+                "A non-compete clause enforceability requires "
+                "limited duration and adequate compensation."
+            ),
+            legal_topic="Restrictive Covenants",
+        )
+
+        def leaky_on_country_search(request: object) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[ch_hit],
+            )
+
+        client = FakeGenerationClient(answer="unused")
+        metrics = _build_metrics("wrong-country-full-overlap")
+
+        specs = [
+            LegalActionEvidenceSpec(
+                country_codes=["ES"],
+                legal_topics=["Restrictive Covenants"],
+                subject_text="non-compete clause enforceability duration",
+                search_concepts=[
+                    ConversationSearchConcept(terms=["garden leave"])
+                ],
+                evidence_mode="direct_topic",
+            )
+        ]
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Is a non-compete clause enforceable in Spain?"
+                ),
+                country_codes=["ES"],
+            ),
+            search_function=leaky_on_country_search,
+            generation_client=client,
+            metrics=metrics,
+            action_specs=specs,
+        )
+
+        self.assertEqual(
+            metrics.evidence_status_by_country,
+            {"ES": "insufficient"},
+        )
+        self.assertFalse(client.called)
+        self.assertFalse(response.grounded)
+        self.assertEqual(response.sources, [])
+
+    def test_wrong_topic_hit_with_full_subject_overlap_is_never_selected(
+        self,
+    ) -> None:
+        # The hit belongs to the requested country and its content
+        # deliberately contains every significant subject word. Its
+        # canonical legal topic is nevertheless wrong. It must be
+        # discarded before evidence coverage and generation.
+        wrong_topic_hit = _build_hit(
+            chunk_id="chunk-wrong-topic",
+            country="Switzerland",
+            country_code="CH",
+            subsection="Annual Leave",
+            content=(
+                "A non-compete clause enforceability assessment "
+                "considers the clause duration and restrictions."
+            ),
+            legal_topic="Employee Benefits",
+        )
+
+        def leaky_on_topic_search(
+            request: object,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[wrong_topic_hit],
+            )
+
+        client = FakeGenerationClient(answer="unused")
+        metrics = _build_metrics(
+            "wrong-topic-full-overlap"
+        )
+
+        specs = [
+            LegalActionEvidenceSpec(
+                country_codes=["CH"],
+                legal_topics=["Restrictive Covenants"],
+                subject_text=(
+                    "non-compete clause enforceability duration"
+                ),
+                search_concepts=[
+                    ConversationSearchConcept(
+                        terms=["garden leave"]
+                    )
+                ],
+                evidence_mode="direct_topic",
+            )
+        ]
+
+        response = answer_legal_question(
+            request=LegalChatRequest(
+                question=(
+                    "Is a non-compete clause enforceable "
+                    "in Switzerland?"
+                ),
+                country_codes=["CH"],
+            ),
+            search_function=leaky_on_topic_search,
+            generation_client=client,
+            metrics=metrics,
+            action_specs=specs,
+        )
+
+        self.assertEqual(
+            metrics.evidence_status_by_country,
+            {"CH": "insufficient"},
+        )
+        self.assertFalse(client.called)
+        self.assertFalse(response.grounded)
+        self.assertEqual(response.sources, [])
+
+
 class RepairPipelineHardeningTests(unittest.TestCase):
     """
     Phase 3 hardening: the exact structural failure diagnosed live

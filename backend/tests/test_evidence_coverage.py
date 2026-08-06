@@ -393,6 +393,253 @@ class RelationRequiredEvidenceTests(unittest.TestCase):
         )
 
 
+class SubjectTextOverlapFallbackTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4" - chat capabilities and evidence stability:
+    the exact Swiss non-compete regression. Four reasonable
+    rephrasings of the same question ("enforceable", "rules",
+    "conditions", "summarise") must all retain at least one source
+    once retrieval already found the right country/topic hits - even
+    when a given phrasing's own model-generated search_concepts happen
+    not to literally appear in the hit text.
+    """
+
+    def setUp(self) -> None:
+        self.hit = _hit(
+            "A post-employment non-compete clause is enforceable "
+            "only if it is limited in duration, geographic scope, "
+            "and type of prohibited activity, and if the employee "
+            "received adequate compensation for the restriction.",
+            section="Restrictive Covenants",
+            subsection="Non-Compete Clauses",
+            country_code="CH",
+        )
+        self.subject_text = (
+            "post-employment non-compete clause conditions"
+        )
+
+    def test_enforceable_phrasing_matches_directly(self) -> None:
+        status = evaluate_evidence_status(
+            [self.hit],
+            [_Concept(["non-compete clause", "enforceable"])],
+            "direct_topic",
+            subject_text=self.subject_text,
+        )
+
+        self.assertEqual(status, "direct")
+
+    def test_rules_phrasing_matches_directly(self) -> None:
+        status = evaluate_evidence_status(
+            [self.hit],
+            [_Concept(["non-compete clause"])],
+            "direct_topic",
+            subject_text=self.subject_text,
+        )
+
+        self.assertEqual(status, "direct")
+
+    def test_conditions_phrasing_falls_back_to_partial(self) -> None:
+        # The model's own synonym generation for this phrasing does
+        # not literally appear in the hit ("validity requirements" is
+        # nowhere in the text) - the exact-phrase check alone would
+        # wrongly return "insufficient" despite the identical hit that
+        # the "enforceable"/"rules" phrasings above correctly matched.
+        status = evaluate_evidence_status(
+            [self.hit],
+            [_Concept(["validity requirements", "formal conditions"])],
+            "direct_topic",
+            subject_text=self.subject_text,
+        )
+
+        self.assertIn(status, ("direct", "partial"))
+        self.assertNotEqual(status, "insufficient")
+
+    def test_summarise_phrasing_falls_back_to_partial(self) -> None:
+        status = evaluate_evidence_status(
+            [self.hit],
+            [_Concept(["overview", "summary of rules"])],
+            "direct_topic",
+            subject_text=self.subject_text,
+        )
+
+        self.assertIn(status, ("direct", "partial"))
+        self.assertNotEqual(status, "insufficient")
+
+    def test_genuinely_unrelated_hit_still_insufficient(self) -> None:
+        # The counter-example the fallback must never paper over: a
+        # hit that is truly about something else entirely, sharing no
+        # meaningful vocabulary with the resolved subject at all.
+        unrelated_hit = _hit(
+            "Employees are entitled to twenty paid vacation days "
+            "per calendar year, prorated for partial years of "
+            "service.",
+            section="Employee Benefits",
+            subsection="Annual Leave",
+            country_code="CH",
+        )
+
+        status = evaluate_evidence_status(
+            [unrelated_hit],
+            [_Concept(["validity requirements", "formal conditions"])],
+            "direct_topic",
+            subject_text=self.subject_text,
+        )
+
+        self.assertEqual(status, "insufficient")
+
+    def test_no_subject_text_never_triggers_fallback(self) -> None:
+        # Without a resolved subject_text at all, behavior is exactly
+        # as before this fix - never a new source of false positives.
+        status = evaluate_evidence_status(
+            [self.hit],
+            [_Concept(["validity requirements", "formal conditions"])],
+            "direct_topic",
+        )
+
+        self.assertEqual(status, "insufficient")
+
+    def test_notice_followup_after_country_only_reply_keeps_a_source(
+        self,
+    ) -> None:
+        # The exact "Tell me about notice." / "Spain" regression: the
+        # inherited search_concepts from the first turn ("termination
+        # notice period") do not literally appear in the Spanish
+        # content's own wording, but the resolved subject_text
+        # ("notice") clearly does.
+        hit = _hit(
+            "An employer must give an employee at least fifteen "
+            "days' advance warning before ending the employment "
+            "relationship, extended by collective agreement for "
+            "longer-serving staff.",
+            section="Termination of Employment Contracts",
+            subsection="Notice Requirements",
+            country_code="ES",
+        )
+
+        status = evaluate_evidence_status(
+            [hit],
+            [_Concept(["termination notice period"])],
+            "direct_topic",
+            subject_text="notice",
+        )
+
+        self.assertNotEqual(status, "insufficient")
+
+    def test_relation_required_also_gets_the_fallback(self) -> None:
+        concepts = [
+            _Concept(["validity requirements"]),
+            _Concept(["formal conditions"]),
+        ]
+
+        status = evaluate_evidence_status(
+            [self.hit],
+            concepts,
+            "relation_required",
+            subject_text=self.subject_text,
+        )
+
+        self.assertIn(status, ("direct", "partial"))
+        self.assertNotEqual(status, "insufficient")
+
+
+class SubjectTextOverlapFallbackCounterExampleTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4" follow-up - counter-examples proving the
+    word-overlap fallback (SubjectTextOverlapFallbackTests above)
+    cannot itself be turned into a grounding bypass. Wrong-country and
+    wrong-topic rejection are proven at the rag_answer.py integration
+    level (test_rag_answer_evidence_gating.py's
+    WrongCountryAndWrongTopicNeverLaunderedTests): evaluate_evidence_
+    status has no country/topic parameter at all - country_code is
+    already used to bucket hits per country before this function ever
+    sees them (rag_answer.py's spec_hits_by_country), and legal_topic
+    is already a hard OpenSearch `terms` filter (test_legal_search.py's
+    test_build_query_with_filters) - so a hit for the wrong country or
+    topic never reaches this function in the first place. These tests
+    cover what genuinely is this function's own responsibility: a
+    subject_text built only from generic framing words, an
+    insufficient (minority) token overlap, and a right-country/right-
+    topic hit that simply does not support the specific detail asked.
+    """
+
+    def test_generic_only_subject_text_never_triggers_fallback_alone(
+        self,
+    ) -> None:
+        # "rules"/"conditions"/"information" describe the shape of the
+        # question, never a specific legal subject - a subject_text
+        # built only from such words must leave zero significant
+        # tokens, so the fallback can never fire from them alone, even
+        # though the hit happens to contain those exact words too.
+        hit = _hit(
+            "General information about workplace rules and "
+            "conditions applicable to all employees.",
+            section="Working Conditions",
+            subsection="General",
+            country_code="CH",
+        )
+
+        status = evaluate_evidence_status(
+            [hit],
+            [_Concept(["non-compete clause"])],
+            "direct_topic",
+            subject_text="What are the rules, conditions, and information?",
+        )
+
+        self.assertEqual(status, "insufficient")
+
+    def test_minority_token_overlap_stays_insufficient(self) -> None:
+        # Only one of the subject's several distinct significant
+        # tokens ("duration") appears in the hit - a genuine minority,
+        # never the majority the fallback requires.
+        subject_text = (
+            "post-employment non-compete clause geographic scope "
+            "limitation duration"
+        )
+        hit = _hit(
+            "Employees are entitled to a fixed duration of paid "
+            "annual leave each calendar year.",
+            section="Employee Benefits",
+            subsection="Annual Leave",
+            country_code="CH",
+        )
+
+        status = evaluate_evidence_status(
+            [hit],
+            [_Concept(["validity requirements"])],
+            "direct_topic",
+            subject_text=subject_text,
+        )
+
+        self.assertEqual(status, "insufficient")
+
+    def test_right_country_and_topic_but_absent_specific_detail(
+        self,
+    ) -> None:
+        # A hit genuinely from the right country and the right broad
+        # topic (Restrictive Covenants) - but about a different
+        # specific clause (non-solicitation) than the one actually
+        # asked about (garden leave compensation). The fallback must
+        # not manufacture support for a detail the hit never discusses,
+        # rather than a real absence of evidence being papered over.
+        hit = _hit(
+            "A non-solicitation clause prevents a former employee "
+            "from soliciting clients or colleagues for a defined "
+            "period after leaving the company.",
+            section="Restrictive Covenants",
+            subsection="Non-Solicitation Clauses",
+            country_code="CH",
+        )
+
+        status = evaluate_evidence_status(
+            [hit],
+            [_Concept(["garden leave pay", "continued salary"])],
+            "direct_topic",
+            subject_text="garden leave compensation entitlement",
+        )
+
+        self.assertEqual(status, "insufficient")
+
+
 class AnswerMentionsConceptsTests(unittest.TestCase):
     """Used only for subject_drift detection on the generated text."""
 
