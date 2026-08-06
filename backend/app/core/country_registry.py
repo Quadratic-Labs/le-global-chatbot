@@ -415,6 +415,30 @@ def canonical_country_name(
     ].display_name
 
 
+def country_name_and_aliases(
+    country_code: str,
+) -> tuple[str, ...]:
+    """
+    Return the display name and every registered alias for one
+    country code - the single, safe source other modules (for example
+    legal_taxonomy's jurisdiction-suffix stripping) must reuse instead
+    of ever keeping a second, independent list of country names.
+    """
+
+    normalized_code = normalize_country_code(
+        country_code
+    )
+
+    definition = _COUNTRIES_BY_CODE[
+        normalized_code
+    ]
+
+    return (
+        definition.display_name,
+        *definition.aliases,
+    )
+
+
 def resolve_country(
     raw_country: str,
     country_code: str | None = None,

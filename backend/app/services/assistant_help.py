@@ -84,6 +84,7 @@ _CONTRACTION_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\b(whats|what's)\b"
 )
 _CANT_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b(cant|can't)\b")
+_BARE_U_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bu\b")
 _PUNCTUATION_PATTERN: Final[re.Pattern[str]] = re.compile(r"[^\w\s']")
 _WHITESPACE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s+")
 
@@ -92,8 +93,9 @@ def _normalize(question: str) -> str:
     """
     Lowercase, unify curly/straight apostrophes and the "what's"/
     "whats" and "can't"/"cant" contraction pairs into one canonical
-    form each, strip all other punctuation, and collapse whitespace -
-    so every pattern below only ever needs to spell out one form.
+    form each, spell out the bare "u" text-speak abbreviation as
+    "you", strip all other punctuation, and collapse whitespace - so
+    every pattern below only ever needs to spell out one form.
     """
 
     text = question.casefold()
@@ -103,6 +105,7 @@ def _normalize(question: str) -> str:
     text = _PUNCTUATION_PATTERN.sub(" ", text)
     text = text.replace("'", " ")
     text = _WHITESPACE_PATTERN.sub(" ", text).strip()
+    text = _BARE_U_PATTERN.sub("you", text)
     return text
 
 
@@ -135,7 +138,7 @@ _CAPABILITIES_PATTERNS: Final[tuple[re.Pattern[str], ...]] = _compile_all(
     (
         r"\bwhat can you (do|answer|help)\b",
         r"\bwhat can i ask( you)?\b",
-        r"\bhow can you help\b",
+        r"\bhow (?:can you|you can) help\b",
         r"\bshow me what you can do\b",
         r"\bwhat do you know about\b",
         r"\bhelp me use this (chatbot|assistant|bot)\b",
@@ -194,7 +197,7 @@ _TOPICS_TOPIC_WORDS: Final[frozenset[str]] = frozenset(
     }
 )
 _TOPICS_SCOPE_VERBS: Final[frozenset[str]] = frozenset(
-    {"cover", "available", "answer", "explain", "ask"}
+    {"cover", "available", "answer", "explain", "ask", "help"}
 )
 
 
@@ -476,11 +479,20 @@ def detect_assistant_help_intent(
     if _is_identity_question(text):
         return AssistantHelpIntent(intent_type="assistant_identity")
 
-    if _is_capabilities_question(text):
-        return AssistantHelpIntent(intent_type="assistant_capabilities")
-
     if _is_topics_question(text):
+        # Checked ahead of _is_capabilities_question: a question
+        # explicitly naming "topics"/"themes" (e.g. "What employment
+        # law topics can you answer questions about?") also happens
+        # to satisfy that function's own broad "can/answer/help +
+        # question word" fallback - the explicit topics word makes
+        # the request for the 11-topic list unambiguous, and must win.
         return AssistantHelpIntent(intent_type="supported_legal_topics")
+
+    if _is_capabilities_question(text):
+        return AssistantHelpIntent(
+            intent_type="assistant_capabilities",
+            referenced_country_codes=country_codes,
+        )
 
     if _is_countries_targeted_question(text) and len(country_codes) == 1:
         return AssistantHelpIntent(
@@ -561,6 +573,37 @@ ASSISTANT_CAPABILITIES_ANSWER: Final[str] = (
     "- \"Compare termination notice in Australia and Peru.\"\n"
     "- \"Give me the contact details in the United Kingdom.\""
 )
+
+def _build_capabilities_answer(
+    country_codes: Sequence[str],
+) -> str:
+    """
+    The assistant_capabilities answer, naming every country the
+    question itself mentioned - never a documentary-insufficiency
+    message, since this is a meta question about what the assistant
+    can do, not a real request for a country's legal content (mission
+    "HOTFIX 0.4.4", section 2.6).
+    """
+
+    if not country_codes:
+        return ASSISTANT_CAPABILITIES_ANSWER
+
+    display_names = [
+        resolve_country_display_name(code) for code in country_codes
+    ]
+
+    countries_phrase = " and ".join(display_names)
+
+    return (
+        f"For {countries_phrase}, I can provide employment-law "
+        "information from the validated L&E Global documents, "
+        f"compare {countries_phrase} with other supported countries "
+        "on the same legal topic, and give you the contact details "
+        "of the local L&E Global member firm. Ask me a specific "
+        "employment-law question to get started, for example: "
+        f"\"Explain termination notice in {display_names[0]}.\""
+    )
+
 
 COMPARISON_CAPABILITIES_ANSWER: Final[str] = (
     "I can compare the same employment-law topic across two or more "
@@ -675,7 +718,7 @@ def build_assistant_help_answer(
         return ASSISTANT_IDENTITY_ANSWER
 
     if intent.intent_type == "assistant_capabilities":
-        return ASSISTANT_CAPABILITIES_ANSWER
+        return _build_capabilities_answer(intent.referenced_country_codes)
 
     if intent.intent_type == "supported_legal_topics":
         return _build_topics_answer()

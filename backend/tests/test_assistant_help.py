@@ -101,6 +101,8 @@ class AssistantCapabilitiesDetectionTests(unittest.TestCase):
         "What can I ask you?",
         "What can you help me with?",
         "How can you help?",
+        "How can u help?",
+        "How you can help me about Canada?",
         "Show me what you can do.",
         "Help.",
         "Help me use this chatbot.",
@@ -122,6 +124,85 @@ class AssistantCapabilitiesDetectionTests(unittest.TestCase):
             original_question="What can you do?",
         )
         self.assertLess(len(answer), 800)
+
+    def test_how_can_u_help_is_detected_despite_the_typo(self) -> None:
+        # Mission "HOTFIX 0.4.4" - the text-speak "u" abbreviation for
+        # "you" must be recognized exactly like the spelled-out form.
+        intent = _detect("How can u help?")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.intent_type, "assistant_capabilities")
+
+    def test_general_answer_describes_the_three_capabilities(
+        self,
+    ) -> None:
+        answer = build_assistant_help_answer(
+            _detect("How can u help?"),
+            original_question="How can u help?",
+        )
+        self.assertIn("country", answer.casefold())
+        self.assertIn("compare", answer.casefold())
+        self.assertIn("contact", answer.casefold())
+
+    def test_no_search_call_for_general_capabilities_question(
+        self,
+    ) -> None:
+        intent = _detect("How can u help?")
+        self.assertEqual(intent.referenced_country_codes, ())
+
+
+class CountrySpecificCapabilitiesDetectionTests(unittest.TestCase):
+    """
+    Mission "HOTFIX 0.4.4", section 2.6 - a capabilities question that
+    also names a country must mention that country explicitly, never
+    a documentary-insufficiency message, and never require OpenSearch.
+    """
+
+    def test_how_can_you_help_me_with_spain_names_spain(self) -> None:
+        intent = _detect("How can you help me with Spain?")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.intent_type, "assistant_capabilities")
+        self.assertEqual(intent.referenced_country_codes, ("ES",))
+
+        answer = build_assistant_help_answer(
+            intent, original_question="How can you help me with Spain?"
+        )
+        self.assertIn("Spain", answer)
+        self.assertNotIn("do not contain enough", answer)
+        self.assertNotIn("do not currently have", answer)
+
+    def test_how_can_you_help_me_about_canada_names_canada(self) -> None:
+        intent = _detect("How can you help me about Canada?")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.referenced_country_codes, ("CA",))
+
+        answer = build_assistant_help_answer(
+            intent,
+            original_question="How can you help me about Canada?",
+        )
+        self.assertIn("Canada", answer)
+        self.assertNotIn("do not contain enough", answer)
+        self.assertNotIn("do not currently have", answer)
+
+    def test_word_order_variant_also_names_canada(self) -> None:
+        intent = _detect("How you can help me about Canada?")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.referenced_country_codes, ("CA",))
+
+        answer = build_assistant_help_answer(
+            intent,
+            original_question="How you can help me about Canada?",
+        )
+        self.assertIn("Canada", answer)
+
+    def test_a_real_legal_question_naming_help_still_reaches_legal_pipeline(
+        self,
+    ) -> None:
+        # Must NOT be captured as a simple capabilities question -
+        # this continues to legal/RequestUnderstanding processing.
+        intent = _detect(
+            "Can you help me understand termination notice in Spain?"
+        )
+        self.assertIsNone(intent)
 
 
 class SupportedLegalTopicsDetectionTests(unittest.TestCase):

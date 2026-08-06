@@ -1,6 +1,12 @@
 import re
 from typing import Final
 
+from app.core.country_registry import (
+    UnknownCountryNameError,
+    country_code_from_name,
+    country_name_and_aliases,
+)
+
 
 LEGAL_TOPICS: Final[tuple[str, ...]] = (
     "Hiring Practices",
@@ -110,10 +116,28 @@ def _clean_label(value: str) -> str:
     return without_trailing_decoration.strip()
 
 
+def _with_the_variant(
+    name: str,
+) -> tuple[str, ...]:
+    """A name plus its "the <name>" / stripped-"the " counterpart."""
+
+    if name.casefold().startswith("the "):
+        return (name, name[4:].strip())
+
+    return (name, f"the {name}")
+
+
 def _country_name_variants(
     country: str | None,
 ) -> tuple[str, ...]:
-    """Return accepted country-label variants."""
+    """
+    Return every safe label variant a heading may use for one
+    country - its own raw label, plus, when it resolves to a
+    registered country, every alias the country registry itself
+    already knows (for example "USA", "U.S.", "U.S.A." for "United
+    States") - never a second, independent list of country names
+    (mission "HOTFIX 0.4.4", final targeted correction).
+    """
 
     if country is None:
         return ()
@@ -125,19 +149,28 @@ def _country_name_variants(
     if not normalized_country:
         return ()
 
-    variants = {
-        normalized_country,
-    }
+    known_names = (normalized_country,)
 
-    if normalized_country.casefold().startswith(
-        "the "
-    ):
-        variants.add(
-            normalized_country[4:].strip()
+    try:
+        resolved_code = country_code_from_name(
+            normalized_country
         )
+
+    except UnknownCountryNameError:
+        pass
+
     else:
-        variants.add(
-            f"the {normalized_country}"
+        known_names = country_name_and_aliases(
+            resolved_code
+        )
+
+    variants: set[str] = set()
+
+    for name in known_names:
+        variants.update(
+            _with_the_variant(
+                _normalize_text(name)
+            )
         )
 
     return tuple(
