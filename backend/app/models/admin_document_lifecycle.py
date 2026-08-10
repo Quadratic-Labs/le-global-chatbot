@@ -37,6 +37,7 @@ class AdminDocumentDeleteResponse(BaseModel):
 
     deleted_chunks: int
     source_file_deleted: bool
+    source_cleanup_deferred: bool = False
 
     class Config:
         extra = "forbid"

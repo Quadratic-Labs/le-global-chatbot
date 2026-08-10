@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.4.8';
+    private const VERSION = '0.4.9';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -1136,13 +1136,44 @@ final class LE_Global_Chatbot_Admin
 
         self::redirect_with_notice(
             'success',
-            sprintf(
-                '%s was deleted successfully. %s indexed chunks were removed.',
+            self::build_delete_success_message(
                 $filename,
-                number_format_i18n(
-                    $deleted_chunks
-                )
+                $deleted_chunks,
+                isset($result['body']['source_cleanup_deferred'])
+                && $result['body']['source_cleanup_deferred'] === true
             )
+        );
+    }
+
+    /**
+     * The delete itself always succeeded when this is called
+     * (status_code=200 was already checked by the caller) -
+     * $source_cleanup_deferred=true can mean either that other
+     * documents still share this country (no physical file could be
+     * safely retired yet) OR that the backend's own best-effort
+     * backup-file cleanup failed after an already-successful,
+     * committed index delete (mission "HOTFIX 0.4.9" review 2,
+     * section 3) - two different causes, so the message stays
+     * deliberately generic rather than naming a specific one that
+     * would be wrong half the time. Either way this is never an
+     * error: the delete itself is done.
+     */
+    private static function build_delete_success_message(
+        string $filename,
+        int $deleted_chunks,
+        bool $source_cleanup_deferred
+    ): string {
+        return sprintf(
+            (
+                $source_cleanup_deferred
+                ? '%s was deleted successfully. %s indexed '
+                    . 'chunks were removed. Source-file cleanup '
+                    . 'is deferred.'
+                : '%s was deleted successfully. %s indexed '
+                    . 'chunks were removed.'
+            ),
+            $filename,
+            number_format_i18n($deleted_chunks)
         );
     }
 
@@ -1421,6 +1452,25 @@ final class LE_Global_Chatbot_Admin
             return trim(
                 $body['detail']
             );
+        }
+
+        // FastAPI's own automatic request-validation errors (a
+        // missing/malformed multipart field, caught before the admin
+        // router's business logic ever runs) shape `detail` as a
+        // list of {loc, msg, type} objects, never a string or a
+        // {message: ...} object - silently falling through to the
+        // generic fallback here previously discarded a real,
+        // structured reason (mission "HOTFIX 0.4.9" review).
+        if (
+            isset($body['detail'])
+            && is_array($body['detail'])
+            && isset($body['detail'][0])
+            && is_array($body['detail'][0])
+            && isset($body['detail'][0]['msg'])
+            && is_string($body['detail'][0]['msg'])
+            && trim($body['detail'][0]['msg']) !== ''
+        ) {
+            return trim($body['detail'][0]['msg']);
         }
 
         if (

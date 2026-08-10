@@ -96,6 +96,36 @@
         return "The document could not be indexed.";
     }
 
+    // The backend's own structured 409 payload (document_replacement_
+    // required/document_already_current), as the WordPress AJAX proxy
+    // relays it: wp_send_json_error wraps whatever the proxy passed as
+    // {success:false, data:{message, detail}} - detail is only ever a
+    // plain object for these two codes (the proxy sends [] for a plain
+    // string backend `detail`, e.g. a 422/500), never a string itself.
+    function extractStructuredDetail(payload) {
+        if (
+            payload
+            && payload.data
+            && payload.data.detail
+            && typeof payload.data.detail === "object"
+            && !Array.isArray(payload.data.detail)
+        ) {
+            return payload.data.detail;
+        }
+
+        return null;
+    }
+
+    function isReplacementRequiredResponse(statusCode, payload) {
+        const detail = extractStructuredDetail(payload);
+
+        return (
+            statusCode === 409
+            && detail !== null
+            && detail.code === "document_replacement_required"
+        );
+    }
+
     uploadForm.addEventListener(
         "submit",
         async (event) => {
@@ -117,21 +147,16 @@
                     false
                 );
 
-                const detail = (
-                    result.payload
-                    && result.payload.data
-                    && result.payload.data.detail
-                    && typeof result.payload.data.detail === "object"
-                )
-                    ? result.payload.data.detail
-                    : null;
-
                 if (
-                    result.response.status === 409
-                    && detail
-                    && detail.code
-                        === "document_replacement_required"
+                    isReplacementRequiredResponse(
+                        result.response.status,
+                        result.payload
+                    )
                 ) {
+                    const detail = extractStructuredDetail(
+                        result.payload
+                    );
+
                     const country = (
                         typeof detail.country === "string"
                         && detail.country.trim() !== ""
@@ -198,4 +223,15 @@
             }
         }
     );
+
+    // Test-only hook: absent in the browser (module is never defined
+    // there), so this changes nothing about how the admin page itself
+    // loads or runs - see assets/chatbot.js for the identical pattern.
+    if (typeof module !== "undefined" && module.exports) {
+        module.exports = {
+            errorMessage,
+            extractStructuredDetail,
+            isReplacementRequiredResponse,
+        };
+    }
 })();

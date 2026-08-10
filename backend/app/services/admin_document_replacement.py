@@ -27,7 +27,6 @@ from app.services.admin_documents import (
     _safe_unlink,
     _sanitize_filename,
     _write_upload,
-    upload_and_index_document,
 )
 from app.services.document_chunk_builder import (
     DOCUMENT_FAMILY,
@@ -124,7 +123,6 @@ CountryDocumentLookup = Callable[
     list[ExistingCountryDocument],
 ]
 CountryDocumentIndexer = Callable[..., DocumentIndexingResult]
-FreshDocumentUploader = Callable[..., AdminDocumentUploadResponse]
 
 
 def _required_string(
@@ -306,14 +304,24 @@ def safe_upload_and_index_document(
     country_document_indexer: CountryDocumentIndexer = (
         replace_country_document_chunks
     ),
-    fresh_document_uploader: FreshDocumentUploader = (
-        upload_and_index_document
-    ),
 ) -> AdminDocumentUploadResponse:
     """
     Upload one DOCX with explicit country-level replacement approval.
 
-    A fresh country delegates to the established upload implementation.
+    file_stream is staged and chunk_builder is invoked exactly once,
+    regardless of whether the detected country is brand new or already
+    active - a fresh country and a confirmed replacement share the
+    exact same write-then-index tail below (country_document_indexer
+    tolerates a country with zero prior chunks - see
+    replace_country_document_chunks's own snapshot/delete-stale logic -
+    so there is no separate "fresh" indexing implementation to fall
+    back to). Earlier versions re-staged and re-parsed the upload a
+    second time through a delegated legacy implementation for a fresh
+    country, which depended on file_stream still being fully re-
+    readable after already being consumed once - fragile by
+    construction, and never necessary in the first place (mission
+    "HOTFIX 0.4.9").
+
     An existing country is never changed unless replace_existing=True.
     """
 
@@ -330,7 +338,7 @@ def safe_upload_and_index_document(
         )
 
         with tempfile.TemporaryDirectory(
-            prefix="document-upload-preflight-",
+            prefix="document-upload-",
             dir=processed_directory,
         ) as temporary_directory:
             staged_path = (
@@ -372,23 +380,6 @@ def safe_upload_and_index_document(
                     "before upload."
                 ) from error
 
-            if not existing_documents:
-                try:
-                    file_stream.seek(0)
-
-                except (AttributeError, OSError):
-                    pass
-
-                return fresh_document_uploader(
-                    filename=safe_filename,
-                    file_stream=file_stream,
-                    source_directory=source_directory,
-                    processed_directory=processed_directory,
-                    maximum_bytes=maximum_bytes,
-                    client=client,
-                    chunk_builder=chunk_builder,
-                )
-
             existing_paths = resolve_country_source_paths(
                 source_root=source_directory,
                 country_code=country_code,
@@ -414,7 +405,7 @@ def safe_upload_and_index_document(
                     country_code=country_code,
                 )
 
-            if not replace_existing:
+            if existing_documents and not replace_existing:
                 raise AdminDocumentReplacementRequiredError(
                     country=first_chunk.country,
                     country_code=country_code,
@@ -479,7 +470,11 @@ def safe_upload_and_index_document(
                 _safe_unlink(backup_path)
 
             return AdminDocumentUploadResponse(
-                status="replaced",
+                status=(
+                    "replaced"
+                    if existing_documents
+                    else "uploaded"
+                ),
                 document_id=indexing_result.document_id,
                 source_filename=safe_filename,
                 country=first_chunk.country,
