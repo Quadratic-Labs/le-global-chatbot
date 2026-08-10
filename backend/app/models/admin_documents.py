@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AdminDocumentSummary(BaseModel):
@@ -52,6 +52,9 @@ class AdminDocumentUploadResponse(BaseModel):
     indexed_chunks: int
     stale_chunks_deleted: int
     replaced_source_file: bool
+    replaced_document_ids: list[str] = Field(
+        default_factory=list
+    )
 
     class Config:
         extra = "forbid"
