@@ -36,6 +36,7 @@ ConversationMetaIntent = Literal[
     "greeting",
     "wellbeing",
     "gratitude",
+    "acknowledgement",
     "farewell",
     "reset",
     "assistant_identity",
@@ -117,6 +118,35 @@ _GRATITUDE_PHRASES: Final[frozenset[str]] = frozenset(
     }
 )
 
+_GRATITUDE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^(?:thank you|thanks|thx|tnx)(?: a lot| so much| very much)?$",
+        r"^(?:thank you|thanks) (?:that|this) was helpful$",
+        r"^(?:thank you|thanks) (?:im|i am) fine$",
+        r"^(?:thank you|thanks) for (?:the|your) help$",
+    )
+)
+
+_ACKNOWLEDGEMENT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^(?:a+ )?(?:ok|okay)$",
+        r"^(?:no problem|got it|understood|alright|all right|sounds good)$",
+    )
+)
+
+_AFFIRMATION_PHRASES: Final[frozenset[str]] = frozenset(
+    {
+        "yes",
+        "yes please",
+        "correct",
+        "thats right",
+        "that is right",
+        "exactly",
+    }
+)
+
 _FAREWELL_PHRASES: Final[frozenset[str]] = frozenset(
     {
         "bye",
@@ -125,6 +155,14 @@ _FAREWELL_PHRASES: Final[frozenset[str]] = frozenset(
         "see you later",
         "have a nice day",
     }
+)
+
+_FAREWELL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^(?:(?:thank you|thanks) )?thats all(?: for now)?$",
+        r"^(?:thank you|thanks) (?:bye|goodbye)$",
+    )
 )
 
 _CAPABILITY_FOLLOWUPS: Final[frozenset[str]] = frozenset(
@@ -143,6 +181,7 @@ _CAPABILITY_PHRASES: Final[tuple[re.Pattern[str], ...]] = tuple(
     re.compile(pattern)
     for pattern in (
         r"^what (else )?can you (do|help with|answer)$",
+        r"^what (else )?can you help( me)? with$",
         r"^how can you help( me)?$",
         r"^how you can help( me)?$",
         r"^can you help me$",
@@ -226,11 +265,39 @@ def _normalize(value: str) -> str:
     text = re.sub(r"\bwhats\b", "what is", text)
     text = _NON_ALPHANUMERIC.sub(" ", text)
     text = text.replace("'", " ")
+    text = re.sub(r"\bthat\s+s\b", "thats", text)
+    text = re.sub(r"\bi\s+m\b", "im", text)
     return _WHITESPACE.sub(" ", text).strip()
 
 
 def _tokens(text: str) -> set[str]:
     return set(text.split())
+
+
+def _matches_any_pattern(
+    text: str,
+    patterns: Sequence[re.Pattern[str]],
+) -> bool:
+    return any(pattern.fullmatch(text) for pattern in patterns)
+
+
+def _history_country_suggestion_code(
+    history: Sequence[Any],
+) -> str | None:
+    """Return the country offered by the latest deterministic suggestion."""
+
+    for value in _history_values(history, role="assistant", maximum=4):
+        normalized = _normalize(value)
+
+        if not normalized.startswith("did you mean "):
+            continue
+
+        country_codes = detect_mentioned_country_codes(value)
+
+        if country_codes:
+            return country_codes[0]
+
+    return None
 
 
 def _history_values(
@@ -457,15 +524,15 @@ def _availability_answer(
     if unavailable:
         verb = "is" if len(unavailable) == 1 else "are"
 
-        noun = (
-            "country"
+        validity_phrase = (
+            "a valid country"
             if len(unavailable) == 1
-            else "countries"
+            else "valid countries"
         )
 
         sections.append(
             f"{_join_names(unavailable)} "
-            f"{verb} valid {noun}, but we do not currently have "
+            f"{verb} {validity_phrase}, but we do not currently have "
             f"validated corpus coverage for "
             f"{'it' if len(unavailable) == 1 else 'them'}."
         )
@@ -501,6 +568,21 @@ def _is_topics_query(text: str) -> bool:
 
     if not tokens & topic_words:
         return False
+
+    concise_catalogue_words = {
+        "and",
+        "the",
+        "what",
+        "which",
+        "about",
+        "legal",
+        "employment",
+        "law",
+        *topic_words,
+    }
+
+    if tokens <= concise_catalogue_words:
+        return True
 
     explicit_catalogue_words = {
         "list",
@@ -562,6 +644,18 @@ def _is_country_catalogue_query(text: str) -> bool:
     if not tokens & country_words:
         return False
 
+    concise_catalogue_words = {
+        "and",
+        "the",
+        "what",
+        "which",
+        "about",
+        *country_words,
+    }
+
+    if tokens <= concise_catalogue_words:
+        return True
+
     if "how many" in text:
         return True
 
@@ -602,6 +696,7 @@ def _is_targeted_country_availability(
             "are available",
             "is supported",
             "are supported",
+            "do you have data",
             "do you have information",
             "do you have documents",
             "can you help with",
@@ -676,18 +771,62 @@ def _country_typo_candidates() -> tuple[
     return tuple(candidates)
 
 
+def _country_typo_fragment(text: str) -> str | None:
+    """Extract a country-like fragment from a natural availability query."""
+
+    patterns = (
+        re.compile(
+            r"^(?:and )?(?:what|how) about (?P<country>[a-z][a-z ]{2,30})$"
+        ),
+        re.compile(
+            r"^(?:no )?(?:i )?(?:mean|ask about|asked about) "
+            r"(?P<country>[a-z][a-z ]{2,30})$"
+        ),
+        re.compile(
+            r"^(?:do|can) you (?:have|support|cover) "
+            r"(?:(?:data|information|documents|coverage) )?"
+            r"(?:(?:for|on|about|in) )?"
+            r"(?P<country>[a-z][a-z ]{2,30})$"
+        ),
+        re.compile(
+            r"^(?:is|are) (?P<country>[a-z][a-z ]{2,30}) "
+            r"(?:available|supported|covered)$"
+        ),
+    )
+
+    for pattern in patterns:
+        match = pattern.fullmatch(text)
+
+        if match is not None:
+            return match.group("country").strip()
+
+    if len(text.split()) <= 3:
+        candidate = " ".join(
+            token
+            for token in text.split()
+            if token
+            not in {
+                "and",
+                "what",
+                "about",
+                "please",
+                "country",
+                "the",
+                "no",
+                "i",
+                "mean",
+            }
+        )
+
+        return candidate or None
+
+    return None
+
+
 def _suggest_country_code(
     text: str,
 ) -> str | None:
-    candidate_text = " ".join(
-        token
-        for token in text.split()
-        if token not in {
-            "please",
-            "country",
-            "the",
-        }
-    )
+    candidate_text = _country_typo_fragment(text)
 
     if not candidate_text:
         return None
@@ -733,7 +872,7 @@ def _suggest_country_code(
     minimum_score = (
         0.86
         if len(candidate_text) <= 4
-        else 0.78
+        else 0.75
     )
 
     if best_score < minimum_score:
@@ -774,6 +913,30 @@ def resolve_conversation_meta(
             preserve_conversation_state=False,
         )
 
+    if text in _AFFIRMATION_PHRASES:
+        suggested_code = _history_country_suggestion_code(history)
+
+        if suggested_code is not None:
+            catalog = _safe_catalog(catalog_provider)
+
+            if catalog is None:
+                answer = (
+                    "The supported-country catalogue is temporarily "
+                    "unavailable. Please try again shortly."
+                )
+            else:
+                answer = _availability_answer(
+                    [suggested_code],
+                    catalog,
+                    comparison=False,
+                )
+
+            return ConversationMetaResolution(
+                intent_type="targeted_country_availability",
+                answer=answer,
+                preserve_conversation_state=False,
+            )
+
     if text in _GREETING_PHRASES:
         return ConversationMetaResolution(
             intent_type="greeting",
@@ -792,7 +955,22 @@ def resolve_conversation_meta(
             ),
         )
 
-    if text in _GRATITUDE_PHRASES:
+    if text in _FAREWELL_PHRASES:
+        return ConversationMetaResolution(
+            intent_type="farewell",
+            answer="Goodbye. Have a nice day.",
+        )
+
+    if _matches_any_pattern(text, _FAREWELL_PATTERNS):
+        return ConversationMetaResolution(
+            intent_type="farewell",
+            answer="You’re welcome. Goodbye. Have a nice day.",
+        )
+
+    if text in _GRATITUDE_PHRASES or _matches_any_pattern(
+        text,
+        _GRATITUDE_PATTERNS,
+    ):
         return ConversationMetaResolution(
             intent_type="gratitude",
             answer=(
@@ -801,10 +979,13 @@ def resolve_conversation_meta(
             ),
         )
 
-    if text in _FAREWELL_PHRASES:
+    if _matches_any_pattern(text, _ACKNOWLEDGEMENT_PATTERNS):
         return ConversationMetaResolution(
-            intent_type="farewell",
-            answer="Goodbye. Have a nice day.",
+            intent_type="acknowledgement",
+            answer=(
+                "No problem. I’m here when you need employment-law "
+                "information."
+            ),
         )
 
     if any(
@@ -1115,11 +1296,7 @@ def resolve_conversation_meta(
                 answer=(
                     f"Did you mean {display_name}? {availability}"
                 ),
-                preserve_conversation_state=(
-                    _preserve_pending_state(
-                        conversation_state
-                    )
-                ),
+                preserve_conversation_state=False,
             )
 
     return None

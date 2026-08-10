@@ -85,6 +85,37 @@ class SmallTalkTests(unittest.TestCase):
             result.answer.casefold(),
         )
 
+    def test_extended_gratitude_is_natural(self) -> None:
+        for question in (
+            "Thank you, that was helpful.",
+            "Thank you im fine",
+        ):
+            with self.subTest(question=question):
+                result = _resolution(question)
+
+                self.assertEqual(result.intent_type, "gratitude")
+                self.assertIn("welcome", result.answer.casefold())
+
+    def test_acknowledgements_are_natural(self) -> None:
+        for question in ("aaa ok", "no problem"):
+            with self.subTest(question=question):
+                result = _resolution(question)
+
+                self.assertEqual(
+                    result.intent_type,
+                    "acknowledgement",
+                )
+                self.assertNotIn(
+                    "clarify",
+                    result.answer.casefold(),
+                )
+
+    def test_gratitude_and_farewell_is_natural(self) -> None:
+        result = _resolution("Thanks, that's all for now.")
+
+        self.assertEqual(result.intent_type, "farewell")
+        self.assertIn("nice day", result.answer.casefold())
+
     def test_smalltalk_does_not_capture_a_legal_question(
         self,
     ) -> None:
@@ -150,6 +181,19 @@ class CapabilityTests(unittest.TestCase):
     ) -> None:
         self.assertIsNone(_resolution("What else?"))
 
+    def test_what_else_can_you_help_me_with_is_recognised(
+        self,
+    ) -> None:
+        result = _resolution(
+            "What else can you help me with?"
+        )
+
+        self.assertEqual(
+            result.intent_type,
+            "assistant_capabilities",
+        )
+        self.assertIn("compare", result.answer.casefold())
+
     def test_comparison_capability_variant(self) -> None:
         result = _resolution(
             "Can you do comparisons too?"
@@ -196,6 +240,34 @@ class CatalogueTests(unittest.TestCase):
             "supported_countries",
         )
 
+    def test_concise_topic_catalogue_question(self) -> None:
+        result = _resolution("whitch topics")
+
+        self.assertEqual(
+            result.intent_type,
+            "supported_legal_topics",
+        )
+
+    def test_concise_country_catalogue_followup(self) -> None:
+        result = _resolution(
+            "And countries?",
+            history=[
+                {
+                    "role": "assistant",
+                    "content": (
+                        "You can ask about the following canonical "
+                        "employment-law topics."
+                    ),
+                }
+            ],
+        )
+
+        self.assertEqual(
+            result.intent_type,
+            "supported_countries",
+        )
+        self.assertIn("3 countries", result.answer)
+
     def test_targeted_unavailable_country(self) -> None:
         result = _resolution(
             "Do you support Tunisia?"
@@ -210,6 +282,65 @@ class CatalogueTests(unittest.TestCase):
             "do not currently have",
             result.answer,
         )
+        self.assertIn(
+            "Tunisia is a valid country",
+            result.answer,
+        )
+
+    def test_embedded_country_typo_is_suggested(self) -> None:
+        result = _resolution(
+            "Do you have data for Egypte?",
+            history=[
+                {"role": "user", "content": "What about France?"},
+                {
+                    "role": "assistant",
+                    "content": "France is not currently available.",
+                },
+                {"role": "user", "content": "What about Tunisia?"},
+            ],
+            conversation_state=SimpleNamespace(
+                pending_clarification=None,
+            ),
+        )
+
+        self.assertEqual(
+            result.intent_type,
+            "country_suggestion",
+        )
+        self.assertIn("Did you mean Egypt", result.answer)
+        self.assertNotIn("France", result.answer)
+        self.assertNotIn("Tunisia", result.answer)
+        self.assertFalse(result.preserve_conversation_state)
+
+    def test_country_correction_inside_natural_phrase(self) -> None:
+        result = _resolution("No, I ask about tunsie")
+
+        self.assertEqual(
+            result.intent_type,
+            "country_suggestion",
+        )
+        self.assertIn("Did you mean Tunisia", result.answer)
+
+    def test_yes_confirms_the_latest_country_suggestion(self) -> None:
+        result = _resolution(
+            "yes",
+            history=[
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Did you mean Tunisia? Tunisia is not currently "
+                        "available in the validated corpus."
+                    ),
+                }
+            ],
+        )
+
+        self.assertEqual(
+            result.intent_type,
+            "targeted_country_availability",
+        )
+        self.assertIn("Tunisia is a valid country", result.answer)
+        self.assertFalse(result.preserve_conversation_state)
 
     def test_mixed_supported_and_unsupported_comparison(
         self,

@@ -756,7 +756,8 @@ second action.
 
 Use the conversation history to resolve references such as "there",
 "locally", "that country", "the first/second/other country", "the same
-rule", "what about X", "add X", "actually", or "instead". A later message
+rule", "the same information", "do the same for X", "what about X",
+"add X", "actually", or "instead". A later message
 expressing a new objective always takes priority - never keep an
 intention from an earlier turn once the latest message expresses a
 different one. If an ordinal or other reference cannot be reliably
@@ -777,8 +778,9 @@ is explicitly stated), "select_action" (the state offered more than one
 action and this message picks one), or "ambiguous" (cannot be determined).
 A message naming only a country, with no new action/subject/topic of its
 own, is "replace_country" whenever the prior state has exactly one
-action; it is "select_action" or "ambiguous" when the prior state held
-more than one.
+action; the same is true for a one-country formulation such as "give me
+the same information for X" or "do the same for X". It is
+"select_action" or "ambiguous" when the prior state held more than one.
 
 For every legal_information or comparison action, also identify the
 precise sub-topic actually asked about, distinct from its broad
