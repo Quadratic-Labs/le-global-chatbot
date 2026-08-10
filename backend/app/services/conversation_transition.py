@@ -23,6 +23,8 @@ retrieval (see RULE 4 below, and the 0.4.2 mission's rectificatif C).
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 
 from app.models.conversation_state import (
@@ -33,6 +35,8 @@ from app.models.conversation_state import (
     ConversationState,
 )
 from app.services.country_detection import (
+    detect_mentioned_country_codes,
+    get_country_name_variants,
     is_country_only_followup,
     resolve_country_display_name,
 )
@@ -46,6 +50,64 @@ from app.services.request_understanding import (
     RequestUnderstandingAction,
     RequestUnderstandingResult,
 )
+
+
+_SAME_SUBJECT_FOLLOWUP_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^(?:now )?(?:please )?(?:(?:give|show|tell)(?: me)? )?"
+        r"(?:the )?same (?:information|info|details|rules|topic|subject|thing)"
+        r"(?: for| in| about)?$",
+        r"^(?:and )?(?:now )?(?:please )?do (?:the )?same"
+        r"(?: for| in| about)?$",
+        r"^(?:and )?(?:now )?(?:please )?(?:the )?same"
+        r"(?: for| in| about)$",
+    )
+)
+
+
+def _normalize_followup_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    without_diacritics = "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", without_diacritics).split())
+
+
+def _same_subject_country_followup(
+    question: str,
+) -> list[str] | None:
+    """Recognize a one-country request that reuses the prior subject."""
+
+    country_codes = detect_mentioned_country_codes(question)
+
+    if len(country_codes) != 1:
+        return None
+
+    working = question
+
+    for variant in (
+        *get_country_name_variants(country_codes[0]),
+        resolve_country_display_name(country_codes[0]),
+    ):
+        working = re.sub(
+            rf"(?<!\w){re.escape(variant)}(?!\w)",
+            " ",
+            working,
+            flags=re.IGNORECASE,
+        )
+
+    normalized = _normalize_followup_text(working)
+
+    if any(
+        pattern.fullmatch(normalized)
+        for pattern in _SAME_SUBJECT_FOLLOWUP_PATTERNS
+    ):
+        return country_codes
+
+    return None
 
 
 class ConversationTransitionError(RuntimeError):
@@ -584,6 +646,43 @@ def _correct_delta_for_country_only_followup(
     )
 
 
+def _correct_delta_for_same_subject_country_followup(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """Make "same information for X" reuse one prior subject locally."""
+
+    if (
+        current_question is None
+        or len(conversation_state.actions) != 1
+        or conversation_state.actions[0].type == "comparison"
+        or hints.comparison_signal
+        or hints.strong_contact_signal
+        or hints.current_legal_topics
+    ):
+        return result
+
+    country_codes = _same_subject_country_followup(current_question)
+
+    if country_codes is None:
+        return result
+
+    return result.model_copy(
+        update={
+            "current_message_delta": CurrentMessageDelta(
+                explicit_action_types=[],
+                explicit_country_codes=country_codes,
+                explicit_legal_topics=[],
+                explicit_subject_text=None,
+                context_operation="replace_country",
+            )
+        }
+    )
+
+
 def apply_conversation_transition(
     *,
     result: RequestUnderstandingResult,
@@ -623,6 +722,12 @@ def apply_conversation_transition(
     result = _correct_delta_for_country_only_followup(
         result=result,
         conversation_state=canonicalized_state,
+        current_question=current_question,
+    )
+    result = _correct_delta_for_same_subject_country_followup(
+        result=result,
+        conversation_state=canonicalized_state,
+        hints=hints,
         current_question=current_question,
     )
 

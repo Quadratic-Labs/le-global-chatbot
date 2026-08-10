@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Final
 
@@ -22,15 +22,23 @@ from app.models.admin_document_lifecycle import (
     AdminDocumentReindexResponse,
 )
 from app.models.document import DocumentChunk
+from app.services.admin_document_replacement import (
+    ExistingCountryDocument,
+    lookup_existing_country_documents,
+)
 from app.services.document_chunk_builder import (
     build_document_chunks_from_docx,
 )
 from app.services.document_indexer import (
+    DEFAULT_BULK_CHUNK_SIZE,
     DocumentIndexingResult,
+    _restore_country_snapshot,
+    _snapshot_country_chunks,
     replace_document_chunks,
 )
 from app.services.document_source_resolver import (
     DocumentSourceConflictError,
+    resolve_country_source_paths,
     resolve_document_source_path,
 )
 from app.services.opensearch_index import (
@@ -89,6 +97,25 @@ class AdminDocumentSourceConflictError(RuntimeError):
 
 class AdminDocumentLifecycleError(RuntimeError):
     """Raised when a document lifecycle operation fails."""
+
+
+class DeleteBackupRestoreError(RuntimeError):
+    """
+    Raised when restoring one or more delete backups to their
+    original, active path fails - the caller must never assume a
+    silent, complete rollback happened just because it *attempted*
+    one (mission "HOTFIX 0.4.9" review 2, section 4). Every backup is
+    still attempted, even after an earlier one fails; this reports
+    every path that could not be restored, never just the first.
+    """
+
+    def __init__(self, failed_paths: Sequence[Path]) -> None:
+        self.failed_paths = tuple(failed_paths)
+
+        super().__init__(
+            "Failed to restore backup(s) for: "
+            + ", ".join(str(path) for path in failed_paths)
+        )
 
 
 def _validate_document_id(
@@ -250,10 +277,144 @@ def _get_document_metadata(
     return source
 
 
+def _validate_delete_by_query_response(
+    response: Any,
+    *,
+    expected_chunks: int | None = None,
+) -> int:
+    """
+    Validate one delete_by_query response and return its deleted
+    count - shared by every delete_by_query caller in this module
+    (mission "HOTFIX 0.4.9" review 3, section 1; review 4 extends
+    this to the stray-chunk cleanup used by reindex's rollback).
+
+    A response is trusted only once every integrity field it can
+    report has been validated. conflicts="proceed" means the query
+    keeps going past a version conflict rather than aborting it - so
+    a response can legitimately report chunks genuinely deleted
+    server-side alongside a non-zero version_conflicts count, a
+    per-shard failure, or a timeout. None of that is acceptable for a
+    destructive ADMIN operation: a PARTIAL deletion must never be
+    reported as success. When expected_chunks is supplied, deleted
+    must equal it exactly - anything else, including a smaller
+    positive count, is an incomplete deletion.
+    """
+
+    if not isinstance(
+        response,
+        dict,
+    ):
+        raise AdminDocumentLifecycleError(
+            "OpenSearch returned an invalid "
+            "document deletion response."
+        )
+
+    if response.get("timed_out", False):
+        raise AdminDocumentLifecycleError(
+            "OpenSearch document deletion timed out."
+        )
+
+    failures = response.get("failures", [])
+
+    if not isinstance(failures, list):
+        raise AdminDocumentLifecycleError(
+            "OpenSearch returned an invalid "
+            "document deletion failure list."
+        )
+
+    if failures:
+        raise AdminDocumentLifecycleError(
+            "OpenSearch document deletion reported "
+            f"{len(failures)} failure(s)."
+        )
+
+    try:
+        version_conflicts = int(
+            response.get("version_conflicts", 0)
+        )
+
+    except (TypeError, ValueError) as error:
+        raise AdminDocumentLifecycleError(
+            "OpenSearch returned an invalid "
+            "document deletion version_conflicts count."
+        ) from error
+
+    if version_conflicts != 0:
+        raise AdminDocumentLifecycleError(
+            "OpenSearch document deletion reported "
+            f"{version_conflicts} version conflict(s)."
+        )
+
+    total: int | None = None
+
+    if "total" in response:
+        try:
+            total = int(response["total"])
+
+        except (TypeError, ValueError) as error:
+            raise AdminDocumentLifecycleError(
+                "OpenSearch returned an invalid "
+                "document deletion total count."
+            ) from error
+
+        if total < 0:
+            raise AdminDocumentLifecycleError(
+                "OpenSearch returned an invalid "
+                "document deletion total count."
+            )
+
+    try:
+        deleted = int(
+            response.get(
+                "deleted",
+                0,
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as error:
+        raise AdminDocumentLifecycleError(
+            "OpenSearch returned an invalid "
+            "deleted chunk count."
+        ) from error
+
+    if deleted < 0:
+        raise AdminDocumentLifecycleError(
+            "OpenSearch returned an invalid "
+            "deleted chunk count."
+        )
+
+    # total is the number of documents delete_by_query matched and
+    # processed; deleted is how many of those it actually deleted.
+    # Cross-checking the two catches a partial deletion on its own,
+    # independent of expected_chunks - the only guard available to a
+    # caller (reindex_indexed_document's previous-document cleanup)
+    # that has no country snapshot to derive an expected count from.
+    if total is not None and deleted != total:
+        raise AdminDocumentLifecycleError(
+            "OpenSearch document deletion was incomplete: deleted "
+            f"{deleted} of {total} matched chunk(s)."
+        )
+
+    if (
+        expected_chunks is not None
+        and deleted != expected_chunks
+    ):
+        raise AdminDocumentLifecycleError(
+            "OpenSearch document deletion was incomplete: deleted "
+            f"{deleted} of {expected_chunks} expected chunk(s)."
+        )
+
+    return deleted
+
+
 def _delete_document_chunks(
     *,
     document_id: str,
     client: OpenSearch,
+    expected_chunks: int | None = None,
 ) -> int:
     """Delete every indexed chunk belonging to one document."""
 
@@ -276,31 +437,80 @@ def _delete_document_chunks(
             "OpenSearch document deletion failed."
         ) from error
 
-    if not isinstance(
+    return _validate_delete_by_query_response(
         response,
-        dict,
-    ):
-        raise AdminDocumentLifecycleError(
-            "OpenSearch returned an invalid "
-            "document deletion response."
-        )
+        expected_chunks=expected_chunks,
+    )
+
+
+def _delete_stray_country_chunks(
+    *,
+    client: OpenSearch,
+    country_code: str,
+    keep_chunk_ids: Sequence[str],
+) -> int:
+    """
+    Delete every chunk in one country NOT among keep_chunk_ids.
+
+    Mission "HOTFIX 0.4.9" review 4: a country-level snapshot restore
+    (_restore_country_snapshot) only re-indexes what it captured - it
+    never deletes anything outside that set. Reindex's rollback pairs
+    a snapshot restore with this to remove whatever a failed reindex
+    attempt actually created, regardless of which document_id it
+    ended up under: the new document_id when reindex produced one,
+    or stray new chunk_ids under the SAME document_id when it did not
+    (e.g. document_indexer's own internal indexing or stale-chunk
+    cleanup failing partway through). keep_chunk_ids is the complete
+    pre-mutation snapshot's own chunk IDs - every sibling document in
+    the country is included in it, so this never touches a document
+    that was never part of this reindex attempt.
+    """
+
+    keep_ids = list(keep_chunk_ids)
+
+    query: dict[str, Any] = (
+        {
+            "term": {
+                "country_code": country_code,
+            }
+        }
+        if not keep_ids
+        else {
+            "bool": {
+                "filter": [
+                    {
+                        "term": {
+                            "country_code": country_code,
+                        }
+                    }
+                ],
+                "must_not": [
+                    {
+                        "terms": {
+                            "chunk_id": keep_ids,
+                        }
+                    }
+                ],
+            }
+        }
+    )
 
     try:
-        return int(
-            response.get(
-                "deleted",
-                0,
-            )
+        response = client.delete_by_query(
+            index=LEGAL_DOCUMENTS_ALIAS,
+            body={
+                "query": query,
+            },
+            conflicts="proceed",
+            refresh=True,
         )
 
-    except (
-        TypeError,
-        ValueError,
-    ) as error:
+    except OpenSearchException as error:
         raise AdminDocumentLifecycleError(
-            "OpenSearch returned an invalid "
-            "deleted chunk count."
+            "OpenSearch stray-chunk cleanup failed."
         ) from error
+
+    return _validate_delete_by_query_response(response)
 
 
 def reindex_indexed_document(
@@ -321,6 +531,21 @@ def reindex_indexed_document(
     When the metadata changes enough to produce a new document ID,
     the previous indexed document is removed after the new version
     has been indexed successfully.
+
+    A reindex is transactional (mission "HOTFIX 0.4.9" review 4):
+    either it ends in the new state (new document fully indexed, old
+    document fully removed when the ID changed) or it ends in exactly
+    the state that existed before it started - never anything in
+    between, and never a stray chunk left over from a failed attempt
+    regardless of which document_id it landed under. A country_code
+    snapshot is captured before document_indexer runs at all, so both
+    document_indexer's own indexing AND the subsequent old-document
+    deletion are covered by the same rollback: on any failure past
+    that point, the snapshot is restored and every chunk in the
+    country NOT present in that snapshot is removed - covering both
+    the ID-changed case (the new document_id's chunks) and the
+    ID-unchanged case (stray new chunk_ids under the same document_id
+    from a document_indexer step that failed partway through).
     """
 
     validated_document_id = (
@@ -343,7 +568,7 @@ def reindex_indexed_document(
         "source_filename",
     )
 
-    country_code = _required_string(
+    old_country_code = _required_string(
         metadata,
         "country_code",
     )
@@ -351,7 +576,7 @@ def reindex_indexed_document(
     try:
         resolved_source = resolve_document_source_path(
             source_root=source_directory,
-            country_code=country_code,
+            country_code=old_country_code,
             source_filename=source_filename,
         )
 
@@ -382,50 +607,133 @@ def reindex_indexed_document(
             "The source DOCX produced no legal chunks."
         )
 
-    indexing_result = document_indexer(
-        chunks=chunks,
+    new_country_code = chunks[0].country_code
+
+    if new_country_code != old_country_code:
+        # A country change during Reindex is not a supported product
+        # behavior today (no existing caller relies on it, and the
+        # source file's own resolved location already encodes its
+        # country) - refusing explicitly, before any mutation, keeps
+        # the rollback model simple and avoids ever restoring only
+        # one of two countries. Upload/Replace already has its own,
+        # separately-guarded workflow for a genuine country change.
+        raise AdminDocumentLifecycleError(
+            "Reindexing this document would change its country from "
+            f"{old_country_code} to {new_country_code}, which "
+            "Reindex does not support - use Upload/Replace instead."
+        )
+
+    chunk_snapshot = _snapshot_country_chunks(
         client=opensearch_client,
+        country_code=old_country_code,
     )
 
-    current_document_id = (
-        indexing_result.document_id
-    )
+    old_snapshot_chunks = [
+        chunk
+        for chunk in chunk_snapshot
+        if (
+            chunk.get("_source", {}).get("document_id")
+            == validated_document_id
+        )
+    ]
 
-    document_id_changed = (
-        current_document_id
-        != validated_document_id
-    )
+    expected_old_chunks = len(old_snapshot_chunks)
 
-    previous_chunks_deleted = 0
+    if expected_old_chunks <= 0:
+        raise AdminDocumentLifecycleError(
+            "The document's indexed chunks could not be found in "
+            "the country snapshot just before reindexing."
+        )
 
-    if document_id_changed:
-        try:
+    try:
+        indexing_result = document_indexer(
+            chunks=chunks,
+            client=opensearch_client,
+        )
+
+        current_document_id = (
+            indexing_result.document_id
+        )
+
+        document_id_changed = (
+            current_document_id
+            != validated_document_id
+        )
+
+        previous_chunks_deleted = 0
+
+        if document_id_changed:
             previous_chunks_deleted = (
                 _delete_document_chunks(
                     document_id=(
                         validated_document_id
                     ),
                     client=opensearch_client,
+                    expected_chunks=expected_old_chunks,
                 )
             )
 
-            if previous_chunks_deleted <= 0:
-                raise AdminDocumentLifecycleError(
-                    "The previous indexed document "
-                    "could not be removed."
-                )
+    except Exception as reindex_error:
+        # The invariant is "the country's indexed state matches the
+        # pre-reindex snapshot exactly" - not merely "the new
+        # document_id's chunks are gone." A snapshot restore alone
+        # only re-indexes what it captured; it never deletes anything
+        # outside that set. That matters regardless of whether this
+        # reindex produced a different document_id: if it did not
+        # (the common case - the same document_id, just edited
+        # content), document_indexer's own internal indexing or
+        # stale-chunk cleanup can still fail partway through and
+        # leave stray new chunk_ids under that SAME document_id,
+        # which the snapshot restore alone would never remove either.
+        # _delete_stray_country_chunks closes both cases uniformly by
+        # deleting anything in the country not present in the
+        # snapshot, whatever document_id it ended up under.
+        index_restored = True
+
+        try:
+            _restore_country_snapshot(
+                client=opensearch_client,
+                snapshot=chunk_snapshot,
+                bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+            )
 
         except Exception:
-            try:
-                _delete_document_chunks(
-                    document_id=current_document_id,
-                    client=opensearch_client,
+            index_restored = False
+
+        extra_chunks_removed = True
+
+        try:
+            _delete_stray_country_chunks(
+                client=opensearch_client,
+                country_code=old_country_code,
+                keep_chunk_ids=[
+                    chunk["_id"]
+                    for chunk in chunk_snapshot
+                ],
+            )
+
+        except Exception:
+            extra_chunks_removed = False
+
+        if not index_restored or not extra_chunks_removed:
+            raise AdminDocumentLifecycleError(
+                "Reindexing failed, and the rollback afterwards was "
+                "incomplete (previous index state "
+                + (
+                    "restored"
+                    if index_restored
+                    else "NOT restored"
                 )
+                + ", extra chunks "
+                + (
+                    "removed"
+                    if extra_chunks_removed
+                    else "NOT removed"
+                )
+                + ") - manual recovery is required."
+            ) from reindex_error
 
-            except Exception:
-                pass
-
-            raise
+        raise
 
     first_chunk = chunks[0]
 
@@ -458,19 +766,74 @@ def reindex_indexed_document(
     )
 
 
+def _restore_delete_backups(
+    backups: Sequence[tuple[Path, Path]],
+) -> None:
+    """
+    Restore every source path moved to a temporary delete backup.
+
+    Only ever called before the index-delete commit point (mission
+    "HOTFIX 0.4.9" review 2, section 2) - at that point every backup
+    is still guaranteed to exist, since nothing has unlinked any of
+    them yet. Every restoration is attempted even if an earlier one
+    fails - never stops at the first error - and raises
+    DeleteBackupRestoreError naming every backup that could not be
+    restored if any failed, so the caller can never mistake an
+    incomplete rollback for a complete one.
+    """
+
+    failed_paths: list[Path] = []
+
+    for original_path, backup_path in reversed(list(backups)):
+        if not backup_path.exists():
+            # Should never happen before the commit point - nothing
+            # has unlinked a backup yet - but the original is still
+            # genuinely unrestored, so this counts as a failure too,
+            # never a silent skip.
+            failed_paths.append(backup_path)
+            continue
+
+        try:
+            os.replace(backup_path, original_path)
+
+        except OSError:
+            failed_paths.append(backup_path)
+
+    if failed_paths:
+        raise DeleteBackupRestoreError(failed_paths)
+
+
 def delete_indexed_document(
     *,
     document_id: str,
     source_directory: Path,
     processed_directory: Path,
     client: OpenSearch | None = None,
+    country_document_lookup: Callable[
+        [str, OpenSearch | None],
+        list[ExistingCountryDocument],
+    ] = lookup_existing_country_documents,
 ) -> AdminDocumentDeleteResponse:
     """
-    Delete an indexed document and its source DOCX safely.
+    Delete one indexed document, acting on the requested document_id
+    first - never by first demanding that exactly one source file
+    resolve for its whole country (mission "HOTFIX 0.4.9": a country
+    left with duplicate or conflicting legacy source files by an
+    earlier defect must still allow every one of its document_ids to
+    be deleted safely, never a server error merely because the
+    country has several sources).
 
-    When the source exists, it is temporarily moved before the
-    OpenSearch deletion and restored if the deletion fails. The
-    backup is created next to the source file (source_path.parent),
+    Physical source files are touched only when this is the last
+    active document for the country: only then is nothing else still
+    depending on any of that country's candidate source files, so
+    every one of them (historical and canonical alike) can be safely
+    retired together. When other documents remain for the country,
+    the index entry for document_id alone is removed and no file is
+    touched at all - which specific file backs which remaining
+    document cannot be proven unambiguously, so none is deleted
+    (source_cleanup_deferred=True signals this to the caller).
+
+    The backup is created next to each source file (its own parent),
     not in processed_directory: those are separate bind mounts in
     production, and os.replace() cannot perform an atomic rename
     across mount points (OSError: Invalid cross-device link).
@@ -503,43 +866,214 @@ def delete_indexed_document(
     )
 
     try:
-        resolved_source = resolve_document_source_path(
-            source_root=source_directory,
-            country_code=country_code,
-            source_filename=source_filename,
+        country_documents = country_document_lookup(
+            country_code,
+            opensearch_client,
         )
 
-    except DocumentSourceConflictError as error:
-        raise AdminDocumentSourceConflictError(
-            str(error)
+    except OpenSearchException as error:
+        raise AdminDocumentLifecycleError(
+            "The country catalog could not be checked before deletion."
         ) from error
 
-    source_path = resolved_source.path
-    source_file_present = source_path is not None
+    other_document_ids = {
+        document.document_id
+        for document in country_documents
+        if document.document_id != validated_document_id
+    }
 
-    backup_path: Path | None = None
+    if other_document_ids:
+        # Other documents remain for this country - deleting only
+        # this document_id's index entry is always safe; touching any
+        # file is not, since ownership between the remaining
+        # document_ids and the country's candidate files cannot be
+        # proven unambiguously (this is exactly the "Multiple distinct
+        # source files resolve" state a pre-existing conflict leaves
+        # behind - never a reason to fail the delete itself).
+        #
+        # This branch never touches a file, but it must still be
+        # rollbackable on the index side (mission "HOTFIX 0.4.9"
+        # review 3, section 2): the country snapshot is captured
+        # BEFORE the target document_id's chunks are deleted, its own
+        # expected chunk count is derived from that same snapshot (so
+        # a delete_by_query response is only ever trusted against a
+        # count taken at the same instant), and the whole snapshot is
+        # restored if the deletion fails or is incomplete.
+        chunk_snapshot = _snapshot_country_chunks(
+            client=opensearch_client,
+            country_code=country_code,
+        )
 
-    if source_file_present:
+        target_snapshot_chunks = [
+            chunk
+            for chunk in chunk_snapshot
+            if (
+                chunk.get("_source", {}).get("document_id")
+                == validated_document_id
+            )
+        ]
+
+        expected_target_chunks = len(target_snapshot_chunks)
+
+        if expected_target_chunks <= 0:
+            raise AdminDocumentLifecycleError(
+                "The document's indexed chunks could not be found "
+                "in the country snapshot just before deletion."
+            )
+
         try:
+            deleted_chunks = _delete_document_chunks(
+                document_id=validated_document_id,
+                client=opensearch_client,
+                expected_chunks=expected_target_chunks,
+            )
+
+        except Exception as index_error:
+            index_restored = True
+
+            try:
+                _restore_country_snapshot(
+                    client=opensearch_client,
+                    snapshot=chunk_snapshot,
+                    bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+                )
+
+            except Exception:
+                index_restored = False
+
+            if not index_restored:
+                raise AdminDocumentLifecycleError(
+                    "The document could not be deleted, and "
+                    "restoring the country's indexed chunks "
+                    "afterwards also failed - manual recovery is "
+                    "required."
+                ) from index_error
+
+            raise
+
+        return AdminDocumentDeleteResponse(
+            status="deleted",
+            document_id=validated_document_id,
+            source_filename=source_filename,
+            deleted_chunks=deleted_chunks,
+            source_file_deleted=False,
+            source_cleanup_deferred=True,
+        )
+
+    # The last active document for this country - every candidate
+    # source file (historical and canonical) may now be retired.
+    #
+    # Order matters (mission "HOTFIX 0.4.9" review 2, section 1): the
+    # snapshot is acquired FIRST, before any filesystem mutation at
+    # all. If it fails, nothing has been touched yet - the exception
+    # propagates directly, no rollback needed. Only once a usable
+    # snapshot exists do sources move to their backup names; only
+    # once that succeeds is the index delete attempted. Everything up
+    # to and including a successful index delete is fully
+    # rollbackable. The index delete succeeding is the commit point:
+    # finalization (removing the now-unused .bak files) after that
+    # point is deliberately best-effort cleanup, never a trigger to
+    # undo the already-successful delete (section 2) - a backup file
+    # already unlinked cannot be "restored", so treating any single
+    # finalization failure as grounds to roll back everything would
+    # misrepresent whichever backups were already, irreversibly,
+    # removed.
+    candidate_paths = resolve_country_source_paths(
+        source_root=source_directory,
+        country_code=country_code,
+        source_filenames=[
+            document.source_filename
+            for document in country_documents
+        ],
+    )
+
+    chunk_snapshot = _snapshot_country_chunks(
+        client=opensearch_client,
+        country_code=country_code,
+    )
+
+    # The snapshot is a strictly more recent read than the earlier
+    # country_document_lookup call above, so it - not the lookup - is
+    # the authority consulted immediately before any mutation happens
+    # (mission "HOTFIX 0.4.9" review 3, section 3):
+    #   A/B. the target document's own chunks must actually be
+    #        present in the snapshot, and there must be at least one;
+    #   C.   since country_document_lookup already asserted this is
+    #        the LAST active document for the country, the snapshot
+    #        must contain no *other* document_id - if one appears
+    #        anyway, the state changed concurrently between the two
+    #        reads and every source file for this country may no
+    #        longer be safe to retire together.
+    # Either violation aborts here, before candidate_paths is ever
+    # touched and before any chunk is deleted.
+    target_snapshot_chunks = [
+        chunk
+        for chunk in chunk_snapshot
+        if (
+            chunk.get("_source", {}).get("document_id")
+            == validated_document_id
+        )
+    ]
+
+    expected_target_chunks = len(target_snapshot_chunks)
+
+    if expected_target_chunks <= 0:
+        raise AdminDocumentLifecycleError(
+            "The document's indexed chunks could not be found in "
+            "the country snapshot just before deletion."
+        )
+
+    sibling_document_ids_in_snapshot = {
+        chunk.get("_source", {}).get("document_id")
+        for chunk in chunk_snapshot
+    } - {validated_document_id}
+
+    if sibling_document_ids_in_snapshot:
+        raise AdminDocumentLifecycleError(
+            "The country snapshot revealed another indexed document "
+            "that the prior lookup did not report - refusing to "
+            "retire this country's source file(s) under a possibly "
+            "stale state."
+        )
+
+    backups: list[tuple[Path, Path]] = []
+
+    try:
+        for candidate_path in candidate_paths:
             backup_path = (
-                source_path.parent
+                candidate_path.parent
                 / (
                     ".delete-backup-"
                     f"{uuid.uuid4().hex}-"
-                    f"{source_path.name}.bak"
+                    f"{candidate_path.name}.bak"
                 )
             )
 
             os.replace(
-                source_path,
+                candidate_path,
                 backup_path,
             )
+            backups.append((candidate_path, backup_path))
 
-        except OSError as error:
+    except OSError as staging_error:
+        try:
+            _restore_delete_backups(backups)
+
+        except Exception as restore_error:
+            # Never narrower than DeleteBackupRestoreError: an
+            # unexpected exception type here must still be reported
+            # as an explicit, controlled failure - never left to
+            # propagate uncontrolled past this handler.
             raise AdminDocumentLifecycleError(
-                "The source DOCX could not be "
-                "prepared for deletion."
-            ) from error
+                "The source DOCX could not be prepared for deletion, "
+                "and restoring the source(s) already moved also "
+                "failed - manual recovery is required."
+            ) from restore_error
+
+        raise AdminDocumentLifecycleError(
+            "The source DOCX could not be "
+            "prepared for deletion."
+        ) from staging_error
 
     try:
         deleted_chunks = (
@@ -548,43 +1082,61 @@ def delete_indexed_document(
                     validated_document_id
                 ),
                 client=opensearch_client,
+                expected_chunks=expected_target_chunks,
             )
         )
 
-        if deleted_chunks <= 0:
-            raise AdminDocumentLifecycleError(
-                "No indexed chunk was deleted."
+    except Exception as index_error:
+        files_restored = True
+
+        try:
+            _restore_delete_backups(backups)
+
+        except Exception:
+            # _restore_delete_backups only ever raises
+            # DeleteBackupRestoreError today, but this must never be
+            # narrower than that: an unexpected exception type here
+            # must still be treated as an incomplete file rollback,
+            # never allowed to skip the index-restore attempt below
+            # or propagate uncontrolled past this handler.
+            files_restored = False
+
+        index_restored = True
+
+        try:
+            _restore_country_snapshot(
+                client=opensearch_client,
+                snapshot=chunk_snapshot,
+                bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
             )
 
-    except Exception:
-        if (
-            backup_path is not None
-            and backup_path.exists()
-        ):
-            try:
-                os.replace(
-                    backup_path,
-                    source_path,
-                )
+        except Exception:
+            index_restored = False
 
-            except OSError:
-                pass
+        if not files_restored or not index_restored:
+            raise AdminDocumentLifecycleError(
+                "The document could not be deleted, and the rollback "
+                "afterwards was incomplete (source files "
+                + ("restored" if files_restored else "NOT restored")
+                + ", index "
+                + ("restored" if index_restored else "NOT restored")
+                + ") - manual recovery is required."
+            ) from index_error
 
         raise
 
-    if (
-        backup_path is not None
-        and backup_path.exists()
-    ):
+    # Commit point reached - the index delete succeeded. Finalization
+    # is best-effort: every backup is still attempted even after an
+    # earlier one fails, but a failure here never restores the
+    # backups or the index - see the docstring note above.
+    failed_backup_paths: list[Path] = []
+
+    for _, backup_path in backups:
         try:
             backup_path.unlink()
 
-        except OSError as error:
-            raise AdminDocumentLifecycleError(
-                "The indexed document was deleted, "
-                "but its source backup could not "
-                "be removed."
-            ) from error
+        except OSError:
+            failed_backup_paths.append(backup_path)
 
     return AdminDocumentDeleteResponse(
         status="deleted",
@@ -592,6 +1144,8 @@ def delete_indexed_document(
         source_filename=source_filename,
         deleted_chunks=deleted_chunks,
         source_file_deleted=(
-            source_file_present
+            bool(candidate_paths)
+            and not failed_backup_paths
         ),
+        source_cleanup_deferred=bool(failed_backup_paths),
     )

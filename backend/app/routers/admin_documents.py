@@ -6,6 +6,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     UploadFile,
     status,
@@ -24,7 +25,11 @@ from app.services.admin_documents import (
     AdminDocumentStorageError,
     InvalidDocumentUploadError,
     list_indexed_documents,
-    upload_and_index_document,
+)
+from app.services.admin_document_replacement import (
+    AdminDocumentAlreadyCurrentError,
+    AdminDocumentReplacementRequiredError,
+    safe_upload_and_index_document,
 )
 from app.services.document_indexer import (
     DocumentIndexingError,
@@ -76,13 +81,14 @@ def get_admin_documents(
 )
 def upload_admin_document(
     file: UploadFile = File(...),
+    replace_existing: bool = Form(False),
 ) -> AdminDocumentUploadResponse:
     """Validate, persist, and index one DOCX document."""
 
     settings = get_settings()
 
     try:
-        return upload_and_index_document(
+        return safe_upload_and_index_document(
             filename=file.filename or "",
             file_stream=file.file,
             source_directory=(
@@ -94,7 +100,20 @@ def upload_admin_document(
             maximum_bytes=(
                 settings.document_upload_max_bytes
             ),
+            replace_existing=replace_existing,
         )
+
+    except AdminDocumentReplacementRequiredError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentAlreadyCurrentError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
 
     except InvalidDocumentUploadError as error:
         raise HTTPException(

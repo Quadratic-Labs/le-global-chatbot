@@ -1441,6 +1441,7 @@ class ChatMetricsTests(unittest.TestCase):
                     ),
                     catalog_provider=_catalog_provider,
                     search_function=failing_search,
+                    understanding_client=_FailingUnderstandingClient(),
                 )
 
         payload = self._single_log_payload(
@@ -1502,6 +1503,7 @@ class ChatMetricsTests(unittest.TestCase):
                     catalog_provider=_catalog_provider,
                     search_function=fake_search,
                     generation_client=client,
+                    understanding_client=_FailingUnderstandingClient(),
                 )
 
         payload = self._single_log_payload(
@@ -1633,6 +1635,7 @@ class ChatMetricsTests(unittest.TestCase):
                 catalog_provider=_catalog_provider,
                 search_function=fake_search,
                 generation_client=client,
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertEqual(
@@ -1703,6 +1706,7 @@ class ChatMetricsTests(unittest.TestCase):
                 catalog_provider=_catalog_provider,
                 search_function=fake_search,
                 generation_client=client,
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         payload = self._single_log_payload(
@@ -2325,6 +2329,7 @@ class HistoryContextTests(unittest.TestCase):
                 catalog_provider=_catalog_provider,
                 search_function=fake_search,
                 generation_client=client,
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertEqual(
@@ -2598,6 +2603,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertTrue(
@@ -2664,6 +2670,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertTrue(
@@ -2918,6 +2925,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertFalse(
@@ -2990,6 +2998,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertEqual(
@@ -3046,6 +3055,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertEqual(
@@ -3091,6 +3101,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertEqual(
@@ -3450,6 +3461,7 @@ class ContactIntentTests(unittest.TestCase):
                 generation_client=(
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertFalse(
@@ -3521,6 +3533,7 @@ class ContactIntentTests(unittest.TestCase):
                     # call happened.
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertTrue(
@@ -3622,6 +3635,7 @@ class ContactIntentTests(unittest.TestCase):
                 catalog_provider=_catalog_provider,
                 search_function=fake_legal_search,
                 generation_client=CountingLegalClient(),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertTrue(
@@ -3798,6 +3812,7 @@ class ContactIntentTests(unittest.TestCase):
                     # call happened.
                     NoCallGenerationClient()
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertTrue(
@@ -4024,6 +4039,7 @@ class ContactIntentTests(unittest.TestCase):
                 catalog_provider=_catalog_provider,
                 search_function=fake_legal_search,
                 generation_client=CountingLegalClient(),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertTrue(
@@ -4117,6 +4133,7 @@ class ContactIntentTests(unittest.TestCase):
                         "- Data privacy rules content [1]."
                     )
                 ),
+                understanding_client=_FailingUnderstandingClient(),
             )
 
         self.assertNotEqual(

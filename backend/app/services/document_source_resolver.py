@@ -18,6 +18,7 @@ filename - a document's country always comes from OpenSearch metadata
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -221,3 +222,43 @@ def resolve_document_source_path(
         path=path,
         origin=origin,
     )
+
+
+def resolve_country_source_paths(
+    *,
+    source_root: Path,
+    country_code: str,
+    source_filenames: Sequence[str],
+) -> tuple[Path, ...]:
+    """
+    Return every distinct real source file that belongs to one country.
+
+    This is intentionally broader than resolve_document_source_path:
+    confirmed replacement must retire all historical and canonical source
+    files for a country instead of refusing when both generations coexist.
+    """
+
+    candidate_names = [
+        *source_filenames,
+        storage_filename_for_country(country_code),
+    ]
+
+    matches: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    for name in candidate_names:
+        resolved_path = _resolve_candidate(
+            source_root,
+            name,
+        )
+
+        if resolved_path is None:
+            continue
+
+        if resolved_path in seen_paths:
+            continue
+
+        seen_paths.add(resolved_path)
+        matches.append(resolved_path)
+
+    return tuple(matches)

@@ -56,7 +56,11 @@ from app.routers.chat import (
     CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
     resolve_legal_chat_response,
 )
-from app.models.conversation_state import ConversationSearchConcept
+from app.models.conversation_state import (
+    ConversationActionState,
+    ConversationSearchConcept,
+    ConversationState,
+)
 from app.services.country_detection import resolve_country_display_name
 from app.services.rag_answer import answer_legal_question
 
@@ -429,6 +433,95 @@ class SequenceABLastStateAndPreciseSubjectTests(unittest.TestCase):
         # And the state persisted for a hypothetical turn 3 still
         # carries the precise sub-topic forward, for Spain now.
         next_state = turn_two_response.conversation_state
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state.actions[0].country_codes, ["ES"])
+        self.assertEqual(
+            next_state.actions[0].subject_text,
+            "dismissal while on sick leave",
+        )
+
+
+class SameInformationCountryFollowUpTests(unittest.TestCase):
+    """A natural one-country "same information" follow-up reuses the subject."""
+
+    def test_same_information_for_new_country_reuses_previous_subject(
+        self,
+    ) -> None:
+        state = ConversationState(
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["PE"],
+                    legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                    subject_text="dismissal while on sick leave",
+                    search_concepts=[
+                        {
+                            "terms": [
+                                "dismissal",
+                                "termination",
+                            ]
+                        },
+                        {
+                            "terms": [
+                                "sick leave",
+                                "medical leave",
+                            ]
+                        },
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="relation_required",
+                )
+            ],
+            focus_action_index=0,
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="clarification",
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["ES"],
+                    )
+                ],
+                is_follow_up=True,
+                clarification_reason="ambiguous_request",
+                delta=_delta(context_operation="ambiguous"),
+            )
+        )
+        generation_client = CapturingGenerationClient(
+            answer=(
+                "Spain\n"
+                "- Dismissal while on sick leave triggers additional "
+                "termination protections. [1]"
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "Now give me the same information for Spain."
+                ),
+                conversation_state=state,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_dismissal_sick_leave_search_function(),
+            generation_client=generation_client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(understanding_client.call_count, 1)
+        self.assertEqual(len(generation_client.calls), 1)
+
+        generation_input = generation_client.calls[0][1]
+        self.assertIn("Spain", generation_input)
+        self.assertIn("dismissal", generation_input)
+        self.assertIn("sick leave", generation_input)
+
+        next_state = response.conversation_state
         self.assertIsNotNone(next_state)
         self.assertEqual(next_state.actions[0].country_codes, ["ES"])
         self.assertEqual(

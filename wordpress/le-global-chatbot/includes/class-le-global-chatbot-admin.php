@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.4.2';
+    private const VERSION = '0.4.9';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -256,7 +256,7 @@ final class LE_Global_Chatbot_Admin
                 <article
                     class="le-global-chatbot-admin__summary-card"
                 >
-                    <span>Missing source files</span>
+                    <span>Source issues</span>
 
                     <strong>
                         <?php
@@ -324,8 +324,8 @@ final class LE_Global_Chatbot_Admin
                         >
 
                         <p class="description">
-                            DOCX format only. The backend controls the
-                            maximum permitted file size.
+                            DOCX format only. Maximum upload size: 25 MB.
+                            Replacing an existing country requires confirmation.
                         </p>
                     </div>
 
@@ -459,16 +459,37 @@ final class LE_Global_Chatbot_Admin
                                         )
                                         : 'unknown';
 
-                                    $status_label = (
-                                        $source_present
-                                        ? 'Indexed'
-                                        : 'Source missing'
-                                    );
+                                    $status_label = match (
+                                        $status_value
+                                    ) {
+                                        'indexed' => 'Indexed',
+                                        'indexed_source_conflict' => (
+                                            'Source conflict'
+                                        ),
+                                        'indexed_source_missing' => (
+                                            'Source missing'
+                                        ),
+                                        default => (
+                                            $source_present
+                                            ? 'Indexed'
+                                            : 'Source unavailable'
+                                        ),
+                                    };
 
                                     $status_class = (
-                                        $source_present
+                                        $status_value === 'indexed'
                                         ? 'is-success'
                                         : 'is-warning'
+                                    );
+
+                                    $source_problem_title = (
+                                        $status_value
+                                        === 'indexed_source_conflict'
+                                        ? (
+                                            'Multiple source DOCX files '
+                                            . 'resolve for this country.'
+                                        )
+                                        : 'The source DOCX is missing.'
                                     );
                                     ?>
                                     <tr>
@@ -629,7 +650,11 @@ final class LE_Global_Chatbot_Admin
                                                         type="button"
                                                         class="button"
                                                         disabled
-                                                        title="The source DOCX is missing."
+                                                        title="<?php
+                                                    echo esc_attr(
+                                                        $source_problem_title
+                                                    );
+                                                ?>"
                                                     >
                                                         Reindex
                                                     </button>
@@ -707,11 +732,49 @@ final class LE_Global_Chatbot_Admin
             self::UPLOAD_ACTION
         );
 
+        $is_ajax = (
+            isset($_POST['le_global_ajax'])
+            && sanitize_text_field(
+                wp_unslash(
+                    (string) $_POST['le_global_ajax']
+                )
+            ) === '1'
+        );
+
+        $replace_existing = (
+            isset($_POST['replace_existing'])
+            && sanitize_text_field(
+                wp_unslash(
+                    (string) $_POST['replace_existing']
+                )
+            ) === '1'
+        );
+
+        $fail = static function (
+            string $message,
+            int $status_code = 400,
+            array $detail = []
+        ) use ($is_ajax): void {
+            if ($is_ajax) {
+                wp_send_json_error(
+                    [
+                        'message' => $message,
+                        'detail' => $detail,
+                    ],
+                    $status_code
+                );
+            }
+
+            self::redirect_with_notice(
+                'error',
+                $message
+            );
+        };
+
         $file = $_FILES['document'] ?? null;
 
         if (!is_array($file)) {
-            self::redirect_with_notice(
-                'error',
+            $fail(
                 'No DOCX document was received.'
             );
         }
@@ -723,8 +786,7 @@ final class LE_Global_Chatbot_Admin
             : UPLOAD_ERR_NO_FILE;
 
         if ($upload_error !== UPLOAD_ERR_OK) {
-            self::redirect_with_notice(
-                'error',
+            $fail(
                 self::upload_error_message(
                     $upload_error
                 )
@@ -752,8 +814,7 @@ final class LE_Global_Chatbot_Admin
                 )
             ) !== 'docx'
         ) {
-            self::redirect_with_notice(
-                'error',
+            $fail(
                 'Only DOCX documents are accepted.'
             );
         }
@@ -764,8 +825,7 @@ final class LE_Global_Chatbot_Admin
                 $temporary_path
             )
         ) {
-            self::redirect_with_notice(
-                'error',
+            $fail(
                 'The uploaded file could not be validated.'
             );
         }
@@ -775,8 +835,7 @@ final class LE_Global_Chatbot_Admin
         );
 
         if ($file_content === false) {
-            self::redirect_with_notice(
-                'error',
+            $fail(
                 'The uploaded document could not be read.'
             );
         }
@@ -792,16 +851,6 @@ final class LE_Global_Chatbot_Admin
 
         $line_break = "\r\n";
 
-        // The arbitrary original filename (accents, spaces, parentheses,
-        // dashes, underscores all included) is sent to the backend
-        // exactly as received - never WordPress's own sanitize_file_name(),
-        // which would strip parentheses and collapse spaces into hyphens.
-        // The backend is the sole authority on filename safety and on
-        // country/year/document identity, all derived from the DOCX
-        // content itself (mission "CONTINUATION PATCH 0.4.3"). Only the
-        // three characters that would break this HTTP header's own
-        // syntax are removed here - a transport-encoding concern, not a
-        // business-format one.
         $header_filename = str_replace(
             [
                 '"',
@@ -813,6 +862,25 @@ final class LE_Global_Chatbot_Admin
         );
 
         $multipart_body = (
+            '--'
+            . $boundary
+            . $line_break
+        );
+
+        $multipart_body .= (
+            'Content-Disposition: form-data; '
+            . 'name="replace_existing"'
+            . $line_break
+            . $line_break
+            . (
+                $replace_existing
+                ? 'true'
+                : 'false'
+            )
+            . $line_break
+        );
+
+        $multipart_body .= (
             '--'
             . $boundary
             . $line_break
@@ -858,21 +926,31 @@ final class LE_Global_Chatbot_Admin
         );
 
         if (is_wp_error($result)) {
-            self::redirect_with_notice(
-                'error',
-                $result->get_error_message()
+            $fail(
+                $result->get_error_message(),
+                503
             );
         }
 
         if (
             (int) $result['status_code'] !== 201
         ) {
-            self::redirect_with_notice(
-                'error',
+            $detail = (
+                isset($result['body']['detail'])
+                && is_array(
+                    $result['body']['detail']
+                )
+            )
+                ? $result['body']['detail']
+                : [];
+
+            $fail(
                 self::extract_message(
                     $result['body'],
                     'The document could not be indexed.'
-                )
+                ),
+                (int) $result['status_code'],
+                $detail
             );
         }
 
@@ -892,15 +970,38 @@ final class LE_Global_Chatbot_Admin
             )
             : 0;
 
+        $result_status = isset(
+            $result['body']['status']
+        )
+            ? (string) $result['body']['status']
+            : 'indexed';
+
+        $success_message = sprintf(
+            (
+                $result_status === 'replaced'
+                ? '%s replaced the previous country document '
+                    . 'successfully with %s chunks.'
+                : '%s was indexed successfully with %s chunks.'
+            ),
+            $indexed_filename,
+            number_format_i18n(
+                $indexed_chunks
+            )
+        );
+
+        if ($is_ajax) {
+            wp_send_json_success(
+                [
+                    'message' => $success_message,
+                    'status' => $result_status,
+                ],
+                201
+            );
+        }
+
         self::redirect_with_notice(
             'success',
-            sprintf(
-                '%s was indexed successfully with %s chunks.',
-                $indexed_filename,
-                number_format_i18n(
-                    $indexed_chunks
-                )
-            )
+            $success_message
         );
     }
 
@@ -1035,13 +1136,44 @@ final class LE_Global_Chatbot_Admin
 
         self::redirect_with_notice(
             'success',
-            sprintf(
-                '%s was deleted successfully. %s indexed chunks were removed.',
+            self::build_delete_success_message(
                 $filename,
-                number_format_i18n(
-                    $deleted_chunks
-                )
+                $deleted_chunks,
+                isset($result['body']['source_cleanup_deferred'])
+                && $result['body']['source_cleanup_deferred'] === true
             )
+        );
+    }
+
+    /**
+     * The delete itself always succeeded when this is called
+     * (status_code=200 was already checked by the caller) -
+     * $source_cleanup_deferred=true can mean either that other
+     * documents still share this country (no physical file could be
+     * safely retired yet) OR that the backend's own best-effort
+     * backup-file cleanup failed after an already-successful,
+     * committed index delete (mission "HOTFIX 0.4.9" review 2,
+     * section 3) - two different causes, so the message stays
+     * deliberately generic rather than naming a specific one that
+     * would be wrong half the time. Either way this is never an
+     * error: the delete itself is done.
+     */
+    private static function build_delete_success_message(
+        string $filename,
+        int $deleted_chunks,
+        bool $source_cleanup_deferred
+    ): string {
+        return sprintf(
+            (
+                $source_cleanup_deferred
+                ? '%s was deleted successfully. %s indexed '
+                    . 'chunks were removed. Source-file cleanup '
+                    . 'is deferred.'
+                : '%s was deleted successfully. %s indexed '
+                    . 'chunks were removed.'
+            ),
+            $filename,
+            number_format_i18n($deleted_chunks)
         );
     }
 
@@ -1290,6 +1422,26 @@ final class LE_Global_Chatbot_Admin
     ): string {
         if (
             isset($body['detail'])
+            && is_array(
+                $body['detail']
+            )
+            && isset(
+                $body['detail']['message']
+            )
+            && is_string(
+                $body['detail']['message']
+            )
+            && trim(
+                $body['detail']['message']
+            ) !== ''
+        ) {
+            return trim(
+                $body['detail']['message']
+            );
+        }
+
+        if (
+            isset($body['detail'])
             && is_string(
                 $body['detail']
             )
@@ -1300,6 +1452,25 @@ final class LE_Global_Chatbot_Admin
             return trim(
                 $body['detail']
             );
+        }
+
+        // FastAPI's own automatic request-validation errors (a
+        // missing/malformed multipart field, caught before the admin
+        // router's business logic ever runs) shape `detail` as a
+        // list of {loc, msg, type} objects, never a string or a
+        // {message: ...} object - silently falling through to the
+        // generic fallback here previously discarded a real,
+        // structured reason (mission "HOTFIX 0.4.9" review).
+        if (
+            isset($body['detail'])
+            && is_array($body['detail'])
+            && isset($body['detail'][0])
+            && is_array($body['detail'][0])
+            && isset($body['detail'][0]['msg'])
+            && is_string($body['detail'][0]['msg'])
+            && trim($body['detail'][0]['msg']) !== ''
+        ) {
+            return trim($body['detail'][0]['msg']);
         }
 
         if (
