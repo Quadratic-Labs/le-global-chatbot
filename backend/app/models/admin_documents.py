@@ -19,6 +19,7 @@ class AdminDocumentSummary(BaseModel):
 
     chunk_count: int
     source_file_present: bool
+    source_bytes: int | None = None
     status: str
 
     class Config:
@@ -30,6 +31,17 @@ class AdminDocumentListResponse(BaseModel):
 
     total: int
     documents: list[AdminDocumentSummary]
+
+    class Config:
+        extra = "forbid"
+
+
+class AdminDocumentStatsResponse(BaseModel):
+    """Aggregate counts over the indexed document catalog."""
+
+    total_documents: int
+    total_countries: int
+    status_counts: dict[str, int]
 
     class Config:
         extra = "forbid"

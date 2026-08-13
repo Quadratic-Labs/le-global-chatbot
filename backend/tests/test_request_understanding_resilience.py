@@ -37,6 +37,14 @@ from app.routers.chat import (
 )
 
 
+# See test_chat.py's _NOT_YET_INDEXED_CODES for the full rationale:
+# country_registry.COUNTRIES now includes several countries (France,
+# Germany among them) registered purely for detection/admin-allowlist
+# purposes, with no real indexed content yet - mirroring it 1:1 into
+# this fake catalog would silently claim otherwise.
+_NOT_YET_INDEXED_CODES: frozenset[str] = frozenset({"FR", "DE"})
+
+
 def _catalog_provider() -> LegalCatalogResponse:
     return LegalCatalogResponse(
         countries=[
@@ -46,6 +54,7 @@ def _catalog_provider() -> LegalCatalogResponse:
                 chunk_count=42,
             )
             for country in COUNTRIES
+            if country.code not in _NOT_YET_INDEXED_CODES
         ],
         legal_topics=[],
         subsections=[],

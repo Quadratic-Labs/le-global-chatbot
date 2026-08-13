@@ -9,13 +9,23 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.4.9';
+    private const VERSION = '0.4.10';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
     private const CAPABILITY = 'manage_options';
 
     private const DOCUMENTS_PATH = '/api/v1/admin/documents';
+
+    // A backend operation on a large document has been measured at
+    // ~30s (mission "ORDER 3B"), which sits exactly at PHP's own
+    // apache2handler max_execution_time (also 30s, unmodified - see
+    // timeout-audit.txt). wp_remote_request's own per-call timeout
+    // (120s/120s/90s below) only bounds how long PHP waits for cURL;
+    // it does nothing to extend PHP's own script execution budget, so
+    // the three handlers proxying a genuinely long operation each
+    // raise it explicitly (mission "ORDER 4", section 8).
+    private const LONG_OPERATION_TIME_LIMIT_SECONDS = 150;
 
     private const UPLOAD_ACTION = (
         'le_global_chatbot_upload_document'
@@ -27,6 +37,26 @@ final class LE_Global_Chatbot_Admin
 
     private const DELETE_ACTION = (
         'le_global_chatbot_delete_document'
+    );
+
+    private const DOWNLOAD_ACTION = (
+        'le_global_chatbot_download_document'
+    );
+
+    private const REFRESH_ACTION = (
+        'le_global_chatbot_refresh_state'
+    );
+
+    private const SECTIONS_LIST_ACTION = (
+        'le_global_chatbot_list_sections'
+    );
+
+    private const SECTION_GET_ACTION = (
+        'le_global_chatbot_get_section'
+    );
+
+    private const SECTION_UPDATE_ACTION = (
+        'le_global_chatbot_update_section'
     );
 
     private static ?string $page_hook = null;
@@ -56,6 +86,31 @@ final class LE_Global_Chatbot_Admin
         add_action(
             'admin_post_' . self::DELETE_ACTION,
             [self::class, 'handle_delete']
+        );
+
+        add_action(
+            'admin_post_' . self::DOWNLOAD_ACTION,
+            [self::class, 'handle_download']
+        );
+
+        add_action(
+            'admin_post_' . self::REFRESH_ACTION,
+            [self::class, 'handle_refresh']
+        );
+
+        add_action(
+            'admin_post_' . self::SECTIONS_LIST_ACTION,
+            [self::class, 'handle_list_sections']
+        );
+
+        add_action(
+            'admin_post_' . self::SECTION_GET_ACTION,
+            [self::class, 'handle_get_section']
+        );
+
+        add_action(
+            'admin_post_' . self::SECTION_UPDATE_ACTION,
+            [self::class, 'handle_update_section']
         );
     }
 
@@ -125,40 +180,19 @@ final class LE_Global_Chatbot_Admin
 
         self::render_notice();
 
-        $result = self::request_backend(
-            'GET',
-            self::DOCUMENTS_PATH,
-            null,
-            30
+        [$documents, $catalog_error] = self::fetch_document_catalog();
+        $stats = self::fetch_document_stats();
+
+        $total_documents = (
+            $stats !== null
+            ? (int) $stats['total_documents']
+            : count($documents)
         );
 
-        $documents = [];
-        $catalog_error = null;
-
-        if (is_wp_error($result)) {
-            $catalog_error = (
-                $result->get_error_message()
-            );
-        } elseif (
-            (int) $result['status_code'] !== 200
-        ) {
-            $catalog_error = self::extract_message(
-                $result['body'],
-                'The document catalog could not be loaded.'
-            );
-        } elseif (
-            isset($result['body']['documents'])
-            && is_array(
-                $result['body']['documents']
-            )
-        ) {
-            $documents = (
-                $result['body']['documents']
-            );
-        }
-
-        $total_documents = count(
-            $documents
+        $total_countries = (
+            $stats !== null
+            ? (int) $stats['total_countries']
+            : 0
         );
 
         $total_chunks = 0;
@@ -218,6 +252,7 @@ final class LE_Global_Chatbot_Admin
             </header>
 
             <section
+                id="le-global-chatbot-summary"
                 class="le-global-chatbot-admin__summary"
                 aria-label="Document summary"
             >
@@ -231,6 +266,22 @@ final class LE_Global_Chatbot_Admin
                         echo esc_html(
                             number_format_i18n(
                                 $total_documents
+                            )
+                        );
+                        ?>
+                    </strong>
+                </article>
+
+                <article
+                    class="le-global-chatbot-admin__summary-card"
+                >
+                    <span>Countries</span>
+
+                    <strong>
+                        <?php
+                        echo esc_html(
+                            number_format_i18n(
+                                $total_countries
                             )
                         );
                         ?>
@@ -293,6 +344,20 @@ final class LE_Global_Chatbot_Admin
                         );
                     ?>"
                     enctype="multipart/form-data"
+                    data-refresh-action="<?php
+                        echo esc_attr(self::REFRESH_ACTION);
+                    ?>"
+                    data-refresh-nonce="<?php
+                        echo esc_attr(
+                            wp_create_nonce(self::REFRESH_ACTION)
+                        );
+                    ?>"
+                    data-reindex-action="<?php
+                        echo esc_attr(self::REINDEX_ACTION);
+                    ?>"
+                    data-delete-action="<?php
+                        echo esc_attr(self::DELETE_ACTION);
+                    ?>"
                 >
                     <input
                         type="hidden"
@@ -312,7 +377,7 @@ final class LE_Global_Chatbot_Admin
 
                     <div class="le-global-chatbot-admin__upload-field">
                         <label for="le-global-document">
-                            Legal document
+                            Legal document(s)
                         </label>
 
                         <input
@@ -320,12 +385,16 @@ final class LE_Global_Chatbot_Admin
                             type="file"
                             name="document"
                             accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            multiple
                             required
                         >
 
                         <p class="description">
-                            DOCX format only. Maximum upload size: 25 MB.
-                            Replacing an existing country requires confirmation.
+                            DOCX format only. Maximum upload size: 25 MB
+                            per file. Select multiple files to queue
+                            them; at most 2 are uploaded at a time.
+                            Replacing an existing country requires
+                            confirmation.
                         </p>
                     </div>
 
@@ -336,6 +405,160 @@ final class LE_Global_Chatbot_Admin
                         Upload and index
                     </button>
                 </form>
+
+                <div
+                    id="le-global-chatbot-queue"
+                    class="le-global-chatbot-admin__queue"
+                    aria-live="polite"
+                ></div>
+            </section>
+
+            <section class="le-global-chatbot-admin__panel">
+                <div class="le-global-chatbot-admin__panel-header">
+                    <div>
+                        <h2>Edit a section</h2>
+
+                        <p>
+                            Edit the current effective content of one
+                            legal topic for an already-indexed country.
+                            This never creates a new section.
+                        </p>
+                    </div>
+                </div>
+
+                <div
+                    id="le-global-chatbot-edit"
+                    class="le-global-chatbot-admin__edit"
+                    data-admin-post-url="<?php
+                        echo esc_url(
+                            admin_url('admin-post.php')
+                        );
+                    ?>"
+                    data-sections-list-action="<?php
+                        echo esc_attr(self::SECTIONS_LIST_ACTION);
+                    ?>"
+                    data-sections-list-nonce="<?php
+                        echo esc_attr(
+                            wp_create_nonce(
+                                self::SECTIONS_LIST_ACTION
+                            )
+                        );
+                    ?>"
+                    data-section-get-action="<?php
+                        echo esc_attr(self::SECTION_GET_ACTION);
+                    ?>"
+                    data-section-get-nonce="<?php
+                        echo esc_attr(
+                            wp_create_nonce(
+                                self::SECTION_GET_ACTION
+                            )
+                        );
+                    ?>"
+                    data-section-update-action="<?php
+                        echo esc_attr(self::SECTION_UPDATE_ACTION);
+                    ?>"
+                    data-section-update-nonce="<?php
+                        echo esc_attr(
+                            wp_create_nonce(
+                                self::SECTION_UPDATE_ACTION
+                            )
+                        );
+                    ?>"
+                >
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-edit-country">
+                            Country
+                        </label>
+
+                        <select id="le-global-edit-country">
+                            <option value="">
+                                Select a country…
+                            </option>
+
+                            <?php
+                            foreach (
+                                self::sorted_documents_for_edit(
+                                    $documents
+                                ) as $edit_document
+                            ) :
+                                ?>
+                                <option
+                                    value="<?php
+                                        echo esc_attr(
+                                            $edit_document[
+                                                'document_id'
+                                            ]
+                                        );
+                                    ?>"
+                                >
+                                    <?php
+                                    echo esc_html(
+                                        $edit_document['country']
+                                        . ' ('
+                                        . $edit_document[
+                                            'country_code'
+                                        ]
+                                        . ')'
+                                    );
+                                    ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-edit-section">
+                            Section
+                        </label>
+
+                        <select
+                            id="le-global-edit-section"
+                            disabled
+                        >
+                            <option value="">
+                                Select a country first…
+                            </option>
+                        </select>
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-edit-content">
+                            Content
+                        </label>
+
+                        <textarea
+                            id="le-global-edit-content"
+                            class="le-global-chatbot-admin__edit-textarea"
+                            disabled
+                        ></textarea>
+                    </div>
+
+                    <div
+                        id="le-global-chatbot-edit-message"
+                        class="le-global-chatbot-admin__edit-message"
+                        aria-live="polite"
+                    ></div>
+
+                    <div class="le-global-chatbot-admin__edit-actions">
+                        <button
+                            type="button"
+                            id="le-global-edit-cancel"
+                            class="button"
+                            disabled
+                        >
+                            Cancel
+                        </button>
+
+                        <button
+                            type="button"
+                            id="le-global-edit-save"
+                            class="button button-primary"
+                            disabled
+                        >
+                            Save changes
+                        </button>
+                    </div>
+                </div>
             </section>
 
             <section class="le-global-chatbot-admin__panel">
@@ -350,6 +573,7 @@ final class LE_Global_Chatbot_Admin
                     </div>
                 </div>
 
+                <div id="le-global-chatbot-documents">
                 <?php if ($catalog_error !== null) : ?>
                     <div class="notice notice-error inline">
                         <p>
@@ -595,6 +819,21 @@ final class LE_Global_Chatbot_Admin
                                             <div
                                                 class="le-global-chatbot-admin__actions"
                                             >
+                                                <?php if ($source_present) : ?>
+                                                    <a
+                                                        class="button"
+                                                        href="<?php
+                                                            echo esc_url(
+                                                                self::build_download_url(
+                                                                    $document_id
+                                                                )
+                                                            );
+                                                        ?>"
+                                                    >
+                                                        Download
+                                                    </a>
+                                                <?php endif; ?>
+
                                                 <?php
                                                 if (
                                                     $source_present
@@ -609,6 +848,7 @@ final class LE_Global_Chatbot_Admin
                                                                 )
                                                             );
                                                         ?>"
+                                                        data-reindex-form
                                                     >
                                                         <input
                                                             type="hidden"
@@ -719,6 +959,7 @@ final class LE_Global_Chatbot_Admin
                         </table>
                     </div>
                 <?php endif; ?>
+                </div>
             </section>
         </div>
         <?php
@@ -731,6 +972,8 @@ final class LE_Global_Chatbot_Admin
         check_admin_referer(
             self::UPLOAD_ACTION
         );
+
+        self::raise_execution_time_limit();
 
         $is_ajax = (
             isset($_POST['le_global_ajax'])
@@ -746,6 +989,15 @@ final class LE_Global_Chatbot_Admin
             && sanitize_text_field(
                 wp_unslash(
                     (string) $_POST['replace_existing']
+                )
+            ) === '1'
+        );
+
+        $confirm_warnings = (
+            isset($_POST['confirm_warnings'])
+            && sanitize_text_field(
+                wp_unslash(
+                    (string) $_POST['confirm_warnings']
                 )
             ) === '1'
         );
@@ -888,6 +1140,25 @@ final class LE_Global_Chatbot_Admin
 
         $multipart_body .= (
             'Content-Disposition: form-data; '
+            . 'name="confirm_warnings"'
+            . $line_break
+            . $line_break
+            . (
+                $confirm_warnings
+                ? 'true'
+                : 'false'
+            )
+            . $line_break
+        );
+
+        $multipart_body .= (
+            '--'
+            . $boundary
+            . $line_break
+        );
+
+        $multipart_body .= (
+            'Content-Disposition: form-data; '
             . 'name="file"; filename="'
             . $header_filename
             . '"'
@@ -994,6 +1265,8 @@ final class LE_Global_Chatbot_Admin
                 [
                     'message' => $success_message,
                     'status' => $result_status,
+                    'source_filename' => $indexed_filename,
+                    'indexed_chunks' => $indexed_chunks,
                 ],
                 201
             );
@@ -1017,6 +1290,10 @@ final class LE_Global_Chatbot_Admin
             . $document_id
         );
 
+        self::raise_execution_time_limit();
+
+        $is_ajax = self::is_ajax_request();
+
         $result = self::request_backend(
             'POST',
             self::DOCUMENTS_PATH
@@ -1030,21 +1307,23 @@ final class LE_Global_Chatbot_Admin
         );
 
         if (is_wp_error($result)) {
-            self::redirect_with_notice(
-                'error',
-                $result->get_error_message()
+            self::fail_reindex_or_delete(
+                $is_ajax,
+                $result->get_error_message(),
+                503
             );
         }
 
         if (
             (int) $result['status_code'] !== 200
         ) {
-            self::redirect_with_notice(
-                'error',
+            self::fail_reindex_or_delete(
+                $is_ajax,
                 self::extract_message(
                     $result['body'],
                     'The document could not be reindexed.'
-                )
+                ),
+                (int) $result['status_code']
             );
         }
 
@@ -1064,15 +1343,27 @@ final class LE_Global_Chatbot_Admin
             )
             : 0;
 
+        $success_message = sprintf(
+            '%s was reindexed successfully with %s chunks.',
+            $filename,
+            number_format_i18n(
+                $indexed_chunks
+            )
+        );
+
+        if ($is_ajax) {
+            wp_send_json_success(
+                [
+                    'message' => $success_message,
+                    'source_filename' => $filename,
+                    'indexed_chunks' => $indexed_chunks,
+                ]
+            );
+        }
+
         self::redirect_with_notice(
             'success',
-            sprintf(
-                '%s was reindexed successfully with %s chunks.',
-                $filename,
-                number_format_i18n(
-                    $indexed_chunks
-                )
-            )
+            $success_message
         );
     }
 
@@ -1088,6 +1379,10 @@ final class LE_Global_Chatbot_Admin
             . $document_id
         );
 
+        self::raise_execution_time_limit();
+
+        $is_ajax = self::is_ajax_request();
+
         $result = self::request_backend(
             'DELETE',
             self::DOCUMENTS_PATH
@@ -1100,21 +1395,23 @@ final class LE_Global_Chatbot_Admin
         );
 
         if (is_wp_error($result)) {
-            self::redirect_with_notice(
-                'error',
-                $result->get_error_message()
+            self::fail_reindex_or_delete(
+                $is_ajax,
+                $result->get_error_message(),
+                503
             );
         }
 
         if (
             (int) $result['status_code'] !== 200
         ) {
-            self::redirect_with_notice(
-                'error',
+            self::fail_reindex_or_delete(
+                $is_ajax,
                 self::extract_message(
                     $result['body'],
                     'The document could not be deleted.'
-                )
+                ),
+                (int) $result['status_code']
             );
         }
 
@@ -1134,15 +1431,602 @@ final class LE_Global_Chatbot_Admin
             )
             : 0;
 
+        $success_message = self::build_delete_success_message(
+            $filename,
+            $deleted_chunks,
+            isset($result['body']['source_cleanup_deferred'])
+            && $result['body']['source_cleanup_deferred'] === true
+        );
+
+        if ($is_ajax) {
+            wp_send_json_success(
+                [
+                    'message' => $success_message,
+                    'source_filename' => $filename,
+                    'deleted_chunks' => $deleted_chunks,
+                ]
+            );
+        }
+
         self::redirect_with_notice(
             'success',
-            self::build_delete_success_message(
-                $filename,
-                $deleted_chunks,
-                isset($result['body']['source_cleanup_deferred'])
-                && $result['body']['source_cleanup_deferred'] === true
-            )
+            $success_message
         );
+    }
+
+    /**
+     * Mission "ORDER 4", section 21/22: reindex/delete gain a fetch-
+     * based JSON response mode as pure progressive enhancement - the
+     * native admin-post.php form submit (no le_global_ajax field,
+     * e.g. JS disabled/failed) must keep working exactly as before,
+     * via the unchanged redirect_with_notice() fallback.
+     */
+    private static function is_ajax_request(): bool
+    {
+        return (
+            isset($_REQUEST['le_global_ajax'])
+            && sanitize_text_field(
+                wp_unslash(
+                    (string) $_REQUEST['le_global_ajax']
+                )
+            ) === '1'
+        );
+    }
+
+    private static function fail_reindex_or_delete(
+        bool $is_ajax,
+        string $message,
+        int $status_code
+    ): void {
+        if ($is_ajax) {
+            wp_send_json_error(
+                [
+                    'message' => $message,
+                    'detail' => [],
+                ],
+                $status_code
+            );
+        }
+
+        self::redirect_with_notice(
+            'error',
+            $message
+        );
+    }
+
+    /**
+     * A backend reindex/delete on a large document has been measured
+     * at ~30s (mission "ORDER 3B"), which sits exactly at PHP's own
+     * unmodified apache2handler max_execution_time (also 30s - see
+     * timeout-audit.txt, measured via a real HTTP request, not the
+     * CLI SAPI's misleading max_execution_time=0). Raised only inside
+     * the three handlers that proxy a genuinely long operation, never
+     * globally - GET-only reads (list/stats/download) keep PHP's
+     * default budget since they never approach it.
+     */
+    private static function raise_execution_time_limit(): void
+    {
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(
+                self::LONG_OPERATION_TIME_LIMIT_SECONDS
+            );
+        }
+    }
+
+    /**
+     * Mission "ORDER 4", section 23: the client supplies only
+     * document_id, never a path or key - PHP resolves the backend
+     * URL server-side (X-API-Key/X-Admin-Key never reach the
+     * browser) and streams the real DOCX bytes back with the
+     * correct Content-Type/Content-Disposition, never as JSON/
+     * base64. A plain <a href> link (no JS required) is the only
+     * caller - this keeps download working with JS disabled too.
+     */
+    public static function handle_download(): void
+    {
+        self::assert_capability();
+
+        $document_id = self::read_document_id();
+
+        check_admin_referer(
+            self::DOWNLOAD_ACTION . ':' . $document_id
+        );
+
+        $configuration = self::get_backend_configuration();
+
+        if (is_wp_error($configuration)) {
+            wp_die(
+                esc_html(
+                    $configuration->get_error_message()
+                ),
+                '',
+                ['response' => 503]
+            );
+        }
+
+        $backend_url = (
+            untrailingslashit($configuration['url'])
+            . self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/download'
+        );
+
+        $response = wp_remote_get(
+            $backend_url,
+            [
+                'timeout' => 60,
+                'headers' => [
+                    'Accept' => (
+                        'application/vnd.openxmlformats-'
+                        . 'officedocument.wordprocessingml.document'
+                    ),
+                    'X-API-Key' => $configuration['api_key'],
+                    'X-Admin-Key' => (
+                        $configuration['admin_api_key']
+                    ),
+                ],
+            ]
+        );
+
+        if (is_wp_error($response)) {
+            wp_die(
+                esc_html__(
+                    'The document could not be downloaded.',
+                    'le-global-chatbot'
+                ),
+                '',
+                ['response' => 503]
+            );
+        }
+
+        $status_code = wp_remote_retrieve_response_code(
+            $response
+        );
+
+        if ((int) $status_code !== 200) {
+            wp_die(
+                esc_html__(
+                    'The document could not be downloaded.',
+                    'le-global-chatbot'
+                ),
+                '',
+                ['response' => $status_code ?: 502]
+            );
+        }
+
+        $body = wp_remote_retrieve_body($response);
+
+        $content_disposition = (string) wp_remote_retrieve_header(
+            $response,
+            'content-disposition'
+        );
+
+        $filename = self::filename_from_content_disposition(
+            $content_disposition,
+            $document_id . '.docx'
+        );
+
+        nocache_headers();
+
+        header(
+            'Content-Type: application/vnd.openxmlformats-'
+            . 'officedocument.wordprocessingml.document'
+        );
+
+        header(
+            'Content-Disposition: attachment; filename="'
+            . $filename
+            . '"'
+        );
+
+        header(
+            'Content-Length: ' . strlen($body)
+        );
+
+        // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+        // -- this is the raw DOCX binary body, never HTML; escaping
+        // it would corrupt the file.
+        echo $body;
+
+        exit;
+    }
+
+    private static function filename_from_content_disposition(
+        string $header,
+        string $fallback
+    ): string {
+        if (
+            preg_match(
+                '/filename="?([^";]+)"?/i',
+                $header,
+                $matches
+            )
+            && trim($matches[1]) !== ''
+        ) {
+            return trim($matches[1]);
+        }
+
+        return $fallback;
+    }
+
+    /**
+     * Mission "ORDER 4", section 26: a small JSON-only read endpoint
+     * so the enhanced (JS) path can refresh the documents table and
+     * summary cards in place after an upload/reindex/delete settles,
+     * instead of a full page reload. Purely additive - render_page()
+     * still renders the exact same data server-side on a normal page
+     * load, via the same fetch_document_catalog()/fetch_document_
+     * stats() helpers.
+     */
+    public static function handle_refresh(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(self::REFRESH_ACTION, 'nonce');
+
+        [$documents, $catalog_error] = (
+            self::fetch_document_catalog()
+        );
+
+        if ($catalog_error !== null) {
+            wp_send_json_error(
+                ['message' => $catalog_error],
+                502
+            );
+        }
+
+        wp_send_json_success(
+            [
+                'documents' => $documents,
+                'stats' => self::fetch_document_stats(),
+            ]
+        );
+    }
+
+    /**
+     * Mission "ORDER 5D": every section that really exists in one
+     * document's current effective state - the Edit UI's section
+     * dropdown is populated from this, never a "Create section"
+     * option, since only an already-existing section may be edited
+     * (see handle_update_section, and the backend's own
+     * update_admin_document_section, which never creates a new
+     * legal_topic).
+     */
+    public static function handle_list_sections(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::SECTIONS_LIST_ACTION,
+            'nonce'
+        );
+
+        $document_id = self::read_document_id_for_json();
+
+        $result = self::request_backend(
+            'GET',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/sections',
+            null,
+            30
+        );
+
+        self::relay_json_result(
+            $result,
+            'The sections could not be loaded.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 5D": the current EFFECTIVE content of one
+     * section - never the original DOCX paragraph text, and never
+     * annotated with any DOCX/manual-edit indicator (the textarea
+     * shows exactly what the chatbot would actually answer with,
+     * indistinguishable from unedited content by design).
+     */
+    public static function handle_get_section(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::SECTION_GET_ACTION,
+            'nonce'
+        );
+
+        $document_id = self::read_document_id_for_json();
+        $section_id = self::read_section_id_for_json();
+
+        $result = self::request_backend(
+            'GET',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/sections/'
+            . rawurlencode($section_id),
+            null,
+            30
+        );
+
+        self::relay_json_result(
+            $result,
+            'The section could not be loaded.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 5D": save a new effective content for one
+     * already-existing section - a single backend mutation per call,
+     * the browser's own double-click/double-submit protection is
+     * enforced client-side (admin.js disables Save for the duration
+     * of the request), never here, since PHP has no way to tell a
+     * genuine retry from a second, distinct click. Content is
+     * unslashed only, deliberately never sanitize_text_field()'d -
+     * that WordPress helper strips tags AND collapses line breaks,
+     * which would silently destroy the paragraph structure the
+     * mission explicitly requires preserving; this is plain text
+     * relayed to a JSON API, never rendered as HTML on either side of
+     * this proxy, so there is nothing here for sanitize_text_field to
+     * usefully protect against.
+     */
+    public static function handle_update_section(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::SECTION_UPDATE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $section_id = self::read_section_id_for_json();
+
+        $content = isset($_POST['content'])
+            ? wp_unslash((string) $_POST['content'])
+            : '';
+
+        if (trim($content) === '') {
+            wp_send_json_error(
+                [
+                    'message' => (
+                        'The section content must not be empty.'
+                    ),
+                ],
+                422
+            );
+        }
+
+        $result = self::request_backend(
+            'PUT',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/sections/'
+            . rawurlencode($section_id),
+            ['content' => $content],
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The section could not be saved.'
+        );
+    }
+
+    /**
+     * Shared JSON relay for the three section endpoints above - the
+     * same is_wp_error/status_code/extract_message pattern
+     * handle_refresh and the older form-based handlers each already
+     * used, factored out once these three needed it identically.
+     */
+    private static function relay_json_result(
+        $result,
+        string $fallback_message
+    ): void {
+        if (is_wp_error($result)) {
+            wp_send_json_error(
+                ['message' => $result->get_error_message()],
+                503
+            );
+        }
+
+        $status_code = (int) $result['status_code'];
+
+        if ($status_code < 200 || $status_code >= 300) {
+            wp_send_json_error(
+                [
+                    'message' => self::extract_message(
+                        $result['body'],
+                        $fallback_message
+                    ),
+                ],
+                $status_code
+            );
+        }
+
+        wp_send_json_success($result['body']);
+    }
+
+    private static function read_document_id_for_json(): string
+    {
+        $document_id = isset($_REQUEST['document_id'])
+            ? sanitize_text_field(
+                wp_unslash(
+                    (string) $_REQUEST['document_id']
+                )
+            )
+            : '';
+
+        if (
+            !preg_match(
+                '/^doc_[0-9a-f]{64}$/',
+                $document_id
+            )
+        ) {
+            wp_send_json_error(
+                [
+                    'message' => (
+                        'The document identifier is invalid.'
+                    ),
+                ],
+                422
+            );
+        }
+
+        return $document_id;
+    }
+
+    private static function read_section_id_for_json(): string
+    {
+        $section_id = isset($_REQUEST['section_id'])
+            ? sanitize_text_field(
+                wp_unslash(
+                    (string) $_REQUEST['section_id']
+                )
+            )
+            : '';
+
+        if ($section_id === '') {
+            wp_send_json_error(
+                [
+                    'message' => (
+                        'The section identifier is invalid.'
+                    ),
+                ],
+                422
+            );
+        }
+
+        return $section_id;
+    }
+
+    /**
+     * @return array{0: array<int, array<string, mixed>>, 1: ?string}
+     */
+    private static function fetch_document_catalog(): array
+    {
+        $result = self::request_backend(
+            'GET',
+            self::DOCUMENTS_PATH,
+            null,
+            30
+        );
+
+        if (is_wp_error($result)) {
+            return [[], $result->get_error_message()];
+        }
+
+        if ((int) $result['status_code'] !== 200) {
+            return [
+                [],
+                self::extract_message(
+                    $result['body'],
+                    'The document catalog could not be loaded.'
+                ),
+            ];
+        }
+
+        if (
+            !isset($result['body']['documents'])
+            || !is_array($result['body']['documents'])
+        ) {
+            return [[], null];
+        }
+
+        $documents = array_map(
+            static function ($document) {
+                if (
+                    !is_array($document)
+                    || !isset($document['document_id'])
+                    || !is_string($document['document_id'])
+                ) {
+                    return $document;
+                }
+
+                $document_id = $document['document_id'];
+
+                $document['download_url'] = (
+                    empty($document['source_file_present'])
+                    ? null
+                    : self::build_download_url($document_id)
+                );
+
+                $document['reindex_nonce'] = (
+                    empty($document['source_file_present'])
+                    ? null
+                    : wp_create_nonce(
+                        self::REINDEX_ACTION . ':' . $document_id
+                    )
+                );
+
+                $document['delete_nonce'] = wp_create_nonce(
+                    self::DELETE_ACTION . ':' . $document_id
+                );
+
+                return $document;
+            },
+            $result['body']['documents']
+        );
+
+        return [$documents, null];
+    }
+
+    private static function build_download_url(
+        string $document_id
+    ): string {
+        return wp_nonce_url(
+            add_query_arg(
+                [
+                    'action' => self::DOWNLOAD_ACTION,
+                    'document_id' => $document_id,
+                ],
+                admin_url('admin-post.php')
+            ),
+            self::DOWNLOAD_ACTION . ':' . $document_id
+        );
+    }
+
+    /**
+     * @return ?array{total_documents: int, total_countries: int, status_counts: array<string, int>}
+     */
+    private static function fetch_document_stats(): ?array
+    {
+        $result = self::request_backend(
+            'GET',
+            self::DOCUMENTS_PATH . '/stats',
+            null,
+            30
+        );
+
+        if (
+            is_wp_error($result)
+            || (int) $result['status_code'] !== 200
+        ) {
+            return null;
+        }
+
+        return [
+            'total_documents' => isset(
+                $result['body']['total_documents']
+            )
+                ? (int) $result['body']['total_documents']
+                : 0,
+            'total_countries' => isset(
+                $result['body']['total_countries']
+            )
+                ? (int) $result['body']['total_countries']
+                : 0,
+            'status_counts' => isset(
+                $result['body']['status_counts']
+            )
+            && is_array($result['body']['status_counts'])
+                ? $result['body']['status_counts']
+                : [],
+        ];
     }
 
     /**
@@ -1200,11 +2084,11 @@ final class LE_Global_Chatbot_Admin
     private static function read_document_id(): string
     {
         $document_id = isset(
-            $_POST['document_id']
+            $_REQUEST['document_id']
         )
             ? sanitize_text_field(
                 wp_unslash(
-                    (string) $_POST['document_id']
+                    (string) $_REQUEST['document_id']
                 )
             )
             : '';
@@ -1515,6 +2399,61 @@ final class LE_Global_Chatbot_Admin
         }
 
         return $remote_address;
+    }
+
+    /**
+     * The Edit UI's country dropdown, built exclusively from the real
+     * indexed catalog (mission "ORDER 5D", section 2) - never the
+     * static 34-country allowlist, and never a country the catalog
+     * does not currently have a document for. Sorted stably by
+     * display name (PHP's usort has been a stable sort since 8.0, so
+     * this needs no manual tie-break) - two countries never swap
+     * places between renders just because the catalog happened to
+     * list them in a different order.
+     *
+     * @param array<int, array<string, mixed>> $documents
+     * @return array<int, array{document_id: string, country: string, country_code: string}>
+     */
+    private static function sorted_documents_for_edit(
+        array $documents
+    ): array {
+        $entries = [];
+
+        foreach ($documents as $document) {
+            if (!is_array($document)) {
+                continue;
+            }
+
+            $document_id = isset($document['document_id'])
+                ? (string) $document['document_id']
+                : '';
+
+            if ($document_id === '') {
+                continue;
+            }
+
+            $entries[] = [
+                'document_id' => $document_id,
+                'country' => isset($document['country'])
+                    ? (string) $document['country']
+                    : '',
+                'country_code' => isset(
+                    $document['country_code']
+                )
+                    ? (string) $document['country_code']
+                    : '',
+            ];
+        }
+
+        usort(
+            $entries,
+            static fn (array $a, array $b): int => strcasecmp(
+                $a['country'],
+                $b['country']
+            )
+        );
+
+        return $entries;
     }
 
     private static function shorten_identifier(

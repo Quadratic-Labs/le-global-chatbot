@@ -295,22 +295,22 @@ class SupportedCountriesDetectionTests(unittest.TestCase):
     def test_unsupported_country_gets_an_honest_negative_answer(
         self,
     ) -> None:
-        intent = _detect("Do you cover France?")
+        intent = _detect("Do you cover Kenya?")
         self.assertIsNotNone(intent)
         answer = build_assistant_help_answer(
-            intent, original_question="Do you cover France?"
+            intent, original_question="Do you cover Kenya?"
         )
         self.assertIn("do not currently have", answer)
-        self.assertIn("France", answer)
+        self.assertIn("Kenya", answer)
 
     def test_never_claims_a_country_without_checking_real_config(
         self,
     ) -> None:
-        # France is not in the 17-country supported set used by these
+        # Kenya is not in the 17-country supported set used by these
         # tests - the answer must say so, never "Yes".
         answer = build_assistant_help_answer(
-            _detect("Do you cover France?"),
-            original_question="Do you cover France?",
+            _detect("Do you cover Kenya?"),
+            original_question="Do you cover Kenya?",
         )
         self.assertNotIn("Yes.", answer)
 

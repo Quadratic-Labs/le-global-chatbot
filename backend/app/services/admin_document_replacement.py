@@ -14,31 +14,51 @@ from typing import BinaryIO
 
 from opensearchpy import OpenSearch
 from opensearchpy.exceptions import (
-    NotFoundError,
     OpenSearchException,
 )
 
 from app.clients.opensearch import get_opensearch_client
+from app.core.admin_country_policy import is_admin_country_allowed
+from app.core.country_registry import CountryMetadataMismatchError
 from app.models.admin_documents import AdminDocumentUploadResponse
 from app.models.document import DocumentChunk
 from app.services.admin_documents import (
     AdminDocumentStorageError,
+    DocumentCorruptError,
+    DocumentCountryUndeterminedError,
+    DocumentParseFailedError,
     InvalidDocumentUploadError,
     _safe_unlink,
     _sanitize_filename,
     _write_upload,
 )
+from app.services.country_lock import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    country_lock,
+)
 from app.services.document_chunk_builder import (
     DOCUMENT_FAMILY,
+    AmbiguousDocumentCountryError,
+    InvalidDocxFormatError,
+    UndeterminableDocumentCountryError,
     build_document_chunks_from_docx,
     storage_filename_for_country,
 )
 from app.services.document_indexer import (
+    DocumentIndexingError,
     DocumentIndexingResult,
+    _fetch_all_chunks,
     replace_country_document_chunks,
+)
+from app.services.document_section_state import (
+    delete_section_edit_state,
 )
 from app.services.document_source_resolver import (
     resolve_country_source_paths,
+)
+from app.services.document_warnings import (
+    TopicCoverageWarning,
+    evaluate_topic_coverage,
 )
 from app.services.opensearch_index import LEGAL_DOCUMENTS_ALIAS
 
@@ -52,6 +72,45 @@ class ExistingCountryDocument:
     country: str
     country_code: str
     reference_year: int | None
+
+
+class AdminDocumentCountryNotAllowedError(ValueError):
+    """
+    Raised when a document's country is correctly detected but is not
+    on the ADMIN upload allowlist (app.core.admin_country_policy).
+
+    Deliberately a distinct error from DocumentCountryUndeterminedError
+    (mission "ORDER 5C": a country the registry could not identify at
+    all, and a country identified perfectly but not currently
+    accepted for new uploads, are different failures with different
+    remediations - conflating them into one generic "undetermined"
+    message would hide which one actually happened).
+    """
+
+    def __init__(
+        self,
+        *,
+        country: str,
+        country_code: str,
+    ) -> None:
+        self.country = country
+        self.country_code = country_code
+
+        super().__init__(
+            f"{country} ({country_code}) is not currently accepted "
+            "for new document uploads."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 422 payload."""
+
+        return {
+            "code": "document_country_not_allowed",
+            "message": str(self),
+            "operation": "upload",
+            "country_code": self.country_code,
+            "country_name": self.country,
+        }
 
 
 class AdminDocumentReplacementRequiredError(ValueError):
@@ -117,6 +176,67 @@ class AdminDocumentAlreadyCurrentError(ValueError):
         }
 
 
+class AdminDocumentWarningConfirmationRequiredError(ValueError):
+    """
+    Raised when a document parses successfully but its topic coverage
+    warrants admin confirmation (confirm_warnings=True) before it is
+    indexed - never raised together with AdminDocumentAlreadyCurrentError
+    (an identical re-upload is always a no-op, regardless of warnings)
+    and never in place of AdminDocumentReplacementRequiredError when no
+    warning applies (mission "ORDER 3", section 14: that simpler,
+    already-supported contract must stay unchanged when it is the only
+    pending decision).
+    """
+
+    def __init__(
+        self,
+        *,
+        country: str,
+        country_code: str,
+        warnings: Sequence[TopicCoverageWarning],
+        replacement_required: bool,
+        existing_document_ids: Sequence[str],
+    ) -> None:
+        self.country = country
+        self.country_code = country_code
+        self.warnings = tuple(warnings)
+        self.replacement_required = replacement_required
+        self.existing_document_ids = tuple(existing_document_ids)
+
+        super().__init__(
+            "The document is technically valid but its content "
+            "requires confirmation before indexing. Set "
+            "confirm_warnings=true to proceed."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 409 payload."""
+
+        return {
+            "code": "document_warning_confirmation_required",
+            "message": str(self),
+            "operation": "upload",
+            "country_code": self.country_code,
+            "country_name": self.country,
+            "replacement_required": self.replacement_required,
+            "existing_document_ids": list(self.existing_document_ids),
+            "warnings": [
+                {
+                    "code": warning.code,
+                    "message": warning.message,
+                    "recognized_topics_count": (
+                        warning.recognized_topics_count
+                    ),
+                    "expected_topics_count": (
+                        warning.expected_topics_count
+                    ),
+                    "missing_topics": list(warning.missing_topics),
+                }
+                for warning in self.warnings
+            ],
+        }
+
+
 ChunkBuilder = Callable[[Path], list[DocumentChunk]]
 CountryDocumentLookup = Callable[
     [str, OpenSearch | None],
@@ -159,49 +279,16 @@ def lookup_existing_country_documents(
     )
 
     try:
-        response = opensearch_client.search(
-            index=LEGAL_DOCUMENTS_ALIAS,
-            body={
-                "size": 10000,
-                "_source": [
-                    "document_id",
-                    "source_filename",
-                    "country",
-                    "country_code",
-                    "reference_year",
-                ],
-                "query": {
-                    "term": {
-                        "country_code": normalized_country_code,
-                    }
-                },
-            },
+        hits = _fetch_all_chunks(
+            client=opensearch_client,
+            field="country_code",
+            value=normalized_country_code,
         )
 
-    except NotFoundError:
-        return []
-
-    except OpenSearchException:
-        raise
-
-    if not isinstance(response, dict):
+    except DocumentIndexingError as error:
         raise AdminDocumentStorageError(
             "OpenSearch returned an invalid country lookup response."
-        )
-
-    hits_container = response.get("hits")
-
-    if not isinstance(hits_container, dict):
-        raise AdminDocumentStorageError(
-            "OpenSearch returned invalid country lookup results."
-        )
-
-    hits = hits_container.get("hits")
-
-    if not isinstance(hits, list):
-        raise AdminDocumentStorageError(
-            "OpenSearch returned an invalid country hit list."
-        )
+        ) from error
 
     documents_by_id: dict[str, ExistingCountryDocument] = {}
 
@@ -296,6 +383,7 @@ def safe_upload_and_index_document(
     processed_directory: Path,
     maximum_bytes: int,
     replace_existing: bool = False,
+    confirm_warnings: bool = False,
     client: OpenSearch | None = None,
     chunk_builder: ChunkBuilder = build_document_chunks_from_docx,
     country_document_lookup: CountryDocumentLookup = (
@@ -304,6 +392,7 @@ def safe_upload_and_index_document(
     country_document_indexer: CountryDocumentIndexer = (
         replace_country_document_chunks
     ),
+    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
 ) -> AdminDocumentUploadResponse:
     """
     Upload one DOCX with explicit country-level replacement approval.
@@ -323,6 +412,16 @@ def safe_upload_and_index_document(
     "HOTFIX 0.4.9").
 
     An existing country is never changed unless replace_existing=True.
+
+    A document that parses successfully but whose topic coverage is
+    atypical (see app.services.document_warnings) is not indexed
+    unless confirm_warnings=True is also passed - the warning itself
+    is always recomputed here, from the real uploaded bytes, never
+    trusted from the caller (mission "ORDER 3", section 13).
+
+    Every read/decide/mutate step from the country lookup onward runs
+    under a per-country lock (country_lock) - never held during
+    chunk_builder's own parsing, which does not touch shared state.
     """
 
     safe_filename = _sanitize_filename(filename)
@@ -355,119 +454,206 @@ def safe_upload_and_index_document(
             try:
                 chunks = chunk_builder(staged_path)
 
+            except InvalidDocxFormatError as error:
+                raise DocumentCorruptError(
+                    f"DOCX validation failed: {error}"
+                ) from error
+
+            except (
+                UndeterminableDocumentCountryError,
+                AmbiguousDocumentCountryError,
+                CountryMetadataMismatchError,
+            ) as error:
+                raise DocumentCountryUndeterminedError(
+                    f"DOCX validation failed: {error}"
+                ) from error
+
             except Exception as error:
-                raise InvalidDocumentUploadError(
+                raise DocumentParseFailedError(
                     f"DOCX validation failed: {error}"
                 ) from error
 
             if not chunks:
-                raise InvalidDocumentUploadError(
+                raise DocumentParseFailedError(
                     "The uploaded DOCX produced no legal chunks."
                 )
 
             first_chunk = chunks[0]
             country_code = first_chunk.country_code.strip().upper()
 
-            try:
-                existing_documents = country_document_lookup(
-                    country_code,
-                    client,
+            # Mission "ORDER 5C", section 10: the allowlist check runs
+            # AFTER country detection/normalization but BEFORE any
+            # mutation - no source commit, no OpenSearch write, no
+            # staging durable, no country_lock acquired yet. The
+            # TemporaryDirectory context above (still open here) means
+            # the staged upload is cleaned up automatically the moment
+            # this raises, exactly like every other pre-mutation
+            # validation failure in this same function.
+            if not is_admin_country_allowed(country_code):
+                raise AdminDocumentCountryNotAllowedError(
+                    country=first_chunk.country,
+                    country_code=country_code,
                 )
 
-            except OpenSearchException as error:
-                raise AdminDocumentStorageError(
-                    "The existing country catalog could not be checked "
-                    "before upload."
-                ) from error
+            topic_warning = evaluate_topic_coverage(chunks)
 
-            existing_paths = resolve_country_source_paths(
-                source_root=source_directory,
-                country_code=country_code,
-                source_filenames=[
-                    document.source_filename
-                    for document in existing_documents
-                ],
-            )
-
-            unique_document_ids = {
-                document.document_id
-                for document in existing_documents
-            }
-
-            if (
-                len(unique_document_ids) == 1
-                and len(existing_paths) == 1
-                and _sha256_file(staged_path)
-                == _sha256_file(existing_paths[0])
+            # Everything from here on reads-then-mutates shared,
+            # country-scoped state (the OpenSearch catalog and the
+            # source filesystem) - held under one lock so two
+            # concurrent uploads for the SAME country can never both
+            # observe "no existing document" and both proceed (mission
+            # "ORDER 3", section 17). chunk_builder above never touches
+            # that shared state, so it deliberately runs outside the
+            # lock.
+            with country_lock(
+                source_directory,
+                country_code,
+                timeout_seconds=lock_timeout_seconds,
             ):
-                raise AdminDocumentAlreadyCurrentError(
-                    country=first_chunk.country,
+                try:
+                    existing_documents = country_document_lookup(
+                        country_code,
+                        client,
+                    )
+
+                except OpenSearchException as error:
+                    raise AdminDocumentStorageError(
+                        "The existing country catalog could not be "
+                        "checked before upload."
+                    ) from error
+
+                existing_paths = resolve_country_source_paths(
+                    source_root=source_directory,
                     country_code=country_code,
+                    source_filenames=[
+                        document.source_filename
+                        for document in existing_documents
+                    ],
                 )
 
-            if existing_documents and not replace_existing:
-                raise AdminDocumentReplacementRequiredError(
-                    country=first_chunk.country,
-                    country_code=country_code,
-                    existing_documents=existing_documents,
+                unique_document_ids = {
+                    document.document_id
+                    for document in existing_documents
+                }
+
+                if (
+                    len(unique_document_ids) == 1
+                    and len(existing_paths) == 1
+                    and _sha256_file(staged_path)
+                    == _sha256_file(existing_paths[0])
+                ):
+                    raise AdminDocumentAlreadyCurrentError(
+                        country=first_chunk.country,
+                        country_code=country_code,
+                    )
+
+                replacement_pending = (
+                    bool(existing_documents)
+                    and not replace_existing
                 )
 
-            operation_id = uuid.uuid4().hex
-            storage_filename = storage_filename_for_country(
-                country_code
-            )
-            final_path = source_directory / storage_filename
-            incoming_path = (
-                source_directory
-                / f".{operation_id}.{storage_filename}.incoming"
-            )
-            backups: list[tuple[Path, Path]] = []
-            new_final_installed = False
+                if (
+                    topic_warning is not None
+                    and not confirm_warnings
+                ):
+                    raise AdminDocumentWarningConfirmationRequiredError(
+                        country=first_chunk.country,
+                        country_code=country_code,
+                        warnings=[topic_warning],
+                        replacement_required=replacement_pending,
+                        existing_document_ids=sorted(
+                            unique_document_ids
+                        ),
+                    )
 
-            shutil.copyfile(staged_path, incoming_path)
+                if replacement_pending:
+                    raise AdminDocumentReplacementRequiredError(
+                        country=first_chunk.country,
+                        country_code=country_code,
+                        existing_documents=existing_documents,
+                    )
 
-            try:
-                for existing_path in existing_paths:
-                    backup_path = (
-                        existing_path.parent
-                        / (
-                            f".{operation_id}."
-                            f"{existing_path.name}.backup"
+                operation_id = uuid.uuid4().hex
+                storage_filename = storage_filename_for_country(
+                    country_code
+                )
+                final_path = source_directory / storage_filename
+                incoming_path = (
+                    source_directory
+                    / f".{operation_id}.{storage_filename}.incoming"
+                )
+                backups: list[tuple[Path, Path]] = []
+                new_final_installed = False
+
+                shutil.copyfile(staged_path, incoming_path)
+
+                try:
+                    for existing_path in existing_paths:
+                        backup_path = (
+                            existing_path.parent
+                            / (
+                                f".{operation_id}."
+                                f"{existing_path.name}.backup"
+                            )
                         )
-                    )
 
-                    os.replace(
-                        existing_path,
-                        backup_path,
-                    )
-                    backups.append(
-                        (
+                        os.replace(
                             existing_path,
                             backup_path,
                         )
+                        backups.append(
+                            (
+                                existing_path,
+                                backup_path,
+                            )
+                        )
+
+                    os.replace(
+                        incoming_path,
+                        final_path,
+                    )
+                    new_final_installed = True
+
+                    indexing_result = country_document_indexer(
+                        chunks=chunks,
+                        client=client,
                     )
 
-                os.replace(
-                    incoming_path,
-                    final_path,
-                )
-                new_final_installed = True
+                except Exception:
+                    if new_final_installed:
+                        _safe_unlink(final_path)
 
-                indexing_result = country_document_indexer(
-                    chunks=chunks,
-                    client=client,
-                )
+                    _safe_unlink(incoming_path)
+                    _restore_backups(backups)
+                    raise
 
-            except Exception:
-                if new_final_installed:
-                    _safe_unlink(final_path)
+                for _, backup_path in backups:
+                    _safe_unlink(backup_path)
 
-                _safe_unlink(incoming_path)
-                _restore_backups(backups)
-                raise
+                # Mission "ORDER 5C", section 34: a CONFIRMED replace
+                # is a full country document reset - every persisted
+                # edit belonging to the document(s) just replaced must
+                # be gone, so it can never silently reapply to the new
+                # DOCX (document_id is deterministic by country_code +
+                # family + language, so the new document commonly
+                # reuses the very same id the old edits were keyed
+                # under). Only reached once the new document is fully
+                # and successfully indexed - a fresh upload with no
+                # existing_documents has nothing to clear.
+                if existing_documents:
+                    try:
+                        for old_document_id in unique_document_ids:
+                            delete_section_edit_state(
+                                source_directory,
+                                old_document_id,
+                            )
 
-            for _, backup_path in backups:
-                _safe_unlink(backup_path)
+                    except OSError as error:
+                        raise AdminDocumentStorageError(
+                            "The document was replaced, but its "
+                            "previous section-edit state could not "
+                            "be fully cleared."
+                        ) from error
 
             return AdminDocumentUploadResponse(
                 status=(

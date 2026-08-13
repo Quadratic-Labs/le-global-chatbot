@@ -433,6 +433,31 @@ class DocumentChunkBuilderTests(unittest.TestCase):
             ):
                 metadata_from_content(file_path=file_path)
 
+    def test_title_with_leading_definite_article_resolves_country(
+        self,
+    ) -> None:
+        # Mission "ORDER 2": Czech Republic's real production source
+        # reads "Labour and employment law in the Czech Republic" -
+        # with the article - and the registry had no "the Czech
+        # Republic" alias, so this raised
+        # UndeterminableDocumentCountryError on Reindex (masked by the
+        # router into a generic 502). Reproduces the exact title
+        # phrasing, not just the country name in isolation.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                [
+                    "Labour and employment law in the Czech Republic"
+                ],
+            )
+
+            metadata = metadata_from_content(
+                file_path=file_path
+            )
+
+        self.assertEqual(metadata.country, "Czech Republic")
+        self.assertEqual(metadata.country_code, "CZ")
+
     def test_uk_content_uses_canonical_country_name(
         self,
     ) -> None:
@@ -835,6 +860,67 @@ class RealDocumentStructureTests(unittest.TestCase):
 
         self.assertEqual(metadata.country, "Philippines")
         self.assertEqual(metadata.country_code, "PH")
+
+    def test_reversed_cover_country_then_plural_heading_with_year_range(
+        self,
+    ) -> None:
+        # The real France document's own cover: a bare country name,
+        # then a heading with a plural "Overviews" and a year range -
+        # the reverse order and wording of the usual two-line cover.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["FRANCE", "EMPLOYMENT LAW OVERVIEWS 2025 - 2026"],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "France")
+        self.assertEqual(metadata.country_code, "FR")
+
+    def test_reversed_cover_country_then_heading_with_template_boilerplate(
+        self,
+    ) -> None:
+        # The real Portugal document's own cover: a bare country
+        # name, then a heading wrapped in unrelated boilerplate words
+        # on both sides ("Country-Specific ... Template").
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                [
+                    "PORTUGAL",
+                    "COUNTRY-SPECIFIC EMPLOYMENT LAW OVERVIEWS 2026 TEMPLATE",
+                ],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Portugal")
+        self.assertEqual(metadata.country_code, "PT")
+
+    def test_reversed_cover_fallback_never_silently_misdetects_an_unrelated_country(
+        self,
+    ) -> None:
+        # The reversed-order fallback's "next line merely contains
+        # the family heading phrase" check is deliberately loose - an
+        # unrelated bare country name sitting directly before some
+        # other line that happens to contain "Employment Law
+        # Overview" (e.g. a real cover's own one-line title for the
+        # actual country) must never be silently accepted as *the*
+        # document's country. The pre-existing ambiguity refusal
+        # (more than one distinct country code found in the front
+        # matter) is what has to catch this - proven here rather than
+        # merely assumed.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Spain", "Employment Law Overview Canada"],
+            )
+
+            with self.assertRaises(
+                AmbiguousDocumentCountryError
+            ):
+                metadata_from_content(file_path=file_path)
 
     def test_document_with_no_standard_cover_is_refused(self) -> None:
         with TemporaryDirectory() as directory:

@@ -1,20 +1,49 @@
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
+from typing import Any
+from unittest import mock
 
+from app.clients.openai_responses import GeneratedText
 from app.models.catalog import (
     LegalCatalogCountry,
     LegalCatalogResponse,
 )
 from app.models.chat import LegalChatRequest
+from app.models.search import LegalSearchResponse
 from app.routers.chat import resolve_legal_chat_response
 from app.services.conversation_meta import (
     append_personalised_legal_caution,
     build_comparison_country_limit_answer,
     requires_personalised_legal_caution,
+    resolve_ambiguous_city_followup_question,
     resolve_conversation_meta,
 )
+
+
+class _FakeUnderstandingClient:
+    """Minimal test double for the semantic-understanding client -
+    only what AmbiguousCityFollowupResumeTests' own end-to-end test
+    needs (see test_chat.py's own, fuller FakeUnderstandingClient for
+    the canonical version)."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.call_count = 0
+
+    def generate(
+        self,
+        instructions: str,
+        input_text: str,
+        text_format: dict[str, Any] | None = None,
+    ) -> GeneratedText:
+        self.call_count += 1
+
+        return GeneratedText(
+            text=json.dumps(self.payload), model="test-model"
+        )
 
 
 def _catalog() -> LegalCatalogResponse:
@@ -286,6 +315,153 @@ class CatalogueTests(unittest.TestCase):
             "Tunisia is a valid country",
             result.answer,
         )
+        self.assertIn(
+            "Would you like to see the countries currently covered?",
+            result.answer,
+        )
+
+    def test_targeted_availability_matches_country_between_verb_and_adjective(
+        self,
+    ) -> None:
+        # Real regression found by adversarial review: a plain
+        # substring check for "is supported"/"is available" missed
+        # the natural word order "is COUNTRY supported/available"
+        # (the country name sits between the verb and the adjective),
+        # falling through to assistant_help.py's older, registry-only
+        # answer instead of this module's catalogue-based one.
+        for question in (
+            "Is Tunisia supported?",
+            "Is Tunisia available?",
+            "Are Tunisia and Algeria supported?",
+        ):
+            with self.subTest(question=question):
+                result = _resolution(question)
+
+                self.assertEqual(
+                    result.intent_type,
+                    "targeted_country_availability",
+                )
+                self.assertIn(
+                    "do not currently have",
+                    result.answer,
+                )
+
+        available = _resolution("Is Spain supported?")
+
+        self.assertEqual(
+            available.intent_type,
+            "targeted_country_availability",
+        )
+        self.assertIn(
+            "Spain is currently available",
+            available.answer,
+        )
+
+    def test_yes_after_unavailable_country_shows_dynamic_coverage_list(
+        self,
+    ) -> None:
+        # Mission "ORDER 5C-GEO", sections 3/18: the offer above must
+        # be followable by a bare "Yes", answered from the real
+        # catalogue - never a hardcoded count.
+        offer = _resolution("Do you support Algeria?")
+
+        result = _resolution(
+            "Yes",
+            history=[
+                {"role": "user", "content": "Do you support Algeria?"},
+                {"role": "assistant", "content": offer.answer},
+            ],
+        )
+
+        self.assertEqual(
+            result.intent_type,
+            "coverage_list_followup",
+        )
+        self.assertIn("3 countries", result.answer)
+        self.assertIn("Spain", result.answer)
+        self.assertIn("Italy", result.answer)
+        self.assertIn("United Kingdom", result.answer)
+
+    def test_coverage_list_followup_state_is_not_stuck(
+        self,
+    ) -> None:
+        # A later, unrelated "Yes" (the offer is no longer the last
+        # assistant turn) must never be misread as asking for the
+        # coverage list again.
+        offer = _resolution("Do you support Algeria?")
+        shown = _resolution(
+            "Yes",
+            history=[
+                {"role": "user", "content": "Do you support Algeria?"},
+                {"role": "assistant", "content": offer.answer},
+            ],
+        )
+
+        result = _resolution(
+            "Yes",
+            history=[
+                {"role": "user", "content": "Do you support Algeria?"},
+                {"role": "assistant", "content": offer.answer},
+                {"role": "user", "content": "Yes"},
+                {"role": "assistant", "content": shown.answer},
+                {"role": "user", "content": "Do you have topics too?"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        "You can ask about the following canonical "
+                        "employment-law topics."
+                    ),
+                },
+            ],
+        )
+
+        self.assertNotEqual(
+            result.intent_type if result else None,
+            "coverage_list_followup",
+        )
+
+    def test_coverage_list_reflects_catalog_changes(self) -> None:
+        # Mission section 3's own worked example - remove a country
+        # from the catalog and the very same flow must name fewer
+        # countries, with zero hardcoded count anywhere in the code
+        # path.
+        def catalog_without_spain() -> LegalCatalogResponse:
+            return LegalCatalogResponse(
+                countries=[
+                    LegalCatalogCountry(
+                        country_code="IT",
+                        country="Italy",
+                        chunk_count=40,
+                    ),
+                    LegalCatalogCountry(
+                        country_code="GB",
+                        country="United Kingdom",
+                        chunk_count=45,
+                    ),
+                ],
+                legal_topics=[],
+                subsections=[],
+            )
+
+        offer = resolve_conversation_meta(
+            question="Do you support Algeria?",
+            history=[],
+            conversation_state=None,
+            catalog_provider=catalog_without_spain,
+        )
+
+        result = resolve_conversation_meta(
+            question="Yes",
+            history=[
+                {"role": "user", "content": "Do you support Algeria?"},
+                {"role": "assistant", "content": offer.answer},
+            ],
+            conversation_state=None,
+            catalog_provider=catalog_without_spain,
+        )
+
+        self.assertIn("2 countries", result.answer)
+        self.assertNotIn("Spain", result.answer)
 
     def test_embedded_country_typo_is_suggested(self) -> None:
         result = _resolution(
@@ -590,6 +766,289 @@ class RouterIntegrationTests(unittest.TestCase):
         self.assertEqual(response.grounded, False)
         self.assertIn("3 countries", response.answer)
         self.assertIn("Italy", response.answer)
+
+
+class AmbiguousCityClarificationTests(unittest.TestCase):
+    """
+    Corrective gate, section 9 - a genuinely ambiguous city name (real
+    geonamescache data: Barcelona, Spain / Barcelona, Venezuela at a
+    ~2x population ratio) asks a specific clarifying question rather
+    than falling through to the generic "specify a country" prompt,
+    and never hijacks a real multi-country comparison (which is also
+    AMBIGUOUS from resolve_jurisdiction's own point of view, but for
+    an entirely different, explicit-countries reason).
+    """
+
+    def test_ambiguous_city_alone_asks_which_country(self) -> None:
+        result = _resolution(
+            "social media rules at work in Barcelona"
+        )
+
+        self.assertEqual(
+            result.intent_type, "ambiguous_city_clarification"
+        )
+        self.assertIn("Barcelona", result.answer)
+        self.assertIn("Spain", result.answer)
+        self.assertIn("Venezuela", result.answer)
+
+    def test_explicit_country_is_never_hijacked_as_ambiguous(
+        self,
+    ) -> None:
+        result = _resolution("Barcelona, Spain")
+
+        self.assertIsNone(result)
+
+    def test_two_country_comparison_is_never_hijacked(self) -> None:
+        # AMBIGUOUS for resolve_jurisdiction too, but matched_location
+        # is unset for this case - must fall through to normal
+        # comparison routing untouched (both countries are in the
+        # shared test catalogue, so this exercises exactly that path,
+        # not the separate, pre-existing "unsupported_comparison"
+        # branch for a country the catalogue does not have).
+        result = _resolution("Compare Spain and Italy")
+
+        self.assertIsNone(result)
+
+
+class NoRedundantCountryDetectionCallTests(unittest.TestCase):
+    """
+    Adversarial-review finding, corrective gate: the ambiguous-city/
+    unknown-locality check used to call the full resolve_jurisdiction,
+    which re-derives explicit countries from scratch even though
+    resolve_conversation_meta's own country_codes (already confirmed
+    empty at that point) came from the exact same ~400-precompiled-
+    regex scan moments earlier - a real, measured ~2x-per-call
+    overhead. Going straight to the city-only primitives instead must
+    call the explicit-country scan exactly once per request.
+    """
+
+    def test_detect_mentioned_country_codes_called_once(self) -> None:
+        import app.services.conversation_meta as conversation_meta_module
+        import app.services.country_detection as country_detection_module
+
+        call_count = 0
+        original = (
+            country_detection_module.detect_mentioned_country_codes
+        )
+
+        def counting(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            country_detection_module,
+            "detect_mentioned_country_codes",
+            side_effect=counting,
+        ), mock.patch.object(
+            conversation_meta_module,
+            "detect_mentioned_country_codes",
+            side_effect=counting,
+        ):
+            resolve_conversation_meta(
+                question=(
+                    "What are the general employment law "
+                    "considerations for probation, notice, and "
+                    "severance, without naming any specific place?"
+                ),
+                history=[],
+                conversation_state=None,
+                catalog_provider=_catalog,
+            )
+
+        self.assertEqual(call_count, 1)
+
+
+class AmbiguousCityFollowupResumeTests(unittest.TestCase):
+    """
+    Corrective gate, section 9 - "User: Spain" after the clarification
+    above resumes the ORIGINAL question with Spain substituted for the
+    ambiguous city, entirely as plain text rewriting (this module has
+    no RAG access of its own).
+    """
+
+    def test_naming_an_offered_country_rebuilds_the_question(
+        self,
+    ) -> None:
+        offer = _resolution(
+            "social media rules at work in Barcelona"
+        )
+
+        resumed = resolve_ambiguous_city_followup_question(
+            question="Spain",
+            history=[
+                {
+                    "role": "user",
+                    "content": (
+                        "social media rules at work in Barcelona"
+                    ),
+                },
+                {"role": "assistant", "content": offer.answer},
+            ],
+        )
+
+        self.assertIsNotNone(resumed)
+        self.assertIn("Spain", resumed)
+        self.assertNotIn("Barcelona", resumed)
+        self.assertIn("social media rules at work", resumed)
+
+    def test_naming_an_unoffered_country_does_not_resume(
+        self,
+    ) -> None:
+        offer = _resolution(
+            "social media rules at work in Barcelona"
+        )
+
+        resumed = resolve_ambiguous_city_followup_question(
+            question="Italy",
+            history=[
+                {
+                    "role": "user",
+                    "content": (
+                        "social media rules at work in Barcelona"
+                    ),
+                },
+                {"role": "assistant", "content": offer.answer},
+            ],
+        )
+
+        self.assertIsNone(resumed)
+
+    def test_unrelated_later_turn_never_resumes(self) -> None:
+        # The offer is no longer the last assistant turn - this must
+        # never fire for an unrelated later "Spain" reply.
+        offer = _resolution(
+            "social media rules at work in Barcelona"
+        )
+
+        resumed = resolve_ambiguous_city_followup_question(
+            question="Spain",
+            history=[
+                {
+                    "role": "user",
+                    "content": (
+                        "social media rules at work in Barcelona"
+                    ),
+                },
+                {"role": "assistant", "content": offer.answer},
+                {"role": "user", "content": "Thanks, one more thing"},
+                {
+                    "role": "assistant",
+                    "content": "Sure, go ahead.",
+                },
+            ],
+        )
+
+        self.assertIsNone(resumed)
+
+    def test_no_prior_offer_never_resumes(self) -> None:
+        resumed = resolve_ambiguous_city_followup_question(
+            question="Spain",
+            history=[],
+        )
+
+        self.assertIsNone(resumed)
+
+    def test_end_to_end_through_the_router_resolves_spain(
+        self,
+    ) -> None:
+        # Full round trip: the ambiguous question, then the
+        # clarification's own answer, then "Spain" as the new
+        # question - resolve_legal_chat_response rewrites request.
+        # question BEFORE routing (chat.py), so the rewritten text is
+        # what every downstream step, including this response's own
+        # echoed `question` field, actually sees - proven here with a
+        # deterministic contact action (never needs a real OpenAI
+        # understanding/generation call).
+        offer_response = resolve_legal_chat_response(
+            LegalChatRequest(
+                question="Who can help me in Barcelona?"
+            ),
+            catalog_provider=_catalog,
+        )
+
+        self.assertIn("Barcelona", offer_response.answer)
+
+        understanding_client = _FakeUnderstandingClient(
+            payload={
+                "status": "resolved",
+                "actions": [
+                    {
+                        "type": "contact",
+                        "country_codes": ["ES"],
+                        "legal_topics": [],
+                        "topic_text": None,
+                        "resolved_question": None,
+                    }
+                ],
+                "is_follow_up": False,
+                "confidence": 0.9,
+                "clarification_reason": None,
+                "current_message_delta": {
+                    "explicit_action_types": ["contact"],
+                    "explicit_country_codes": ["ES"],
+                    "explicit_legal_topics": [],
+                    "explicit_subject_text": None,
+                    "context_operation": "independent",
+                },
+            }
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            return_value=LegalSearchResponse(
+                query="",
+                total=0,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            ),
+        ):
+            resumed_response = resolve_legal_chat_response(
+                LegalChatRequest(
+                    question="Spain",
+                    history=[
+                        {
+                            "role": "user",
+                            "content": "Who can help me in Barcelona?",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": offer_response.answer,
+                        },
+                    ],
+                ),
+                catalog_provider=_catalog,
+                understanding_client=understanding_client,
+            )
+
+        self.assertIn("Spain", resumed_response.question)
+        self.assertNotIn("Barcelona", resumed_response.question)
+        self.assertEqual(understanding_client.call_count, 1)
+
+
+class UnknownLocalityClarificationTests(unittest.TestCase):
+    """
+    Corrective gate, section 11 - a question that clearly names a
+    place the dataset does not recognize must ask which country it is
+    in, never fabricate a country, and never call the internet or an
+    LLM to resolve it.
+    """
+
+    def test_unrecognized_place_asks_which_country(self) -> None:
+        result = _resolution("employment law in Ruritania")
+
+        self.assertEqual(
+            result.intent_type, "unknown_locality_clarification"
+        )
+        self.assertIn("Ruritania", result.answer)
+        self.assertIn("Which country", result.answer)
+
+    def test_no_location_at_all_is_not_hijacked(self) -> None:
+        result = _resolution("What are the rules on termination?")
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
