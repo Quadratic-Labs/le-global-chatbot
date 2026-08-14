@@ -669,6 +669,58 @@ def metadata_from_content(
     )
 
 
+def resolve_effective_legal_topic(
+    *,
+    parsed_section: ParsedSection,
+    section: str,
+    country: str,
+) -> tuple[str, str | None]:
+    """
+    Return (document_type, legal_topic) for one parsed section - the
+    single rule every caller that needs a section's effective topic
+    must share (the chunk builder, and the admin section-editing
+    service that reads the current DOCX as authority), so a section
+    is never classified two different ways in two different places.
+
+    Raises UnknownLegalTopicError for a heading-like section that
+    resolves to neither the fixed taxonomy, a one-off subsection
+    override, nor a parser-confirmed custom top-level topic - a real
+    parser bug, never silently swallowed.
+    """
+
+    if is_overview_section(
+        section=section,
+        country=country,
+    ):
+        return "overview", None
+
+    legal_topic = (
+        get_canonical_legal_topic(
+            section=section,
+            country=country,
+        )
+        or get_subsection_topic_override(
+            section
+        )
+    )
+
+    if (
+        legal_topic is None
+        and parsed_section.is_custom_legal_topic
+    ):
+        legal_topic = section
+
+    if legal_topic is None:
+        raise UnknownLegalTopicError(
+            "Unknown legal topic detected. "
+            f"Section: {section!r}. "
+            "The document was not indexed because "
+            "the topic is outside the approved taxonomy."
+        )
+
+    return "comparator", legal_topic
+
+
 def build_document_chunks(
     parsed_sections: Sequence[
         ParsedSection
@@ -744,33 +796,11 @@ def build_document_chunks(
         if not content:
             continue
 
-        if is_overview_section(
+        document_type, legal_topic = resolve_effective_legal_topic(
+            parsed_section=parsed_section,
             section=section,
             country=country,
-        ):
-            document_type = "overview"
-            legal_topic = None
-
-        else:
-            document_type = "comparator"
-
-            legal_topic = (
-                get_canonical_legal_topic(
-                    section=section,
-                    country=country,
-                )
-                or get_subsection_topic_override(
-                    section
-                )
-            )
-
-            if legal_topic is None:
-                raise UnknownLegalTopicError(
-                    "Unknown legal topic detected. "
-                    f"Section: {section!r}. "
-                    "The document was not indexed because "
-                    "the topic is outside the approved taxonomy."
-                )
+        )
 
         path_key = (
             document_type,

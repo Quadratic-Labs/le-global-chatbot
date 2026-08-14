@@ -3399,9 +3399,18 @@ class SectionEditLifecycleIntegrationTests(unittest.TestCase):
     STATE).
     """
 
-    def test_reindex_overlays_persisted_edit_and_leaves_other_topics_fresh(
+    def test_reindex_ignores_legacy_persisted_edit_state(
         self,
     ) -> None:
+        """
+        ORDER 8A, sections 5/19: the current DOCX is the unique source
+        of truth - Reindex must NEVER apply a legacy .admin-state
+        override anymore, even if one is still present on disk from
+        before this architecture change. Every topic's fresh,
+        DOCX-derived content wins, including the one a stale override
+        file claims to have edited.
+        """
+
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
 
@@ -3520,7 +3529,10 @@ class SectionEditLifecycleIntegrationTests(unittest.TestCase):
 
             self.assertEqual(
                 by_topic["Employment Contracts"].content,
-                "EDITED content - must survive Reindex.",
+                (
+                    "FRESH DOCX content - must be replaced "
+                    "by the persisted edit."
+                ),
             )
             self.assertEqual(
                 by_topic["Hiring Practices"].content,
@@ -3528,6 +3540,19 @@ class SectionEditLifecycleIntegrationTests(unittest.TestCase):
                     "FRESH DOCX content - unaffected, no persisted "
                     "edit exists for this topic."
                 ),
+            )
+
+            # The legacy override file itself is left physically
+            # untouched by Reindex (no auto-migration/deletion) - only
+            # no longer READ.
+            legacy_state = read_section_edit_state(
+                source_directory,
+                document_id,
+            )
+            self.assertIsNotNone(legacy_state)
+            self.assertIn(
+                section_id_for_legal_topic("Employment Contracts"),
+                legacy_state.sections,
             )
 
     def test_delete_last_document_clears_section_edit_state(

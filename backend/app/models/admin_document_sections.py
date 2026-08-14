@@ -60,8 +60,19 @@ class AdminDocumentSectionUpdateResponse(BaseModel):
         extra = "forbid"
 
 
-class AdminDocumentSectionRestoreResponse(BaseModel):
-    """Result of restoring one section back to the current DOCX's own content."""
+class AdminDocumentSectionAddRequest(BaseModel):
+    """A brand-new top-level legal topic an admin wants to add."""
+
+    title: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    position: str = Field(min_length=1)
+
+    class Config:
+        extra = "forbid"
+
+
+class AdminDocumentSectionAddResponse(BaseModel):
+    """Result of successfully adding a new top-level legal topic."""
 
     document_id: str
     section_id: str

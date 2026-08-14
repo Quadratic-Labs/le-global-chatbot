@@ -3,11 +3,12 @@
 declare(strict_types=1);
 
 /**
- * Permanent, framework-free CLI test for the three "Edit a section"
- * proxy handlers added to LE_Global_Chatbot_Admin (mission
- * "ORDER 5D") - list_sections/get_section/update_section - matching
- * tests/extract-message.test.php's own "no PHPUnit, no autoloader,
- * plain PHP reflection over the real plugin file" convention.
+ * Permanent, framework-free CLI test for the "Add / Edit a section"
+ * proxy handlers on LE_Global_Chatbot_Admin - list_sections/
+ * get_section/update_section (mission "ORDER 5D") and add_section
+ * (mission "ORDER 8A-C"/"ORDER 8B") - matching tests/extract-
+ * message.test.php's own "no PHPUnit, no autoloader, plain PHP
+ * reflection over the real plugin file" convention.
  *
  * Run with:
  *   php wordpress/le-global-chatbot/tests/admin-sections.test.php
@@ -395,75 +396,140 @@ check(
     [false, 404, 'No section "sec-missing" exists for this document.']
 );
 
-// --- restore_section (mission "ORDER 7C") -----------------------------
+// --- add_section (mission "ORDER 8A-C" backend / "ORDER 8B" proxy) ---
 
-reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => 'Remote Working',
+    'content' => 'Employees may work remotely.',
+    'position' => 'end',
+]);
 $GLOBALS['__test_current_user_can'] = false;
-$halt = invoke_handler('handle_restore_section');
+$halt = invoke_handler('handle_add_section');
 check(
-    'unauthorized user gets a 403 and zero backend calls (restore_section)',
+    'unauthorized user gets a 403 and zero backend calls (add_section)',
     [$halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
     [403, 0]
 );
 
-reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => 'Remote Working',
+    'content' => 'Employees may work remotely.',
+    'position' => 'end',
+]);
 $GLOBALS['__test_nonce_valid'] = false;
-$halt = invoke_handler('handle_restore_section');
+$halt = invoke_handler('handle_add_section');
 check(
-    'an invalid nonce halts before any backend call (restore_section)',
+    'an invalid nonce halts before any backend call (add_section)',
     [$halt !== null, count($GLOBALS['__test_backend_calls'])],
     [true, 0]
 );
 
-reset_state(['document_id' => 'not-a-real-id', 'section_id' => 'sec-1']);
-$halt = invoke_handler('handle_restore_section');
+reset_state(['document_id' => 'not-a-real-id'], [
+    'title' => 'Remote Working',
+    'content' => 'Employees may work remotely.',
+    'position' => 'end',
+]);
+$halt = invoke_handler('handle_add_section');
 check(
-    'an invalid document_id is rejected with 422 and zero backend calls (restore_section)',
+    'an invalid document_id is rejected with 422 and zero backend calls (add_section)',
     [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
     [false, 422, 0]
 );
 
-reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => '']);
-$halt = invoke_handler('handle_restore_section');
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => '   ',
+    'content' => 'Employees may work remotely.',
+    'position' => 'end',
+]);
+$halt = invoke_handler('handle_add_section');
 check(
-    'an empty section_id is rejected with 422 and zero backend calls (restore_section)',
+    'an empty title is rejected with 422 and zero backend calls (add_section)',
     [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
     [false, 422, 0]
 );
 
-reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'hiring_practices']);
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => 'Remote Working',
+    'content' => '   ',
+    'position' => 'end',
+]);
+$halt = invoke_handler('handle_add_section');
+check(
+    'empty content is rejected with 422 and zero backend calls (add_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [false, 422, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => 'Remote Working',
+    'content' => 'Employees may work remotely.',
+    'position' => '',
+]);
+$halt = invoke_handler('handle_add_section');
+check(
+    'an empty position is rejected with 422 and zero backend calls (add_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [false, 422, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => 'Remote Working',
+    'content' => "Paragraph one.\n\nParagraph two with café.",
+    'position' => 'after:hiring_practices',
+]);
 $GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
     'document_id' => $VALID_DOCUMENT_ID,
-    'section_id' => 'hiring_practices',
-    'legal_topic' => 'Hiring Practices',
-    'indexed_chunks' => 4,
+    'section_id' => 'remote_working',
+    'legal_topic' => 'Remote Working',
+    'indexed_chunks' => 1,
 ]);
-$halt = invoke_handler('handle_restore_section');
+$halt = invoke_handler('handle_add_section');
+$sent_body = json_decode($GLOBALS['__test_backend_calls'][0]['body'] ?? '', true);
 check(
-    'a successful restore is relayed via wp_send_json_success',
-    [$halt?->jsonSuccess, $halt?->jsonData['indexed_chunks'] ?? null],
-    [true, 4]
+    'the exact title/content/position are forwarded to the backend unmodified',
+    $sent_body,
+    [
+        'title' => 'Remote Working',
+        'content' => "Paragraph one.\n\nParagraph two with café.",
+        'position' => 'after:hiring_practices',
+    ]
 );
 check(
-    'the restore is sent as a POST to the backend restore path, exactly once, with no content field',
+    'a successful add is relayed via wp_send_json_success',
+    [$halt?->jsonSuccess, $halt?->jsonData['legal_topic'] ?? null],
+    [true, 'Remote Working']
+);
+check(
+    'the add is sent as a POST to the backend sections collection path, exactly once',
     [
         $GLOBALS['__test_backend_calls'][0]['method'] ?? null,
-        str_ends_with($GLOBALS['__test_backend_calls'][0]['url'] ?? '', '/sections/hiring_practices/restore'),
-        $GLOBALS['__test_backend_calls'][0]['body'] ?? null,
+        str_ends_with($GLOBALS['__test_backend_calls'][0]['url'] ?? '', '/documents/' . $VALID_DOCUMENT_ID . '/sections'),
         count($GLOBALS['__test_backend_calls']),
     ],
-    ['POST', true, null, 1]
+    ['POST', true, 1]
 );
 
-reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-missing']);
-$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(404, [
-    'detail' => ['code' => 'document_section_not_found', 'message' => 'No section "sec-missing" exists for this document.'],
+reset_state(['document_id' => $VALID_DOCUMENT_ID], [
+    'title' => 'Hiring Practices',
+    'content' => 'Duplicate attempt.',
+    'position' => 'end',
 ]);
-$halt = invoke_handler('handle_restore_section');
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(409, [
+    'detail' => [
+        'code' => 'section_already_exists',
+        'message' => "A section already exists with this title: 'Hiring Practices'. Use Edit instead.",
+        'title' => 'Hiring Practices',
+    ],
+]);
+$halt = invoke_handler('handle_add_section');
 check(
-    'a section-not-found backend error is propagated with its real message (restore_section)',
-    [$halt?->jsonSuccess, $halt?->statusCode, $halt?->jsonData['message'] ?? null],
-    [false, 404, 'No section "sec-missing" exists for this document.']
+    'a section_already_exists backend error is propagated with its structured detail',
+    [
+        $halt?->jsonSuccess,
+        $halt?->statusCode,
+        $halt?->jsonData['detail']['code'] ?? null,
+    ],
+    [false, 409, 'section_already_exists']
 );
 
 if ($failures > 0) {

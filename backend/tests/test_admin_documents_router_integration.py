@@ -647,6 +647,36 @@ class ReindexHttpContractTests(AdminRouterIntegrationTestCase):
             "supported country", detail["message"].casefold()
         )
 
+    def test_reindex_with_country_conflict_returns_structured_409(
+        self,
+    ) -> None:
+        # ORDER 8A, section 23 - a country with more than one active
+        # document_id must refuse Reindex with a structured
+        # country_document_conflict, never an unmapped raw exception.
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        self.fake.add(
+            document_id="doc_" + "b" * 64,
+            country_code="AR",
+            source_filename="Argentina-legacy.docx",
+            chunk_id="doc_" + "b" * 64 + "-chunk-0",
+        )
+
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.reindex_admin_document(
+                document_id=document_id
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "country_document_conflict")
+        self.assertEqual(detail["operation"], "reindex")
+        self.assertEqual(detail["country_code"], "AR")
+
 
 class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
     """Mission "ORDER 3", sections 8/9/27 - every technical upload
@@ -928,3 +958,38 @@ class SharedInvariantHelperUsageTests(AdminRouterIntegrationTestCase):
         ]
 
         assert_zero_mutation(before, after)
+
+
+class RestoreEndpointRemovedTests(unittest.TestCase):
+    """
+    ORDER 8A, section 5: the ORDER 7C "Restore from document" endpoint
+    is now moot (Edit itself mutates the current DOCX) and must be
+    fully removed from the runtime - never merely hidden.
+    """
+
+    def test_no_restore_route_is_registered(self) -> None:
+        restore_paths = [
+            route.path
+            for route in lifecycle_router.router.routes
+            if route.path.endswith("/restore")
+        ]
+
+        self.assertEqual(restore_paths, [])
+
+    def test_add_section_route_is_registered_instead(self) -> None:
+        add_section_routes = [
+            route
+            for route in lifecycle_router.router.routes
+            if route.path
+            == "/api/v1/admin/documents/{document_id}/sections"
+            and "POST" in route.methods
+        ]
+
+        self.assertEqual(len(add_section_routes), 1)
+
+    def test_restore_effective_section_no_longer_exists(self) -> None:
+        import app.services.admin_document_sections as sections_service
+
+        self.assertFalse(
+            hasattr(sections_service, "restore_effective_section")
+        )

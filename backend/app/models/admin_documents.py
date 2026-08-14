@@ -20,6 +20,7 @@ class AdminDocumentSummary(BaseModel):
     chunk_count: int
     source_file_present: bool
     source_bytes: int | None = None
+    updated_at: str | None = None
     status: str
 
     class Config:

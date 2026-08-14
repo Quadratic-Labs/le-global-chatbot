@@ -30,10 +30,7 @@ from app.services.admin_document_replacement import (
 from app.services.country_lock import (
     country_lock,
 )
-from app.services.docx_parser import ParsedSection
 from app.services.document_chunk_builder import (
-    DocumentMetadata,
-    build_document_chunks,
     build_document_chunks_from_docx,
 )
 from app.services.document_indexer import (
@@ -44,9 +41,7 @@ from app.services.document_indexer import (
     replace_document_chunks,
 )
 from app.services.document_section_state import (
-    SectionStateError,
     delete_section_edit_state,
-    read_section_edit_state,
 )
 from app.services.document_source_resolver import (
     DocumentSourceConflictError,
@@ -55,10 +50,6 @@ from app.services.document_source_resolver import (
 )
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
-)
-from app.services.section_splitter import (
-    DEFAULT_MAX_CHARS,
-    split_parsed_sections,
 )
 
 
@@ -126,6 +117,80 @@ class AdminDocumentRollbackError(AdminDocumentLifecycleError):
     subclass specifically (mission "ORDER 2": the admin router does)
     can flag it as the more urgent condition it actually is.
     """
+
+
+class AdminDocumentCountryConflictError(RuntimeError):
+    """
+    Raised when more than one active document_id already exists for a
+    document's country before a normal mutation - Edit/Add/Reindex
+    must never arbitrarily pick one of them (ORDER 8A, section 23).
+    Protects legacy duplicate-country states (e.g. Italy today) from
+    being silently mutated through only one of their two IDs. A
+    confirmed Upload/Replace is the one legitimate way to resolve such
+    a conflict (it retires every candidate source and chunk for the
+    country atomically) and is deliberately not gated by this check.
+    """
+
+    def __init__(
+        self,
+        *,
+        country_code: str,
+        document_ids: Sequence[str],
+        operation: str = "section_update",
+    ) -> None:
+        self.country_code = country_code
+        self.document_ids = tuple(document_ids)
+        self.operation = operation
+
+        super().__init__(
+            f"Country {country_code!r} has {len(self.document_ids)} "
+            "active documents - refusing to mutate any single one "
+            "until the conflict is resolved."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        return {
+            "code": "country_document_conflict",
+            "message": str(self),
+            "operation": self.operation,
+            "country_code": self.country_code,
+            "document_ids": list(self.document_ids),
+        }
+
+
+def _ensure_no_country_conflict(
+    *,
+    country_code: str,
+    client: OpenSearch,
+    operation: str = "section_update",
+) -> None:
+    """
+    ORDER 8A section 23: refuse any normal mutation, with zero effect,
+    when more than one active document_id already exists for this
+    country - never guess which one is "the real one".
+    """
+
+    try:
+        existing_documents = lookup_existing_country_documents(
+            country_code,
+            client,
+        )
+
+    except Exception as error:
+        raise AdminDocumentLifecycleError(
+            "The country catalog could not be checked before this "
+            "operation."
+        ) from error
+
+    if len(existing_documents) > 1:
+        raise AdminDocumentCountryConflictError(
+            country_code=country_code,
+            operation=operation,
+            document_ids=[
+                document.document_id
+                for document in existing_documents
+            ],
+        )
 
 
 def _tag_country_code(
@@ -638,77 +703,6 @@ def _delete_stray_country_chunks(
     return _validate_delete_by_query_response(response)
 
 
-def _apply_persisted_section_edits(
-    *,
-    chunks: list[DocumentChunk],
-    document_id: str,
-    source_directory: Path,
-) -> list[DocumentChunk]:
-    """
-    Overlay any durably persisted section edits onto freshly re-parsed
-    DOCX chunks - mission "ORDER 5C", section 2: "DOCX actuel +
-    dernieres sections editees = document effectif. Un Reindex NE DOIT
-    PAS annuler un Edit."
-
-    For every legal_topic with a persisted edit, the DOCX-derived
-    chunks for that topic are discarded and rebuilt from the edited
-    content instead, through the exact same chunking pipeline used by
-    update_effective_section - so an edited topic's reindexed chunk_ids
-    are identical to what Edit already saved. Topics with no persisted
-    edit are left exactly as the DOCX produced them.
-    """
-
-    try:
-        state = read_section_edit_state(source_directory, document_id)
-    except SectionStateError as error:
-        raise AdminDocumentLifecycleError(str(error)) from error
-
-    if state is None or not state.sections:
-        return chunks
-
-    first_chunk = chunks[0]
-
-    metadata = DocumentMetadata(
-        country=first_chunk.country,
-        country_code=first_chunk.country_code,
-        reference_year=first_chunk.reference_year,
-        language=first_chunk.language,
-        source_filename=first_chunk.source_filename,
-        source_format=first_chunk.source_format,
-    )
-
-    edited_topics = {
-        edit.legal_topic for edit in state.sections.values()
-    }
-
-    effective_chunks = [
-        chunk
-        for chunk in chunks
-        if chunk.legal_topic not in edited_topics
-    ]
-
-    for edit in state.sections.values():
-        parsed_sections = split_parsed_sections(
-            [
-                ParsedSection(
-                    section=edit.section,
-                    subsection=edit.subsection,
-                    content=edit.content,
-                )
-            ],
-            max_chars=DEFAULT_MAX_CHARS,
-        )
-
-        effective_chunks.extend(
-            build_document_chunks(
-                parsed_sections,
-                metadata,
-            )
-        )
-
-    return effective_chunks
-
-
 def reindex_indexed_document(
     *,
     document_id: str,
@@ -810,6 +804,12 @@ def _reindex_indexed_document_locked(
         "country_code",
     )
 
+    _ensure_no_country_conflict(
+        country_code=old_country_code,
+        client=opensearch_client,
+        operation="reindex",
+    )
+
     try:
         resolved_source = resolve_document_source_path(
             source_root=source_directory,
@@ -873,12 +873,6 @@ def _reindex_indexed_document_locked(
             ),
             old_country_code,
         )
-
-    chunks = _apply_persisted_section_edits(
-        chunks=chunks,
-        document_id=validated_document_id,
-        source_directory=source_directory,
-    )
 
     chunk_snapshot = _snapshot_country_chunks(
         client=opensearch_client,

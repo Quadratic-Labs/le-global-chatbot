@@ -8,12 +8,24 @@
     const DOCUMENTS_CONTAINER_ID = "le-global-chatbot-documents";
     const SUMMARY_CONTAINER_ID = "le-global-chatbot-summary";
 
+    const UNSAVED_CHANGES_PROMPT = (
+        "You have unsaved changes. Discard them and continue?"
+    );
+
     // Populated from the real upload form's data-* attributes the
     // first time a refresh runs - the single source of truth for the
     // action name strings stays server-side (PHP constants), JS only
     // ever reads them, never hardcodes them (mission "ORDER 4",
     // section 6: no client-invented endpoint name).
     let adminFormConfig = null;
+
+    // The most recently known document catalog - kept purely so the
+    // upload queue can resolve a country's *existing* filename from
+    // the replacement-required error's existing_document_ids (mission
+    // "ORDER 8B", section 11), and so the Overview/Documents panels
+    // can compute business-facing status/conflict info without a
+    // second round trip.
+    let lastKnownDocuments = [];
 
     // --- tiny DOM/string helpers -----------------------------------
 
@@ -44,9 +56,17 @@
         return Array.from(fileInput.files);
     }
 
+    function findDocumentById(documentId) {
+        return (
+            lastKnownDocuments.find(
+                (document) => document.document_id === documentId
+            ) || null
+        );
+    }
+
     // --- pure response-classification helpers (unchanged contract) -
 
-    function errorMessage(payload) {
+    function errorMessage(payload, fallback = "The document could not be indexed.") {
         if (
             payload
             && payload.data
@@ -56,14 +76,14 @@
             return payload.data.message.trim();
         }
 
-        return "The document could not be indexed.";
+        return fallback;
     }
 
     // The backend's own structured 409/4xx payload, as the WordPress
     // AJAX proxy relays it: wp_send_json_error wraps whatever the
     // proxy passed as {success:false, data:{message, detail}} -
     // detail is only ever a plain object for the backend's own
-    // structured codes, never a string itself (the proxy sends []
+    // structured codes, never a string itself (the proxy sends [] //
     // whenever the backend's own `detail` was a plain string).
     function extractStructuredDetail(payload) {
         if (
@@ -89,6 +109,50 @@
         );
     }
 
+    // Mission "ORDER 8B", section 38 - a small, explicit map from the
+    // backend's own structured error codes to the business-facing
+    // sentence an admin should see. Never the technical code itself,
+    // never a stack trace. Any code not listed here simply falls back
+    // to the backend/proxy's own `message` (already free of internal
+    // identifiers for every code that reaches this layer today), then
+    // to a caller-supplied fallback.
+    const BUSINESS_ERROR_MESSAGES = {
+        section_already_exists: (
+            "This section already exists. Use \"Edit a section\" to "
+            + "update it."
+        ),
+        country_document_conflict: (
+            "This country has conflicting document records. Please "
+            + "contact support before making changes."
+        ),
+        rollback_failed: (
+            "We couldn't save your changes. Nothing has been "
+            + "confirmed as completed. Please try again or contact "
+            + "support."
+        ),
+        document_country_not_allowed: (
+            "This country is not currently supported for document "
+            + "uploads."
+        ),
+    };
+
+    function businessMessage(payload, fallback) {
+        const detail = extractStructuredDetail(payload);
+
+        if (
+            detail
+            && typeof detail.code === "string"
+            && Object.prototype.hasOwnProperty.call(
+                BUSINESS_ERROR_MESSAGES,
+                detail.code
+            )
+        ) {
+            return BUSINESS_ERROR_MESSAGES[detail.code];
+        }
+
+        return errorMessage(payload, fallback);
+    }
+
     // Classifies one upload response into exactly one outcome kind -
     // the single place that decides which queue-item status a
     // response maps to, kept pure/DOM-free so it is directly
@@ -97,14 +161,23 @@
     // confused outcomes).
     function classifyUploadResponse(statusCode, payload) {
         const detail = extractStructuredDetail(payload);
+        const fallback = "The document could not be indexed.";
 
         if (statusCode === 409 && detail) {
             if (detail.code === "document_already_current") {
-                return { kind: "already_current", detail, message: errorMessage(payload) };
+                return {
+                    kind: "already_current",
+                    detail,
+                    message: businessMessage(payload, fallback),
+                };
             }
 
             if (detail.code === "document_replacement_required") {
-                return { kind: "replacement_required", detail, message: errorMessage(payload) };
+                return {
+                    kind: "replacement_required",
+                    detail,
+                    message: businessMessage(payload, fallback),
+                };
             }
 
             if (detail.code === "document_warning_confirmation_required") {
@@ -113,16 +186,193 @@
                         ? "combined_required"
                         : "warning_required",
                     detail,
-                    message: errorMessage(payload),
+                    message: businessMessage(payload, fallback),
                 };
             }
         }
 
         if (!payload || payload.success !== true) {
-            return { kind: "error", detail, message: errorMessage(payload) };
+            return {
+                kind: "error",
+                detail,
+                message: businessMessage(payload, fallback),
+            };
         }
 
-        return { kind: "success", detail: null, message: errorMessage(payload) };
+        return { kind: "success", detail: null, message: businessMessage(payload, fallback) };
+    }
+
+    // --- documents: status/conflict/date helpers (pure, DOM-free) ---
+    //
+    // Mission "ORDER 8B", sections 25-27 - mirrors the equally-pure
+    // PHP helpers of the same name (detect_conflicted_country_codes,
+    // compute_display_status, format_last_updated) so the documents
+    // table renders identically whether it came from the initial
+    // server-side page load or a later AJAX refresh.
+
+    function detectConflictedCountryCodes(documents) {
+        const counts = {};
+
+        (documents || []).forEach((document) => {
+            const code = document && document.country_code;
+
+            if (!code) {
+                return;
+            }
+
+            counts[code] = (counts[code] || 0) + 1;
+        });
+
+        return new Set(
+            Object.keys(counts).filter((code) => counts[code] > 1)
+        );
+    }
+
+    function computeDisplayStatus(document, hasCountryConflict) {
+        if (hasCountryConflict) {
+            return {
+                value: "needs_attention",
+                label: "Needs attention",
+                icon: "⚠",
+                cls: "is-warning",
+                title: "This country has conflicting document records.",
+            };
+        }
+
+        const statusValue = (document && document.status) || "unknown";
+
+        if (statusValue === "indexed") {
+            return {
+                value: "ready",
+                label: "Ready",
+                icon: "✓",
+                cls: "is-success",
+                title: "This document is available to the chatbot.",
+            };
+        }
+
+        return {
+            value: "needs_attention",
+            label: "Needs attention",
+            icon: "⚠",
+            cls: "is-warning",
+            title: (
+                statusValue === "indexed_source_conflict"
+                    ? "Multiple source documents resolve for this country."
+                    : "The source document is missing."
+            ),
+        };
+    }
+
+    const MONTH_NAMES = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    function formatLastUpdated(iso) {
+        if (!iso) {
+            return "—";
+        }
+
+        const date = new Date(iso);
+
+        if (Number.isNaN(date.getTime())) {
+            return "—";
+        }
+
+        const day = date.getDate();
+        const month = MONTH_NAMES[date.getMonth()];
+        const year = date.getFullYear();
+        const hours = String(date.getHours()).padStart(2, "0");
+        const minutes = String(date.getMinutes()).padStart(2, "0");
+
+        return `${day} ${month} ${year}, ${hours}:${minutes}`;
+    }
+
+    // --- Add-a-section: pure helpers (title matching, position map) -
+    //
+    // Mission "ORDER 8B", sections 16-17 - the position dropdown and
+    // duplicate-title detection are both plain data transforms, kept
+    // DOM-free so they are directly unit-testable.
+
+    function normalizeTitle(value) {
+        return String(value || "")
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, " ");
+    }
+
+    function findDuplicateSectionIn(sections, title) {
+        const normalized = normalizeTitle(title);
+
+        if (normalized === "") {
+            return null;
+        }
+
+        return (
+            (sections || []).find(
+                (section) => normalizeTitle(section.legal_topic) === normalized
+            ) || null
+        );
+    }
+
+    function buildPositionOptions(sections) {
+        const options = [{ value: "beginning", label: "At the beginning" }];
+
+        (sections || []).forEach((section) => {
+            options.push({
+                value: `after:${section.section_id}`,
+                label: `After "${section.legal_topic}"`,
+            });
+        });
+
+        options.push({ value: "end", label: "At the end" });
+
+        return options;
+    }
+
+    // --- upload queue: pure batch-summary helper --------------------
+    //
+    // Mission "ORDER 8B", section 9 - a zero-count category is simply
+    // never listed, and the running total only reads "processed" once
+    // every item has left the queued/uploading state (kept pure so
+    // the batch-reset fix and the summary wording are both directly
+    // testable without a DOM).
+
+    function summarizeQueue(queue) {
+        const total = queue.length;
+
+        const settledCount = queue.filter(
+            (item) => item.status !== "queued" && item.status !== "uploading"
+        ).length;
+
+        const allSettled = total > 0 && settledCount === total;
+
+        const counts = queue.reduce((accumulator, item) => {
+            accumulator[item.status] = (accumulator[item.status] || 0) + 1;
+            return accumulator;
+        }, {});
+
+        const needsConfirmation = (
+            (counts.awaiting_replacement_confirmation || 0)
+            + (counts.awaiting_warning_confirmation || 0)
+            + (counts.awaiting_combined_confirmation || 0)
+        );
+
+        const categories = [
+            { key: "added", count: counts.indexed || 0, icon: "✓" },
+            { key: "replaced", count: counts.replaced || 0, icon: "✓" },
+            {
+                key: "already up to date",
+                count: counts.already_current || 0,
+                icon: "✓",
+            },
+            { key: "needs confirmation", count: needsConfirmation, icon: "⚠" },
+            { key: "cancelled", count: counts.cancelled || 0, icon: "—" },
+            { key: "failed", count: counts.failed || 0, icon: "✕" },
+        ].filter((category) => category.count > 0);
+
+        return { total, allSettled, categories };
     }
 
     // --- delete forms: progressive enhancement ----------------------
@@ -142,31 +392,40 @@
 
         deleteForms.forEach((form) => {
             form.addEventListener("submit", (event) => {
+                const countryName = form.dataset.countryName || "";
                 const documentName = (
                     form.dataset.documentName || "this document"
                 );
 
                 const confirmed = window.confirm(
-                    `Delete ${documentName}? `
-                    + "The source DOCX and all indexed chunks "
-                    + "will be removed."
+                    `Delete ${countryName ? countryName + " document" : "this document"}? `
+                    + `'${documentName}' will be removed from the `
+                    + "chatbot."
                 );
 
                 if (!confirmed) {
                     event.preventDefault();
-                    return;
+                    return undefined;
                 }
 
                 event.preventDefault();
-                runFormAsAjax(form, {
+                closeOpenMenu();
+                return runFormAsAjax(form, {
                     disable: form.querySelector('button[type="submit"]'),
                     busyText: "Deleting…",
+                    successMessage: `✓ ${documentName} was deleted successfully.`,
+                    errorFallback: "The document could not be deleted.",
                 });
             });
         });
     }
 
-    // --- reindex forms: progressive enhancement (new capability) ---
+    // --- reindex forms: progressive enhancement ---------------------
+    //
+    // Mission "ORDER 8B", section 29 - "Reindex" never appears to the
+    // admin: the very same backend reindex endpoint is now presented
+    // as "Refresh chatbot data", with wording that makes clear the
+    // document itself is not changed.
 
     function wireReindexForms() {
         const reindexForms = document.querySelectorAll(
@@ -176,9 +435,22 @@
         reindexForms.forEach((form) => {
             form.addEventListener("submit", (event) => {
                 event.preventDefault();
-                runFormAsAjax(form, {
+
+                const confirmed = window.confirm(
+                    "Refresh chatbot data from the current Word "
+                    + "document? This does not change the document."
+                );
+
+                if (!confirmed) {
+                    return undefined;
+                }
+
+                closeOpenMenu();
+                return runFormAsAjax(form, {
                     disable: form.querySelector('button[type="submit"]'),
-                    busyText: "Reindexing…",
+                    busyText: "Refreshing…",
+                    successMessage: "✓ Chatbot data refreshed successfully.",
+                    errorFallback: "The chatbot data could not be refreshed.",
                 });
             });
         });
@@ -189,8 +461,10 @@
     // "ORDER 4", section 54) - the button is disabled for the whole
     // request and only re-enabled by a full refresh (success) or
     // explicitly on failure, so a user cannot fire it twice while a
-    // reindex/delete is genuinely still in flight.
-    async function runFormAsAjax(form, { disable, busyText }) {
+    // reindex/delete is genuinely still in flight. Success/error text
+    // renders into the documents panel's own aria-live message area,
+    // never a window.alert (mission "ORDER 8B", section 36).
+    async function runFormAsAjax(form, { disable, busyText, successMessage, errorFallback }) {
         if (disable && disable.disabled) {
             return;
         }
@@ -200,6 +474,8 @@
             disable.dataset.originalText = disable.textContent;
             disable.textContent = busyText;
         }
+
+        setDocumentsMessage("", null);
 
         const formData = new FormData(form);
         formData.set("le_global_ajax", "1");
@@ -231,10 +507,16 @@
             }
 
             if (!response.ok || !payload || payload.success !== true) {
-                throw new Error(errorMessage(payload));
+                throw new Error(
+                    businessMessage(
+                        payload,
+                        errorFallback || "The request could not be completed."
+                    )
+                );
             }
 
             await refreshAdminState();
+            setDocumentsMessage(successMessage || "✓ Done.", "is-success");
 
             if (disable) {
                 disable.disabled = false;
@@ -246,10 +528,162 @@
                 disable.textContent = disable.dataset.originalText || busyText;
             }
 
-            window.alert(
+            setDocumentsMessage(
                 (error && typeof error.message === "string" && error.message)
-                    || "The request could not be completed."
+                    || "The request could not be completed.",
+                "is-error"
             );
+        }
+    }
+
+    function setDocumentsMessage(text, kind) {
+        const element = document.getElementById(
+            "le-global-documents-message"
+        );
+
+        if (!element) {
+            return;
+        }
+
+        element.textContent = text || "";
+        element.className = (
+            "le-global-chatbot-admin__edit-message"
+            + (kind ? ` ${kind}` : "")
+        );
+    }
+
+    // --- documents actions menu ("⋯") --------------------------------
+
+    let openMenu = null;
+
+    function closeOpenMenu() {
+        if (!openMenu) {
+            return;
+        }
+
+        openMenu.list.hidden = true;
+        openMenu.toggle.setAttribute("aria-expanded", "false");
+        openMenu = null;
+    }
+
+    function wireDocumentMenus() {
+        const container = document.getElementById(DOCUMENTS_CONTAINER_ID);
+
+        if (!container) {
+            return;
+        }
+
+        container
+            .querySelectorAll(".le-global-chatbot-admin__menu")
+            .forEach((menu) => {
+                const toggle = menu.querySelector(
+                    ".le-global-chatbot-admin__menu-toggle"
+                );
+                const list = menu.querySelector(
+                    ".le-global-chatbot-admin__menu-list"
+                );
+
+                if (!toggle || !list) {
+                    return;
+                }
+
+                toggle.addEventListener("click", (event) => {
+                    event.stopPropagation();
+
+                    const wasOpen = Boolean(
+                        openMenu && openMenu.list === list
+                    );
+
+                    closeOpenMenu();
+
+                    if (!wasOpen) {
+                        list.hidden = false;
+                        toggle.setAttribute("aria-expanded", "true");
+                        openMenu = { toggle, list };
+
+                        const firstItem = list.querySelector(
+                            ".le-global-chatbot-admin__menu-item:not(:disabled)"
+                        );
+
+                        if (firstItem) {
+                            firstItem.focus();
+                        }
+                    }
+                });
+
+                list.addEventListener("keydown", (event) => {
+                    if (event.key === "Escape") {
+                        closeOpenMenu();
+                        toggle.focus();
+                    }
+                });
+            });
+    }
+
+    document.addEventListener("click", () => closeOpenMenu());
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+            closeOpenMenu();
+        }
+    });
+
+    // --- documents search + status filter ---------------------------
+    //
+    // Mission "ORDER 8B", sections 31-32 - purely client-side, over
+    // whatever rows are already rendered (server-side or via the AJAX
+    // refresh below); never a new server round-trip.
+
+    function applyDocumentsFilter() {
+        const table = document.getElementById("le-global-documents-table");
+
+        if (!table) {
+            return;
+        }
+
+        const searchInput = document.getElementById(
+            "le-global-documents-search"
+        );
+        const statusFilter = document.getElementById(
+            "le-global-documents-status-filter"
+        );
+
+        const query = (
+            (searchInput && searchInput.value) || ""
+        ).trim().toLowerCase();
+        const status = (statusFilter && statusFilter.value) || "";
+
+        table.querySelectorAll("tbody tr").forEach((row) => {
+            row.hidden = !rowMatchesFilter(row.dataset, query, status);
+        });
+    }
+
+    function rowMatchesFilter(rowData, query, status) {
+        const matchesQuery = (
+            query === ""
+            || ((rowData && rowData.country) || "").includes(query)
+            || ((rowData && rowData.filename) || "").includes(query)
+        );
+        const matchesStatus = (
+            status === "" || (rowData && rowData.status) === status
+        );
+
+        return matchesQuery && matchesStatus;
+    }
+
+    function wireDocumentsToolbar() {
+        const searchInput = document.getElementById(
+            "le-global-documents-search"
+        );
+        const statusFilter = document.getElementById(
+            "le-global-documents-status-filter"
+        );
+
+        if (searchInput) {
+            searchInput.addEventListener("input", applyDocumentsFilter);
+        }
+
+        if (statusFilter) {
+            statusFilter.addEventListener("change", applyDocumentsFilter);
         }
     }
 
@@ -330,26 +764,36 @@
             ? payload.data.documents
             : [];
 
-        const totalChunks = documents.reduce(
-            (sum, item) => sum + (Number(item.chunk_count) || 0),
-            0
-        );
-
-        renderSummary(payload.data.stats, totalChunks);
+        renderSummary(payload.data.stats, documents);
         renderDocuments(documents);
     }
 
-    function renderSummary(stats, totalChunks) {
+    // Mission "ORDER 8B", section 35 - Overview shows only the three
+    // business-useful numbers; chunk counts/index health never render
+    // here (they stay available to developers via logs/tests only).
+    function renderSummary(stats, documents) {
         const container = document.getElementById(SUMMARY_CONTAINER_ID);
 
-        if (!container || !stats) {
+        if (!container) {
             return;
         }
 
+        const totalDocuments = (
+            stats ? stats.total_documents : documents.length
+        );
+        const totalCountries = stats ? stats.total_countries : 0;
+
+        const conflictedCodes = detectConflictedCountryCodes(documents);
+        const needsAttention = documents.filter((document) => {
+            const code = document.country_code || "";
+            const hasConflict = code !== "" && conflictedCodes.has(code);
+            return computeDisplayStatus(document, hasConflict).value !== "ready";
+        }).length;
+
         container.innerHTML = (
-            summaryCardHtml("Indexed documents", stats.total_documents)
-            + summaryCardHtml("Countries", stats.total_countries)
-            + summaryCardHtml("Indexed chunks", totalChunks)
+            summaryCardHtml("Documents", totalDocuments)
+            + summaryCardHtml("Countries", totalCountries)
+            + summaryCardHtml("Documents needing attention", needsAttention)
         );
     }
 
@@ -362,41 +806,50 @@
         );
     }
 
-    const STATUS_LABELS = {
-        indexed: "Indexed",
-        indexed_source_conflict: "Source conflict",
-        indexed_source_missing: "Source missing",
-    };
+    // --- documents table ---------------------------------------------
+    //
+    // Mission "ORDER 8B", sections 22-34 - no Chunks column, no
+    // visible document_id (it survives only as a data attribute),
+    // Ready/Needs attention status, a readable Last updated, and
+    // Download + a single "⋯" menu instead of three same-weight
+    // buttons.
 
     function renderDocuments(documents) {
-        const container = document.getElementById(
-            DOCUMENTS_CONTAINER_ID
-        );
+        lastKnownDocuments = Array.isArray(documents) ? documents : [];
+
+        const container = document.getElementById(DOCUMENTS_CONTAINER_ID);
 
         if (!container) {
             return;
         }
 
-        if (!Array.isArray(documents) || documents.length === 0) {
+        updateDocumentCount(lastKnownDocuments.length);
+
+        if (lastKnownDocuments.length === 0) {
             container.innerHTML = (
                 '<div class="le-global-chatbot-admin__empty">'
-                + "No indexed document is currently available."
+                + "No document is currently available."
                 + "</div>"
             );
             return;
         }
 
-        const rows = documents.map(documentRowHtml).join("");
+        const conflictedCodes = detectConflictedCountryCodes(
+            lastKnownDocuments
+        );
+        const rows = lastKnownDocuments
+            .map((item) => documentRowHtml(item, conflictedCodes))
+            .join("");
 
         container.innerHTML = (
             '<div class="le-global-chatbot-admin__table-container">'
-            + '<table class="widefat striped le-global-chatbot-admin__table">'
+            + '<table class="widefat striped le-global-chatbot-admin__table" id="le-global-documents-table">'
             + "<thead><tr>"
             + "<th scope=\"col\">Country</th>"
-            + "<th scope=\"col\">Source file</th>"
+            + "<th scope=\"col\">Document</th>"
             + "<th scope=\"col\">Year</th>"
-            + "<th scope=\"col\">Chunks</th>"
             + "<th scope=\"col\">Status</th>"
+            + "<th scope=\"col\">Last updated</th>"
             + "<th scope=\"col\">Actions</th>"
             + "</tr></thead>"
             + `<tbody>${rows}</tbody>`
@@ -405,59 +858,131 @@
 
         wireReindexForms();
         wireDeleteForms();
+        wireDocumentMenus();
+        applyDocumentsFilter();
     }
 
-    function documentRowHtml(item) {
-        const statusValue = item.status || "unknown";
-        const statusLabel = (
-            STATUS_LABELS[statusValue]
-            || (item.source_file_present ? "Indexed" : "Source unavailable")
+    function updateDocumentCount(count) {
+        const element = document.getElementById("le-global-document-count");
+
+        if (!element) {
+            return;
+        }
+
+        element.textContent = `${count} document${count === 1 ? "" : "s"}`;
+    }
+
+    function documentRowHtml(item, conflictedCodes) {
+        const country = item.country || "";
+        const countryCode = item.country_code || "";
+        const filename = item.source_filename || "";
+        const hasConflict = (
+            countryCode !== "" && conflictedCodes.has(countryCode)
         );
+        const displayStatus = computeDisplayStatus(item, hasConflict);
 
         return (
-            "<tr>"
-            + `<td><strong>${escapeHtml(item.country)}</strong> `
-            + `<span class="le-global-chatbot-admin__country-code">${escapeHtml(item.country_code)}</span></td>`
-            + `<td>${escapeHtml(item.source_filename)}</td>`
-            + `<td>${escapeHtml(item.reference_year || "—")}</td>`
-            + `<td>${escapeHtml(item.chunk_count || 0)}</td>`
-            + `<td>${escapeHtml(statusLabel)}</td>`
-            + `<td>${rowActionsHtml(item)}</td>`
+            "<tr "
+            + `data-country="${escapeHtml(country.toLowerCase())}" `
+            + `data-filename="${escapeHtml(filename.toLowerCase())}" `
+            + `data-status="${escapeHtml(displayStatus.value)}">`
+            + `<td><strong>${escapeHtml(country)}</strong> `
+            + (
+                countryCode
+                    ? `<span class="le-global-chatbot-admin__country-code">${escapeHtml(countryCode)}</span>`
+                    : ""
+            )
+            + "</td>"
+            + '<td><span class="le-global-chatbot-admin__filename" '
+            + `data-document-id="${escapeHtml(item.document_id || "")}">`
+            + `${escapeHtml(filename)}</span></td>`
+            + `<td>${item.reference_year ? escapeHtml(item.reference_year) : "—"}</td>`
+            + `<td>${statusBadgeHtml(displayStatus)}</td>`
+            + `<td>${escapeHtml(formatLastUpdated(item.updated_at))}</td>`
+            + `<td>${rowActionsHtml(item, hasConflict)}</td>`
             + "</tr>"
         );
     }
 
-    function rowActionsHtml(item) {
+    function statusBadgeHtml(displayStatus) {
+        return (
+            `<span class="le-global-chatbot-admin__status ${displayStatus.cls}" `
+            + `title="${escapeHtml(displayStatus.title)}">`
+            + `<span aria-hidden="true">${displayStatus.icon}</span> `
+            + `${escapeHtml(displayStatus.label)}`
+            + "</span>"
+        );
+    }
+
+    function rowActionsHtml(item, hasConflict) {
         const parts = [];
 
         if (item.download_url) {
             parts.push(
                 `<a class="button" href="${escapeHtml(item.download_url)}">Download</a>`
             );
+        } else {
+            parts.push(
+                '<button type="button" class="button" disabled '
+                + 'title="No unambiguous source document is available to download.">'
+                + "Download</button>"
+            );
         }
 
-        if (adminFormConfig && item.reindex_nonce) {
-            parts.push(actionFormHtml({
+        let refreshItem;
+
+        if (adminFormConfig && item.reindex_nonce && !hasConflict) {
+            refreshItem = actionFormHtml({
                 action: adminFormConfig.reindexAction,
                 nonce: item.reindex_nonce,
                 documentId: item.document_id,
-                buttonClass: "button",
-                buttonLabel: "Reindex",
+                buttonClass: "le-global-chatbot-admin__menu-item",
+                buttonLabel: "Refresh chatbot data",
                 markerAttribute: "data-reindex-form",
-            }));
+                buttonAttributes: 'role="menuitem"',
+            });
+        } else {
+            const title = hasConflict
+                ? "This country has conflicting document records."
+                : "The source document is unavailable.";
+
+            refreshItem = (
+                '<button type="button" class="le-global-chatbot-admin__menu-item" '
+                + `role="menuitem" disabled title="${escapeHtml(title)}">`
+                + "Refresh chatbot data</button>"
+            );
         }
 
+        let deleteItem = "";
+
         if (adminFormConfig && item.delete_nonce) {
-            parts.push(actionFormHtml({
+            deleteItem = actionFormHtml({
                 action: adminFormConfig.deleteAction,
                 nonce: item.delete_nonce,
                 documentId: item.document_id,
-                buttonClass: "button button-link-delete",
-                buttonLabel: "Delete",
+                buttonClass: "le-global-chatbot-admin__menu-item is-destructive",
+                buttonLabel: "Delete document",
                 markerAttribute: "data-confirm-delete",
-                extraAttributes: `data-document-name="${escapeHtml(item.source_filename)}"`,
-            }));
+                formAttributes: (
+                    `data-document-name="${escapeHtml(item.source_filename || "")}" `
+                    + `data-country-name="${escapeHtml(item.country || "")}"`
+                ),
+                buttonAttributes: 'role="menuitem"',
+            });
         }
+
+        parts.push(
+            '<div class="le-global-chatbot-admin__menu">'
+            + '<button type="button" class="button le-global-chatbot-admin__menu-toggle" '
+            + 'aria-haspopup="true" aria-expanded="false" '
+            + `aria-label="${escapeHtml("More actions for " + (item.source_filename || ""))}">`
+            + "&hellip;</button>"
+            + '<div class="le-global-chatbot-admin__menu-list" role="menu" hidden>'
+            + refreshItem
+            + '<div class="le-global-chatbot-admin__menu-separator"></div>'
+            + deleteItem
+            + "</div></div>"
+        );
 
         return (
             '<div class="le-global-chatbot-admin__actions">'
@@ -473,31 +998,32 @@
         buttonClass,
         buttonLabel,
         markerAttribute,
-        extraAttributes = "",
+        formAttributes = "",
+        buttonAttributes = "",
     }) {
         return (
-            `<form method="post" action="${escapeHtml(adminFormConfig.adminPostUrl || "")}" ${markerAttribute} ${extraAttributes}>`
+            `<form method="post" action="${escapeHtml(adminFormConfig.adminPostUrl || "")}" ${markerAttribute} ${formAttributes}>`
             + `<input type="hidden" name="action" value="${escapeHtml(action)}">`
             + `<input type="hidden" name="document_id" value="${escapeHtml(documentId)}">`
             + `<input type="hidden" name="_wpnonce" value="${escapeHtml(nonce)}">`
-            + `<button type="submit" class="${buttonClass}">${escapeHtml(buttonLabel)}</button>`
+            + `<button type="submit" class="${buttonClass}" ${buttonAttributes}>${escapeHtml(buttonLabel)}</button>`
             + "</form>"
         );
     }
 
-    // --- Edit a section ---------------------------------------------
+    // --- Add / Edit a section -----------------------------------------
     //
-    // Mission "ORDER 5D": country dropdown lists only real indexed
-    // documents (rendered server-side from the same catalog the
-    // documents table uses, never the static 34-country allowlist -
-    // this module never re-derives that list itself). Section
-    // dropdown loads only once a country is chosen, and only ever
-    // lists sections that really exist (never a "Create section"
-    // option). Every async step carries a generation token, bumped
-    // on every country change, section change, and Cancel - a
-    // response that arrives after a newer one has already
-    // superseded it is discarded outright, never applied on top of
-    // whatever the admin is looking at now.
+    // Mission "ORDER 8B", sections 12-21: one segmented control picks
+    // between Edit and Add, Edit stays the default visible mode.
+    // Country dropdown lists only real documents (rendered server-
+    // side from the same catalog the documents table uses, excluding
+    // any country in conflict - never a static allowlist). Section/
+    // position lists load only once a country is chosen, and only
+    // ever list sections that really exist (never a "Create section"
+    // option in Edit, never a fabricated position in Add). Every
+    // async step carries a generation token, bumped on every country
+    // change and section change - a response that arrives after a
+    // newer one has already superseded it is discarded outright.
 
     let editSectionGeneration = 0;
 
@@ -510,14 +1036,33 @@
             return;
         }
 
+        const modeEditButton = document.getElementById("le-global-mode-edit");
+        const modeAddButton = document.getElementById("le-global-mode-add");
         const countrySelect = document.getElementById(
             "le-global-edit-country"
+        );
+        const editOnlyFields = document.getElementById(
+            "le-global-edit-only-fields"
         );
         const sectionSelect = document.getElementById(
             "le-global-edit-section"
         );
         const textarea = document.getElementById(
             "le-global-edit-content"
+        );
+        const editHintEl = document.getElementById("le-global-edit-hint");
+        const addOnlyFields = document.getElementById(
+            "le-global-add-only-fields"
+        );
+        const addTitleInput = document.getElementById("le-global-add-title");
+        const addPositionSelect = document.getElementById(
+            "le-global-add-position"
+        );
+        const duplicateWarningEl = document.getElementById(
+            "le-global-add-duplicate-warning"
+        );
+        const addContentTextarea = document.getElementById(
+            "le-global-add-content"
         );
         const messageEl = document.getElementById(
             "le-global-chatbot-edit-message"
@@ -528,25 +1073,29 @@
         const saveButton = document.getElementById(
             "le-global-edit-save"
         );
-        const restoreButton = document.getElementById(
-            "le-global-edit-restore"
+        const addSubmitButton = document.getElementById(
+            "le-global-add-submit"
         );
 
         if (
-            !countrySelect
-            || !sectionSelect
-            || !textarea
-            || !messageEl
-            || !cancelButton
-            || !saveButton
-            || !restoreButton
+            !modeEditButton || !modeAddButton || !countrySelect
+            || !editOnlyFields || !sectionSelect || !textarea || !editHintEl
+            || !addOnlyFields || !addTitleInput || !addPositionSelect
+            || !duplicateWarningEl || !addContentTextarea || !messageEl
+            || !cancelButton || !saveButton || !addSubmitButton
         ) {
             return;
         }
 
         const config = container.dataset;
+
+        let mode = "edit";
         let saving = false;
-        let restoring = false;
+        let adding = false;
+        let previousCountryValue = "";
+        let previousSectionValue = "";
+        let currentSections = [];
+        let editBaselineContent = null;
 
         // Messages/textarea content only ever go through .textContent
         // or .value - never innerHTML - so nothing rendered here can
@@ -559,6 +1108,16 @@
                 "le-global-chatbot-admin__edit-message"
                 + (kind ? ` ${kind}` : "")
             );
+        }
+
+        function selectedCountryName() {
+            const option = countrySelect.options[countrySelect.selectedIndex];
+
+            if (!option) {
+                return "the";
+            }
+
+            return option.textContent.replace(/\s*\([^)]*\)\s*$/, "").trim();
         }
 
         function setSectionOptions(placeholderText, sections) {
@@ -575,6 +1134,151 @@
                 option.textContent = section.legal_topic;
                 sectionSelect.appendChild(option);
             });
+        }
+
+        function setPositionPlaceholder(text) {
+            addPositionSelect.textContent = "";
+
+            const option = document.createElement("option");
+            option.value = "";
+            option.textContent = text;
+            addPositionSelect.appendChild(option);
+        }
+
+        function populatePositionOptions(sections) {
+            addPositionSelect.textContent = "";
+
+            buildPositionOptions(sections).forEach(({ value, label }) => {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = label;
+                addPositionSelect.appendChild(option);
+            });
+
+            addPositionSelect.value = "end";
+        }
+
+        function findDuplicateSection(title) {
+            return findDuplicateSectionIn(currentSections, title);
+        }
+
+        function hideDuplicateWarning() {
+            duplicateWarningEl.hidden = true;
+            duplicateWarningEl.innerHTML = "";
+            updateAddSubmitAvailability();
+        }
+
+        function showDuplicateWarning(duplicateSection) {
+            duplicateWarningEl.hidden = false;
+            duplicateWarningEl.innerHTML = "";
+
+            const message = document.createElement("p");
+            message.textContent = (
+                `"${duplicateSection.legal_topic}" already exists for `
+                + "this country. To change its content, use \"Edit a "
+                + "section\"."
+            );
+            duplicateWarningEl.appendChild(message);
+
+            const switchButton = document.createElement("button");
+            switchButton.type = "button";
+            switchButton.className = "button";
+            switchButton.textContent = `Edit "${duplicateSection.legal_topic}"`;
+            switchButton.addEventListener("click", () => {
+                if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                    return undefined;
+                }
+
+                setMode("edit");
+                sectionSelect.value = duplicateSection.section_id;
+                previousSectionValue = duplicateSection.section_id;
+                return onSectionChange();
+            });
+            duplicateWarningEl.appendChild(switchButton);
+
+            updateAddSubmitAvailability();
+        }
+
+        function checkDuplicateTitle() {
+            const duplicate = findDuplicateSection(addTitleInput.value);
+
+            if (duplicate) {
+                showDuplicateWarning(duplicate);
+                return true;
+            }
+
+            hideDuplicateWarning();
+            return false;
+        }
+
+        function isEditDirty() {
+            return (
+                editBaselineContent !== null
+                && textarea.value !== editBaselineContent
+            );
+        }
+
+        function isAddDirty() {
+            return (
+                addTitleInput.value.trim() !== ""
+                || addContentTextarea.value.trim() !== ""
+            );
+        }
+
+        function isDirty() {
+            return mode === "edit" ? isEditDirty() : isAddDirty();
+        }
+
+        function updateSaveAvailability() {
+            const ready = (
+                !saving
+                && editBaselineContent !== null
+                && textarea.value !== editBaselineContent
+                && textarea.value.trim() !== ""
+            );
+
+            saveButton.disabled = !ready;
+        }
+
+        function updateAddSubmitAvailability() {
+            const ready = (
+                !adding
+                && countrySelect.value !== ""
+                && addTitleInput.value.trim() !== ""
+                && addContentTextarea.value.trim() !== ""
+                && addPositionSelect.value !== ""
+                && duplicateWarningEl.hidden
+            );
+
+            addSubmitButton.disabled = !ready;
+        }
+
+        function renderModeUI() {
+            const isEdit = mode === "edit";
+
+            modeEditButton.classList.toggle("is-active", isEdit);
+            modeAddButton.classList.toggle("is-active", !isEdit);
+            modeEditButton.setAttribute("aria-selected", String(isEdit));
+            modeAddButton.setAttribute("aria-selected", String(!isEdit));
+
+            editOnlyFields.hidden = !isEdit;
+            addOnlyFields.hidden = isEdit;
+            saveButton.hidden = !isEdit;
+            addSubmitButton.hidden = isEdit;
+        }
+
+        function setMode(nextMode) {
+            if (mode === nextMode || saving || adding) {
+                return;
+            }
+
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
+            mode = nextMode;
+            setMessage("", null);
+            renderModeUI();
         }
 
         function buildQueryUrl(action, nonce, params) {
@@ -622,16 +1326,32 @@
 
         function resetToEmpty() {
             editSectionGeneration += 1;
+
             countrySelect.disabled = false;
             countrySelect.value = "";
+            previousCountryValue = "";
+            currentSections = [];
+
             setSectionOptions("Select a country first…", []);
             sectionSelect.disabled = true;
+            previousSectionValue = "";
             textarea.value = "";
             textarea.disabled = true;
+            editBaselineContent = null;
+            editHintEl.textContent = "";
+
+            addTitleInput.value = "";
+            addTitleInput.disabled = true;
+            setPositionPlaceholder("Select a country first…");
+            addPositionSelect.disabled = true;
+            addContentTextarea.value = "";
+            addContentTextarea.disabled = true;
+            hideDuplicateWarning();
+
             setMessage("", null);
             cancelButton.disabled = true;
             saveButton.disabled = true;
-            restoreButton.disabled = true;
+            addSubmitButton.disabled = true;
         }
 
         async function onCountryChange() {
@@ -640,17 +1360,30 @@
             editSectionGeneration += 1;
             const generation = editSectionGeneration;
 
+            currentSections = [];
             setSectionOptions("Loading sections…", []);
             sectionSelect.disabled = true;
             textarea.value = "";
             textarea.disabled = true;
+            editBaselineContent = null;
+            editHintEl.textContent = "";
+
+            addTitleInput.value = "";
+            addTitleInput.disabled = true;
+            setPositionPlaceholder("Loading sections…");
+            addPositionSelect.disabled = true;
+            addContentTextarea.value = "";
+            addContentTextarea.disabled = true;
+            hideDuplicateWarning();
+
             setMessage("", null);
             cancelButton.disabled = documentId === "";
             saveButton.disabled = true;
-            restoreButton.disabled = true;
+            addSubmitButton.disabled = true;
 
             if (documentId === "") {
                 setSectionOptions("Select a country first…", []);
+                setPositionPlaceholder("Select a country first…");
                 return;
             }
 
@@ -674,8 +1407,12 @@
 
             if (!isSuccessful(result)) {
                 setSectionOptions("Select a country…", []);
+                setPositionPlaceholder("Select a country…");
                 setMessage(
-                    errorMessage(result ? result.payload : null),
+                    businessMessage(
+                        result ? result.payload : null,
+                        "The sections could not be loaded."
+                    ),
                     "is-error"
                 );
                 return;
@@ -688,8 +1425,15 @@
                 ? result.payload.data.sections
                 : [];
 
+            currentSections = sections;
+
             setSectionOptions("Select a section…", sections);
             sectionSelect.disabled = sections.length === 0;
+
+            populatePositionOptions(sections);
+            addPositionSelect.disabled = false;
+            addTitleInput.disabled = false;
+            addContentTextarea.disabled = false;
 
             if (sections.length === 0) {
                 setMessage(
@@ -697,6 +1441,9 @@
                     null
                 );
             }
+
+            checkDuplicateTitle();
+            updateAddSubmitAvailability();
         }
 
         async function onSectionChange() {
@@ -708,9 +1455,10 @@
 
             textarea.value = "";
             textarea.disabled = true;
+            editBaselineContent = null;
+            editHintEl.textContent = "";
             setMessage("", null);
             saveButton.disabled = true;
-            restoreButton.disabled = true;
 
             if (documentId === "" || sectionId === "") {
                 return;
@@ -736,7 +1484,10 @@
 
             if (!isSuccessful(result)) {
                 setMessage(
-                    errorMessage(result ? result.payload : null),
+                    businessMessage(
+                        result ? result.payload : null,
+                        "The section could not be loaded."
+                    ),
                     "is-error"
                 );
                 return;
@@ -751,12 +1502,23 @@
 
             textarea.value = content;
             textarea.disabled = false;
-            saveButton.disabled = false;
-            restoreButton.disabled = false;
+            editBaselineContent = content;
+            saveButton.disabled = true;
+
+            const sectionTitle = sectionSelect.options[
+                sectionSelect.selectedIndex
+            ]
+                ? sectionSelect.options[sectionSelect.selectedIndex].textContent
+                : "this section";
+
+            editHintEl.textContent = (
+                `Saving will replace the current content of "${sectionTitle}" `
+                + `in the ${selectedCountryName()} document.`
+            );
         }
 
         async function onSave() {
-            if (saving || restoring || saveButton.disabled) {
+            if (saving || adding || saveButton.disabled) {
                 return;
             }
 
@@ -767,11 +1529,21 @@
                 return;
             }
 
+            const sectionTitle = sectionSelect.options[
+                sectionSelect.selectedIndex
+            ]
+                ? sectionSelect.options[sectionSelect.selectedIndex].textContent
+                : "This section";
+            const countryName = selectedCountryName();
+
             saving = true;
             saveButton.disabled = true;
-            restoreButton.disabled = true;
+            saveButton.textContent = "Saving…";
+            cancelButton.disabled = true;
             countrySelect.disabled = true;
             sectionSelect.disabled = true;
+            modeEditButton.disabled = true;
+            modeAddButton.disabled = true;
             setMessage("Saving…", null);
 
             const generation = editSectionGeneration;
@@ -804,14 +1576,22 @@
 
             if (!isSuccessful(result)) {
                 saving = false;
-                saveButton.disabled = false;
-                restoreButton.disabled = false;
+                saveButton.textContent = "Save changes";
+                cancelButton.disabled = false;
                 countrySelect.disabled = false;
                 sectionSelect.disabled = false;
+                modeEditButton.disabled = false;
+                modeAddButton.disabled = false;
                 setMessage(
-                    errorMessage(result ? result.payload : null),
+                    businessMessage(
+                        result ? result.payload : null,
+                        "We couldn't save your changes. Nothing has "
+                        + "been confirmed as completed. Please try "
+                        + "again or contact support."
+                    ),
                     "is-error"
                 );
+                updateSaveAvailability();
                 return;
             }
 
@@ -833,15 +1613,17 @@
             }
 
             saving = false;
+            saveButton.textContent = "Save changes";
 
             if (generation !== editSectionGeneration) {
                 return;
             }
 
+            cancelButton.disabled = false;
             countrySelect.disabled = false;
             sectionSelect.disabled = false;
-            saveButton.disabled = false;
-            restoreButton.disabled = false;
+            modeEditButton.disabled = false;
+            modeAddButton.disabled = false;
 
             if (
                 isSuccessful(refetch)
@@ -849,53 +1631,69 @@
                 && typeof refetch.payload.data.content === "string"
             ) {
                 textarea.value = refetch.payload.data.content;
-                setMessage("Section saved successfully.", "is-success");
+                editBaselineContent = refetch.payload.data.content;
+                setMessage(
+                    `✓ ${sectionTitle} was updated successfully. The `
+                    + `${countryName} document and chatbot content `
+                    + "are now up to date.",
+                    "is-success"
+                );
             } else {
+                editBaselineContent = textarea.value;
                 setMessage(
                     "Saved, but the updated content could not be "
                     + "re-loaded for confirmation.",
                     "is-error"
                 );
             }
+
+            updateSaveAvailability();
         }
 
-        async function onRestore() {
-            if (restoring || saving || restoreButton.disabled) {
+        async function onAddSubmit() {
+            if (saving || adding || addSubmitButton.disabled) {
                 return;
             }
 
             const documentId = countrySelect.value;
-            const sectionId = sectionSelect.value;
+            const title = addTitleInput.value.trim();
+            const content = addContentTextarea.value;
+            const position = addPositionSelect.value;
 
-            if (documentId === "" || sectionId === "") {
+            if (
+                documentId === ""
+                || title === ""
+                || content.trim() === ""
+                || position === ""
+                || findDuplicateSection(title)
+            ) {
+                checkDuplicateTitle();
                 return;
             }
 
-            const confirmed = window.confirm(
-                "Restore this section from the current source "
-                + "document? Any Edit saved for this section will be "
-                + "discarded and replaced with the document's own "
-                + "content."
-            );
+            const countryName = selectedCountryName();
 
-            if (!confirmed) {
-                return;
-            }
-
-            restoring = true;
-            saveButton.disabled = true;
-            restoreButton.disabled = true;
+            adding = true;
+            addSubmitButton.disabled = true;
+            addSubmitButton.textContent = "Adding section…";
+            cancelButton.disabled = true;
             countrySelect.disabled = true;
-            sectionSelect.disabled = true;
-            setMessage("Restoring…", null);
+            addTitleInput.disabled = true;
+            addPositionSelect.disabled = true;
+            addContentTextarea.disabled = true;
+            modeEditButton.disabled = true;
+            modeAddButton.disabled = true;
+            setMessage("Adding section…", null);
 
             const generation = editSectionGeneration;
 
             const formData = new FormData();
-            formData.set("action", config.sectionRestoreAction);
-            formData.set("nonce", config.sectionRestoreNonce);
+            formData.set("action", config.sectionAddAction);
+            formData.set("nonce", config.sectionAddNonce);
             formData.set("document_id", documentId);
-            formData.set("section_id", sectionId);
+            formData.set("title", title);
+            formData.set("content", content);
+            formData.set("position", position);
 
             let result;
 
@@ -909,32 +1707,41 @@
             }
 
             if (generation !== editSectionGeneration) {
-                // Cancel (or a fresh country/section pick) already
-                // reset the UI while this restore was in flight -
-                // never touch controls it already reset or disabled.
-                restoring = false;
+                adding = false;
                 return;
             }
 
             if (!isSuccessful(result)) {
-                restoring = false;
-                saveButton.disabled = false;
-                restoreButton.disabled = false;
+                adding = false;
+                addSubmitButton.textContent = "+ Add section";
+                cancelButton.disabled = false;
                 countrySelect.disabled = false;
-                sectionSelect.disabled = false;
+                addTitleInput.disabled = false;
+                addPositionSelect.disabled = false;
+                addContentTextarea.disabled = false;
+                modeEditButton.disabled = false;
+                modeAddButton.disabled = false;
                 setMessage(
-                    errorMessage(result ? result.payload : null),
+                    businessMessage(
+                        result ? result.payload : null,
+                        "We couldn't add the section. Nothing has "
+                        + "been confirmed as completed. Please try "
+                        + "again or contact support."
+                    ),
                     "is-error"
                 );
+                updateAddSubmitAvailability();
                 return;
             }
 
-            // Re-fetch the section so the UI always shows the value
-            // really persisted, never just an assumed reset.
+            // Re-fetch the sections list so the new section is
+            // immediately available in Edit mode (mission "ORDER 8B",
+            // section 18) - never trust the bare success response as
+            // final proof.
             const url = buildQueryUrl(
-                config.sectionGetAction,
-                config.sectionGetNonce,
-                { document_id: documentId, section_id: sectionId }
+                config.sectionsListAction,
+                config.sectionsListNonce,
+                { document_id: documentId }
             );
 
             let refetch;
@@ -945,65 +1752,108 @@
                 refetch = null;
             }
 
-            restoring = false;
+            adding = false;
+            addSubmitButton.textContent = "+ Add section";
 
             if (generation !== editSectionGeneration) {
                 return;
             }
 
+            cancelButton.disabled = false;
             countrySelect.disabled = false;
-            sectionSelect.disabled = false;
-            saveButton.disabled = false;
-            restoreButton.disabled = false;
+            modeEditButton.disabled = false;
+            modeAddButton.disabled = false;
 
             if (
                 isSuccessful(refetch)
                 && refetch.payload.data
-                && typeof refetch.payload.data.content === "string"
+                && Array.isArray(refetch.payload.data.sections)
             ) {
-                textarea.value = refetch.payload.data.content;
-                setMessage(
-                    "Section restored from document successfully.",
-                    "is-success"
-                );
-            } else {
-                setMessage(
-                    "Restored, but the updated content could not be "
-                    + "re-loaded for confirmation.",
-                    "is-error"
-                );
+                currentSections = refetch.payload.data.sections;
+                setSectionOptions("Select a section…", currentSections);
+                sectionSelect.disabled = currentSections.length === 0;
+                populatePositionOptions(currentSections);
             }
+
+            addTitleInput.value = "";
+            addTitleInput.disabled = false;
+            addPositionSelect.disabled = false;
+            addContentTextarea.value = "";
+            addContentTextarea.disabled = false;
+            hideDuplicateWarning();
+
+            setMessage(
+                `✓ "${title}" was added successfully. The `
+                + `${countryName} document and chatbot content are `
+                + "now up to date.",
+                "is-success"
+            );
+
+            updateAddSubmitAvailability();
         }
 
         function onCancel() {
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
             resetToEmpty();
         }
 
-        countrySelect.addEventListener("change", onCountryChange);
-        sectionSelect.addEventListener("change", onSectionChange);
+        countrySelect.addEventListener("change", () => {
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                countrySelect.value = previousCountryValue;
+                return undefined;
+            }
+
+            previousCountryValue = countrySelect.value;
+            return onCountryChange();
+        });
+
+        sectionSelect.addEventListener("change", () => {
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                sectionSelect.value = previousSectionValue;
+                return undefined;
+            }
+
+            previousSectionValue = sectionSelect.value;
+            return onSectionChange();
+        });
+
+        textarea.addEventListener("input", updateSaveAvailability);
         saveButton.addEventListener("click", onSave);
-        restoreButton.addEventListener("click", onRestore);
+
+        addTitleInput.addEventListener("input", () => {
+            checkDuplicateTitle();
+            updateAddSubmitAvailability();
+        });
+        addContentTextarea.addEventListener("input", updateAddSubmitAvailability);
+        addPositionSelect.addEventListener("change", updateAddSubmitAvailability);
+        addSubmitButton.addEventListener("click", onAddSubmit);
+
         cancelButton.addEventListener("click", onCancel);
+        modeEditButton.addEventListener("click", () => setMode("edit"));
+        modeAddButton.addEventListener("click", () => setMode("add"));
+
+        renderModeUI();
     }
 
     wireEditSection();
 
-    // --- upload form: multi-file queue ------------------------------
+    wireDocumentsToolbar();
+    wireDeleteForms();
+    wireReindexForms();
+    wireDocumentMenus();
+
+    // --- upload form: dropzone + multi-file queue --------------------
 
     const uploadForm = document.querySelector(
         ".le-global-chatbot-admin__upload-form"
     );
 
-    wireDeleteForms();
-    wireReindexForms();
-
     if (!uploadForm) {
         return;
     }
-
-    const submitButton = uploadForm.querySelector(
-        'button[type="submit"]'
-    );
 
     const fileInput = document.getElementById(FILE_INPUT_ID);
 
@@ -1065,6 +1915,9 @@
         return { response, payload };
     }
 
+    // Mission "ORDER 8B", section 9 - zero-count categories are never
+    // shown; while any file is still queued/uploading, the summary
+    // reads as an in-progress count rather than a final tally.
     function renderQueue() {
         const container = document.getElementById(QUEUE_CONTAINER_ID);
 
@@ -1077,25 +1930,21 @@
             return;
         }
 
-        const counts = queue.reduce((accumulator, item) => {
-            accumulator[item.status] = (accumulator[item.status] || 0) + 1;
-            return accumulator;
-        }, {});
+        const { total, allSettled, categories } = summarizeQueue(queue);
 
-        const summary = (
-            `Indexed: ${counts.indexed || 0} · `
-            + `Already current: ${counts.already_current || 0} · `
-            + `Awaiting decision: ${
-                (counts.awaiting_replacement_confirmation || 0)
-                + (counts.awaiting_warning_confirmation || 0)
-                + (counts.awaiting_combined_confirmation || 0)
-            } · `
-            + `Cancelled: ${counts.cancelled || 0} · `
-            + `Failed: ${counts.failed || 0}`
-        );
+        const summaryLine = allSettled
+            ? `${total} document${total === 1 ? "" : "s"} processed`
+            : `Processing ${total} document${total === 1 ? "" : "s"}…`;
+
+        const summaryDetails = categories
+            .map((category) => `${category.icon} ${category.count} ${category.key}`)
+            .join(" · ");
 
         container.innerHTML = (
-            `<p class="le-global-chatbot-admin__queue-summary">${escapeHtml(summary)}</p>`
+            '<p class="le-global-chatbot-admin__queue-summary">'
+            + escapeHtml(summaryLine)
+            + (allSettled && summaryDetails ? ` — ${escapeHtml(summaryDetails)}` : "")
+            + "</p>"
             + '<ul class="le-global-chatbot-admin__queue-list">'
             + queue.map(queueItemHtml).join("")
             + "</ul>"
@@ -1111,18 +1960,49 @@
         });
     }
 
+    // Mission "ORDER 8B", section 8 - user-facing terminology only;
+    // the backend's own internal status strings never change.
     const STATUS_TEXT = {
         queued: "Queued",
         uploading: "Uploading…",
-        indexed: "Indexed",
-        already_current: "Already current",
+        indexed: "Added",
+        replaced: "Replaced",
+        already_current: "Already up to date",
+        awaiting_replacement_confirmation: "Needs confirmation",
+        awaiting_warning_confirmation: "Needs confirmation",
+        awaiting_combined_confirmation: "Needs confirmation",
         cancelled: "Cancelled",
         failed: "Failed",
     };
 
+    function queueIconFor(status) {
+        if (
+            status === "indexed"
+            || status === "replaced"
+            || status === "already_current"
+        ) {
+            return { icon: "✓", cls: "is-success" };
+        }
+
+        if (status === "failed") {
+            return { icon: "✕", cls: "is-error" };
+        }
+
+        if (
+            status === "awaiting_replacement_confirmation"
+            || status === "awaiting_warning_confirmation"
+            || status === "awaiting_combined_confirmation"
+        ) {
+            return { icon: "⚠", cls: "is-warning" };
+        }
+
+        return { icon: "…", cls: "" };
+    }
+
     function queueItemHtml(item) {
         const filename = escapeHtml(item.file.name);
         const statusText = STATUS_TEXT[item.status] || item.status;
+        const { icon, cls } = queueIconFor(item.status);
 
         let extra = "";
 
@@ -1130,16 +2010,30 @@
             extra = `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(item.message)}</span>`;
         } else if (item.status === "awaiting_replacement_confirmation") {
             const country = (
-                (item.detail && item.detail.country) || "this country"
+                (item.detail && item.detail.country) || "This country"
             );
+            const existingIds = (
+                item.detail && Array.isArray(item.detail.existing_document_ids)
+            )
+                ? item.detail.existing_document_ids
+                : [];
+            const existingDocument = existingIds.length > 0
+                ? findDocumentById(existingIds[0])
+                : null;
 
             extra = (
-                `<span class="le-global-chatbot-admin__queue-message">A document already exists for ${escapeHtml(country)}.</span>`
-                + decisionButtonsHtml(item.id, "Cancel", "cancel", "Replace", "replace")
+                `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(country)} already has a document.</span>`
+                + (
+                    existingDocument && existingDocument.source_filename
+                        ? `<span class="le-global-chatbot-admin__queue-message">Current document: ${escapeHtml(existingDocument.source_filename)}</span>`
+                        : ""
+                )
+                + `<span class="le-global-chatbot-admin__queue-message">New document: ${filename}</span>`
+                + decisionButtonsHtml(item.id, "Cancel", "cancel", "Replace document", "replace")
             );
         } else if (item.status === "awaiting_warning_confirmation") {
             extra = (
-                `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(item.message)}</span>`
+                warningMessagesHtml(item.detail)
                 + decisionButtonsHtml(item.id, "Cancel", "cancel", "Continue", "continue")
             );
         } else if (item.status === "awaiting_combined_confirmation") {
@@ -1148,7 +2042,8 @@
             );
 
             extra = (
-                `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(item.message)} A document already exists for ${escapeHtml(country)}.</span>`
+                warningMessagesHtml(item.detail)
+                + `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(country)} already has a document.</span>`
                 + decisionButtonsHtml(item.id, "Cancel", "cancel", "Continue and replace", "continue-and-replace")
             );
         }
@@ -1156,17 +2051,46 @@
         return (
             '<li class="le-global-chatbot-admin__queue-item" '
             + `data-status="${escapeHtml(item.status)}">`
+            + `<span class="le-global-chatbot-admin__queue-icon ${cls}" aria-hidden="true">${icon}</span>`
+            + '<span class="le-global-chatbot-admin__queue-body">'
             + `<span class="le-global-chatbot-admin__queue-filename">${filename}</span>`
             + `<span class="le-global-chatbot-admin__queue-status">${escapeHtml(statusText)}</span>`
             + extra
-            + "</li>"
+            + "</span></li>"
         );
+    }
+
+    // The raw top-level error message on a warning/combined outcome
+    // mentions confirm_warnings/indexing internals - each individual
+    // warning's own .message field is written in business language
+    // instead, so that is what renders here (mission "ORDER 8B",
+    // section 6).
+    function warningMessagesHtml(detail) {
+        const warnings = (detail && Array.isArray(detail.warnings))
+            ? detail.warnings
+            : [];
+
+        if (warnings.length === 0) {
+            return (
+                '<span class="le-global-chatbot-admin__queue-message">'
+                + "This document may need a quick review before it is added."
+                + "</span>"
+            );
+        }
+
+        return warnings
+            .map((warning) => (
+                `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(warning.message)}</span>`
+            ))
+            .join("");
     }
 
     function decisionButtonsHtml(itemId, cancelLabel, cancelValue, continueLabel, continueValue) {
         return (
-            `<button type="button" class="button" data-decision="${cancelValue}" data-item-id="${itemId}">${escapeHtml(cancelLabel)}</button>`
+            `<span class="le-global-chatbot-admin__queue-decisions">`
+            + `<button type="button" class="button" data-decision="${cancelValue}" data-item-id="${itemId}">${escapeHtml(cancelLabel)}</button>`
             + `<button type="button" class="button button-primary" data-decision="${continueValue}" data-item-id="${itemId}">${escapeHtml(continueLabel)}</button>`
+            + "</span>"
         );
     }
 
@@ -1273,7 +2197,11 @@
             return;
         }
 
-        item.status = "indexed";
+        item.status = (
+            item.forcedOptions && item.forcedOptions.replaceExisting
+        )
+            ? "replaced"
+            : "indexed";
         renderQueue();
     }
 
@@ -1302,6 +2230,21 @@
         }
     }
 
+    function settledPromise(item) {
+        return new Promise((resolve) => {
+            const check = () => {
+                if (item.status !== "queued" && item.status !== "uploading") {
+                    resolve();
+                    return;
+                }
+
+                setTimeout(check, 10);
+            };
+
+            check();
+        });
+    }
+
     function enqueueFiles(files) {
         const newItems = files.map((file) => {
             const item = {
@@ -1324,59 +2267,125 @@
         return newItems;
     }
 
-    function settledPromise(item) {
-        return new Promise((resolve) => {
-            const check = () => {
-                if (item.status !== "queued" && item.status !== "uploading") {
-                    resolve();
-                    return;
-                }
+    // Mission "ORDER 8B", section 7 - a brand-new file selection is
+    // always its own batch: the previous batch's summary and result
+    // list never bleed into the next one. This clears only the
+    // in-page batch DISPLAY - it never deletes an already-indexed
+    // document. Returns a promise that settles once the whole batch
+    // has left the queued/uploading state and the single shared
+    // refresh for it has run - never awaited by the live change/drop
+    // handlers below (genuinely fire-and-forget there), but useful
+    // for anything (including tests) that needs to know a batch is
+    // done.
+    function startNewBatch(files) {
+        queue.length = 0;
+        renderQueue();
 
-                setTimeout(check, 10);
-            };
+        const newItems = enqueueFiles(files);
 
-            check();
+        // One refresh for the whole batch, never one per file
+        // (mission "ORDER 5D", section 4) - a file still awaiting a
+        // replacement/warning decision at this point is refreshed
+        // later, on its own, once the admin actually resolves it
+        // (see resolveDecision above).
+        return Promise.all(newItems.map(settledPromise)).then(() => (
+            refreshAdminState()
+        ));
+    }
+
+    function handleFilesSelected(files) {
+        const fileArray = Array.from(files || []);
+
+        if (fileArray.length === 0) {
+            return Promise.resolve();
+        }
+
+        return startNewBatch(fileArray);
+    }
+
+    // Mission "ORDER 8B", section 5 - the real <input type="file">
+    // stays the one true source of files (reachable by keyboard/
+    // assistive tech via the "Choose documents" label's native
+    // for=/id= relationship, no JS required for that part); drag-and-
+    // drop on the dropzone is a purely additive convenience that
+    // funnels into the exact same entry point.
+    function wireUploadDropzone() {
+        const dropzone = document.getElementById("le-global-dropzone");
+        const fallbackSubmit = uploadForm.querySelector(
+            ".le-global-chatbot-admin__upload-fallback-submit"
+        );
+
+        // Hiding the no-JS fallback submit button only once this
+        // script actually runs means a genuinely no-JS visitor still
+        // sees and can use it - it is never removed from the DOM,
+        // only taken out of the accessible/tab order once the
+        // enhanced flow above has taken over (mission "ORDER 8B",
+        // section 5).
+        if (fallbackSubmit) {
+            fallbackSubmit.hidden = true;
+        }
+
+        if (fileInput) {
+            fileInput.addEventListener("change", () => {
+                const files = getSelectedFiles(fileInput);
+
+                // A real browser never fires "change" a second time for
+                // an unchanged selection (confirmed against real
+                // Chromium, mission "ORDER 8B") - clearing the input's
+                // own value immediately after reading it means picking
+                // the exact same file(s) again still registers as a
+                // fresh change, so a repeat upload of an identical
+                // batch works exactly like the first one.
+                fileInput.value = "";
+
+                return handleFilesSelected(files);
+            });
+        }
+
+        if (!dropzone) {
+            return;
+        }
+
+        ["dragenter", "dragover"].forEach((eventName) => {
+            dropzone.addEventListener(eventName, (event) => {
+                event.preventDefault();
+                dropzone.classList.add("is-dragover");
+            });
+        });
+
+        ["dragleave", "dragend"].forEach((eventName) => {
+            dropzone.addEventListener(eventName, (event) => {
+                event.preventDefault();
+                dropzone.classList.remove("is-dragover");
+            });
+        });
+
+        dropzone.addEventListener("drop", (event) => {
+            event.preventDefault();
+            dropzone.classList.remove("is-dragover");
+
+            const files = (event.dataTransfer && event.dataTransfer.files)
+                ? Array.from(event.dataTransfer.files)
+                : [];
+
+            return handleFilesSelected(files);
         });
     }
 
-    uploadForm.addEventListener(
-        "submit",
-        async (event) => {
-            event.preventDefault();
+    wireUploadDropzone();
 
-            if (submitButton && submitButton.disabled) {
-                return;
-            }
-
-            const files = getSelectedFiles(fileInput);
-
-            if (files.length === 0) {
-                return;
-            }
-
-            if (submitButton) {
-                submitButton.disabled = true;
-            }
-
-            try {
-                const items = enqueueFiles(files);
-                await Promise.all(items.map(settledPromise));
-
-                // One refresh for the whole batch, never one per
-                // file (mission "ORDER 5D", section 4: the 33-file
-                // corpus campaign must not amplify into 33 separate
-                // list/stats refreshes) - a file still awaiting a
-                // replacement/warning decision at this point is
-                // refreshed later, on its own, once the admin
-                // actually resolves it (see resolveDecision above).
-                await refreshAdminState();
-            } finally {
-                if (submitButton) {
-                    submitButton.disabled = false;
-                }
-            }
-        }
-    );
+    // Defensive no-JS-submit fallback: routes through the exact same
+    // entry point as the change/drop handlers above, so even if this
+    // ever fires (it shouldn't - the fallback submit button is hidden
+    // the moment this script runs) it can never start a second,
+    // duplicate batch alongside one already in progress. Returns the
+    // batch-completion promise (ignored by a real browser's dispatch,
+    // useful for a caller - e.g. a test - that invokes this handler
+    // directly).
+    uploadForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        return handleFilesSelected(getSelectedFiles(fileInput));
+    });
 
     // Test-only hook: absent in the browser (module is never defined
     // there), so this changes nothing about how the admin page itself
@@ -1387,11 +2396,22 @@
             extractStructuredDetail,
             isReplacementRequiredResponse,
             classifyUploadResponse,
+            businessMessage,
+            detectConflictedCountryCodes,
+            computeDisplayStatus,
+            formatLastUpdated,
+            rowMatchesFilter,
+            normalizeTitle,
+            findDuplicateSectionIn,
+            buildPositionOptions,
+            summarizeQueue,
             MAX_CONCURRENT_UPLOADS,
             getSelectedFiles,
             __queueForTests: {
                 enqueueFiles,
                 resolveDecision,
+                startNewBatch,
+                refresh: refreshAdminState,
                 getQueueSnapshot: () => queue.map((item) => ({ ...item })),
                 activeUploadCount: () => activeUploadCount,
             },

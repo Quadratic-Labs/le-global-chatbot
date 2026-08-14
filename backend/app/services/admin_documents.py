@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
     Any,
@@ -800,6 +801,15 @@ def list_indexed_documents(
                 else None
             )
 
+            updated_at = (
+                datetime.fromtimestamp(
+                    resolved_source.path.stat().st_mtime,
+                    tz=timezone.utc,
+                ).isoformat()
+                if resolved_source.path is not None
+                else None
+            )
+
             document_status = (
                 "indexed"
                 if source_file_present
@@ -809,6 +819,7 @@ def list_indexed_documents(
         except DocumentSourceConflictError:
             source_file_present = False
             source_bytes = None
+            updated_at = None
             document_status = "indexed_source_conflict"
 
         reference_year = source.get(
@@ -854,6 +865,7 @@ def list_indexed_documents(
                     source_file_present
                 ),
                 source_bytes=source_bytes,
+                updated_at=updated_at,
                 status=document_status,
             )
         )

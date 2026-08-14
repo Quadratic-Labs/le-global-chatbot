@@ -1,36 +1,40 @@
 """
-Admin section editing (mission "ORDER 5C").
+Admin section editing - ORDER 8A architecture.
 
-Country -> Section -> current effective content -> Edit -> Save.
-
-OpenSearch treats every section identically regardless of provenance
-(section 2/28: "SECTION = SECTION", no manual-edit flag, no special
-retrieval handling) - the only thing this module adds beyond the
-existing lifecycle primitives is the durable technical record of
-which content is currently effective per section (document_section_
-state.py), so a later Reindex/restart never silently reverts an edit.
+The CURRENT DOCX is the unique source of truth: there is no separate
+"admin override" layer anymore. Edit and Add physically mutate a copy
+of the source DOCX first, validate it by a full reparse, and only then
+atomically apply both the targeted OpenSearch chunks and the new
+current source file - never an override layered on top of an
+unmodified DOCX, and OpenSearch is never the source of truth for
+reconstructing editable text (it is checked only as a post-write
+invariant).
 """
 
 from __future__ import annotations
 
+import os
+import re
+import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from docx import Document
 from opensearchpy import OpenSearch
-from opensearchpy.exceptions import OpenSearchException
 
 from app.core.country_registry import canonical_country_name
-from app.core.legal_taxonomy import get_canonical_legal_topic
 from app.models.admin_document_sections import (
+    AdminDocumentSectionAddResponse,
     AdminDocumentSectionListResponse,
     AdminDocumentSectionResponse,
-    AdminDocumentSectionRestoreResponse,
     AdminDocumentSectionSummary,
     AdminDocumentSectionUpdateResponse,
 )
 from app.services.admin_document_lifecycle import (
     AdminDocumentLifecycleError,
     AdminDocumentRollbackError,
+    _ensure_no_country_conflict,
     _get_document_metadata,
     _required_string,
     _validate_document_id,
@@ -39,10 +43,17 @@ from app.services.country_lock import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     country_lock,
 )
-from app.services.docx_parser import ParsedSection, parse_docx_sections
+from app.services.docx_parser import (
+    TopicLocation,
+    locate_top_level_topics,
+    parse_docx_sections,
+)
 from app.services.document_chunk_builder import (
     DocumentMetadata,
     build_document_chunks,
+    metadata_from_content,
+    resolve_effective_legal_topic,
+    validate_docx_format,
 )
 from app.services.document_indexer import (
     DEFAULT_BULK_CHUNK_SIZE,
@@ -51,25 +62,47 @@ from app.services.document_indexer import (
     _snapshot_document_chunks,
     replace_document_section_chunks,
 )
+from app.services.document_mutation import (
+    LegalTopicAlreadyExistsError,
+    insert_top_level_topic,
+    normalize_topic_title,
+    replace_top_level_topic,
+)
 from app.services.document_source_resolver import (
     DocumentSourceConflictError,
     resolve_document_source_path,
 )
-from app.services.document_section_state import (
-    SectionEdit,
-    SectionEditState,
-    SectionStateError,
-    legal_topic_for_section_id,
-    read_section_edit_state,
-    section_id_for_legal_topic,
-    write_section_edit_state_atomic,
-)
-from app.services.opensearch_index import LEGAL_DOCUMENTS_ALIAS
 from app.clients.opensearch import get_opensearch_client
 from app.services.section_splitter import (
     DEFAULT_MAX_CHARS,
     split_parsed_sections,
 )
+
+
+_SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
+
+_MAX_SECTION_TITLE_LENGTH = 100
+
+
+def section_id_for_legal_topic(
+    legal_topic: str,
+) -> str:
+    """
+    A deterministic identifier derived from ANY legal topic name that
+    is actually present in the current DOCX right now - known
+    taxonomy topic or admin-added custom one alike. Never derived from
+    raw client input directly: callers always resolve a client-
+    supplied section_id back against the CURRENT DOCX's own real
+    topics (see list_effective_sections/get_effective_section) rather
+    than trusting an arbitrary string.
+    """
+
+    slug = _SLUG_PATTERN.sub(
+        "_",
+        legal_topic.strip().lower(),
+    ).strip("_")
+
+    return slug
 
 
 class AdminDocumentSectionNotFoundError(LookupError):
@@ -122,6 +155,40 @@ class AdminDocumentSectionUpdateFailedError(RuntimeError):
         }
 
 
+class AdminDocumentSectionAlreadyExistsError(ValueError):
+    """Raised when a new section's title collides with an existing topic."""
+
+    def __init__(self, *, title: str) -> None:
+        self.title = title
+
+        super().__init__(
+            f"A section already exists with this title: {title!r}. "
+            "Use Edit instead."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        return {
+            "code": "section_already_exists",
+            "message": str(self),
+            "operation": "section_add",
+            "title": self.title,
+        }
+
+
+class AdminDocumentSectionPositionError(ValueError):
+    """Raised when an Add position reference is missing or ambiguous."""
+
+    def __init__(self, *, message: str) -> None:
+        super().__init__(message)
+
+    def to_detail(self) -> dict[str, object]:
+        return {
+            "code": "document_section_invalid_position",
+            "message": str(self),
+            "operation": "section_add",
+        }
+
+
 def _resolve_current_source_path(
     *,
     document_metadata: dict[str, Any],
@@ -157,115 +224,96 @@ def _resolve_current_source_path(
     return resolved.path
 
 
-def _real_topics_from_opensearch(
-    *,
-    client: OpenSearch,
-    document_id: str,
-) -> set[str]:
-    """Every distinct legal_topic among this document's real chunks now."""
-
-    try:
-        response = client.search(
-            index=LEGAL_DOCUMENTS_ALIAS,
-            body={
-                "size": 0,
-                "query": {"term": {"document_id": document_id}},
-                "aggs": {
-                    "topics": {
-                        "terms": {
-                            "field": "legal_topic",
-                            "size": 100,
-                        }
-                    }
-                },
-            },
-        )
-
-    except OpenSearchException as error:
-        raise AdminDocumentLifecycleError(
-            "OpenSearch topic lookup failed."
-        ) from error
-
-    aggregations = response.get("aggregations")
-
-    if not isinstance(aggregations, dict):
-        return set()
-
-    topics_agg = aggregations.get("topics")
-
-    if not isinstance(topics_agg, dict):
-        return set()
-
-    buckets = topics_agg.get("buckets")
-
-    if not isinstance(buckets, list):
-        return set()
-
-    return {
-        bucket["key"]
-        for bucket in buckets
-        if isinstance(bucket, dict) and bucket.get("key")
-    }
-
-
-def _parsed_sections_for_topic(
+def _current_topics(
     *,
     source_path: Path,
     country: str,
-    legal_topic: str,
-) -> list[Any]:
-    parsed_sections = parse_docx_sections(
-        source_path,
+) -> list[TopicLocation]:
+    """The CURRENT DOCX's own real top-level topics, right now."""
+
+    document = Document(
+        source_path
+    )
+
+    return locate_top_level_topics(
+        document,
         country=country,
     )
 
-    matching = []
 
-    for parsed_section in parsed_sections:
-        derived_topic = get_canonical_legal_topic(
-            section=parsed_section.section,
+def _effective_legal_topic(
+    parsed_section: Any,
+    country: str,
+) -> str | None:
+    """The effective legal_topic of one parsed section, or None for
+    overview/front-matter content that is not an editable section."""
+
+    section = parsed_section.section.strip()
+
+    try:
+        document_type, legal_topic = resolve_effective_legal_topic(
+            parsed_section=parsed_section,
+            section=section,
             country=country,
         )
 
-        if derived_topic == legal_topic:
-            matching.append(parsed_section)
+    except Exception:
+        return None
 
-    return matching
+    if document_type != "comparator":
+        return None
+
+    return legal_topic
 
 
 def list_effective_sections(
     *,
     document_id: str,
+    source_directory: Path,
     client: OpenSearch | None = None,
 ) -> AdminDocumentSectionListResponse:
     """
-    Every section that really exists in the document's effective
-    state right now - never a fixed list of all 11 taxonomy topics
-    (mission "ORDER 5C", section 20).
+    Every top-level legal topic that REALLY exists in the current
+    DOCX right now - known taxonomy topic or admin-added custom one
+    alike - never a fixed list of the 11 historical topics, and never
+    derived from OpenSearch (ORDER 8A, section 6).
     """
 
     document_id = _validate_document_id(document_id)
 
     opensearch_client = client or get_opensearch_client()
 
-    _get_document_metadata(
+    document_metadata = _get_document_metadata(
         document_id=document_id,
         client=opensearch_client,
     )
 
-    topics = sorted(
-        _real_topics_from_opensearch(
-            client=opensearch_client,
-            document_id=document_id,
-        )
+    country_code = _required_string(
+        document_metadata,
+        "country_code",
+    )
+    country = canonical_country_name(
+        country_code
+    )
+
+    source_path = _resolve_current_source_path(
+        document_metadata=document_metadata,
+        source_directory=source_directory,
+    )
+
+    topics = _current_topics(
+        source_path=source_path,
+        country=country,
     )
 
     return AdminDocumentSectionListResponse(
         document_id=document_id,
         sections=[
             AdminDocumentSectionSummary(
-                section_id=section_id_for_legal_topic(topic),
-                legal_topic=topic,
+                section_id=section_id_for_legal_topic(
+                    topic.legal_topic
+                ),
+                legal_topic=topic.legal_topic,
             )
             for topic in topics
         ],
@@ -280,21 +328,12 @@ def get_effective_section(
     client: OpenSearch | None = None,
 ) -> AdminDocumentSectionResponse:
     """
-    The current EFFECTIVE content of one section - the last saved
-    edit if one exists, otherwise the real DOCX's own current text
-    for that section, extracted structurally (never a naive join of
-    OpenSearch chunk texts - mission "ORDER 5C", section 22).
+    The current content of one section, extracted structurally from
+    the CURRENT DOCX - never from OpenSearch, never from a persisted
+    override (ORDER 8A, section 6).
     """
 
     document_id = _validate_document_id(document_id)
-
-    legal_topic = legal_topic_for_section_id(section_id)
-
-    if legal_topic is None:
-        raise AdminDocumentSectionNotFoundError(
-            document_id=document_id,
-            section_id=section_id,
-        )
 
     opensearch_client = client or get_opensearch_client()
 
@@ -306,58 +345,238 @@ def get_effective_section(
     country_code = _required_string(document_metadata, "country_code")
     country = canonical_country_name(country_code)
 
-    real_topics = _real_topics_from_opensearch(
-        client=opensearch_client,
-        document_id=document_id,
+    source_path = _resolve_current_source_path(
+        document_metadata=document_metadata,
+        source_directory=source_directory,
     )
 
-    try:
-        state = read_section_edit_state(source_directory, document_id)
-    except SectionStateError as error:
-        raise AdminDocumentLifecycleError(str(error)) from error
-
-    existing_edit = (
-        state.sections.get(section_id) if state is not None else None
+    topics = _current_topics(
+        source_path=source_path,
+        country=country,
     )
 
-    if existing_edit is not None:
-        content = existing_edit.content
+    matching_topic = next(
+        (
+            topic
+            for topic in topics
+            if section_id_for_legal_topic(topic.legal_topic) == section_id
+        ),
+        None,
+    )
 
-    elif legal_topic in real_topics:
-        source_path = _resolve_current_source_path(
-            document_metadata=document_metadata,
-            source_directory=source_directory,
-        )
-
-        matching_sections = _parsed_sections_for_topic(
-            source_path=source_path,
-            country=country,
-            legal_topic=legal_topic,
-        )
-
-        if not matching_sections:
-            raise AdminDocumentSectionNotFoundError(
-                document_id=document_id,
-                section_id=section_id,
-            )
-
-        content = "\n\n".join(
-            section.content for section in matching_sections
-        )
-
-    else:
+    if matching_topic is None:
         raise AdminDocumentSectionNotFoundError(
             document_id=document_id,
             section_id=section_id,
         )
+
+    parsed_sections = parse_docx_sections(
+        source_path,
+        country=country,
+    )
+
+    matching_content = [
+        parsed_section.content
+        for parsed_section in parsed_sections
+        if _effective_legal_topic(parsed_section, country)
+        == matching_topic.legal_topic
+    ]
+
+    content = "\n\n".join(
+        matching_content
+    )
 
     return AdminDocumentSectionResponse(
         document_id=document_id,
         country_code=country_code,
         country_name=country,
         section_id=section_id,
-        legal_topic=legal_topic,
+        legal_topic=matching_topic.legal_topic,
         content=content,
+    )
+
+
+def _make_temp_docx_path(
+    source_path: Path,
+) -> Path:
+    """
+    A temporary DOCX path in the SAME directory as source_path, so the
+    later atomic replace (os.replace) is a same-filesystem rename,
+    never a cross-device copy (ORDER 8A, section 15, step 4).
+    """
+
+    file_descriptor, temporary_path_str = tempfile.mkstemp(
+        prefix=f".{source_path.stem}-",
+        suffix=".tmp.docx",
+        dir=source_path.parent,
+    )
+
+    os.close(
+        file_descriptor
+    )
+
+    return Path(
+        temporary_path_str
+    )
+
+
+def _fsync_path(
+    path: Path,
+) -> None:
+    """fsync a file or directory by path, for durability after a write."""
+
+    flags = (
+        os.O_RDONLY
+        if path.is_dir()
+        else os.O_RDWR
+    )
+
+    file_descriptor = os.open(
+        path,
+        flags,
+    )
+
+    try:
+        os.fsync(
+            file_descriptor
+        )
+
+    finally:
+        os.close(
+            file_descriptor
+        )
+
+
+def _build_metadata(
+    *,
+    document_metadata: dict[str, Any],
+    detected: DocumentMetadata,
+) -> DocumentMetadata:
+    """
+    Combine the freshly re-detected DOCX metadata (country/country_code
+    from content) with the identity metadata the file keeps on disk
+    (its own filename, reference year) - the file's storage identity
+    never changes just because its content was edited.
+    """
+
+    reference_year = document_metadata.get(
+        "reference_year"
+    )
+
+    return DocumentMetadata(
+        country=detected.country,
+        country_code=detected.country_code,
+        reference_year=(
+            int(reference_year)
+            if isinstance(reference_year, int)
+            else detected.reference_year
+        ),
+        language="en",
+        source_filename=_required_string(
+            document_metadata,
+            "source_filename",
+        ),
+        source_format=detected.source_format,
+    )
+
+
+def _validate_mutated_docx(
+    *,
+    temp_path: Path,
+    country: str,
+    expected_country_code: str,
+    document_metadata: dict[str, Any],
+) -> DocumentMetadata:
+    """
+    ORDER 8A section 14: the mandatory reparse-validation every DOCX
+    mutation must pass before anything is allowed to touch OpenSearch
+    or the real source file. Returns the metadata to build chunks
+    with. Raises AdminDocumentSectionUpdateFailedError on any failure
+    - callers must guarantee zero mutation happened before this point.
+    """
+
+    try:
+        validate_docx_format(
+            temp_path
+        )
+
+    except Exception as error:
+        raise AdminDocumentSectionUpdateFailedError(
+            message=(
+                "The updated document is not a valid DOCX file - no "
+                "change was saved."
+            )
+        ) from error
+
+    try:
+        detected = metadata_from_content(
+            temp_path,
+            country_code=expected_country_code,
+            language="en",
+        )
+
+    except Exception as error:
+        raise AdminDocumentSectionUpdateFailedError(
+            message=(
+                "The updated document's country could not be "
+                "re-validated - no change was saved."
+            )
+        ) from error
+
+    if detected.country_code.strip().upper() != expected_country_code.strip().upper():
+        raise AdminDocumentSectionUpdateFailedError(
+            message=(
+                "The edit would change this document's country - no "
+                "change was saved."
+            )
+        )
+
+    return _build_metadata(
+        document_metadata=document_metadata,
+        detected=detected,
+    )
+
+
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def _normalize_for_comparison(
+    text: str,
+) -> str:
+    return _WHITESPACE_PATTERN.sub(
+        " ",
+        text,
+    ).strip()
+
+
+def _build_topic_chunks(
+    *,
+    temp_path: Path,
+    country: str,
+    legal_topic: str,
+    metadata: DocumentMetadata,
+) -> list[Any]:
+    """Build chunks for exactly one legal_topic from a (temp) DOCX."""
+
+    parsed_sections = parse_docx_sections(
+        temp_path,
+        country=country,
+    )
+
+    matching = [
+        parsed_section
+        for parsed_section in parsed_sections
+        if _effective_legal_topic(parsed_section, country) == legal_topic
+    ]
+
+    split_sections = split_parsed_sections(
+        matching,
+        max_chars=DEFAULT_MAX_CHARS,
+    )
+
+    return build_document_chunks(
+        split_sections,
+        metadata,
     )
 
 
@@ -371,14 +590,10 @@ def update_effective_section(
     lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
 ) -> AdminDocumentSectionUpdateResponse:
     """
-    Save a new effective content for one existing section.
-
-    Follows the mission's own transaction order (section 26): re-read
-    current state under lock, verify the section still exists, build
-    the new chunks, mutate OpenSearch first, and only once that has
-    fully succeeded, atomically commit the state file - never the
-    reverse, so a crash/failure between the two never leaves the
-    state file claiming content OpenSearch does not actually have.
+    Edit an existing section: the CURRENT DOCX is really modified
+    (ORDER 8A, section 8), validated by a full reparse (section 14),
+    and only then applied atomically to both OpenSearch (targeted to
+    this one legal_topic only) and the real source file (section 15).
     """
 
     document_id = _validate_document_id(document_id)
@@ -390,19 +605,8 @@ def update_effective_section(
             message="Section content must not be empty."
         )
 
-    legal_topic = legal_topic_for_section_id(section_id)
-
-    if legal_topic is None:
-        raise AdminDocumentSectionNotFoundError(
-            document_id=document_id,
-            section_id=section_id,
-        )
-
     opensearch_client = client or get_opensearch_client()
 
-    # A preliminary, lock-free read only to discover which country
-    # this document belongs to - re-verified again immediately below,
-    # once the lock is actually held (mission section 26, steps 1-2).
     preliminary_metadata = _get_document_metadata(
         document_id=document_id,
         client=opensearch_client,
@@ -430,107 +634,45 @@ def update_effective_section(
                 "operation."
             )
 
-        country = canonical_country_name(country_code)
-        source_filename = _required_string(
-            document_metadata, "source_filename"
-        )
-        reference_year = document_metadata.get("reference_year")
-
-        real_topics = _real_topics_from_opensearch(
+        _ensure_no_country_conflict(
+            country_code=country_code,
             client=opensearch_client,
-            document_id=document_id,
+            operation="section_update",
         )
 
-        try:
-            state = read_section_edit_state(source_directory, document_id)
-        except SectionStateError as error:
-            raise AdminDocumentLifecycleError(str(error)) from error
+        country = canonical_country_name(country_code)
 
-        existing_sections = dict(state.sections) if state is not None else {}
-        existing_edit = existing_sections.get(section_id)
+        source_path = _resolve_current_source_path(
+            document_metadata=document_metadata,
+            source_directory=source_directory,
+        )
 
-        if existing_edit is not None:
-            section_label = existing_edit.section
-            subsection_label = existing_edit.subsection
+        topics = _current_topics(
+            source_path=source_path,
+            country=country,
+        )
 
-        elif legal_topic in real_topics:
-            source_path = _resolve_current_source_path(
-                document_metadata=document_metadata,
-                source_directory=source_directory,
-            )
+        matching_topic = next(
+            (
+                topic
+                for topic in topics
+                if section_id_for_legal_topic(topic.legal_topic)
+                == section_id
+            ),
+            None,
+        )
 
-            matching_sections = _parsed_sections_for_topic(
-                source_path=source_path,
-                country=country,
-                legal_topic=legal_topic,
-            )
-
-            if not matching_sections:
-                raise AdminDocumentSectionNotFoundError(
-                    document_id=document_id,
-                    section_id=section_id,
-                )
-
-            section_label = matching_sections[0].section
-            subsection_label = matching_sections[0].subsection
-
-        else:
+        if matching_topic is None:
             raise AdminDocumentSectionNotFoundError(
                 document_id=document_id,
                 section_id=section_id,
             )
 
-        metadata = DocumentMetadata(
-            country=country,
-            country_code=country_code,
-            reference_year=(
-                int(reference_year)
-                if isinstance(reference_year, int)
-                else None
-            ),
-            language="en",
-            source_filename=source_filename,
-        )
+        legal_topic = matching_topic.legal_topic
 
-        parsed_sections = split_parsed_sections(
-            [
-                ParsedSection(
-                    section=section_label,
-                    subsection=subsection_label,
-                    content=trimmed_content,
-                )
-            ],
-            max_chars=DEFAULT_MAX_CHARS,
-        )
+        # --- section 15, steps 2-3: snapshot BEFORE any mutation ---
+        original_bytes = source_path.read_bytes()
 
-        new_chunks = build_document_chunks(parsed_sections, metadata)
-
-        actual_topics = {chunk.legal_topic for chunk in new_chunks}
-
-        if actual_topics != {legal_topic}:
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The edited content did not resolve back to the "
-                    "same section - no change was saved."
-                )
-            )
-
-        # Captured BEFORE any mutation, scoped to exactly this
-        # (document_id, legal_topic) section - the exact pre-edit
-        # state this whole transaction rolls back to if anything
-        # past this point fails, including a durable state-file
-        # commit failure AFTER OpenSearch has already succeeded
-        # (mission "ORDER 5C" corrective gate, section 1: an Edit has
-        # only two allowed outcomes - fully applied, or exactly as
-        # before - never OpenSearch=new with persisted state=old).
-        #
-        # This read can itself fail (a transient OpenSearch error) -
-        # nothing has mutated yet at this point, so it is reported
-        # through the exact same structured error type as every other
-        # failure in this transaction, never as a raw
-        # DocumentIndexingError escaping unwrapped past this function
-        # and past the router's own except clauses (corrective gate,
-        # section 3: no boundary violation, however early it occurs).
         try:
             pre_edit_snapshot = [
                 item
@@ -549,122 +691,435 @@ def update_effective_section(
                 )
             ) from error
 
+        temp_path = _make_temp_docx_path(
+            source_path
+        )
+
         try:
-            indexing_result = replace_document_section_chunks(
-                new_chunks,
-                legal_topic,
-                client=opensearch_client,
+            try:
+                replace_top_level_topic(
+                    file_path=source_path,
+                    output_path=temp_path,
+                    country=country,
+                    legal_topic=legal_topic,
+                    new_content=trimmed_content,
+                )
+                _fsync_path(
+                    temp_path
+                )
+
+            except Exception as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The section could not be edited: "
+                        f"{error}"
+                    )
+                ) from error
+
+            metadata = _validate_mutated_docx(
+                temp_path=temp_path,
+                country=country,
+                expected_country_code=country_code,
+                document_metadata=document_metadata,
             )
 
-        except DocumentIndexingError as error:
-            # replace_document_section_chunks is itself internally
-            # atomic - on any failure inside it, it has already
-            # restored OpenSearch to exactly its own pre-call state
-            # before this exception ever reaches here, so no further
-            # OpenSearch rollback is needed; the durable state file
-            # (not yet touched at this point) is untouched too.
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The section could not be saved to the search "
-                    "index."
-                )
-            ) from error
-
-        new_state = SectionEditState(
-            document_id=document_id,
-            country_code=country_code,
-            sections={
-                **existing_sections,
-                section_id: SectionEdit(
-                    legal_topic=legal_topic,
-                    section=section_label,
-                    subsection=subsection_label,
-                    content=trimmed_content,
-                ),
-            },
-        )
-
-        try:
-            write_section_edit_state_atomic(source_directory, new_state)
-
-        except OSError as state_error:
-            # OpenSearch already committed the new section content
-            # successfully - it is OpenSearch, not the (untouched,
-            # atomically-written) state file, that must now be rolled
-            # back, so the two never end up disagreeing.
             try:
-                _restore_section_snapshot(
+                new_chunks = _build_topic_chunks(
+                    temp_path=temp_path,
+                    country=country,
+                    legal_topic=legal_topic,
+                    metadata=metadata,
+                )
+
+            except Exception as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The updated document could not be "
+                        f"re-parsed - no change was saved: {error}"
+                    )
+                ) from error
+
+            actual_topics = {
+                chunk.legal_topic for chunk in new_chunks
+            }
+
+            if actual_topics != {legal_topic}:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The edited content did not resolve back to "
+                        "the same section - no change was saved."
+                    )
+                )
+
+            actual_content = "\n\n".join(
+                chunk.content for chunk in new_chunks
+            )
+
+            if _normalize_for_comparison(
+                actual_content
+            ) != _normalize_for_comparison(
+                trimmed_content
+            ):
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The saved content did not match what was "
+                        "submitted - no change was saved."
+                    )
+                )
+
+            try:
+                indexing_result = replace_document_section_chunks(
+                    new_chunks,
+                    legal_topic,
                     client=opensearch_client,
+                )
+
+            except DocumentIndexingError as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The section could not be saved to the "
+                        "search index."
+                    )
+                ) from error
+
+            try:
+                os.replace(
+                    temp_path,
+                    source_path,
+                )
+                _fsync_path(
+                    source_path.parent
+                )
+
+            except OSError as replace_error:
+                _rollback_after_source_replace_failure(
+                    opensearch_client=opensearch_client,
                     document_id=document_id,
                     legal_topic=legal_topic,
-                    snapshot=pre_edit_snapshot,
-                    bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+                    pre_mutation_snapshot=pre_edit_snapshot,
+                    replace_error=replace_error,
+                    context="section",
                 )
 
-            except Exception as rollback_error:
-                raise AdminDocumentRollbackError(
-                    "The section's durable state could not be "
-                    "saved, and rolling the search index back to "
-                    "its previous content afterward also failed - "
-                    "manual recovery is required."
-                ) from rollback_error
+            temp_path = None
 
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The section could not be saved: its durable "
-                    "state could not be written, so the search "
-                    "index was rolled back to its previous content."
+            try:
+                _verify_section_invariant(
+                    source_path=source_path,
+                    country=country,
+                    legal_topic=legal_topic,
+                    metadata=metadata,
+                    document_id=document_id,
+                    client=opensearch_client,
                 )
-            ) from state_error
 
-        return AdminDocumentSectionUpdateResponse(
-            document_id=document_id,
-            section_id=section_id,
+            except AdminDocumentSectionUpdateFailedError as verify_error:
+                _rollback_after_invariant_failure(
+                    opensearch_client=opensearch_client,
+                    document_id=document_id,
+                    legal_topic=legal_topic,
+                    pre_mutation_snapshot=pre_edit_snapshot,
+                    verify_error=verify_error,
+                    context="section",
+                    source_path=source_path,
+                    original_source_bytes=original_bytes,
+                )
+
+            return AdminDocumentSectionUpdateResponse(
+                document_id=document_id,
+                section_id=section_id,
+                legal_topic=legal_topic,
+                indexed_chunks=indexing_result.indexed_chunks,
+            )
+
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(
+                    missing_ok=True
+                )
+
+
+def _verify_section_invariant(
+    *,
+    source_path: Path,
+    country: str,
+    legal_topic: str,
+    metadata: DocumentMetadata,
+    document_id: str,
+    client: OpenSearch,
+) -> None:
+    """
+    ORDER 8A section 18: after success, deterministically verify that
+    the target topic as parsed from the now-current DOCX matches what
+    is actually indexed for it - derived from the parser/chunk builder,
+    never from a raw textarea-text comparison.
+    """
+
+    try:
+        expected_chunks = _build_topic_chunks(
+            temp_path=source_path,
+            country=country,
             legal_topic=legal_topic,
-            indexed_chunks=indexing_result.indexed_chunks,
+            metadata=metadata,
+        )
+
+    except Exception as error:
+        raise AdminDocumentSectionUpdateFailedError(
+            message=(
+                "The post-write invariant check could not re-parse "
+                f"the current document: {error}"
+            )
+        ) from error
+
+    try:
+        indexed = [
+            item
+            for item in _snapshot_document_chunks(
+                client=client,
+                document_id=document_id,
+            )
+            if item["_source"].get("legal_topic") == legal_topic
+        ]
+
+    except DocumentIndexingError as error:
+        raise AdminDocumentSectionUpdateFailedError(
+            message="The post-write invariant check could not read "
+            "the search index."
+        ) from error
+
+    expected_hashes = sorted(
+        chunk.content_hash for chunk in expected_chunks
+    )
+    indexed_hashes = sorted(
+        item["_source"].get("content_hash")
+        for item in indexed
+    )
+
+    if expected_hashes != indexed_hashes:
+        raise AdminDocumentSectionUpdateFailedError(
+            message=(
+                "Post-write invariant check failed: the search "
+                "index does not match the current document's own "
+                "content for this section."
+            )
         )
 
 
-def restore_effective_section(
+def _rollback_after_source_replace_failure(
+    *,
+    opensearch_client: OpenSearch,
+    document_id: str,
+    legal_topic: str,
+    pre_mutation_snapshot: list[dict[str, Any]],
+    replace_error: OSError,
+    context: str,
+) -> None:
+    """
+    ORDER 8A section 16, case E: the atomic source replace failed
+    AFTER OpenSearch already succeeded - roll OpenSearch back to
+    exactly its pre-mutation snapshot (the old source is already
+    intact, since os.replace never partially applies). Shared by
+    Edit and Add - only the snapshot/topic and error message differ.
+    """
+
+    try:
+        _restore_section_snapshot(
+            client=opensearch_client,
+            document_id=document_id,
+            legal_topic=legal_topic,
+            snapshot=pre_mutation_snapshot,
+            bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+        )
+
+    except Exception as rollback_error:
+        raise AdminDocumentRollbackError(
+            f"The {context} could not be saved to the source "
+            "document, and rolling the search index back afterward "
+            "also failed - manual recovery is required."
+        ) from rollback_error
+
+    raise AdminDocumentSectionUpdateFailedError(
+        message=(
+            f"The {context} could not be saved to the source "
+            "document; the search index was rolled back to its "
+            "previous content."
+        )
+    ) from replace_error
+
+
+def _rollback_after_invariant_failure(
+    *,
+    opensearch_client: OpenSearch,
+    document_id: str,
+    legal_topic: str,
+    pre_mutation_snapshot: list[dict[str, Any]],
+    verify_error: AdminDocumentSectionUpdateFailedError,
+    context: str,
+    source_path: Path | None = None,
+    original_source_bytes: bytes | None = None,
+) -> None:
+    """
+    ORDER 8A section 16, case F: failure after the source was already
+    replaced - restore the original source exactly (when a pre-
+    mutation copy was captured) AND restore OpenSearch exactly. Shared
+    by Edit and Add.
+    """
+
+    source_restored = True
+
+    if source_path is not None and original_source_bytes is not None:
+        try:
+            source_path.write_bytes(
+                original_source_bytes
+            )
+            _fsync_path(
+                source_path
+            )
+            _fsync_path(
+                source_path.parent
+            )
+
+        except OSError:
+            source_restored = False
+
+    index_restored = True
+
+    try:
+        _restore_section_snapshot(
+            client=opensearch_client,
+            document_id=document_id,
+            legal_topic=legal_topic,
+            snapshot=pre_mutation_snapshot,
+            bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+        )
+
+    except Exception:
+        index_restored = False
+
+    if not source_restored or not index_restored:
+        raise AdminDocumentRollbackError(
+            f"The post-write invariant check failed for the "
+            f"{context}, and the rollback afterward was incomplete "
+            "(source "
+            + (
+                "restored"
+                if source_restored
+                else "NOT restored"
+            )
+            + ", index "
+            + (
+                "restored"
+                if index_restored
+                else "NOT restored"
+            )
+            + ") - manual recovery is required."
+        ) from verify_error
+
+    raise verify_error
+
+
+def _validate_new_section_title(
+    *,
+    title: str,
+    existing_topics: Sequence[TopicLocation],
+) -> str:
+    trimmed = " ".join(
+        title.split()
+    )
+
+    if not trimmed:
+        raise AdminDocumentSectionInvalidError(
+            message="Section title must not be empty."
+        )
+
+    if len(trimmed) > _MAX_SECTION_TITLE_LENGTH:
+        raise AdminDocumentSectionInvalidError(
+            message=(
+                "Section title must be at most "
+                f"{_MAX_SECTION_TITLE_LENGTH} characters."
+            )
+        )
+
+    normalized_new = normalize_topic_title(
+        trimmed
+    )
+
+    for topic in existing_topics:
+        if (
+            normalize_topic_title(topic.legal_topic) == normalized_new
+            or section_id_for_legal_topic(topic.legal_topic)
+            == section_id_for_legal_topic(trimmed)
+        ):
+            raise AdminDocumentSectionAlreadyExistsError(
+                title=trimmed
+            )
+
+    return trimmed
+
+
+def _resolve_add_position(
+    *,
+    position: str,
+    existing_topics: Sequence[TopicLocation],
+    document_id: str,
+) -> str:
+    normalized = position.strip()
+
+    if normalized in ("beginning", "end"):
+        return normalized
+
+    if normalized.startswith("after:"):
+        target_section_id = normalized[len("after:") :]
+
+        matching = next(
+            (
+                topic
+                for topic in existing_topics
+                if section_id_for_legal_topic(topic.legal_topic)
+                == target_section_id
+            ),
+            None,
+        )
+
+        if matching is None:
+            raise AdminDocumentSectionNotFoundError(
+                document_id=document_id,
+                section_id=target_section_id,
+            )
+
+        return f"after:{matching.legal_topic}"
+
+    raise AdminDocumentSectionPositionError(
+        message=(
+            f"Unsupported position: {position!r}. Use 'beginning', "
+            "'end', or 'after:<section_id>'."
+        )
+    )
+
+
+def add_new_section(
     *,
     document_id: str,
-    section_id: str,
+    title: str,
+    content: str,
+    position: str,
     source_directory: Path,
     client: OpenSearch | None = None,
     lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-) -> AdminDocumentSectionRestoreResponse:
+) -> AdminDocumentSectionAddResponse:
     """
-    Discard any persisted Edit for exactly this one section and
-    restore it to the current source DOCX's own real content -
-    mission "ORDER 7C": the only supported path back to the DOCX for a
-    single section, so recovering from a bad Edit never requires a
-    full document Replace/Delete (which would also discard every
-    OTHER section's own edits).
-
-    Every real subsection the DOCX currently has for this legal_topic
-    is rebuilt through the exact same chunking pipeline a fresh
-    upload/reindex uses (split_parsed_sections + build_document_chunks),
-    so restored chunks carry their own true subsection labels - never
-    the single borrowed label update_effective_section's one-blob
-    Edit uses. Follows the same transaction order as
-    update_effective_section (mutate OpenSearch first, then commit the
-    state file, rolling OpenSearch back if the state commit fails).
-
-    Idempotent: when section_id has no persisted override already, the
-    state file is simply rewritten unchanged and OpenSearch already
-    holds - or is harmlessly re-indexed to - exactly the DOCX's own
-    content; every OTHER section's own persisted edit is carried
-    forward untouched either way.
+    Add a brand-new top-level legal topic: a real new heading is added
+    to the current DOCX at the requested position, validated by a full
+    reparse, and only then applied atomically (ORDER 8A, sections 9-18).
     """
 
     document_id = _validate_document_id(document_id)
 
-    legal_topic = legal_topic_for_section_id(section_id)
+    trimmed_content = content.strip()
 
-    if legal_topic is None:
-        raise AdminDocumentSectionNotFoundError(
-            document_id=document_id,
-            section_id=section_id,
+    if not trimmed_content:
+        raise AdminDocumentSectionInvalidError(
+            message="Section content must not be empty."
         )
 
     opensearch_client = client or get_opensearch_client()
@@ -696,150 +1151,254 @@ def restore_effective_section(
                 "operation."
             )
 
-        country = canonical_country_name(country_code)
-        source_filename = _required_string(
-            document_metadata, "source_filename"
+        _ensure_no_country_conflict(
+            country_code=country_code,
+            client=opensearch_client,
+            operation="section_add",
         )
-        reference_year = document_metadata.get("reference_year")
+
+        country = canonical_country_name(country_code)
 
         source_path = _resolve_current_source_path(
             document_metadata=document_metadata,
             source_directory=source_directory,
         )
 
-        matching_sections = _parsed_sections_for_topic(
+        existing_topics = _current_topics(
             source_path=source_path,
             country=country,
-            legal_topic=legal_topic,
         )
 
-        if not matching_sections:
-            raise AdminDocumentSectionNotFoundError(
-                document_id=document_id,
-                section_id=section_id,
-            )
-
-        metadata = DocumentMetadata(
-            country=country,
-            country_code=country_code,
-            reference_year=(
-                int(reference_year)
-                if isinstance(reference_year, int)
-                else None
-            ),
-            language="en",
-            source_filename=source_filename,
+        trimmed_title = _validate_new_section_title(
+            title=title,
+            existing_topics=existing_topics,
         )
 
-        parsed_sections = split_parsed_sections(
-            matching_sections,
-            max_chars=DEFAULT_MAX_CHARS,
+        resolved_position = _resolve_add_position(
+            position=position,
+            existing_topics=existing_topics,
+            document_id=document_id,
         )
 
-        new_chunks = build_document_chunks(parsed_sections, metadata)
-
-        actual_topics = {chunk.legal_topic for chunk in new_chunks}
-
-        if actual_topics != {legal_topic}:
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The document's own content did not resolve back "
-                    "to the same section - nothing was restored."
-                )
-            )
-
-        try:
-            state = read_section_edit_state(source_directory, document_id)
-        except SectionStateError as error:
-            raise AdminDocumentLifecycleError(str(error)) from error
-
-        existing_sections = dict(state.sections) if state is not None else {}
-
-        # Captured BEFORE any mutation, exactly like
-        # update_effective_section's own pre-edit snapshot - this
-        # transaction rolls back to this if anything past this point
-        # fails.
-        try:
-            pre_restore_snapshot = [
-                item
-                for item in _snapshot_document_chunks(
-                    client=opensearch_client,
-                    document_id=document_id,
-                )
-                if item["_source"].get("legal_topic") == legal_topic
-            ]
-
-        except DocumentIndexingError as error:
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The section's current content could not be "
-                    "read from the search index before restoring."
-                )
-            ) from error
-
-        try:
-            indexing_result = replace_document_section_chunks(
-                new_chunks,
-                legal_topic,
-                client=opensearch_client,
-            )
-
-        except DocumentIndexingError as error:
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The section could not be restored in the "
-                    "search index."
-                )
-            ) from error
-
-        # Discard only this section_id's own override - every other
-        # persisted edit for this document is carried forward
-        # unchanged, and a section_id that never had an override
-        # simply leaves the dict unchanged (idempotent).
-        remaining_sections = {
-            key: value
-            for key, value in existing_sections.items()
-            if key != section_id
+        existing_legal_topics = {
+            topic.legal_topic for topic in existing_topics
         }
 
-        new_state = SectionEditState(
-            document_id=document_id,
-            country_code=country_code,
-            sections=remaining_sections,
+        original_bytes = source_path.read_bytes()
+
+        temp_path = _make_temp_docx_path(
+            source_path
         )
 
         try:
-            write_section_edit_state_atomic(source_directory, new_state)
-
-        except OSError as state_error:
             try:
-                _restore_section_snapshot(
+                insert_top_level_topic(
+                    file_path=source_path,
+                    output_path=temp_path,
+                    country=country,
+                    title=trimmed_title,
+                    content=trimmed_content,
+                    position=resolved_position,
+                )
+                _fsync_path(
+                    temp_path
+                )
+
+            except LegalTopicAlreadyExistsError as error:
+                raise AdminDocumentSectionAlreadyExistsError(
+                    title=trimmed_title
+                ) from error
+
+            except Exception as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        f"The section could not be added: {error}"
+                    )
+                ) from error
+
+            metadata = _validate_mutated_docx(
+                temp_path=temp_path,
+                country=country,
+                expected_country_code=country_code,
+                document_metadata=document_metadata,
+            )
+
+            try:
+                new_topics = locate_top_level_topics(
+                    Document(
+                        temp_path
+                    ),
+                    country=country,
+                )
+
+            except Exception as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The updated document could not be "
+                        f"re-parsed - no change was saved: {error}"
+                    )
+                ) from error
+
+            added_topics = [
+                topic
+                for topic in new_topics
+                if topic.legal_topic not in existing_legal_topics
+            ]
+
+            if len(added_topics) != 1:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The new section could not be uniquely "
+                        "identified after reparsing - no change was "
+                        "saved."
+                    )
+                )
+
+            legal_topic = added_topics[0].legal_topic
+
+            new_topic_names = [
+                topic.legal_topic for topic in new_topics
+            ]
+            new_index = new_topic_names.index(
+                legal_topic
+            )
+
+            if resolved_position == "beginning":
+                position_ok = new_index == 0
+
+            elif resolved_position == "end":
+                position_ok = (
+                    new_index == len(new_topic_names) - 1
+                )
+
+            else:
+                after_topic = resolved_position[
+                    len("after:") :
+                ]
+                position_ok = (
+                    new_index > 0
+                    and new_topic_names[new_index - 1] == after_topic
+                )
+
+            if not position_ok:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The new section was not placed at the "
+                        "requested position - no change was saved."
+                    )
+                )
+
+            try:
+                new_chunks = _build_topic_chunks(
+                    temp_path=temp_path,
+                    country=country,
+                    legal_topic=legal_topic,
+                    metadata=metadata,
+                )
+
+            except Exception as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The updated document could not be "
+                        f"re-parsed - no change was saved: {error}"
+                    )
+                ) from error
+
+            if {chunk.legal_topic for chunk in new_chunks} != {
+                legal_topic
+            }:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The new section's content did not resolve "
+                        "to a single topic - no change was saved."
+                    )
+                )
+
+            try:
+                pre_add_snapshot = [
+                    item
+                    for item in _snapshot_document_chunks(
+                        client=opensearch_client,
+                        document_id=document_id,
+                    )
+                    if item["_source"].get("legal_topic") == legal_topic
+                ]
+
+            except DocumentIndexingError as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The search index could not be read before "
+                        "adding the section."
+                    )
+                ) from error
+
+            try:
+                indexing_result = replace_document_section_chunks(
+                    new_chunks,
+                    legal_topic,
                     client=opensearch_client,
+                )
+
+            except DocumentIndexingError as error:
+                raise AdminDocumentSectionUpdateFailedError(
+                    message=(
+                        "The new section could not be saved to the "
+                        "search index."
+                    )
+                ) from error
+
+            try:
+                os.replace(
+                    temp_path,
+                    source_path,
+                )
+                _fsync_path(
+                    source_path.parent
+                )
+
+            except OSError as replace_error:
+                _rollback_after_source_replace_failure(
+                    opensearch_client=opensearch_client,
                     document_id=document_id,
                     legal_topic=legal_topic,
-                    snapshot=pre_restore_snapshot,
-                    bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+                    pre_mutation_snapshot=pre_add_snapshot,
+                    replace_error=replace_error,
+                    context="new section",
                 )
 
-            except Exception as rollback_error:
-                raise AdminDocumentRollbackError(
-                    "The section's durable state could not be "
-                    "saved, and rolling the search index back to "
-                    "its previous content afterward also failed - "
-                    "manual recovery is required."
-                ) from rollback_error
+            temp_path = None
 
-            raise AdminDocumentSectionUpdateFailedError(
-                message=(
-                    "The section could not be restored: its durable "
-                    "state could not be written, so the search "
-                    "index was rolled back to its previous content."
+            try:
+                _verify_section_invariant(
+                    source_path=source_path,
+                    country=country,
+                    legal_topic=legal_topic,
+                    metadata=metadata,
+                    document_id=document_id,
+                    client=opensearch_client,
                 )
-            ) from state_error
 
-        return AdminDocumentSectionRestoreResponse(
-            document_id=document_id,
-            section_id=section_id,
-            legal_topic=legal_topic,
-            indexed_chunks=indexing_result.indexed_chunks,
-        )
+            except AdminDocumentSectionUpdateFailedError as verify_error:
+                _rollback_after_invariant_failure(
+                    opensearch_client=opensearch_client,
+                    document_id=document_id,
+                    legal_topic=legal_topic,
+                    pre_mutation_snapshot=pre_add_snapshot,
+                    verify_error=verify_error,
+                    context="new section",
+                    source_path=source_path,
+                    original_source_bytes=original_bytes,
+                )
+
+            return AdminDocumentSectionAddResponse(
+                document_id=document_id,
+                section_id=section_id_for_legal_topic(legal_topic),
+                legal_topic=legal_topic,
+                indexed_chunks=indexing_result.indexed_chunks,
+            )
+
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(
+                    missing_ok=True
+                )

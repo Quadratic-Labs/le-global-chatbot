@@ -20,9 +20,10 @@ from app.models.admin_document_lifecycle import (
     AdminDocumentReindexResponse,
 )
 from app.models.admin_document_sections import (
+    AdminDocumentSectionAddRequest,
+    AdminDocumentSectionAddResponse,
     AdminDocumentSectionListResponse,
     AdminDocumentSectionResponse,
-    AdminDocumentSectionRestoreResponse,
     AdminDocumentSectionUpdateRequest,
     AdminDocumentSectionUpdateResponse,
 )
@@ -30,6 +31,7 @@ from app.security.admin import (
     require_admin_key,
 )
 from app.services.admin_document_lifecycle import (
+    AdminDocumentCountryConflictError,
     AdminDocumentLifecycleError,
     AdminDocumentNotFoundError,
     AdminDocumentRollbackError,
@@ -41,12 +43,14 @@ from app.services.admin_document_lifecycle import (
     reindex_indexed_document,
 )
 from app.services.admin_document_sections import (
+    AdminDocumentSectionAlreadyExistsError,
     AdminDocumentSectionInvalidError,
     AdminDocumentSectionNotFoundError,
+    AdminDocumentSectionPositionError,
     AdminDocumentSectionUpdateFailedError,
+    add_new_section,
     get_effective_section,
     list_effective_sections,
-    restore_effective_section,
     update_effective_section,
 )
 from app.services.country_lock import (
@@ -181,6 +185,19 @@ def reindex_admin_document(
                 operation="reindex",
                 document_id=document_id,
             ),
+        ) from error
+
+    except AdminDocumentCountryConflictError as error:
+        log_admin_business_error(
+            operation="reindex",
+            error=error,
+            document_id=document_id,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
         ) from error
 
     except AdminDocumentRollbackError as error:
@@ -465,12 +482,15 @@ def download_admin_document(
 def list_admin_document_sections(
     document_id: str,
 ) -> AdminDocumentSectionListResponse:
-    """List every section that really exists in one document's
-    current effective state (mission "ORDER 5C")."""
+    """List every top-level legal topic that really exists in the
+    document's CURRENT DOCX right now (ORDER 8A, section 6)."""
+
+    settings = get_settings()
 
     try:
         return list_effective_sections(
             document_id=document_id,
+            source_directory=settings.document_source_dir,
         )
 
     except InvalidAdminDocumentIdError as error:
@@ -716,6 +736,19 @@ def update_admin_document_section(
             ),
         ) from error
 
+    except AdminDocumentCountryConflictError as error:
+        log_admin_business_error(
+            operation="section_update",
+            error=error,
+            document_id=document_id,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
     except AdminDocumentSectionUpdateFailedError as error:
         log_admin_business_error(
             operation="section_update",
@@ -764,30 +797,31 @@ def update_admin_document_section(
 
 
 @router.post(
-    "/documents/{document_id}/sections/{section_id}/restore",
-    response_model=AdminDocumentSectionRestoreResponse,
+    "/documents/{document_id}/sections",
+    response_model=AdminDocumentSectionAddResponse,
 )
-def restore_admin_document_section(
+def add_admin_document_section(
     document_id: str,
-    section_id: str,
-) -> AdminDocumentSectionRestoreResponse:
-    """Discard any persisted Edit for one section and restore it to
-    the current source DOCX's own content (mission "ORDER 7C") - the
-    only supported path back to the DOCX for a single section, never
-    a full document Replace/Delete."""
+    payload: AdminDocumentSectionAddRequest,
+) -> AdminDocumentSectionAddResponse:
+    """Add a brand-new top-level legal topic to the current DOCX
+    (ORDER 8A, sections 9-11). position must be exactly one of
+    "beginning", "end", or "after:<section_id>"."""
 
     settings = get_settings()
 
     try:
-        return restore_effective_section(
+        return add_new_section(
             document_id=document_id,
-            section_id=section_id,
+            title=payload.title,
+            content=payload.content,
+            position=payload.position,
             source_directory=settings.document_source_dir,
         )
 
     except InvalidAdminDocumentIdError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
         )
@@ -799,14 +833,14 @@ def restore_admin_document_section(
             detail=admin_error_detail(
                 code="invalid_document_id",
                 message=str(error),
-                operation="section_restore",
+                operation="section_add",
                 document_id=document_id,
             ),
         ) from error
 
     except AdminDocumentNotFoundError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
         )
@@ -816,14 +850,14 @@ def restore_admin_document_section(
             detail=admin_error_detail(
                 code="document_not_found",
                 message=str(error),
-                operation="section_restore",
+                operation="section_add",
                 document_id=document_id,
             ),
         ) from error
 
     except AdminDocumentSectionNotFoundError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
         )
@@ -833,9 +867,38 @@ def restore_admin_document_section(
             detail=error.to_detail(),
         ) from error
 
+    except AdminDocumentSectionAlreadyExistsError as error:
+        log_admin_business_error(
+            operation="section_add",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except (
+        AdminDocumentSectionInvalidError,
+        AdminDocumentSectionPositionError,
+    ) as error:
+        log_admin_business_error(
+            operation="section_add",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=error.to_detail(),
+        ) from error
+
     except AdminDocumentOperationInProgressError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
             country_code=error.country_code,
@@ -846,14 +909,27 @@ def restore_admin_document_section(
             detail=admin_error_detail(
                 code="document_operation_in_progress",
                 message=str(error),
-                operation="section_restore",
+                operation="section_add",
                 document_id=document_id,
             ),
         ) from error
 
+    except AdminDocumentCountryConflictError as error:
+        log_admin_business_error(
+            operation="section_add",
+            error=error,
+            document_id=document_id,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
     except AdminDocumentSectionUpdateFailedError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
         )
@@ -865,7 +941,7 @@ def restore_admin_document_section(
 
     except AdminDocumentRollbackError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
         )
@@ -875,14 +951,14 @@ def restore_admin_document_section(
             detail=admin_error_detail(
                 code="rollback_failed",
                 message=str(error),
-                operation="section_restore",
+                operation="section_add",
                 document_id=document_id,
             ),
         ) from error
 
     except AdminDocumentLifecycleError as error:
         log_admin_business_error(
-            operation="section_restore",
+            operation="section_add",
             error=error,
             document_id=document_id,
         )
@@ -892,7 +968,7 @@ def restore_admin_document_section(
             detail=admin_error_detail(
                 code="document_catalog_unavailable",
                 message=str(error),
-                operation="section_restore",
+                operation="section_add",
                 document_id=document_id,
             ),
         ) from error
