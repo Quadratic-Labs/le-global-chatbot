@@ -61,6 +61,21 @@ _FALSE_XML_VALUES = frozenset(
     }
 )
 
+_MAX_CUSTOM_TOPIC_HEADING_LENGTH: Final[int] = 100
+
+_SENTENCE_TERMINATOR_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[.;,:]$"
+)
+
+# ORDER 8A-C: a dedicated Word paragraph style is the deterministic,
+# DOCX-native marker for an ADMIN-added top-level legal topic - see
+# document_mutation.py, which creates/reuses this exact style name
+# whenever it inserts a new section. Recognizing it never depends on
+# the document's own native heading convention (Heading 1, bold-only,
+# numbered, or anything else), on the country, on document position,
+# or on the visible title text - only on this one style being applied.
+ADMIN_SECTION_STYLE_NAME: Final[str] = "LE Global Admin Section Heading"
+
 BlockItem: TypeAlias = Paragraph | Table
 
 
@@ -71,6 +86,13 @@ class ParsedSection:
     section: str
     subsection: str | None
     content: str
+
+    # True only for a top-level legal topic recognized outside the
+    # fixed LEGAL_TOPICS taxonomy (an admin-added custom section). Lets
+    # the chunk builder accept it as its own legal_topic instead of
+    # raising UnknownLegalTopicError, without weakening that check for
+    # any other, genuinely-unrecognized heading.
+    is_custom_legal_topic: bool = False
 
 
 def _normalize_text(
@@ -297,6 +319,258 @@ def _get_main_legal_topic(
         return None
 
     return legal_topic
+
+
+def is_admin_section_heading(
+    paragraph: Paragraph,
+) -> bool:
+    """
+    Return whether a paragraph carries the dedicated ADMIN-added
+    top-level-section marker style (ORDER 8A-C, section 2).
+
+    This is the sole, deterministic identity check for an admin-
+    created section: it never depends on the document's own native
+    heading convention, on country, on document position, or on the
+    visible title text - only on this exact style name. Nothing in
+    any real historical L&E document uses this project-specific style
+    name, so it can never collide with genuine native content.
+    """
+
+    style = paragraph.style
+
+    return (
+        style is not None
+        and style.name == ADMIN_SECTION_STYLE_NAME
+    )
+
+
+_TOPIC_SIGNAL_HEADING_LEVEL_1: Final[str] = "heading_level_1"
+_TOPIC_SIGNAL_NUMBERING: Final[str] = "numbering"
+_TOPIC_SIGNAL_PREFIX: Final[str] = "topic_number_prefix"
+_TOPIC_SIGNAL_BOLD: Final[str] = "explicit_bold"
+
+
+def _main_section_signals(
+    paragraph: Paragraph,
+    text: str,
+    heading_level: int | None,
+) -> frozenset[str]:
+    """Return which individual main-section structural signals hold."""
+
+    signals: set[str] = set()
+
+    if heading_level == 1:
+        signals.add(
+            _TOPIC_SIGNAL_HEADING_LEVEL_1
+        )
+
+    if _has_numbering(
+        paragraph
+    ):
+        signals.add(
+            _TOPIC_SIGNAL_NUMBERING
+        )
+
+    if _has_topic_number_prefix(
+        text
+    ):
+        signals.add(
+            _TOPIC_SIGNAL_PREFIX
+        )
+
+    if _has_explicit_bold_text(
+        paragraph
+    ):
+        signals.add(
+            _TOPIC_SIGNAL_BOLD
+        )
+
+    return frozenset(
+        signals
+    )
+
+
+def _learn_custom_topic_signal_requirement(
+    document: DocxDocument,
+    country: str | None,
+) -> frozenset[str] | None:
+    """
+    Learn which structural signals this document's own confirmed legal
+    topics consistently carry, so a custom (non-taxonomy) heading is
+    only ever recognized against the SAME evidentiary bar - never a
+    weaker one.
+
+    Returns None (never accept a custom topic) when the document has
+    no confirmed topic to learn from, or when its confirmed topics do
+    not consistently use a real Word Heading 1 / outline-level-0
+    paragraph. Bold text, list numbering, and textual "N." prefixes are
+    also used pervasively by ordinary subsections and body emphasis in
+    these documents, so on their own they are too ambiguous to promote
+    an unrecognized heading to a legal topic - only Heading 1 is a
+    structural marker reserved for real top-level sections. Documents
+    whose own topics rely solely on those weaker signals (no Heading 1
+    at all) do not support custom top-level topics.
+    """
+
+    if country is None:
+        return None
+
+    confirmed_signal_sets: list[frozenset[str]] = []
+
+    for block_item in _iter_block_items(
+        document
+    ):
+        if not isinstance(
+            block_item,
+            Paragraph,
+        ):
+            continue
+
+        text = _normalize_text(
+            block_item.text
+        )
+
+        if (
+            not text
+            or _is_ignored_text(
+                text
+            )
+        ):
+            continue
+
+        heading_level = _get_heading_level(
+            block_item
+        )
+
+        legal_topic = _get_main_legal_topic(
+            paragraph=block_item,
+            text=text,
+            heading_level=heading_level,
+            country=country,
+        )
+
+        if legal_topic is None:
+            continue
+
+        confirmed_signal_sets.append(
+            _main_section_signals(
+                paragraph=block_item,
+                text=text,
+                heading_level=heading_level,
+            )
+        )
+
+    if not confirmed_signal_sets:
+        return None
+
+    required = confirmed_signal_sets[0]
+
+    for signals in confirmed_signal_sets[1:]:
+        required = required & signals
+
+    if _TOPIC_SIGNAL_HEADING_LEVEL_1 not in required:
+        return None
+
+    return required
+
+
+def _looks_like_topic_title(
+    label: str,
+) -> bool:
+    """
+    Return whether text reads like a section title rather than a
+    sentence or list-item fragment.
+
+    A real legal-topic heading is a short title case/sentence case
+    phrase (e.g. "Hiring Practices", or "12. Remote Working" with the
+    document's own numbering convention); it never starts with a
+    lowercase word (once any leading number prefix is set aside) or
+    ends with sentence punctuation the way an enumerated list item or
+    clause does (e.g. "the Corporations Act;").
+    """
+
+    if not label:
+        return False
+
+    unprefixed = _TOPIC_NUMBER_PREFIX_PATTERN.sub(
+        "",
+        label,
+    ) or label
+
+    if not unprefixed[0].isupper():
+        return False
+
+    if _SENTENCE_TERMINATOR_PATTERN.search(
+        label
+    ):
+        return False
+
+    return True
+
+
+def _get_custom_legal_topic(
+    paragraph: Paragraph,
+    text: str,
+    heading_level: int | None,
+    country: str | None,
+    past_front_matter: bool,
+    required_signals: frozenset[str] | None,
+) -> str | None:
+    """
+    Return a custom (non-taxonomy) legal-topic title, when justified.
+
+    An admin can add a brand-new top-level topic that has no entry in
+    the fixed LEGAL_TOPICS taxonomy (e.g. "Remote Working"). Recognizing
+    it generically requires evidence at least as strong as whatever
+    this specific document's OWN confirmed topics already carry
+    (required_signals, from _learn_custom_topic_signal_requirement) -
+    a single ambiguous signal such as bold text is not enough on its
+    own, since ordinary subsections also use bold text.
+
+    Only considered once the document's own front matter has been left
+    behind (its overview or first main heading has already been seen),
+    so a title page or introductory heading is never mistaken for a
+    legal topic.
+    """
+
+    if country is None:
+        return None
+
+    if not past_front_matter:
+        return None
+
+    if required_signals is None:
+        return None
+
+    candidate_signals = _main_section_signals(
+        paragraph=paragraph,
+        text=text,
+        heading_level=heading_level,
+    )
+
+    if not required_signals.issubset(
+        candidate_signals
+    ):
+        return None
+
+    label = _clean_structural_label(
+        text
+    )
+
+    # A real topic heading is a short title, not a full sentence - this
+    # also matches the "reasonable length" convention new custom
+    # section titles must already follow (see admin ADD validation).
+    # Excludes the rare list item that happens to share the document's
+    # own heading signal combination by formatting accident.
+    if len(label) > _MAX_CUSTOM_TOPIC_HEADING_LENGTH:
+        return None
+
+    if not _looks_like_topic_title(
+        label
+    ):
+        return None
+
+    return label
 
 
 def _get_subsection_topic_override(
@@ -550,6 +824,20 @@ def parse_docx_sections(
 
     current_legal_topic: str | None = None
     current_subsection: str | None = None
+    current_is_custom_legal_topic = False
+
+    # Becomes True once the document's own overview or first main
+    # heading has been seen, so a title-page or introductory heading
+    # is never mistaken for a custom (non-taxonomy) legal topic.
+    past_front_matter = False
+
+    # The structural signal combination this document's own confirmed
+    # topics consistently carry (or None if there is none to learn),
+    # used as the evidentiary bar a custom heading must also clear.
+    required_custom_topic_signals = _learn_custom_topic_signal_requirement(
+        document=document,
+        country=country,
+    )
 
     # Set while inside a one-off SUBSECTION_TOPIC_OVERRIDES block: holds
     # the (section, legal_topic) to restore as soon as the next heading
@@ -557,7 +845,7 @@ def parse_docx_sections(
     # what topic subsequent subsections of the enclosing section
     # resolve against.
     pending_topic_override: (
-        tuple[str, str | None] | None
+        tuple[str, str | None, bool] | None
     ) = None
 
     content_buffer: list[str] = []
@@ -575,6 +863,7 @@ def parse_docx_sections(
                     section=current_section,
                     subsection=current_subsection,
                     content=content,
+                    is_custom_legal_topic=current_is_custom_legal_topic,
                 )
             )
 
@@ -603,6 +892,22 @@ def parse_docx_sections(
                 block_item
             )
 
+            if is_admin_section_heading(
+                block_item
+            ):
+                flush_content()
+
+                current_section = _clean_structural_label(
+                    text
+                )
+
+                current_legal_topic = current_section
+                current_subsection = None
+                current_is_custom_legal_topic = True
+                pending_topic_override = None
+                past_front_matter = True
+                continue
+
             topic_override = _get_subsection_topic_override(
                 paragraph=block_item,
                 text=text,
@@ -615,6 +920,7 @@ def parse_docx_sections(
                     pending_topic_override = (
                         current_section,
                         current_legal_topic,
+                        current_is_custom_legal_topic,
                     )
 
                 current_section = _clean_structural_label(
@@ -623,6 +929,7 @@ def parse_docx_sections(
 
                 current_legal_topic = topic_override
                 current_subsection = None
+                current_is_custom_legal_topic = False
                 continue
 
             legal_topic = _get_main_legal_topic(
@@ -641,7 +948,9 @@ def parse_docx_sections(
 
                 current_legal_topic = legal_topic
                 current_subsection = None
+                current_is_custom_legal_topic = False
                 pending_topic_override = None
+                past_front_matter = True
                 continue
 
             if _is_overview_heading(
@@ -658,7 +967,9 @@ def parse_docx_sections(
 
                 current_legal_topic = None
                 current_subsection = None
+                current_is_custom_legal_topic = False
                 pending_topic_override = None
+                past_front_matter = True
                 continue
 
             if _is_generic_main_heading(
@@ -674,6 +985,30 @@ def parse_docx_sections(
 
                 current_legal_topic = None
                 current_subsection = None
+                current_is_custom_legal_topic = False
+                pending_topic_override = None
+                past_front_matter = True
+                continue
+
+            custom_legal_topic = _get_custom_legal_topic(
+                paragraph=block_item,
+                text=text,
+                heading_level=heading_level,
+                country=country,
+                past_front_matter=past_front_matter,
+                required_signals=required_custom_topic_signals,
+            )
+
+            if custom_legal_topic is not None:
+                flush_content()
+
+                current_section = _clean_structural_label(
+                    text
+                )
+
+                current_legal_topic = custom_legal_topic
+                current_subsection = None
+                current_is_custom_legal_topic = True
                 pending_topic_override = None
                 continue
 
@@ -698,6 +1033,7 @@ def parse_docx_sections(
                     (
                         current_section,
                         current_legal_topic,
+                        current_is_custom_legal_topic,
                     ) = pending_topic_override
 
                     pending_topic_override = None
@@ -723,6 +1059,195 @@ def parse_docx_sections(
     flush_content()
 
     return parsed_sections
+
+
+@dataclass(frozen=True, slots=True)
+class TopicLocation:
+    """
+    One top-level legal topic's raw position within a DOCX body.
+
+    For mutation purposes only (Edit/Add a section) - not a substitute
+    for parse_docx_sections. Subsections are not tracked here: a
+    mutation always replaces a topic's content in full, and the normal
+    parser re-derives subsection metadata from the result afterwards.
+    """
+
+    legal_topic: str
+    is_custom_legal_topic: bool
+    heading_element: CT_P
+    body_elements: tuple[CT_P | CT_Tbl, ...]
+
+
+def locate_top_level_topics(
+    document: DocxDocument,
+    country: str,
+) -> list[TopicLocation]:
+    """
+    Find each top-level legal-topic heading (canonical or custom) in an
+    already-open DOCX document and the raw body elements between it
+    and the next top-level heading-like paragraph (main topic,
+    overview, or generic-main heading).
+
+    Takes the same in-memory document object a caller intends to
+    mutate (rather than a file path), so the returned elements belong
+    to the exact tree the caller will modify and save - never a
+    separate, throwaway parse of the same file.
+
+    Reuses the same heading-classification rules as
+    parse_docx_sections, so a topic's boundary here always matches
+    what the parser would extract as that topic's content.
+    """
+
+    required_custom_topic_signals = _learn_custom_topic_signal_requirement(
+        document=document,
+        country=country,
+    )
+
+    locations: list[TopicLocation] = []
+
+    current_heading_element: CT_P | None = None
+    current_legal_topic: str | None = None
+    current_is_custom = False
+    current_body_elements: list[CT_P | CT_Tbl] = []
+    past_front_matter = False
+
+    def flush_topic() -> None:
+        if (
+            current_heading_element is not None
+            and current_legal_topic is not None
+        ):
+            locations.append(
+                TopicLocation(
+                    legal_topic=current_legal_topic,
+                    is_custom_legal_topic=current_is_custom,
+                    heading_element=current_heading_element,
+                    body_elements=tuple(
+                        current_body_elements
+                    ),
+                )
+            )
+
+    for block_item in _iter_block_items(
+        document
+    ):
+        if isinstance(
+            block_item,
+            Paragraph,
+        ):
+            text = _normalize_text(
+                block_item.text
+            )
+
+            if (
+                not text
+                or _is_ignored_text(
+                    text
+                )
+            ):
+                if current_legal_topic is not None:
+                    current_body_elements.append(
+                        block_item._p
+                    )
+
+                continue
+
+            heading_level = _get_heading_level(
+                block_item
+            )
+
+            if is_admin_section_heading(
+                block_item
+            ):
+                flush_topic()
+
+                current_heading_element = block_item._p
+                current_legal_topic = _clean_structural_label(
+                    text
+                )
+                current_is_custom = True
+                current_body_elements = []
+                past_front_matter = True
+                continue
+
+            legal_topic = _get_main_legal_topic(
+                paragraph=block_item,
+                text=text,
+                heading_level=heading_level,
+                country=country,
+            )
+
+            if legal_topic is not None:
+                flush_topic()
+
+                current_heading_element = block_item._p
+                current_legal_topic = legal_topic
+                current_is_custom = False
+                current_body_elements = []
+                past_front_matter = True
+                continue
+
+            if _is_overview_heading(
+                paragraph=block_item,
+                text=text,
+                heading_level=heading_level,
+                country=country,
+            ):
+                flush_topic()
+
+                current_heading_element = None
+                current_legal_topic = None
+                current_body_elements = []
+                past_front_matter = True
+                continue
+
+            if _is_generic_main_heading(
+                paragraph=block_item,
+                heading_level=heading_level,
+                country=country,
+            ):
+                flush_topic()
+
+                current_heading_element = None
+                current_legal_topic = None
+                current_body_elements = []
+                past_front_matter = True
+                continue
+
+            custom_legal_topic = _get_custom_legal_topic(
+                paragraph=block_item,
+                text=text,
+                heading_level=heading_level,
+                country=country,
+                past_front_matter=past_front_matter,
+                required_signals=required_custom_topic_signals,
+            )
+
+            if custom_legal_topic is not None:
+                flush_topic()
+
+                current_heading_element = block_item._p
+                current_legal_topic = custom_legal_topic
+                current_is_custom = True
+                current_body_elements = []
+                continue
+
+            # Subsections, one-off topic overrides, and plain content
+            # all stay part of the current topic's own body elements.
+            if current_legal_topic is not None:
+                current_body_elements.append(
+                    block_item._p
+                )
+
+            continue
+
+        if current_legal_topic is not None:
+            current_body_elements.append(
+                block_item._tbl
+            )
+
+    flush_topic()
+
+    return locations
 
 
 # --- Contact-card extraction -------------------------------------------

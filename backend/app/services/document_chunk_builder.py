@@ -78,6 +78,20 @@ _BARE_FAMILY_HEADING_PATTERN: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
+# A looser, "contains" signal for the same document family - some
+# real covers (e.g. France's "EMPLOYMENT LAW OVERVIEWS 2025 - 2026",
+# Portugal's "COUNTRY-SPECIFIC EMPLOYMENT LAW OVERVIEWS 2026
+# TEMPLATE") wrap the family phrase in extra words the exact
+# _BARE_FAMILY_HEADING_PATTERN never anticipated (a plural, a year
+# range, template boilerplate). Used only to recognize *that a line
+# is heading-shaped*, in the reversed two-line cover below - the
+# actual country token still has to pass resolve_country() downstream,
+# so a loose match here never by itself accepts a non-country line.
+_FAMILY_HEADING_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"Labour and Employment Law|Employment Law Overview",
+    re.IGNORECASE,
+)
+
 # Mission "HOTFIX 0.4.4": real L&E Global documents are longer and
 # less uniform than the original 17-document corpus, so the front-
 # matter scan window is widened from a plain paragraph count to
@@ -363,10 +377,12 @@ def _match_title_line(
     """
     One candidate (raw country token, optional year) from a single
     title/cover line, or from that line paired with the one right
-    after it - covers both a one-line cover ("Employment Law
-    Overview Canada 2026", "Labour and Employment Law / Canada") and
-    a two-line cover (a bare "Labour and Employment Law" heading
-    immediately followed by a "Canada" line).
+    after it - covers a one-line cover ("Employment Law Overview
+    Canada 2026", "Labour and Employment Law / Canada") and a
+    two-line cover in either order: a bare "Labour and Employment
+    Law" heading immediately followed by a "Canada" line, or a bare
+    "France" / "Portugal" country line immediately followed by a
+    heading line (some real covers put the country first).
     """
 
     line = _normalize_front_matter_line(line)
@@ -406,6 +422,14 @@ def _match_title_line(
         and not _BARE_FAMILY_HEADING_PATTERN.fullmatch(next_line)
     ):
         return next_line.strip(), None
+
+    if (
+        next_line
+        and _FAMILY_HEADING_TOKEN_PATTERN.search(next_line)
+        and not _FAMILY_HEADING_TOKEN_PATTERN.search(line)
+        and line
+    ):
+        return line.strip(), None
 
     return None
 
@@ -645,6 +669,58 @@ def metadata_from_content(
     )
 
 
+def resolve_effective_legal_topic(
+    *,
+    parsed_section: ParsedSection,
+    section: str,
+    country: str,
+) -> tuple[str, str | None]:
+    """
+    Return (document_type, legal_topic) for one parsed section - the
+    single rule every caller that needs a section's effective topic
+    must share (the chunk builder, and the admin section-editing
+    service that reads the current DOCX as authority), so a section
+    is never classified two different ways in two different places.
+
+    Raises UnknownLegalTopicError for a heading-like section that
+    resolves to neither the fixed taxonomy, a one-off subsection
+    override, nor a parser-confirmed custom top-level topic - a real
+    parser bug, never silently swallowed.
+    """
+
+    if is_overview_section(
+        section=section,
+        country=country,
+    ):
+        return "overview", None
+
+    legal_topic = (
+        get_canonical_legal_topic(
+            section=section,
+            country=country,
+        )
+        or get_subsection_topic_override(
+            section
+        )
+    )
+
+    if (
+        legal_topic is None
+        and parsed_section.is_custom_legal_topic
+    ):
+        legal_topic = section
+
+    if legal_topic is None:
+        raise UnknownLegalTopicError(
+            "Unknown legal topic detected. "
+            f"Section: {section!r}. "
+            "The document was not indexed because "
+            "the topic is outside the approved taxonomy."
+        )
+
+    return "comparator", legal_topic
+
+
 def build_document_chunks(
     parsed_sections: Sequence[
         ParsedSection
@@ -720,33 +796,11 @@ def build_document_chunks(
         if not content:
             continue
 
-        if is_overview_section(
+        document_type, legal_topic = resolve_effective_legal_topic(
+            parsed_section=parsed_section,
             section=section,
             country=country,
-        ):
-            document_type = "overview"
-            legal_topic = None
-
-        else:
-            document_type = "comparator"
-
-            legal_topic = (
-                get_canonical_legal_topic(
-                    section=section,
-                    country=country,
-                )
-                or get_subsection_topic_override(
-                    section
-                )
-            )
-
-            if legal_topic is None:
-                raise UnknownLegalTopicError(
-                    "Unknown legal topic detected. "
-                    f"Section: {section!r}. "
-                    "The document was not indexed because "
-                    "the topic is outside the approved taxonomy."
-                )
+        )
 
         path_key = (
             document_type,

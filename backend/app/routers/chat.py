@@ -22,6 +22,7 @@ from app.clients.openai_responses import (
 )
 from app.core.config import get_settings
 from app.core.country_registry import COUNTRIES
+from app.models.catalog import LegalCatalogResponse
 from app.models.chat import (
     LegalAnswerSource,
     LegalChatHistoryMessage,
@@ -44,6 +45,7 @@ from app.services.conversation_transition import (
 from app.services.conversation_meta import (
     append_personalised_legal_caution,
     requires_personalised_legal_caution,
+    resolve_ambiguous_city_followup_question,
     resolve_conversation_meta,
 )
 
@@ -100,7 +102,8 @@ UNAVAILABLE_COUNTRIES_ANSWER_TEMPLATE: Final[str] = (
     "The validated L&E Global corpus does not currently "
     "contain documents for {countries}. Please contact "
     "the relevant L&E Global member firm for "
-    "country-specific legal advice."
+    "country-specific legal advice. Would you like to see the "
+    "countries currently covered?"
 )
 
 MISSING_COUNTRY_ANSWER: Final[str] = (
@@ -642,6 +645,22 @@ def _build_deterministic_hints(
     return hints, current_country_scope, current_legal_scope
 
 
+CONTACT_COUNTRY_FALLBACK_CODES: Final[dict[str, str]] = {
+    # Business rule (corrective gate, section 16): Slovakia has no
+    # Employment Law Overview of its own yet, so no indexed contact
+    # chunk exists for SK either - docx_parser.py extracts contact/
+    # member-firm details from that same per-country Overview document
+    # (see its own member_firm field), so no Overview means no contact
+    # chunk from that path. The client's member firm for Slovakia is
+    # reached through the Czech Republic office instead - contact
+    # routing only, never a legal-content or jurisdiction substitution
+    # (section 18): SK stays SK everywhere else (detection, policy,
+    # coverage) - see country_detection.py/admin_country_policy.py,
+    # neither of which this mapping touches.
+    "SK": "CZ",
+}
+
+
 def _build_contact_section(
     country_codes: list[str],
     unavailable_country_codes: list[str],
@@ -653,6 +672,15 @@ def _build_contact_section(
     section appended after a legal answer never collides with the
     legal answer's own citations.
 
+    A requested country with no contact chunk of its own falls back to
+    another country's contact chunk only when CONTACT_COUNTRY_
+    FALLBACK_CODES names one for it (currently Slovakia only) - the
+    section is still labelled with the REQUESTED country's own name;
+    only the underlying contact content, and its own country label,
+    come from the fallback country, and the answer says so explicitly
+    rather than silently presenting Czech contact details as if they
+    were Slovakia's own.
+
     Returns (answer_text, sources, retrieval_total, took_ms) - the
     caller updates shared metrics itself, since this function may be
     invoked once per contact action.
@@ -663,10 +691,34 @@ def _build_contact_section(
     retrieval_total = 0
     took_ms = 0.0
 
-    if country_codes:
+    requested_codes = [code.upper() for code in country_codes]
+    unavailable_codes = [
+        code.upper() for code in unavailable_country_codes
+    ]
+
+    # An "unavailable" country never had its own contact chunk
+    # searched before this fallback existed either: no Overview means
+    # no contact chunk from the same document (see docstring above),
+    # so searching for that code's own contact content would always
+    # come back empty by construction. Only the requested codes
+    # themselves (as before) and any fallback TARGET a requested code
+    # actually needs go into the real OpenSearch call.
+    fallback_targets_needed = {
+        CONTACT_COUNTRY_FALLBACK_CODES[code]
+        for code in (*requested_codes, *unavailable_codes)
+        if code in CONTACT_COUNTRY_FALLBACK_CODES
+    }
+
+    search_codes = list(
+        dict.fromkeys([*requested_codes, *fallback_targets_needed])
+    )
+
+    hits_by_country_code: dict[str, list] = {}
+
+    if search_codes:
         try:
             contact_response = search_contact_chunks(
-                country_codes=country_codes
+                country_codes=search_codes
             )
         except LegalSearchError as error:
             raise RagAnswerError(
@@ -676,35 +728,66 @@ def _build_contact_section(
         took_ms = float(contact_response.took_ms)
         retrieval_total += contact_response.total
 
-        hits_by_country_code: dict[str, list] = {}
-
         for hit in contact_response.hits:
             hits_by_country_code.setdefault(
                 hit.country_code.upper(),
                 [],
             ).append(hit)
 
-        for country_code in country_codes:
-            country_hits = hits_by_country_code.get(
-                country_code.upper(),
-                [],
+    # A hit already cited under one country_code (e.g. Czechia's own
+    # contact chunk) must reuse the SAME citation number, never a new
+    # one, when the identical chunk is rendered again through
+    # Slovakia's fallback for the same request - found by adversarial
+    # review: requesting contact for both SK and CZ together (a
+    # realistic combined question) otherwise cited the one underlying
+    # Czech chunk twice under two different numbers.
+    citation_by_hit_identity: dict[tuple[str, str], int] = {}
+
+    def render(country_code: str) -> None:
+        upper_code = country_code.upper()
+        display_name = resolve_country_display_name(country_code)
+        own_hits = hits_by_country_code.get(upper_code, [])
+
+        source_hits = own_hits
+        fallback_preamble: str | None = None
+
+        if not own_hits:
+            fallback_code = CONTACT_COUNTRY_FALLBACK_CODES.get(
+                upper_code
+            )
+            fallback_hits = (
+                hits_by_country_code.get(fallback_code, [])
+                if fallback_code
+                else []
             )
 
-            display_name = resolve_country_display_name(
-                country_code
-            )
-
-            if not country_hits:
-                answer_sections.append(
-                    f"{display_name}\n"
-                    + CONTACT_NOT_FOUND_ANSWER_TEMPLATE.format(
-                        country=display_name
-                    )
+            if fallback_hits:
+                fallback_display_name = resolve_country_display_name(
+                    fallback_code
                 )
-                continue
+                source_hits = fallback_hits
+                fallback_preamble = (
+                    f"No dedicated {display_name} contact is listed "
+                    f"yet; {display_name} enquiries are handled by "
+                    f"the {fallback_display_name} member firm below."
+                )
 
-            for hit in country_hits:
+        if not source_hits:
+            answer_sections.append(
+                f"{display_name}\n"
+                + CONTACT_NOT_FOUND_ANSWER_TEMPLATE.format(
+                    country=display_name
+                )
+            )
+            return
+
+        for hit in source_hits:
+            hit_identity = (hit.document_id, hit.chunk_id)
+            citation = citation_by_hit_identity.get(hit_identity)
+
+            if citation is None:
                 citation = citation_offset + len(sources) + 1
+                citation_by_hit_identity[hit_identity] = citation
 
                 sources.append(
                     LegalAnswerSource(
@@ -722,25 +805,24 @@ def _build_contact_section(
                     )
                 )
 
-                sanitized_content = _sanitize_contact_content(
-                    hit.content
-                )
+            sanitized_content = _sanitize_contact_content(
+                hit.content
+            )
 
-                answer_sections.append(
-                    f"{display_name}\n{sanitized_content} [{citation}]"
-                )
+            body = f"{display_name}\n"
+
+            if fallback_preamble is not None:
+                body += f"{fallback_preamble}\n"
+
+            body += f"{sanitized_content} [{citation}]"
+
+            answer_sections.append(body)
+
+    for country_code in country_codes:
+        render(country_code)
 
     for country_code in unavailable_country_codes:
-        display_name = resolve_country_display_name(
-            country_code
-        )
-
-        answer_sections.append(
-            f"{display_name}\n"
-            + CONTACT_NOT_FOUND_ANSWER_TEMPLATE.format(
-                country=display_name
-            )
-        )
+        render(country_code)
 
     return (
         "\n\n".join(answer_sections),
@@ -1513,11 +1595,46 @@ def resolve_legal_chat_response(
         for message in request.history
     )
 
+    # Corrective gate, section 9: a bare country-name reply to an
+    # ambiguous-city clarification ("Barcelona" -> ask -> "Spain")
+    # resumes the ORIGINAL question with that country substituted for
+    # the city, rewriting request.question once, right here, before
+    # anything else (conversation_meta, hints, RequestUnderstanding)
+    # ever sees it - every downstream step then behaves exactly as if
+    # the user had asked the resolved question from the start. A
+    # no-op (returns None) for every other request.
+    resumed_question = resolve_ambiguous_city_followup_question(
+        question=request.question,
+        history=request.history,
+    )
+
+    if resumed_question is not None:
+        request = request.model_copy(
+            update={"question": resumed_question}
+        )
+
+    # Mission "ORDER 5C-GEO", section 25/26: this one request goes on
+    # to call resolve_conversation_meta, _build_deterministic_hints
+    # (itself up to two calls), understand_request, and
+    # _execute_resolved_plan - each independently invoking
+    # catalog_provider for what is, within one request, always the
+    # exact same real indexed-country catalog. A request-scoped
+    # memoization (created fresh here, discarded with this call frame,
+    # never a persistent/global cache to invalidate) turns that into a
+    # single real catalog fetch per request, not four or more.
+    cached_catalog_results: list[LegalCatalogResponse] = []
+
+    def memoized_catalog_provider() -> LegalCatalogResponse:
+        if not cached_catalog_results:
+            cached_catalog_results.append(catalog_provider())
+
+        return cached_catalog_results[0]
+
     meta_resolution = resolve_conversation_meta(
         question=request.question,
         history=request.history,
         conversation_state=request.conversation_state,
-        catalog_provider=catalog_provider,
+        catalog_provider=memoized_catalog_provider,
     )
 
     if meta_resolution is not None:
@@ -1587,7 +1704,7 @@ def resolve_legal_chat_response(
             current_legal_scope,
         ) = _build_deterministic_hints(
             request=request,
-            catalog_provider=catalog_provider,
+            catalog_provider=memoized_catalog_provider,
         )
 
         history_turns = [
@@ -1626,7 +1743,7 @@ def resolve_legal_chat_response(
             history=history_turns,
             hints=hints,
             conversation_state=previous_conversation_state,
-            catalog_provider=catalog_provider,
+            catalog_provider=memoized_catalog_provider,
             generation_client=understanding_client,
         )
 
@@ -1878,7 +1995,7 @@ def resolve_legal_chat_response(
             request=request,
             result=final_result,
             metrics=metrics,
-            catalog_provider=catalog_provider,
+            catalog_provider=memoized_catalog_provider,
             search_function=search_function,
             generation_client=generation_client,
             rerank_enabled=rerank_enabled,

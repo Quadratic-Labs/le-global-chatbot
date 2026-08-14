@@ -7,19 +7,13 @@
 // admin.js is a browser IIFE with no module system of its own; its
 // tail adds a test-only `module.exports` hook (skipped entirely in a
 // real browser, where `module` is never defined) that exposes the
-// pure, DOM-free parsing functions (errorMessage/extractStructured
-// Detail/isReplacementRequiredResponse) plus the mission's mandatory
-// fetch-count/replace_existing flow, exercised here through a
-// minimal fake DOM/fetch/FormData - never a real browser or Node's
-// own strict FormData(form) constructor, which rejects a plain fake
-// form outright.
-//
-// Every exported function is defined AFTER admin.js's own top-level
-// `if (!uploadForm) { return; }` guard, so even importing the pure
-// functions requires document.querySelector to already return a
-// (minimal) fake form before the very first require() below - real
-// browsers always have one; a real admin page without the upload
-// form present simply never reaches any of this code either.
+// pure, DOM-free parsing/classification/formatting functions plus a
+// small __queueForTests seam onto the real multi-file queue engine -
+// exercised here through a minimal fake DOM/fetch/FormData, never a
+// real browser (that is the Playwright E2E suite's job, mission
+// "ORDER 8B" - these tests complement it, they do not replace it,
+// especially for DOM-interaction-heavy behavior like the documents
+// search/filter/menu, which is verified end-to-end in the browser).
 
 const assert = require("node:assert/strict");
 const path = require("node:path");
@@ -54,6 +48,165 @@ class FakeFormData {
     }
 }
 
+class FakeElement {
+    constructor() {
+        this.innerHTML = "";
+        this.dataset = {};
+        this.hidden = false;
+        this._listeners = {};
+
+        const classes = new Set();
+
+        this.classList = {
+            add: (cls) => classes.add(cls),
+            remove: (cls) => classes.delete(cls),
+            toggle: (cls, force) => {
+                const shouldHave = (
+                    force === undefined ? !classes.has(cls) : Boolean(force)
+                );
+
+                if (shouldHave) {
+                    classes.add(cls);
+                } else {
+                    classes.delete(cls);
+                }
+
+                return shouldHave;
+            },
+            contains: (cls) => classes.has(cls),
+        };
+    }
+
+    querySelectorAll() {
+        return [];
+    }
+
+    querySelector() {
+        return null;
+    }
+
+    addEventListener(eventName, handler) {
+        this._listeners[eventName] = handler;
+    }
+}
+
+function makeFakeButton() {
+    const classes = new Set();
+    const attributes = {};
+
+    const button = {
+        disabled: false,
+        hidden: false,
+        textContent: "",
+        dataset: {},
+        _listeners: {},
+        classList: {
+            add: (cls) => classes.add(cls),
+            remove: (cls) => classes.delete(cls),
+            toggle: (cls, force) => {
+                const shouldHave = (
+                    force === undefined ? !classes.has(cls) : Boolean(force)
+                );
+
+                if (shouldHave) {
+                    classes.add(cls);
+                } else {
+                    classes.delete(cls);
+                }
+
+                return shouldHave;
+            },
+            contains: (cls) => classes.has(cls),
+        },
+        setAttribute(name, value) {
+            attributes[name] = String(value);
+        },
+        getAttribute(name) {
+            return (
+                Object.prototype.hasOwnProperty.call(attributes, name)
+                    ? attributes[name]
+                    : null
+            );
+        },
+        addEventListener(eventName, handler) {
+            button._listeners[eventName] = handler;
+        },
+    };
+
+    return button;
+}
+
+function makeFakeSelect() {
+    const select = {
+        value: "",
+        disabled: false,
+        options: [],
+        _listeners: {},
+        addEventListener(eventName, handler) {
+            select._listeners[eventName] = handler;
+        },
+        appendChild(option) {
+            select.options.push(option);
+        },
+    };
+
+    Object.defineProperty(select, "textContent", {
+        get() {
+            return "";
+        },
+        set() {
+            select.options = [];
+        },
+    });
+
+    return select;
+}
+
+function makeFakeTextarea() {
+    const element = {
+        value: "",
+        disabled: false,
+        _listeners: {},
+        addEventListener(eventName, handler) {
+            element._listeners[eventName] = handler;
+        },
+    };
+
+    return element;
+}
+
+function makeFakeMessageElement() {
+    return { textContent: "", className: "" };
+}
+
+function makeFakeContainer() {
+    const container = {
+        hidden: false,
+        innerHTML: "",
+        _children: [],
+        appendChild(child) {
+            container._children.push(child);
+        },
+    };
+
+    return container;
+}
+
+function makeFakeGenericElement() {
+    const element = {
+        value: "",
+        textContent: "",
+        type: "",
+        className: "",
+        _listeners: {},
+        addEventListener(eventName, handler) {
+            element._listeners[eventName] = handler;
+        },
+    };
+
+    return element;
+}
+
 function makeFakeResponse({ ok, status, payload }) {
     return {
         ok,
@@ -68,12 +221,70 @@ function makeFakeResponse({ ok, status, payload }) {
     };
 }
 
-function installFakeDom({ submitHandlerHolder } = {}) {
-    const fakeButton = { disabled: false };
+function makeFakeFile(name) {
+    return { name, size: 1024 };
+}
+
+function installFakeDom({
+    submitHandlerHolder,
+    changeHandlerHolder,
+    initialFiles = [],
+} = {}) {
+    const fakeButton = { disabled: false, textContent: "Upload documents" };
+    const fakeFallbackSubmit = makeFakeButton();
+
+    const fakeFileInput = {
+        id: "le-global-document",
+        files: initialFiles,
+        _listeners: {},
+        addEventListener(eventName, handler) {
+            fakeFileInput._listeners[eventName] = handler;
+
+            if (eventName === "change" && changeHandlerHolder) {
+                changeHandlerHolder.handler = handler;
+            }
+        },
+    };
+
+    const fakeActionInput = {
+        name: "action",
+        value: "le_global_chatbot_upload_document",
+    };
+
+    const fakeQueueContainer = new FakeElement();
+    const fakeDocumentsContainer = new FakeElement();
+    const fakeSummaryContainer = new FakeElement();
+    const fakeDocumentsMessage = new FakeElement();
+    const fakeDocumentCount = { textContent: "" };
+    const fakeDropzone = new FakeElement();
+    const fakeSearchInput = makeFakeGenericElement();
+    const fakeStatusFilter = makeFakeGenericElement();
 
     const fakeForm = {
-        action: "https://example.test/wp-admin/admin-post.php",
-        dataset: {},
+        // Deliberately NOT a URL string, exactly like a real browser:
+        // a form containing <input name="action"> (WordPress's own
+        // admin-post.php dispatch convention) shadows the .action IDL
+        // property with that named control, turning fetch(form.action)
+        // into fetch("[object HTMLInputElement]") - this is the real,
+        // confirmed root cause of the mission's historical upload bug
+        // (mission "ORDER 4", section 33). Any code that regresses to
+        // reading form.action instead of form.getAttribute("action")
+        // must fail these tests loudly, not silently pass against an
+        // unrealistically-clean fake.
+        action: fakeActionInput,
+        dataset: {
+            refreshAction: "le_global_chatbot_refresh_state",
+            refreshNonce: "test-refresh-nonce",
+            reindexAction: "le_global_chatbot_reindex_document",
+            deleteAction: "le_global_chatbot_delete_document",
+        },
+        getAttribute(name) {
+            if (name === "action") {
+                return "https://example.test/wp-admin/admin-post.php";
+            }
+
+            return null;
+        },
         addEventListener(eventName, handler) {
             if (eventName === "submit" && submitHandlerHolder) {
                 submitHandlerHolder.handler = handler;
@@ -84,8 +295,31 @@ function installFakeDom({ submitHandlerHolder } = {}) {
                 return fakeButton;
             }
 
+            if (selector === 'input[name="action"]') {
+                return fakeActionInput;
+            }
+
+            if (selector === ".le-global-chatbot-admin__upload-fallback-submit") {
+                return fakeFallbackSubmit;
+            }
+
             return null;
         },
+        querySelectorAll(_selector) {
+            return [];
+        },
+    };
+
+    const byId = {
+        "le-global-document": fakeFileInput,
+        "le-global-chatbot-queue": fakeQueueContainer,
+        "le-global-chatbot-documents": fakeDocumentsContainer,
+        "le-global-chatbot-summary": fakeSummaryContainer,
+        "le-global-documents-message": fakeDocumentsMessage,
+        "le-global-document-count": fakeDocumentCount,
+        "le-global-dropzone": fakeDropzone,
+        "le-global-documents-search": fakeSearchInput,
+        "le-global-documents-status-filter": fakeStatusFilter,
     };
 
     global.document = {
@@ -97,6 +331,9 @@ function installFakeDom({ submitHandlerHolder } = {}) {
 
             return null;
         },
+        getElementById: (id) => byId[id] || null,
+        addEventListener() {},
+        removeEventListener() {},
     };
 
     global.window = {
@@ -107,7 +344,20 @@ function installFakeDom({ submitHandlerHolder } = {}) {
 
     global.FormData = FakeFormData;
 
-    return { fakeButton, fakeForm };
+    return {
+        fakeButton,
+        fakeForm,
+        fakeFileInput,
+        fakeFallbackSubmit,
+        fakeQueueContainer,
+        fakeDocumentsContainer,
+        fakeSummaryContainer,
+        fakeDocumentsMessage,
+        fakeDocumentCount,
+        fakeDropzone,
+        fakeSearchInput,
+        fakeStatusFilter,
+    };
 }
 
 function loadFreshAdminModule() {
@@ -122,13 +372,25 @@ const {
     errorMessage,
     extractStructuredDetail,
     isReplacementRequiredResponse,
+    classifyUploadResponse,
+    businessMessage,
+    detectConflictedCountryCodes,
+    computeDisplayStatus,
+    formatLastUpdated,
+    normalizeTitle,
+    findDuplicateSectionIn,
+    buildPositionOptions,
+    summarizeQueue,
+    rowMatchesFilter,
+    MAX_CONCURRENT_UPLOADS,
+    getSelectedFiles,
 } = loadFreshAdminModule();
 
 delete global.document;
 delete global.window;
 delete global.FormData;
 
-// --- Pure parsing/decision function tests -------------------------
+// --- Pure parsing/decision function tests (unchanged contract) ----
 
 test("errorMessage uses the structured data.message when present", () => {
     assert.equal(
@@ -152,19 +414,14 @@ test("errorMessage falls back to the generic text only when no usable message ex
     );
 });
 
+test("errorMessage accepts a caller-supplied fallback (ORDER 8B, business-friendly generic errors)", () => {
+    assert.equal(
+        errorMessage({ success: false, data: {} }, "Custom fallback."),
+        "Custom fallback."
+    );
+});
+
 test("errorMessage surfaces the real backend reason for every HTTP error code the mission lists", () => {
-    // 400/413/422/500 all reach the PHP proxy as a plain string
-    // `detail` (a bare FastAPI HTTPException) - extract_message()
-    // relays it verbatim as data.message; only a response with
-    // neither a usable detail nor message string falls back. This
-    // backend never natively emits a 413 itself (oversized uploads
-    // are rejected as 422 - see the size-limit case below); a real
-    // 413 could only originate from an infrastructure layer in
-    // front of it (e.g. a reverse proxy body-size limit), which is
-    // untested here as it is outside this admin code's own
-    // responsibility - what IS tested is that errorMessage()/
-    // extract_message() extract a plain-string detail identically
-    // no matter which status code carries it.
     const cases = [
         "No DOCX document was received.",
         "The uploaded DOCX exceeds the configured size limit.",
@@ -178,41 +435,6 @@ test("errorMessage surfaces the real backend reason for every HTTP error code th
             message
         );
     }
-
-    // The generic mechanism itself does not discriminate by status
-    // code - a 413-shaped response with a plain-string detail (were
-    // one ever produced, e.g. by a future infrastructure change)
-    // would be surfaced exactly the same way.
-    assert.equal(
-        errorMessage({
-            success: false,
-            data: { message: "Request entity too large." },
-        }),
-        "Request entity too large."
-    );
-});
-
-test("a FastAPI RequestValidationError's list-shaped detail surfaces a useful message, never the generic fallback", () => {
-    // Mission "HOTFIX 0.4.9" review, section 3 - FastAPI's own
-    // automatic request validation (e.g. a missing/malformed
-    // multipart `file` field, intercepted before the admin router's
-    // business logic even runs) produces detail=[{loc,msg,type}, ...],
-    // never a string or a {message: ...} object. extract_message()
-    // (PHP) now extracts detail[0].msg from this shape and relays it
-    // as data.message - by the time it reaches admin.js, this is
-    // already a plain string, so errorMessage() needs no JS-side
-    // change; this test proves the two sides genuinely compose: the
-    // exact string PHP would now produce is what errorMessage()
-    // shows, never "The document could not be indexed."
-    const messageAfterPhpExtraction = "Field required";
-
-    assert.equal(
-        errorMessage({
-            success: false,
-            data: { message: messageAfterPhpExtraction },
-        }),
-        "Field required"
-    );
 });
 
 test("extractStructuredDetail returns the object for a 409 structured payload", () => {
@@ -234,10 +456,6 @@ test("extractStructuredDetail returns the object for a 409 structured payload", 
 });
 
 test("extractStructuredDetail is null when detail is a plain string, absent, or empty", () => {
-    // The WordPress proxy sends [] (an empty array, not an object)
-    // whenever the backend's own `detail` was a plain string (a
-    // regular HTTPException) - is_array() is false for a string on
-    // the PHP side, so this must never be treated as structured.
     assert.equal(
         extractStructuredDetail({ success: false, data: { detail: [] } }),
         null
@@ -269,8 +487,6 @@ test("isReplacementRequiredResponse is true only for 409 + document_replacement_
         true
     );
 
-    // A different 409 code (already-current) must never be confused
-    // with the replacement-confirmation flow.
     assert.equal(
         isReplacementRequiredResponse(409, {
             success: false,
@@ -279,7 +495,6 @@ test("isReplacementRequiredResponse is true only for 409 + document_replacement_
         false
     );
 
-    // Same detail, wrong status.
     assert.equal(
         isReplacementRequiredResponse(422, replacementPayload),
         false
@@ -288,26 +503,427 @@ test("isReplacementRequiredResponse is true only for 409 + document_replacement_
     assert.equal(isReplacementRequiredResponse(409, null), false);
 });
 
-// --- Fetch-count / replace_existing flow (mocked DOM + fetch) -----
+// --- businessMessage: error-code -> business-friendly text (ORDER 8B, section 38) -
 
-describe("upload form fetch flow", () => {
+describe("businessMessage", () => {
+    test("maps section_already_exists to the Edit-a-section guidance", () => {
+        assert.equal(
+            businessMessage(
+                {
+                    success: false,
+                    data: { detail: { code: "section_already_exists" } },
+                },
+                "fallback"
+            ),
+            "This section already exists. Use \"Edit a section\" to update it."
+        );
+    });
+
+    test("maps country_document_conflict to the support-contact message", () => {
+        assert.equal(
+            businessMessage(
+                {
+                    success: false,
+                    data: { detail: { code: "country_document_conflict" } },
+                },
+                "fallback"
+            ),
+            "This country has conflicting document records. Please contact support before making changes."
+        );
+    });
+
+    test("maps rollback_failed to the nothing-was-confirmed message", () => {
+        assert.equal(
+            businessMessage(
+                { success: false, data: { detail: { code: "rollback_failed" } } },
+                "fallback"
+            ),
+            "We couldn't save your changes. Nothing has been confirmed as completed. Please try again or contact support."
+        );
+    });
+
+    test("maps document_country_not_allowed to the unsupported-country message", () => {
+        assert.equal(
+            businessMessage(
+                {
+                    success: false,
+                    data: { detail: { code: "document_country_not_allowed" } },
+                },
+                "fallback"
+            ),
+            "This country is not currently supported for document uploads."
+        );
+    });
+
+    test("an unmapped code falls back to the backend's own message, then the caller fallback", () => {
+        assert.equal(
+            businessMessage(
+                {
+                    success: false,
+                    data: {
+                        message: "Only DOCX documents are accepted.",
+                        detail: { code: "something_unmapped" },
+                    },
+                },
+                "fallback"
+            ),
+            "Only DOCX documents are accepted."
+        );
+
+        assert.equal(
+            businessMessage({ success: false, data: {} }, "fallback"),
+            "fallback"
+        );
+    });
+
+    test("never leaks the raw technical code itself as the displayed text", () => {
+        const message = businessMessage(
+            {
+                success: false,
+                data: { detail: { code: "country_document_conflict" } },
+            },
+            "fallback"
+        );
+
+        assert.equal(message.includes("country_document_conflict"), false);
+    });
+});
+
+// --- classifyUploadResponse: the new decision-routing logic --------
+
+describe("classifyUploadResponse", () => {
+    test("a fresh 201 classifies as success", () => {
+        const outcome = classifyUploadResponse(201, {
+            success: true,
+            data: { message: "Chile.docx was indexed successfully.", status: "uploaded" },
+        });
+
+        assert.equal(outcome.kind, "success");
+    });
+
+    test("document_already_current never requires a decision", () => {
+        const outcome = classifyUploadResponse(409, {
+            success: false,
+            data: {
+                message: "Chile.docx is already the current source.",
+                detail: { code: "document_already_current" },
+            },
+        });
+
+        assert.equal(outcome.kind, "already_current");
+    });
+
+    test("document_replacement_required routes to replacement_required", () => {
+        const outcome = classifyUploadResponse(409, {
+            success: false,
+            data: {
+                detail: {
+                    code: "document_replacement_required",
+                    country: "Argentina",
+                },
+            },
+        });
+
+        assert.equal(outcome.kind, "replacement_required");
+        assert.equal(outcome.detail.country, "Argentina");
+    });
+
+    test("document_warning_confirmation_required with replacement_required=false routes to warning_required, never combined", () => {
+        const outcome = classifyUploadResponse(409, {
+            success: false,
+            data: {
+                detail: {
+                    code: "document_warning_confirmation_required",
+                    replacement_required: false,
+                    warnings: [{ code: "STRUCTURE_WARNING" }],
+                },
+            },
+        });
+
+        assert.equal(outcome.kind, "warning_required");
+    });
+
+    test("document_warning_confirmation_required with replacement_required=true routes to combined_required", () => {
+        const outcome = classifyUploadResponse(409, {
+            success: false,
+            data: {
+                detail: {
+                    code: "document_warning_confirmation_required",
+                    replacement_required: true,
+                    country_name: "Peru",
+                },
+            },
+        });
+
+        assert.equal(outcome.kind, "combined_required");
+    });
+
+    test("any other error status/payload routes to error, with the real backend message", () => {
+        const outcome = classifyUploadResponse(422, {
+            success: false,
+            data: { message: "Only DOCX documents are accepted." },
+        });
+
+        assert.equal(outcome.kind, "error");
+        assert.equal(outcome.message, "Only DOCX documents are accepted.");
+    });
+
+    test("document_country_not_allowed (a plain 422 error) is mapped to the business-friendly text (ORDER 8B, section 38)", () => {
+        const outcome = classifyUploadResponse(422, {
+            success: false,
+            data: {
+                message: "Narnia (NA) is not currently accepted for new document uploads.",
+                detail: { code: "document_country_not_allowed" },
+            },
+        });
+
+        assert.equal(outcome.kind, "error");
+        assert.equal(
+            outcome.message,
+            "This country is not currently supported for document uploads."
+        );
+    });
+});
+
+// --- documents table: pure status/conflict/date/filter helpers ------
+//
+// Mission "ORDER 8B", sections 22-27, 31-32 - these mirror the equally
+// pure PHP helpers of the same name so the table renders identically
+// on first load (server-rendered) and after an AJAX refresh.
+
+describe("detectConflictedCountryCodes", () => {
+    test("flags only country codes appearing more than once", () => {
+        const codes = detectConflictedCountryCodes([
+            { country_code: "IT" },
+            { country_code: "IT" },
+            { country_code: "FR" },
+        ]);
+
+        assert.equal(codes.has("IT"), true);
+        assert.equal(codes.has("FR"), false);
+    });
+
+    test("ignores documents with no country_code", () => {
+        const codes = detectConflictedCountryCodes([{}, { country_code: "" }]);
+
+        assert.equal(codes.size, 0);
+    });
+});
+
+describe("computeDisplayStatus", () => {
+    test("a country conflict always wins, regardless of the document's own status", () => {
+        const status = computeDisplayStatus({ status: "indexed" }, true);
+
+        assert.equal(status.value, "needs_attention");
+        assert.equal(status.label, "Needs attention");
+    });
+
+    test("status 'indexed' with no conflict is Ready", () => {
+        const status = computeDisplayStatus({ status: "indexed" }, false);
+
+        assert.equal(status.value, "ready");
+        assert.equal(status.label, "Ready");
+        assert.equal(status.icon, "✓");
+    });
+
+    test("any other status with no conflict is Needs attention, never a fabricated status", () => {
+        const status = computeDisplayStatus(
+            { status: "indexed_source_missing" },
+            false
+        );
+
+        assert.equal(status.value, "needs_attention");
+        assert.equal(status.label, "Needs attention");
+    });
+
+    test("status is never conveyed by color alone: label and icon are always both present", () => {
+        [true, false].forEach((conflict) => {
+            const status = computeDisplayStatus({ status: "indexed" }, conflict);
+
+            assert.ok(status.icon.length > 0);
+            assert.ok(status.label.length > 0);
+        });
+    });
+});
+
+describe("formatLastUpdated", () => {
+    test("renders a business-friendly date, never a raw ISO string", () => {
+        const formatted = formatLastUpdated("2026-08-14T14:32:18.921Z");
+
+        assert.equal(formatted.includes("T"), false);
+        assert.equal(formatted.includes("Z"), false);
+        assert.match(formatted, /^\d{1,2} \w{3} \d{4}, \d{2}:\d{2}$/);
+    });
+
+    test("returns an em dash placeholder for a missing or invalid value", () => {
+        assert.equal(formatLastUpdated(null), "—");
+        assert.equal(formatLastUpdated(""), "—");
+        assert.equal(formatLastUpdated("not-a-date"), "—");
+    });
+});
+
+describe("rowMatchesFilter", () => {
+    const row = { country: "italy", filename: "labour law italy.docx", status: "ready" };
+
+    test("an empty query and empty status match everything", () => {
+        assert.equal(rowMatchesFilter(row, "", ""), true);
+    });
+
+    test("matches by country or by filename, case-insensitively (caller lowercases)", () => {
+        assert.equal(rowMatchesFilter(row, "italy", ""), true);
+        assert.equal(rowMatchesFilter(row, "labour", ""), true);
+        assert.equal(rowMatchesFilter(row, "france", ""), false);
+    });
+
+    test("the status filter narrows independently of the search query", () => {
+        assert.equal(rowMatchesFilter(row, "", "ready"), true);
+        assert.equal(rowMatchesFilter(row, "", "needs_attention"), false);
+    });
+});
+
+// --- Add-a-section: pure title-matching / position-mapping helpers --
+
+describe("normalizeTitle / findDuplicateSectionIn", () => {
+    test("normalizes case and collapses whitespace before comparing", () => {
+        assert.equal(normalizeTitle("  Hiring   Practices "), "hiring practices");
+    });
+
+    test("finds a duplicate regardless of case/whitespace differences", () => {
+        const sections = [{ section_id: "sec-1", legal_topic: "Hiring Practices" }];
+
+        const duplicate = findDuplicateSectionIn(sections, "  hiring   practices");
+
+        assert.equal(duplicate.section_id, "sec-1");
+    });
+
+    test("an empty or non-matching title finds nothing", () => {
+        const sections = [{ section_id: "sec-1", legal_topic: "Hiring Practices" }];
+
+        assert.equal(findDuplicateSectionIn(sections, ""), null);
+        assert.equal(findDuplicateSectionIn(sections, "Remote Working"), null);
+    });
+});
+
+describe("buildPositionOptions", () => {
+    test("always offers beginning/end, plus one 'After X' entry per existing section, never a raw section_id in the label", () => {
+        const options = buildPositionOptions([
+            { section_id: "sec-1", legal_topic: "Hiring Practices" },
+            { section_id: "sec-2", legal_topic: "Termination" },
+        ]);
+
+        assert.deepEqual(
+            options.map((option) => option.value),
+            ["beginning", "after:sec-1", "after:sec-2", "end"]
+        );
+        assert.equal(options[0].label, "At the beginning");
+        assert.equal(options[1].label, "After \"Hiring Practices\"");
+        assert.equal(options[3].label, "At the end");
+    });
+
+    test("still offers beginning/end for a country with zero sections", () => {
+        const options = buildPositionOptions([]);
+
+        assert.deepEqual(options.map((option) => option.value), ["beginning", "end"]);
+    });
+});
+
+describe("summarizeQueue", () => {
+    test("zero-count categories are never included (ORDER 8B, section 9)", () => {
+        const { categories } = summarizeQueue([
+            { status: "indexed" },
+            { status: "indexed" },
+        ]);
+
+        assert.deepEqual(categories, [{ key: "added", count: 2, icon: "✓" }]);
+    });
+
+    test("is not 'allSettled' while anything is still queued/uploading", () => {
+        const summary = summarizeQueue([
+            { status: "indexed" },
+            { status: "uploading" },
+        ]);
+
+        assert.equal(summary.allSettled, false);
+    });
+
+    test("is 'allSettled' once every item has left queued/uploading, including awaiting-decision items", () => {
+        const summary = summarizeQueue([
+            { status: "indexed" },
+            { status: "awaiting_replacement_confirmation" },
+        ]);
+
+        assert.equal(summary.allSettled, true);
+    });
+
+    test("awaiting_* states of all three kinds collapse into one 'needs confirmation' category", () => {
+        const { categories } = summarizeQueue([
+            { status: "awaiting_replacement_confirmation" },
+            { status: "awaiting_warning_confirmation" },
+            { status: "awaiting_combined_confirmation" },
+        ]);
+
+        assert.deepEqual(categories, [
+            { key: "needs confirmation", count: 3, icon: "⚠" },
+        ]);
+    });
+
+    test("a mixed batch lists only its non-zero categories, in a stable order", () => {
+        const { categories } = summarizeQueue([
+            { status: "indexed" },
+            { status: "already_current" },
+            { status: "failed" },
+        ]);
+
+        assert.deepEqual(categories, [
+            { key: "added", count: 1, icon: "✓" },
+            { key: "already up to date", count: 1, icon: "✓" },
+            { key: "failed", count: 1, icon: "✕" },
+        ]);
+    });
+});
+
+// --- getSelectedFiles / MAX_CONCURRENT_UPLOADS ----------------------
+
+test("getSelectedFiles reads from input.files, never input.value", () => {
+    const files = [makeFakeFile("a.docx"), makeFakeFile("b.docx")];
+
+    assert.deepEqual(
+        getSelectedFiles({ files, value: "C:\\fakepath\\a.docx" }).map((f) => f.name),
+        ["a.docx", "b.docx"]
+    );
+
+    assert.deepEqual(getSelectedFiles(null), []);
+    assert.deepEqual(getSelectedFiles({ files: null }), []);
+});
+
+test("MAX_CONCURRENT_UPLOADS is exactly 2 (mission ORDER 4, section 12)", () => {
+    assert.equal(MAX_CONCURRENT_UPLOADS, 2);
+});
+
+// --- Fetch-count / queue flow (mocked DOM + fetch) ------------------
+
+describe("upload queue flow", () => {
     let fakeButton;
     let submitHandlerHolder;
     let fetchCalls;
-    let alerts;
+    let moduleExports;
 
-    beforeEach(() => {
-        fetchCalls = [];
-        alerts = [];
+    function installFilesAndLoad(files) {
         submitHandlerHolder = {};
 
-        const dom = installFakeDom({ submitHandlerHolder });
+        const dom = installFakeDom({ submitHandlerHolder, initialFiles: files });
         fakeButton = dom.fakeButton;
 
         global.window.confirm = () => true;
-        global.window.alert = (message) => alerts.push(message);
+        global.window.alert = () => {};
 
-        loadFreshAdminModule();
+        moduleExports = loadFreshAdminModule();
+
+        return dom;
+    }
+
+    beforeEach(() => {
+        fetchCalls = [];
     });
 
     afterEach(() => {
@@ -317,74 +933,133 @@ describe("upload form fetch flow", () => {
         delete require.cache[require.resolve(ADMIN_JS_PATH)];
     });
 
-    function queueResponses(...responses) {
+    function queueFetchResponses(responses) {
         let call = 0;
 
         global.fetch = async (_url, options) => {
             fetchCalls.push({
                 replaceExisting: options.body.get("replace_existing"),
+                confirmWarnings: options.body.get("confirm_warnings"),
             });
 
-            const response = responses[call];
+            const response = responses[Math.min(call, responses.length - 1)];
             call += 1;
 
             return makeFakeResponse(response);
         };
     }
 
-    function submit() {
+    async function submit() {
         const event = { preventDefault: () => {} };
 
         return submitHandlerHolder.handler(event);
     }
 
-    test(
-        "409 replacement_required then Cancel makes exactly one fetch total",
-        async () => {
-            global.window.confirm = () => false;
+    function snapshot() {
+        return moduleExports.__queueForTests.getQueueSnapshot();
+    }
 
-            queueResponses({
-                ok: false,
-                status: 409,
-                payload: {
-                    success: false,
-                    data: {
-                        message: "A document already exists for Argentina.",
-                        detail: {
-                            code: "document_replacement_required",
-                            country: "Argentina",
-                            country_code: "AR",
-                            existing_document_ids: ["doc_a"],
-                        },
+    test(
+        "a fresh single-file upload (HTTP 201) makes exactly one fetch and ends indexed",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Argentina.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "Argentina.docx was indexed successfully with 2 chunks.", status: "uploaded" },
                     },
                 },
-            });
+            ]);
 
             await submit();
 
             assert.equal(fetchCalls.length, 1);
-            assert.equal(fetchCalls[0].replaceExisting, null);
-            // Cancel: no success alert, button re-enabled.
-            assert.equal(alerts.length, 0);
-            assert.equal(fakeButton.disabled, false);
+            assert.equal(snapshot()[0].status, "indexed");
         }
     );
 
     test(
-        "409 replacement_required then Confirm makes exactly two fetches, replace=false then replace=true",
+        "409 document_already_current never makes a second request and never shows a replace decision",
         async () => {
-            global.window.confirm = () => true;
+            installFilesAndLoad([makeFakeFile("Chile.docx")]);
 
-            queueResponses(
+            queueFetchResponses([
                 {
                     ok: false,
                     status: 409,
                     payload: {
                         success: false,
                         data: {
-                            message: (
-                                "A document already exists for Argentina."
-                            ),
+                            message: "Chile.docx is already the current source.",
+                            detail: { code: "document_already_current" },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "already_current");
+        }
+    );
+
+    test(
+        "409 replacement_required then Cancel makes exactly one fetch total, zero mutation",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Argentina.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "A document already exists for Argentina.",
+                            detail: {
+                                code: "document_replacement_required",
+                                country: "Argentina",
+                                country_code: "AR",
+                                existing_document_ids: ["doc_a"],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_replacement_confirmation"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(0, "cancel");
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "cancelled");
+        }
+    );
+
+    test(
+        "409 replacement_required then Replace makes exactly two fetches, replace=false then replace=true, and ends 'replaced' (ORDER 8B terminology)",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Argentina.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "A document already exists for Argentina.",
                             detail: {
                                 code: "document_replacement_required",
                                 country: "Argentina",
@@ -400,79 +1075,188 @@ describe("upload form fetch flow", () => {
                     payload: {
                         success: true,
                         data: {
-                            message: (
-                                "Argentina.docx replaced the previous "
-                                + "country document successfully with "
-                                + "2 chunks."
-                            ),
+                            message: "Argentina.docx replaced the previous country document successfully with 2 chunks.",
                             status: "replaced",
                         },
                     },
-                }
-            );
-
-            await submit();
-
-            assert.equal(fetchCalls.length, 2);
-            assert.equal(fetchCalls[0].replaceExisting, null);
-            assert.equal(fetchCalls[1].replaceExisting, "1");
-            assert.equal(alerts.length, 1);
-            assert.match(alerts[0], /replaced the previous country/);
-        }
-    );
-
-    test(
-        "a fresh-country upload (HTTP 201, no confirmation) makes exactly one fetch",
-        async () => {
-            queueResponses({
-                ok: true,
-                status: 201,
-                payload: {
-                    success: true,
-                    data: {
-                        message: (
-                            "Argentina.docx was indexed successfully "
-                            + "with 2 chunks."
-                        ),
-                        status: "uploaded",
-                    },
                 },
-            });
+            ]);
 
             await submit();
 
             assert.equal(fetchCalls.length, 1);
-            assert.equal(alerts.length, 1);
-            assert.match(alerts[0], /indexed successfully/);
+
+            moduleExports.__queueForTests.resolveDecision(0, "replace");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(fetchCalls[0].replaceExisting, null);
+            assert.equal(fetchCalls[1].replaceExisting, "1");
+            assert.equal(snapshot()[0].status, "replaced");
+        }
+    );
+
+    test(
+        "409 warning_confirmation_required (replacement_required=false) then Continue sends confirm_warnings=1, replace_existing unset",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Peru.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "Confirmation required.",
+                            detail: {
+                                code: "document_warning_confirmation_required",
+                                replacement_required: false,
+                                country_name: "Peru",
+                                warnings: [{ code: "STRUCTURE_WARNING", message: "Low topic coverage." }],
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "Peru.docx was indexed successfully.", status: "uploaded" },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_warning_confirmation"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(0, "continue");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(fetchCalls[1].confirmWarnings, "1");
+            assert.equal(fetchCalls[1].replaceExisting, null);
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    test(
+        "409 warning_confirmation_required (replacement_required=false) then Cancel makes zero further requests",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Peru.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_warning_confirmation_required",
+                                replacement_required: false,
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            moduleExports.__queueForTests.resolveDecision(0, "cancel");
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "cancelled");
+        }
+    );
+
+    test(
+        "409 warning_confirmation_required (replacement_required=true) is the combined decision, never confused with either single decision",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Peru.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_warning_confirmation_required",
+                                replacement_required: true,
+                                country_name: "Peru",
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "Peru.docx replaced the previous country document successfully.", status: "replaced" },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_combined_confirmation"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(
+                0,
+                "continue-and-replace"
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(fetchCalls[1].confirmWarnings, "1");
+            assert.equal(fetchCalls[1].replaceExisting, "1");
+            assert.equal(snapshot()[0].status, "replaced");
         }
     );
 
     test(
         "a 422 with a structured message never shows the generic fallback",
         async () => {
-            queueResponses({
-                ok: false,
-                status: 422,
-                payload: {
-                    success: false,
-                    data: {
-                        message: "Only DOCX documents are accepted.",
-                        detail: [],
+            installFilesAndLoad([makeFakeFile("bad.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 422,
+                    payload: {
+                        success: false,
+                        data: { message: "Only DOCX documents are accepted.", detail: [] },
                     },
                 },
-            });
+            ]);
 
             await submit();
 
             assert.equal(fetchCalls.length, 1);
-            assert.equal(alerts.length, 1);
-            assert.equal(alerts[0], "Only DOCX documents are accepted.");
+            assert.equal(snapshot()[0].status, "failed");
+            assert.equal(snapshot()[0].message, "Only DOCX documents are accepted.");
         }
     );
 
     test(
         "a 500 with no usable body falls back to the generic message, never a raw crash",
         async () => {
+            installFilesAndLoad([makeFakeFile("x.docx")]);
+
             global.fetch = async (_url, options) => {
                 fetchCalls.push({
                     replaceExisting: options.body.get("replace_existing"),
@@ -484,21 +1268,97 @@ describe("upload form fetch flow", () => {
             await submit();
 
             assert.equal(fetchCalls.length, 1);
-            assert.equal(alerts.length, 1);
-            assert.equal(alerts[0], "The document could not be indexed.");
+            assert.equal(snapshot()[0].status, "failed");
+            assert.equal(
+                snapshot()[0].message,
+                "The document could not be indexed."
+            );
         }
     );
 
     test(
-        "the submit button is disabled during the request and re-enabled after",
+        "a queue item reads 'Uploading…' while the request is in flight (business-friendly, no technical status)",
         async () => {
-            let disabledDuringFetch = null;
+            installFilesAndLoad([makeFakeFile("x.docx")]);
+
+            let resolveFetch;
+
+            // Only the upload POST is held open - the batch's own
+            // trailing refresh (a GET, no FormData body) must resolve
+            // immediately or this test's own final `await
+            // submitPromise` would hang forever waiting on a second,
+            // never-released promise from the same mock.
+            global.fetch = (_url, options) => {
+                if (options && options.body && typeof options.body.get === "function") {
+                    return new Promise((resolve) => {
+                        resolveFetch = () => resolve(makeFakeResponse({
+                            ok: true,
+                            status: 201,
+                            payload: { success: true, data: { message: "ok", status: "uploaded" } },
+                        }));
+                    });
+                }
+
+                return Promise.resolve(makeFakeResponse({
+                    ok: true,
+                    status: 200,
+                    payload: { success: true, data: { documents: [], stats: {} } },
+                }));
+            };
+
+            const submitPromise = submit();
+
+            await new Promise((resolve) => setTimeout(resolve, 10));
+
+            assert.equal(snapshot()[0].status, "uploading");
+
+            resolveFetch();
+            await submitPromise;
+
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    test(
+        "submitting with no file selected never fetches (required-input guard, not a crash)",
+        async () => {
+            installFilesAndLoad([]);
+
+            const event = { preventDefault: () => {} };
+            await submitHandlerHolder.handler(event);
+
+            assert.equal(fetchCalls.length, 0);
+        }
+    );
+
+    test(
+        "multi-file selection: at most 2 requests are ever in flight at once (mission ORDER 4, section 12)",
+        async () => {
+            installFilesAndLoad([
+                makeFakeFile("a.docx"),
+                makeFakeFile("b.docx"),
+                makeFakeFile("c.docx"),
+                makeFakeFile("d.docx"),
+                makeFakeFile("e.docx"),
+            ]);
+
+            let inFlight = 0;
+            let maxInFlight = 0;
+            const releasers = [];
 
             global.fetch = async (_url, options) => {
-                disabledDuringFetch = fakeButton.disabled;
                 fetchCalls.push({
                     replaceExisting: options.body.get("replace_existing"),
                 });
+
+                inFlight += 1;
+                maxInFlight = Math.max(maxInFlight, inFlight);
+
+                await new Promise((resolve) => {
+                    releasers.push(resolve);
+                });
+
+                inFlight -= 1;
 
                 return makeFakeResponse({
                     ok: true,
@@ -510,22 +1370,1759 @@ describe("upload form fetch flow", () => {
                 });
             };
 
-            await submit();
+            const submitPromise = submit();
 
-            assert.equal(disabledDuringFetch, true);
-            assert.equal(fakeButton.disabled, false);
+            // Let the microtask queue drain enough for the queue
+            // engine to start its first batch of requests.
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(
+                fetchCalls.length,
+                2,
+                "only 2 of the 5 files should have started a request"
+            );
+            assert.equal(maxInFlight, 2);
+
+            while (releasers.length > 0) {
+                releasers.shift()();
+                // eslint-disable-next-line no-await-in-loop
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+
+            await submitPromise;
+
+            assert.equal(fetchCalls.length, 5);
+            assert.equal(maxInFlight, 2);
+            assert.ok(
+                snapshot().every((item) => item.status === "indexed")
+            );
         }
     );
 
     test(
-        "a second submit while a request is in flight never doubles the fetch count",
+        "one file's failure never blocks or rolls back the others (mission ORDER 4, section 13)",
         async () => {
-            fakeButton.disabled = true;
+            installFilesAndLoad([
+                makeFakeFile("good-a.docx"),
+                makeFakeFile("corrupt.docx"),
+                makeFakeFile("good-b.docx"),
+            ]);
 
-            const event = { preventDefault: () => {} };
-            await submitHandlerHolder.handler(event);
+            queueFetchResponses([
+                {
+                    ok: true,
+                    status: 201,
+                    payload: { success: true, data: { message: "ok", status: "uploaded" } },
+                },
+                {
+                    ok: false,
+                    status: 422,
+                    payload: { success: false, data: { message: "DOCX validation failed: bad zip." } },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: { success: true, data: { message: "ok", status: "uploaded" } },
+                },
+            ]);
 
-            assert.equal(fetchCalls.length, 0);
+            await submit();
+
+            const statuses = snapshot().map((item) => item.status);
+
+            assert.equal(fetchCalls.length, 3);
+            assert.deepEqual(statuses, ["indexed", "failed", "indexed"]);
         }
     );
+
+    test(
+        "a multi-file batch triggers exactly one list/stats refresh, never one per file (mission ORDER 5D, section 4)",
+        async () => {
+            installFilesAndLoad([
+                makeFakeFile("Argentina.docx"),
+                makeFakeFile("Brazil.docx"),
+                makeFakeFile("Chile.docx"),
+            ]);
+
+            let uploadCalls = 0;
+            let refreshCalls = 0;
+
+            global.fetch = async (_url, options) => {
+                if (options && options.body && typeof options.body.get === "function") {
+                    uploadCalls += 1;
+
+                    return makeFakeResponse({
+                        ok: true,
+                        status: 201,
+                        payload: { success: true, data: { message: "ok", status: "uploaded" } },
+                    });
+                }
+
+                refreshCalls += 1;
+
+                return makeFakeResponse({
+                    ok: true,
+                    status: 200,
+                    payload: { success: true, data: { documents: [], stats: {} } },
+                });
+            };
+
+            await submit();
+
+            assert.equal(uploadCalls, 3);
+            assert.equal(
+                refreshCalls,
+                1,
+                "a 3-file batch must collapse into exactly one refresh, not three"
+            );
+        }
+    );
+
+    test(
+        "resolveDecision on a parked item never pushes concurrency past MAX_CONCURRENT_UPLOADS",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Denmark.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "A document already exists for Denmark.",
+                            detail: {
+                                code: "document_replacement_required",
+                                country: "Denmark",
+                                country_code: "DK",
+                                existing_document_ids: ["doc_dk"],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_replacement_confirmation"
+            );
+
+            const resolvers = [];
+
+            global.fetch = () => new Promise((resolve) => {
+                resolvers.push(() => resolve(makeFakeResponse({
+                    ok: true,
+                    status: 201,
+                    payload: { success: true, data: { message: "ok", status: "uploaded" } },
+                })));
+            });
+
+            moduleExports.__queueForTests.enqueueFiles([
+                makeFakeFile("Argentina.docx"),
+                makeFakeFile("Belgium.docx"),
+            ]);
+
+            assert.equal(
+                resolvers.length,
+                2,
+                "the fresh 2-file batch alone reaches the cap"
+            );
+            assert.equal(
+                moduleExports.__queueForTests.activeUploadCount(),
+                2
+            );
+
+            moduleExports.__queueForTests.resolveDecision(0, "replace");
+
+            assert.equal(
+                resolvers.length,
+                2,
+                "Denmark's replace must not fire a third concurrent request while the cap is held"
+            );
+            assert.equal(
+                moduleExports.__queueForTests.activeUploadCount(),
+                2,
+                "active concurrency must stay at the cap, never 3"
+            );
+
+            resolvers[0]();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(
+                resolvers.length,
+                3,
+                "Denmark's replace request fires only once a slot actually frees up"
+            );
+
+            resolvers[1]();
+            resolvers[2]();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+    );
+
+    // --- ORDER 8B, section 7: the batch-reset bug fix -------------------
+
+    test(
+        "selecting a brand-new batch after the previous one finished clears the old summary/results entirely",
+        async () => {
+            const dom = installFilesAndLoad([makeFakeFile("a.docx"), makeFakeFile("b.docx")]);
+
+            queueFetchResponses([
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+            ]);
+
+            await submit();
+
+            assert.match(dom.fakeQueueContainer.innerHTML, /2 documents processed/);
+            assert.match(dom.fakeQueueContainer.innerHTML, /2 added/);
+
+            // The exact same files are re-selected as a brand-new batch.
+            // The OLD summary/result list must be gone entirely, not
+            // accumulated alongside the new one.
+            moduleExports.__queueForTests.startNewBatch([
+                makeFakeFile("c.docx"),
+            ]);
+
+            await new Promise((resolve) => setTimeout(resolve, 10));
+
+            assert.equal(
+                (dom.fakeQueueContainer.innerHTML.match(/document/g) || []).length
+                    < 6,
+                true,
+                "the old batch's own summary text must not still be present"
+            );
+            assert.equal(
+                dom.fakeQueueContainer.innerHTML.includes("2 documents processed"),
+                false,
+                "the previous batch's total must never leak into the new one"
+            );
+        }
+    );
+
+    test(
+        "starting a new batch never issues a delete/removal request - it only resets the batch display",
+        async () => {
+            installFilesAndLoad([]);
+
+            const methodsUsed = [];
+
+            global.fetch = async (_url, options) => {
+                methodsUsed.push((options && options.method) || "GET");
+
+                if (options && options.body && typeof options.body.get === "function") {
+                    return makeFakeResponse({
+                        ok: true,
+                        status: 201,
+                        payload: { success: true, data: { message: "ok", status: "uploaded" } },
+                    });
+                }
+
+                return makeFakeResponse({
+                    ok: true,
+                    status: 200,
+                    payload: { success: true, data: { documents: [], stats: {} } },
+                });
+            };
+
+            // startNewBatch only ever talks to the upload/refresh
+            // endpoints - it has no delete/removal code path at all,
+            // so there is nothing here that could remove a document.
+            await moduleExports.__queueForTests.startNewBatch([makeFakeFile("a.docx")]);
+            await moduleExports.__queueForTests.startNewBatch([makeFakeFile("b.docx")]);
+
+            assert.ok(methodsUsed.length > 0);
+            assert.equal(methodsUsed.includes("DELETE"), false);
+        }
+    );
+
+    // --- ORDER 8B, section 8/9/10: terminology + zero-count hiding ------
+
+    test(
+        "the rendered summary never shows a zero-count category (ORDER 8B, section 9)",
+        async () => {
+            const dom = installFilesAndLoad([makeFakeFile("a.docx")]);
+
+            queueFetchResponses([
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+            ]);
+
+            await submit();
+
+            const html = dom.fakeQueueContainer.innerHTML;
+
+            assert.match(html, /1 document processed/);
+            assert.match(html, /1 added/);
+            assert.equal(html.includes("Already up to date: 0"), false);
+            assert.equal(html.includes("Cancelled: 0"), false);
+            assert.equal(html.includes("Failed: 0"), false);
+        }
+    );
+
+    test(
+        "individual results render as structured lines, never 'filename.docxAdded' run together (ORDER 8B, section 10)",
+        async () => {
+            const dom = installFilesAndLoad([makeFakeFile("Employment Law Overview Indonesia.docx")]);
+
+            queueFetchResponses([
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+            ]);
+
+            await submit();
+
+            const html = dom.fakeQueueContainer.innerHTML;
+
+            assert.equal(
+                html.includes("Employment Law Overview Indonesia.docxAdded"),
+                false
+            );
+            assert.match(
+                html,
+                /Employment Law Overview Indonesia\.docx<\/span><span class="le-global-chatbot-admin__queue-status">Added/
+            );
+        }
+    );
+
+    test(
+        "upload terminology never leaks internal words like 'Indexed'/'Awaiting decision' (ORDER 8B, section 8)",
+        async () => {
+            const dom = installFilesAndLoad([makeFakeFile("a.docx")]);
+
+            queueFetchResponses([
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+            ]);
+
+            await submit();
+
+            const html = dom.fakeQueueContainer.innerHTML;
+
+            assert.equal(html.includes(">Indexed<"), false);
+            assert.equal(html.includes("Awaiting decision"), false);
+            assert.match(html, />Added</);
+        }
+    );
+
+    test(
+        "a country-replacement decision shows the country, and the existing document's own filename when it is already known (ORDER 8B, section 11)",
+        async () => {
+            const dom = installFilesAndLoad([makeFakeFile("Italy-new.docx")]);
+
+            // The catalog already knows about Italy's current document -
+            // exactly what a real page load/refresh would have primed.
+            global.fetch = async () => makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        documents: [
+                            {
+                                document_id: "doc_a",
+                                country: "Italy",
+                                country_code: "IT",
+                                source_filename: "Italy-old.docx",
+                                status: "indexed",
+                                source_file_present: true,
+                            },
+                        ],
+                        stats: { total_documents: 1, total_countries: 1 },
+                    },
+                },
+            });
+
+            await moduleExports.__queueForTests.refresh();
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "A document already exists for Italy.",
+                            detail: {
+                                code: "document_replacement_required",
+                                country: "Italy",
+                                country_code: "IT",
+                                existing_document_ids: ["doc_a"],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            const html = dom.fakeQueueContainer.innerHTML;
+
+            assert.match(html, /Italy already has a document/);
+            assert.match(html, /Current document: Italy-old\.docx/);
+            assert.match(html, /New document: Italy-new\.docx/);
+            assert.equal(html.includes("document_id"), false);
+            assert.equal(html.includes("chunk"), false);
+        }
+    );
+
+    // --- ORDER 8B, section 5: dropzone / fallback submit -----------------
+
+    test(
+        "the no-JS fallback submit button is hidden once the JS enhancement wires up",
+        () => {
+            const dom = installFilesAndLoad([]);
+
+            assert.equal(dom.fakeFallbackSubmit.hidden, true);
+        }
+    );
+
+    test(
+        "dropping files on the dropzone runs the exact same upload flow as picking them (ORDER 8B, section 5)",
+        async () => {
+            const dom = installFilesAndLoad([]);
+
+            queueFetchResponses([
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+            ]);
+
+            await dom.fakeDropzone._listeners.drop({
+                preventDefault: () => {},
+                dataTransfer: { files: [makeFakeFile("dropped.docx")] },
+            });
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].file.name, "dropped.docx");
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    test(
+        "selecting files via the real file input's change event starts the upload automatically",
+        async () => {
+            const changeHandlerHolder = {};
+            submitHandlerHolder = {};
+
+            const dom = installFakeDom({ submitHandlerHolder, changeHandlerHolder });
+            fakeButton = dom.fakeButton;
+            global.window.confirm = () => true;
+
+            moduleExports = loadFreshAdminModule();
+
+            dom.fakeFileInput.files = [makeFakeFile("auto.docx")];
+
+            queueFetchResponses([
+                { ok: true, status: 201, payload: { success: true, data: { message: "ok", status: "uploaded" } } },
+            ]);
+
+            await changeHandlerHolder.handler();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+});
+
+// --- Documents table rendering (AJAX-refresh integration) -----------
+//
+// Mission "ORDER 8B", sections 22-30 - exercised through the same
+// refresh path a real upload/reindex/delete triggers, asserting on
+// the rendered HTML string (this harness has no real DOM parser, so
+// assertions are deliberately scoped to precise substrings/regexes
+// rather than full markup structure - the Chromium E2E suite is the
+// authority for genuine DOM interaction).
+
+describe("documents table rendering", () => {
+    let dom;
+    let moduleExports;
+
+    beforeEach(() => {
+        dom = installFakeDom();
+        global.window.confirm = () => true;
+        moduleExports = loadFreshAdminModule();
+    });
+
+    afterEach(() => {
+        delete global.document;
+        delete global.window;
+        delete global.FormData;
+        delete global.fetch;
+        delete require.cache[require.resolve(ADMIN_JS_PATH)];
+    });
+
+    function mockRefresh(documents, stats) {
+        global.fetch = async () => makeFakeResponse({
+            ok: true,
+            status: 200,
+            payload: { success: true, data: { documents, stats } },
+        });
+
+        return moduleExports.__queueForTests.refresh();
+    }
+
+    test("chunk counts are never shown, even though they remain present in the underlying data", async () => {
+        await mockRefresh(
+            [
+                {
+                    document_id: `doc_${"a".repeat(64)}`,
+                    country: "Italy",
+                    country_code: "IT",
+                    source_filename: "Italy.docx",
+                    reference_year: 2026,
+                    status: "indexed",
+                    source_file_present: true,
+                    updated_at: "2026-08-14T14:32:00.000Z",
+                    chunk_count: 42,
+                    download_url: "https://example.test/download",
+                    reindex_nonce: "n1",
+                    delete_nonce: "n2",
+                },
+            ],
+            { total_documents: 1, total_countries: 1 }
+        );
+
+        const html = dom.fakeDocumentsContainer.innerHTML;
+
+        assert.equal(/chunk/i.test(html), false);
+    });
+
+    test("document_id is never shown as visible text, only inside the data-document-id attribute", async () => {
+        const documentId = `doc_${"b".repeat(64)}`;
+
+        await mockRefresh(
+            [
+                {
+                    document_id: documentId,
+                    country: "France",
+                    country_code: "FR",
+                    source_filename: "France.docx",
+                    reference_year: 2025,
+                    status: "indexed",
+                    source_file_present: true,
+                    updated_at: "2026-08-10T09:00:00.000Z",
+                    download_url: "https://example.test/download",
+                    reindex_nonce: "n1",
+                    delete_nonce: "n2",
+                },
+            ],
+            { total_documents: 1, total_countries: 1 }
+        );
+
+        const html = dom.fakeDocumentsContainer.innerHTML;
+
+        assert.equal(html.includes(`data-document-id="${documentId}"`), true);
+        // The id never appears as element text content (immediately
+        // after a ">"), only inside the attribute value above.
+        assert.equal(html.includes(`>${documentId}<`), false);
+    });
+
+    test("status 'indexed' with no conflict renders as Ready, not the raw backend status word", async () => {
+        await mockRefresh(
+            [
+                {
+                    document_id: "doc_ready",
+                    country: "Spain",
+                    country_code: "ES",
+                    source_filename: "Spain.docx",
+                    status: "indexed",
+                    source_file_present: true,
+                    updated_at: "2026-08-01T00:00:00.000Z",
+                },
+            ],
+            { total_documents: 1, total_countries: 1 }
+        );
+
+        const html = dom.fakeDocumentsContainer.innerHTML;
+
+        assert.match(html, / Ready<\/span>/);
+        assert.equal(html.includes(">Indexed<"), false);
+    });
+
+    test("Last updated renders the business-friendly formatted date, never the raw ISO timestamp", async () => {
+        const iso = "2026-08-14T14:32:18.921Z";
+
+        await mockRefresh(
+            [
+                {
+                    document_id: "doc_dates",
+                    country: "Germany",
+                    country_code: "DE",
+                    source_filename: "Germany.docx",
+                    status: "indexed",
+                    source_file_present: true,
+                    updated_at: iso,
+                },
+            ],
+            { total_documents: 1, total_countries: 1 }
+        );
+
+        const html = dom.fakeDocumentsContainer.innerHTML;
+
+        assert.equal(html.includes(iso), false);
+        assert.equal(html.includes(formatLastUpdated(iso)), true);
+    });
+
+    test("Reindex is presented only as 'Refresh chatbot data', never the word 'Reindex' as visible text", async () => {
+        await mockRefresh(
+            [
+                {
+                    document_id: "doc_refresh",
+                    country: "Belgium",
+                    country_code: "BE",
+                    source_filename: "Belgium.docx",
+                    status: "indexed",
+                    source_file_present: true,
+                    updated_at: "2026-08-01T00:00:00.000Z",
+                    reindex_nonce: "n1",
+                    delete_nonce: "n2",
+                },
+            ],
+            { total_documents: 1, total_countries: 1 }
+        );
+
+        const html = dom.fakeDocumentsContainer.innerHTML;
+
+        assert.match(html, />Refresh chatbot data</);
+        assert.equal(html.includes(">Reindex<"), false);
+    });
+
+    test("a country conflict shows Needs attention on every affected row and disables Refresh chatbot data for them", async () => {
+        await mockRefresh(
+            [
+                {
+                    document_id: "doc_it1",
+                    country: "Italy",
+                    country_code: "IT",
+                    source_filename: "Italy-1.docx",
+                    status: "indexed",
+                    source_file_present: true,
+                    reindex_nonce: "n1",
+                    delete_nonce: "n2",
+                },
+                {
+                    document_id: "doc_it2",
+                    country: "Italy",
+                    country_code: "IT",
+                    source_filename: "Italy-2.docx",
+                    status: "indexed",
+                    source_file_present: true,
+                    reindex_nonce: "n3",
+                    delete_nonce: "n4",
+                },
+                {
+                    document_id: "doc_fr",
+                    country: "France",
+                    country_code: "FR",
+                    source_filename: "France.docx",
+                    status: "indexed",
+                    source_file_present: true,
+                    reindex_nonce: "n5",
+                    delete_nonce: "n6",
+                },
+            ],
+            { total_documents: 3, total_countries: 2 }
+        );
+
+        const html = dom.fakeDocumentsContainer.innerHTML;
+
+        assert.equal(
+            (html.match(/ Needs attention<\/span>/g) || []).length,
+            2,
+            "both conflicting Italy rows must show Needs attention"
+        );
+        assert.equal(
+            (html.match(/ Ready<\/span>/g) || []).length,
+            1,
+            "the unaffected France row must still show Ready"
+        );
+        assert.equal(
+            (html.match(/data-reindex-form/g) || []).length,
+            1,
+            "only France's real Refresh form should render; Italy's two rows must be disabled instead"
+        );
+        assert.equal(
+            html.includes("This country has conflicting document records."),
+            true
+        );
+        // document_id may still exist technically (e.g. the hidden
+        // <input name="document_id"> the Refresh/Delete forms POST) -
+        // only its VALUE must never render as visible text.
+        assert.equal(html.includes(">doc_it1<"), false);
+        assert.equal(html.includes(">doc_it2<"), false);
+        assert.equal(html.includes(">doc_fr<"), false);
+        assert.equal(html.includes("chunk"), false);
+    });
+
+    test("the document count updates after a refresh", async () => {
+        await mockRefresh(
+            [
+                { document_id: "doc_1", country: "Italy", country_code: "IT", source_filename: "a.docx", status: "indexed", source_file_present: true },
+                { document_id: "doc_2", country: "France", country_code: "FR", source_filename: "b.docx", status: "indexed", source_file_present: true },
+            ],
+            { total_documents: 2, total_countries: 2 }
+        );
+
+        assert.equal(dom.fakeDocumentCount.textContent, "2 documents");
+    });
+
+    test("Overview shows Documents/Countries/Documents needing attention only - no chunk or index metrics", async () => {
+        await mockRefresh(
+            [
+                { document_id: "doc_1", country: "Italy", country_code: "IT", source_filename: "a.docx", status: "indexed", source_file_present: true },
+                { document_id: "doc_2", country: "Spain", country_code: "ES", source_filename: "b.docx", status: "indexed_source_missing", source_file_present: false },
+            ],
+            { total_documents: 2, total_countries: 2 }
+        );
+
+        const html = dom.fakeSummaryContainer.innerHTML;
+
+        assert.match(html, /<span>Documents<\/span>/);
+        assert.match(html, /<span>Countries<\/span>/);
+        assert.match(html, /<span>Documents needing attention<\/span>/);
+        assert.equal(/chunk/i.test(html), false);
+        assert.equal(/opensearch/i.test(html), false);
+
+        const values = [...html.matchAll(/<strong>(\d+)<\/strong>/g)].map(
+            (match) => Number(match[1])
+        );
+
+        assert.deepEqual(values, [2, 2, 1]);
+    });
+
+    test("the empty-documents state never fetches search/filter data and shows no table", async () => {
+        await mockRefresh([], { total_documents: 0, total_countries: 0 });
+
+        assert.match(
+            dom.fakeDocumentsContainer.innerHTML,
+            /No document is currently available\./
+        );
+        assert.equal(dom.fakeDocumentCount.textContent, "0 documents");
+    });
+});
+
+// --- Document row actions: Refresh chatbot data / Delete -------------
+//
+// Mission "ORDER 8B", sections 29-30, 38 - jargon-free confirmation
+// text and a business-friendly success/error message rendered into
+// the documents panel's own aria-live area (never window.alert).
+
+describe("document row actions: Refresh chatbot data / Delete", () => {
+    let dom;
+    let moduleExports;
+    let confirmCalls;
+    let reindexForm;
+    let deleteForm;
+
+    function makeFakeRowForm(dataset = {}) {
+        const button = makeFakeButton();
+
+        return {
+            method: "post",
+            dataset,
+            _listeners: {},
+            addEventListener(eventName, handler) {
+                this._listeners[eventName] = handler;
+            },
+            getAttribute(name) {
+                if (name === "action") {
+                    return "https://example.test/wp-admin/admin-post.php";
+                }
+
+                return null;
+            },
+            querySelector(selector) {
+                if (selector === 'button[type="submit"]') {
+                    return button;
+                }
+
+                return null;
+            },
+        };
+    }
+
+    beforeEach(() => {
+        confirmCalls = [];
+        dom = installFakeDom();
+
+        reindexForm = makeFakeRowForm();
+        deleteForm = makeFakeRowForm({
+            documentName: "Italy.docx",
+            countryName: "Italy",
+        });
+
+        global.document.querySelectorAll = (selector) => {
+            if (selector === "[data-reindex-form]") {
+                return [reindexForm];
+            }
+
+            if (selector === "[data-confirm-delete]") {
+                return [deleteForm];
+            }
+
+            return [];
+        };
+
+        global.window.confirm = (message) => {
+            confirmCalls.push(message);
+            return true;
+        };
+
+        moduleExports = loadFreshAdminModule();
+    });
+
+    afterEach(() => {
+        delete global.document;
+        delete global.window;
+        delete global.FormData;
+        delete global.fetch;
+        delete require.cache[require.resolve(ADMIN_JS_PATH)];
+    });
+
+    test("Refresh chatbot data confirms with jargon-free wording naming the document, not the index", async () => {
+        global.fetch = async () => makeFakeResponse({
+            ok: true,
+            status: 200,
+            payload: { success: true, data: { documents: [], stats: {} } },
+        });
+
+        await reindexForm._listeners.submit({ preventDefault: () => {} });
+
+        assert.equal(confirmCalls.length, 1);
+        assert.match(confirmCalls[0], /Refresh chatbot data/);
+        assert.match(confirmCalls[0], /does not change the document/);
+        assert.equal(/reindex/i.test(confirmCalls[0]), false);
+        assert.match(dom.fakeDocumentsMessage.textContent, /Chatbot data refreshed successfully/);
+        assert.equal(/chunk/i.test(dom.fakeDocumentsMessage.textContent), false);
+    });
+
+    test("declining the Refresh confirmation makes zero network calls", async () => {
+        global.window.confirm = (message) => {
+            confirmCalls.push(message);
+            return false;
+        };
+
+        let fetchCalled = false;
+
+        global.fetch = async () => {
+            fetchCalled = true;
+            return makeFakeResponse({ ok: true, status: 200, payload: { success: true, data: {} } });
+        };
+
+        await reindexForm._listeners.submit({ preventDefault: () => {} });
+
+        assert.equal(fetchCalled, false);
+    });
+
+    test("a country_document_conflict error from Refresh maps to the business-friendly support message", async () => {
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 409,
+            payload: {
+                success: false,
+                data: {
+                    message: "This country has conflicting document records.",
+                    detail: { code: "country_document_conflict" },
+                },
+            },
+        });
+
+        await reindexForm._listeners.submit({ preventDefault: () => {} });
+
+        assert.equal(
+            dom.fakeDocumentsMessage.textContent,
+            "This country has conflicting document records. Please contact support before making changes."
+        );
+        assert.equal(dom.fakeDocumentsMessage.className.includes("is-error"), true);
+    });
+
+    test("Delete confirms with the country/document name and never mentions chunks or the index", async () => {
+        global.fetch = async () => makeFakeResponse({
+            ok: true,
+            status: 200,
+            payload: { success: true, data: { documents: [], stats: {} } },
+        });
+
+        await deleteForm._listeners.submit({ preventDefault: () => {} });
+
+        assert.equal(confirmCalls.length, 1);
+        assert.match(confirmCalls[0], /Delete Italy document\?/);
+        assert.match(confirmCalls[0], /'Italy\.docx' will be removed from the chatbot\./);
+        assert.equal(/chunk/i.test(confirmCalls[0]), false);
+        assert.match(
+            dom.fakeDocumentsMessage.textContent,
+            /Italy\.docx was deleted successfully\./
+        );
+    });
+
+    test("a generic Delete failure maps to the 'nothing was confirmed' business message", async () => {
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 500,
+            payload: { success: false, data: { detail: { code: "rollback_failed" } } },
+        });
+
+        await deleteForm._listeners.submit({ preventDefault: () => {} });
+
+        assert.equal(
+            dom.fakeDocumentsMessage.textContent,
+            "We couldn't save your changes. Nothing has been confirmed as completed. Please try again or contact support."
+        );
+    });
+});
+
+// --- Add / Edit a section (mission "ORDER 5D" + "ORDER 8B") ---------
+//
+// A dedicated, self-contained fake DOM/fetch - the Edit/Add UI has its
+// own set of elements (segmented control, country/section selects,
+// textareas, message, Cancel/Save/Add) never touched by the upload-
+// queue or documents-table tests above.
+
+describe("add / edit a section", () => {
+    function installEditSectionFakeDom() {
+        const modeEditButton = makeFakeButton();
+        const modeAddButton = makeFakeButton();
+        const countrySelect = makeFakeSelect();
+        const editOnlyFields = { hidden: false };
+        const sectionSelect = makeFakeSelect();
+        const textarea = makeFakeTextarea();
+        const editHintEl = { textContent: "" };
+        const addOnlyFields = { hidden: true };
+        const addTitleInput = makeFakeTextarea();
+        const addPositionSelect = makeFakeSelect();
+        const duplicateWarningEl = makeFakeContainer();
+        const addContentTextarea = makeFakeTextarea();
+        const messageEl = makeFakeMessageElement();
+        const cancelButton = makeFakeButton();
+        const saveButton = makeFakeButton();
+        const addSubmitButton = makeFakeButton();
+
+        const editContainer = {
+            dataset: {
+                adminPostUrl: "https://example.test/wp-admin/admin-post.php",
+                sectionsListAction: "le_global_chatbot_list_sections",
+                sectionsListNonce: "sections-list-nonce",
+                sectionGetAction: "le_global_chatbot_get_section",
+                sectionGetNonce: "section-get-nonce",
+                sectionUpdateAction: "le_global_chatbot_update_section",
+                sectionUpdateNonce: "section-update-nonce",
+                sectionAddAction: "le_global_chatbot_add_section",
+                sectionAddNonce: "section-add-nonce",
+            },
+        };
+
+        const byId = {
+            "le-global-chatbot-edit": editContainer,
+            "le-global-mode-edit": modeEditButton,
+            "le-global-mode-add": modeAddButton,
+            "le-global-edit-country": countrySelect,
+            "le-global-edit-only-fields": editOnlyFields,
+            "le-global-edit-section": sectionSelect,
+            "le-global-edit-content": textarea,
+            "le-global-edit-hint": editHintEl,
+            "le-global-add-only-fields": addOnlyFields,
+            "le-global-add-title": addTitleInput,
+            "le-global-add-position": addPositionSelect,
+            "le-global-add-duplicate-warning": duplicateWarningEl,
+            "le-global-add-content": addContentTextarea,
+            "le-global-chatbot-edit-message": messageEl,
+            "le-global-edit-cancel": cancelButton,
+            "le-global-edit-save": saveButton,
+            "le-global-add-submit": addSubmitButton,
+        };
+
+        global.document = {
+            querySelectorAll: () => [],
+            querySelector: () => null,
+            getElementById: (id) => byId[id] || null,
+            createElement: () => makeFakeGenericElement(),
+            addEventListener() {},
+            removeEventListener() {},
+        };
+
+        global.window = {
+            confirm: () => true,
+            alert: () => {},
+            location: { reload: () => {} },
+        };
+
+        global.FormData = FakeFormData;
+
+        return {
+            modeEditButton,
+            modeAddButton,
+            countrySelect,
+            editOnlyFields,
+            sectionSelect,
+            textarea,
+            editHintEl,
+            addOnlyFields,
+            addTitleInput,
+            addPositionSelect,
+            duplicateWarningEl,
+            addContentTextarea,
+            messageEl,
+            cancelButton,
+            saveButton,
+            addSubmitButton,
+        };
+    }
+
+    let dom;
+    let fetchCalls;
+
+    beforeEach(() => {
+        dom = installEditSectionFakeDom();
+        fetchCalls = [];
+        loadFreshAdminModule();
+    });
+
+    afterEach(() => {
+        delete global.document;
+        delete global.window;
+        delete global.FormData;
+        delete global.fetch;
+        delete require.cache[require.resolve(ADMIN_JS_PATH)];
+    });
+
+    function queueFetchResponses(responses) {
+        let call = 0;
+
+        global.fetch = async (url, options) => {
+            fetchCalls.push({ url, options });
+
+            const response = responses[Math.min(call, responses.length - 1)];
+            call += 1;
+
+            return makeFakeResponse(response);
+        };
+    }
+
+    async function changeCountry(value) {
+        dom.countrySelect.value = value;
+        return dom.countrySelect._listeners.change();
+    }
+
+    async function changeSection(value) {
+        dom.sectionSelect.value = value;
+        return dom.sectionSelect._listeners.change();
+    }
+
+    async function clickSave() {
+        return dom.saveButton._listeners.click();
+    }
+
+    async function clickAdd() {
+        return dom.addSubmitButton._listeners.click();
+    }
+
+    function clickCancel() {
+        return dom.cancelButton._listeners.click();
+    }
+
+    function clickModeAdd() {
+        return dom.modeAddButton._listeners.click();
+    }
+
+    function clickModeEdit() {
+        return dom.modeEditButton._listeners.click();
+    }
+
+    const TWO_SECTIONS_RESPONSE = {
+        ok: true,
+        status: 200,
+        payload: {
+            success: true,
+            data: {
+                document_id: "doc_aaa",
+                sections: [
+                    { section_id: "sec-1", legal_topic: "Working Time" },
+                    { section_id: "sec-2", legal_topic: "Termination" },
+                ],
+            },
+        },
+    };
+
+    // --- Edit mode (unchanged contract from mission "ORDER 5D") --------
+
+    test("selecting a country fetches its sections and populates both the Edit dropdown and the Add position dropdown", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+
+        await changeCountry("doc_aaa");
+
+        assert.equal(fetchCalls.length, 1);
+        assert.match(fetchCalls[0].url, /action=le_global_chatbot_list_sections/);
+        assert.match(fetchCalls[0].url, /document_id=doc_aaa/);
+        assert.equal(dom.sectionSelect.disabled, false);
+        // Placeholder + 2 real sections, never a "Create section" entry.
+        assert.equal(dom.sectionSelect.options.length, 3);
+        assert.equal(dom.sectionSelect.options[1].value, "sec-1");
+        assert.equal(dom.sectionSelect.options[1].textContent, "Working Time");
+        assert.equal(dom.cancelButton.disabled, false);
+        assert.equal(dom.saveButton.disabled, true);
+
+        // Add's position dropdown: beginning / after each section / end.
+        assert.deepEqual(
+            dom.addPositionSelect.options.map((option) => option.value),
+            ["beginning", "after:sec-1", "after:sec-2", "end"]
+        );
+        assert.equal(dom.addTitleInput.disabled, false);
+        assert.equal(dom.addContentTextarea.disabled, false);
+    });
+
+    test("a country with zero sections disables the Edit dropdown but Add can still be used", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_empty", sections: [] } },
+            },
+        ]);
+
+        await changeCountry("doc_empty");
+
+        assert.equal(dom.sectionSelect.disabled, true);
+        assert.equal(dom.messageEl.textContent, "This country has no editable section yet.");
+        assert.deepEqual(
+            dom.addPositionSelect.options.map((option) => option.value),
+            ["beginning", "end"]
+        );
+        assert.equal(dom.addTitleInput.disabled, false);
+    });
+
+    test("clearing the country selection resets both modes' fields and makes zero network calls", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+
+        await changeCountry("doc_aaa");
+        await changeCountry("");
+
+        assert.equal(fetchCalls.length, 1);
+        assert.equal(dom.sectionSelect.disabled, true);
+        assert.equal(dom.textarea.value, "");
+        assert.equal(dom.textarea.disabled, true);
+        assert.equal(dom.cancelButton.disabled, true);
+        assert.equal(dom.saveButton.disabled, true);
+        assert.equal(dom.addTitleInput.disabled, true);
+        assert.equal(dom.addSubmitButton.disabled, true);
+    });
+
+    test("selecting a section fetches its effective content and enables Save only once the content actually changes", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Employees are entitled to 25 days of paid leave.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.match(fetchCalls[0].url, /action=le_global_chatbot_get_section/);
+        assert.equal(dom.textarea.value, "Employees are entitled to 25 days of paid leave.");
+        assert.equal(dom.textarea.disabled, false);
+        // Save is disabled until the admin actually edits the content
+        // (ORDER 8B, section 14: "disabled if no real change").
+        assert.equal(dom.saveButton.disabled, true);
+
+        dom.textarea.value = "Employees are entitled to 30 days of paid leave.";
+        dom.textarea._listeners.input();
+
+        assert.equal(dom.saveButton.disabled, false);
+    });
+
+    test("re-typing the exact original content disables Save again", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", content: "Original." } },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        dom.textarea.value = "Edited.";
+        dom.textarea._listeners.input();
+        assert.equal(dom.saveButton.disabled, false);
+
+        dom.textarea.value = "Original.";
+        dom.textarea._listeners.input();
+        assert.equal(dom.saveButton.disabled, true);
+    });
+
+    test("Save posts the edited content and re-fetches to show the value really persisted, with a business-friendly success message", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.countrySelect.options = [{ value: "doc_aaa", textContent: "Italy (IT)" }];
+        dom.countrySelect.selectedIndex = 0;
+        dom.sectionSelect.value = "sec-1";
+        dom.sectionSelect.options = [
+            { value: "", textContent: "Select a section…" },
+            { value: "sec-1", textContent: "Hiring Practices" },
+        ];
+        dom.sectionSelect.selectedIndex = 1;
+        dom.textarea.value = "Draft text the admin just typed.";
+        dom.saveButton.disabled = false;
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Hiring Practices" } },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Hiring Practices", content: "Draft text the admin just typed." },
+                },
+            },
+        ]);
+
+        await clickSave();
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].options.method, "POST");
+        assert.equal(fetchCalls[0].options.body.get("content"), "Draft text the admin just typed.");
+        assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_aaa");
+        assert.equal(fetchCalls[0].options.body.get("section_id"), "sec-1");
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_get_section/);
+        assert.equal(dom.textarea.value, "Draft text the admin just typed.");
+        assert.equal(
+            dom.messageEl.textContent,
+            "✓ Hiring Practices was updated successfully. The Italy document and chatbot content are now up to date."
+        );
+        assert.equal(dom.messageEl.className.includes("is-success"), true);
+        assert.equal(/chunk/i.test(dom.messageEl.textContent), false);
+        assert.equal(/index/i.test(dom.messageEl.textContent), false);
+    });
+
+    test("Save is a single mutation even under a double click", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "Some content.";
+        dom.saveButton.disabled = false;
+
+        let resolveFirstFetch;
+        let callCount = 0;
+
+        global.fetch = (url, options) => {
+            fetchCalls.push({ url, options });
+            callCount += 1;
+
+            if (callCount === 1) {
+                return new Promise((resolve) => {
+                    resolveFirstFetch = () => resolve(makeFakeResponse({
+                        ok: true,
+                        status: 200,
+                        payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x" } },
+                    }));
+                });
+            }
+
+            return Promise.resolve(makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", content: "Some content." } },
+            }));
+        };
+
+        const firstSave = clickSave();
+        const secondSave = clickSave();
+
+        resolveFirstFetch();
+        await firstSave;
+        await secondSave;
+
+        assert.equal(
+            fetchCalls.filter((call) => call.options.method === "POST").length,
+            1
+        );
+    });
+
+    test("Cancel resets everything (Edit and Add) to empty and makes zero network calls", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Some loaded content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.equal(fetchCalls.length, 1);
+
+        clickCancel();
+
+        assert.equal(fetchCalls.length, 1, "Cancel must never itself call fetch");
+        assert.equal(dom.countrySelect.value, "");
+        assert.equal(dom.sectionSelect.disabled, true);
+        assert.equal(dom.textarea.value, "");
+        assert.equal(dom.textarea.disabled, true);
+        assert.equal(dom.messageEl.textContent, "");
+        assert.equal(dom.cancelButton.disabled, true);
+        assert.equal(dom.saveButton.disabled, true);
+        assert.equal(dom.addSubmitButton.disabled, true);
+        assert.equal(dom.duplicateWarningEl.hidden, true);
+    });
+
+    test("changing the country again before the first sections fetch resolves discards the stale response", async () => {
+        let resolveFirst;
+        let secondResolved = false;
+
+        global.fetch = (url) => {
+            fetchCalls.push({ url });
+
+            if (fetchCalls.length === 1) {
+                return new Promise((resolve) => {
+                    resolveFirst = () => resolve(makeFakeResponse({
+                        ok: true,
+                        status: 200,
+                        payload: {
+                            success: true,
+                            data: { document_id: "doc_stale", sections: [{ section_id: "old-sec", legal_topic: "Stale" }] },
+                        },
+                    }));
+                });
+            }
+
+            secondResolved = true;
+
+            return Promise.resolve(makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_fresh", sections: [{ section_id: "new-sec", legal_topic: "Fresh" }] },
+                },
+            }));
+        };
+
+        dom.countrySelect.value = "doc_stale";
+        const firstChange = changeCountry("doc_stale");
+
+        dom.countrySelect.value = "doc_fresh";
+        await changeCountry("doc_fresh");
+
+        assert.equal(secondResolved, true);
+        assert.equal(dom.sectionSelect.options[1].value, "new-sec");
+
+        resolveFirst();
+        await firstChange;
+
+        assert.equal(dom.sectionSelect.options[1].value, "new-sec");
+    });
+
+    test("a structured backend error is surfaced verbatim, never the generic fallback", async () => {
+        queueFetchResponses([
+            {
+                ok: false,
+                status: 404,
+                payload: { success: false, data: { message: "No indexed document was found for this country." } },
+            },
+        ]);
+
+        await changeCountry("doc_missing");
+
+        assert.equal(dom.messageEl.textContent, "No indexed document was found for this country.");
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+    });
+
+    test("exotic content (script tags, ampersands, quotes) round-trips through .value untouched, never innerHTML", async () => {
+        const exotic = "<Company>\n<script>alert(1)</script>\n& \"quoted\" text";
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", content: exotic },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.equal(dom.textarea.value, exotic);
+    });
+
+    test("the update request is sent to the real admin-post URL from config, not a form.action lookalike", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "content";
+        dom.saveButton.disabled = false;
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x" } },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", content: "content" } },
+            },
+        ]);
+
+        await clickSave();
+
+        assert.equal(
+            fetchCalls[0].url,
+            "https://example.test/wp-admin/admin-post.php"
+        );
+    });
+
+    test("Cancel while a Save is still in flight leaves the country dropdown usable, not stuck disabled", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "content";
+        dom.saveButton.disabled = false;
+
+        let resolveSave;
+
+        global.fetch = (url) => {
+            fetchCalls.push({ url });
+
+            return new Promise((resolve) => {
+                resolveSave = () => resolve(makeFakeResponse({
+                    ok: true,
+                    status: 200,
+                    payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x" } },
+                }));
+            });
+        };
+
+        const savePromise = clickSave();
+
+        assert.equal(dom.countrySelect.disabled, true);
+
+        clickCancel();
+
+        assert.equal(dom.countrySelect.disabled, false);
+        assert.equal(dom.countrySelect.value, "");
+
+        resolveSave();
+        await savePromise;
+
+        assert.equal(dom.countrySelect.disabled, false);
+        assert.equal(dom.countrySelect.value, "");
+    });
+
+    // --- Mode toggle (ORDER 8B, section 12) ------------------------------
+
+    test("the segmented control defaults to Edit mode and toggling shows/hides the right fields", () => {
+        assert.equal(dom.editOnlyFields.hidden, false);
+        assert.equal(dom.addOnlyFields.hidden, true);
+        assert.equal(dom.saveButton.hidden, false);
+        assert.equal(dom.addSubmitButton.hidden, true);
+
+        clickModeAdd();
+
+        assert.equal(dom.editOnlyFields.hidden, true);
+        assert.equal(dom.addOnlyFields.hidden, false);
+        assert.equal(dom.saveButton.hidden, true);
+        assert.equal(dom.addSubmitButton.hidden, false);
+
+        clickModeEdit();
+
+        assert.equal(dom.editOnlyFields.hidden, false);
+        assert.equal(dom.addOnlyFields.hidden, true);
+    });
+
+    test("switching to Add mode with unsaved Edit content asks for confirmation; declining keeps the content and stays in Edit mode", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", content: "Original." } },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        dom.textarea.value = "Edited but not saved.";
+        dom.textarea._listeners.input();
+
+        global.window.confirm = () => false;
+
+        clickModeAdd();
+
+        assert.equal(dom.editOnlyFields.hidden, false, "must stay in Edit mode");
+        assert.equal(dom.textarea.value, "Edited but not saved.", "content must be preserved");
+    });
+
+    test("switching modes with no unsaved changes never prompts", async () => {
+        let confirmCalled = false;
+        global.window.confirm = () => {
+            confirmCalled = true;
+            return true;
+        };
+
+        clickModeAdd();
+
+        assert.equal(confirmCalled, false);
+    });
+
+    // --- Add flow (ORDER 8B, sections 15-18) -----------------------------
+
+    test("Add posts title/content/position, then re-fetches sections so the new one is immediately usable in Edit mode", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        await changeCountry("doc_aaa");
+
+        dom.countrySelect.options = [{ value: "doc_aaa", textContent: "Italy (IT)" }];
+        dom.countrySelect.selectedIndex = 0;
+
+        clickModeAdd();
+
+        dom.addTitleInput.value = "Remote Working";
+        dom.addTitleInput._listeners.input();
+        dom.addContentTextarea.value = "Employees may work remotely up to 2 days a week.";
+        dom.addContentTextarea._listeners.input();
+        dom.addPositionSelect.value = "after:sec-1";
+        dom.addPositionSelect._listeners.change();
+
+        assert.equal(dom.addSubmitButton.disabled, false);
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", legal_topic: "Remote Working" } },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        sections: [
+                            { section_id: "sec-1", legal_topic: "Working Time" },
+                            { section_id: "sec-3", legal_topic: "Remote Working" },
+                            { section_id: "sec-2", legal_topic: "Termination" },
+                        ],
+                    },
+                },
+            },
+        ]);
+
+        await clickAdd();
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].options.method, "POST");
+        assert.equal(fetchCalls[0].options.body.get("title"), "Remote Working");
+        assert.equal(
+            fetchCalls[0].options.body.get("content"),
+            "Employees may work remotely up to 2 days a week."
+        );
+        assert.equal(fetchCalls[0].options.body.get("position"), "after:sec-1");
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_sections/);
+
+        assert.equal(
+            dom.messageEl.textContent,
+            "✓ \"Remote Working\" was added successfully. The Italy document and chatbot content are now up to date."
+        );
+        assert.equal(/parser/i.test(dom.messageEl.textContent), false);
+        assert.equal(/index/i.test(dom.messageEl.textContent), false);
+
+        // The new section is immediately present for Edit mode.
+        assert.equal(dom.sectionSelect.options.length, 4);
+        assert.ok(
+            dom.sectionSelect.options.some((option) => option.value === "sec-3")
+        );
+
+        // The Add form itself clears for the next entry.
+        assert.equal(dom.addTitleInput.value, "");
+        assert.equal(dom.addContentTextarea.value, "");
+    });
+
+    test("a duplicate section title disables Add and shows the business-friendly warning, without ever calling the backend", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        await changeCountry("doc_aaa");
+
+        clickModeAdd();
+
+        dom.addTitleInput.value = "working time";
+        dom.addTitleInput._listeners.input();
+        dom.addContentTextarea.value = "Some content.";
+        dom.addContentTextarea._listeners.input();
+        dom.addPositionSelect.value = "end";
+        dom.addPositionSelect._listeners.change();
+
+        assert.equal(dom.duplicateWarningEl.hidden, false);
+        assert.equal(dom.addSubmitButton.disabled, true);
+        assert.match(
+            dom.duplicateWarningEl._children[0].textContent,
+            /"Working Time" already exists for this country/
+        );
+
+        const fetchCallsBefore = fetchCalls.length;
+        await clickAdd();
+
+        assert.equal(fetchCalls.length, fetchCallsBefore, "the backend must never be called for a known duplicate");
+    });
+
+    test("the duplicate warning's inline switch button jumps to Edit mode with that section selected", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        await changeCountry("doc_aaa");
+
+        clickModeAdd();
+
+        dom.addTitleInput.value = "Termination";
+        dom.addTitleInput._listeners.input();
+
+        const switchButton = dom.duplicateWarningEl._children[1];
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_aaa", section_id: "sec-2", legal_topic: "Termination", content: "Existing content." },
+                },
+            },
+        ]);
+
+        await switchButton._listeners.click();
+
+        assert.equal(dom.editOnlyFields.hidden, false);
+        assert.equal(dom.sectionSelect.value, "sec-2");
+        assert.equal(dom.textarea.value, "Existing content.");
+    });
+
+    test("Add is a single mutation even under a double click", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        await changeCountry("doc_aaa");
+
+        clickModeAdd();
+
+        dom.addTitleInput.value = "Remote Working";
+        dom.addTitleInput._listeners.input();
+        dom.addContentTextarea.value = "Content.";
+        dom.addContentTextarea._listeners.input();
+        dom.addPositionSelect.value = "end";
+        dom.addPositionSelect._listeners.change();
+
+        let resolveFirst;
+        let callCount = 0;
+
+        global.fetch = (url, options) => {
+            fetchCalls.push({ url, options });
+            callCount += 1;
+
+            if (callCount === 1) {
+                return new Promise((resolve) => {
+                    resolveFirst = () => resolve(makeFakeResponse({
+                        ok: true,
+                        status: 200,
+                        payload: { success: true, data: { document_id: "doc_aaa", legal_topic: "Remote Working" } },
+                    }));
+                });
+            }
+
+            return Promise.resolve(makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { sections: [] } },
+            }));
+        };
+
+        const firstAdd = clickAdd();
+        const secondAdd = clickAdd();
+
+        resolveFirst();
+        await firstAdd;
+        await secondAdd;
+
+        assert.equal(
+            fetchCalls.filter((call) => call.options.method === "POST").length,
+            1
+        );
+    });
+
+    test("a section_already_exists error from the backend maps to the business-friendly message, never the raw code", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        await changeCountry("doc_aaa");
+
+        clickModeAdd();
+
+        dom.addTitleInput.value = "Something New";
+        dom.addTitleInput._listeners.input();
+        dom.addContentTextarea.value = "Content.";
+        dom.addContentTextarea._listeners.input();
+        dom.addPositionSelect.value = "end";
+        dom.addPositionSelect._listeners.change();
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 409,
+            payload: {
+                success: false,
+                data: { detail: { code: "section_already_exists" } },
+            },
+        });
+
+        await clickAdd();
+
+        assert.equal(
+            dom.messageEl.textContent,
+            "This section already exists. Use \"Edit a section\" to update it."
+        );
+        assert.equal(dom.messageEl.textContent.includes("section_already_exists"), false);
+    });
+
+    test("changing country while Add has unsaved input asks for confirmation; accepting clears Add's fields", async () => {
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        await changeCountry("doc_aaa");
+
+        clickModeAdd();
+
+        dom.addTitleInput.value = "Draft title";
+        dom.addTitleInput._listeners.input();
+
+        global.window.confirm = () => true;
+
+        queueFetchResponses([TWO_SECTIONS_RESPONSE]);
+        dom.countrySelect.value = "";
+        await dom.countrySelect._listeners.change();
+
+        assert.equal(dom.addTitleInput.value, "");
+    });
+
+    test("Cancel with unsaved Add input asks for confirmation; declining leaves the draft untouched", () => {
+        dom.countrySelect.value = "doc_aaa";
+        clickModeAdd();
+
+        dom.addTitleInput.value = "Draft";
+        dom.addTitleInput._listeners.input();
+
+        global.window.confirm = () => false;
+
+        clickCancel();
+
+        assert.equal(dom.addTitleInput.value, "Draft", "declining must never discard the draft");
+    });
 });

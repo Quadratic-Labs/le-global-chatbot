@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
     Any,
@@ -25,6 +26,7 @@ from app.clients.opensearch import (
 )
 from app.models.admin_documents import (
     AdminDocumentListResponse,
+    AdminDocumentStatsResponse,
     AdminDocumentSummary,
     AdminDocumentUploadResponse,
 )
@@ -76,6 +78,43 @@ ExistingSourceLookup = Callable[
 
 class InvalidDocumentUploadError(ValueError):
     """Raised when an uploaded document is invalid."""
+
+
+class InvalidExtensionError(InvalidDocumentUploadError):
+    """Raised when the uploaded filename is not a .docx file."""
+
+
+class DocumentEmptyError(InvalidDocumentUploadError):
+    """Raised when the uploaded document has zero bytes."""
+
+
+class DocumentTooLargeError(InvalidDocumentUploadError):
+    """
+    Raised when the uploaded document exceeds the configured size
+    limit - carries the limit itself so the router can report
+    max_bytes/max_mb without the client having to already know it.
+    """
+
+    def __init__(self, *, maximum_bytes: int) -> None:
+        self.maximum_bytes = maximum_bytes
+        self.maximum_megabytes = round(maximum_bytes / (1024 * 1024), 2)
+
+        super().__init__(
+            "The uploaded DOCX exceeds the configured size limit of "
+            f"{self.maximum_megabytes} MB."
+        )
+
+
+class DocumentCorruptError(InvalidDocumentUploadError):
+    """Raised when the uploaded file is not a genuinely valid DOCX."""
+
+
+class DocumentParseFailedError(InvalidDocumentUploadError):
+    """Raised when a structurally valid DOCX could not be parsed."""
+
+
+class DocumentCountryUndeterminedError(InvalidDocumentUploadError):
+    """Raised when no supported country could be resolved from content."""
 
 
 class AdminDocumentStorageError(RuntimeError):
@@ -132,7 +171,7 @@ def _sanitize_filename(
         )
 
     if Path(basename).suffix.casefold() != ".docx":
-        raise InvalidDocumentUploadError(
+        raise InvalidExtensionError(
             "Only DOCX documents are accepted."
         )
 
@@ -182,9 +221,8 @@ def _write_upload(
             )
 
             if written_bytes > maximum_bytes:
-                raise InvalidDocumentUploadError(
-                    "The uploaded DOCX exceeds "
-                    "the configured size limit."
+                raise DocumentTooLargeError(
+                    maximum_bytes=maximum_bytes
                 )
 
             output_file.write(
@@ -192,7 +230,7 @@ def _write_upload(
             )
 
     if written_bytes == 0:
-        raise InvalidDocumentUploadError(
+        raise DocumentEmptyError(
             "The uploaded DOCX is empty."
         )
 
@@ -757,6 +795,21 @@ def list_indexed_documents(
                 resolved_source.path is not None
             )
 
+            source_bytes = (
+                resolved_source.path.stat().st_size
+                if resolved_source.path is not None
+                else None
+            )
+
+            updated_at = (
+                datetime.fromtimestamp(
+                    resolved_source.path.stat().st_mtime,
+                    tz=timezone.utc,
+                ).isoformat()
+                if resolved_source.path is not None
+                else None
+            )
+
             document_status = (
                 "indexed"
                 if source_file_present
@@ -765,6 +818,8 @@ def list_indexed_documents(
 
         except DocumentSourceConflictError:
             source_file_present = False
+            source_bytes = None
+            updated_at = None
             document_status = "indexed_source_conflict"
 
         reference_year = source.get(
@@ -809,6 +864,8 @@ def list_indexed_documents(
                 source_file_present=(
                     source_file_present
                 ),
+                source_bytes=source_bytes,
+                updated_at=updated_at,
                 status=document_status,
             )
         )
@@ -825,4 +882,43 @@ def list_indexed_documents(
             documents
         ),
         documents=documents,
+    )
+
+
+def get_admin_document_stats(
+    *,
+    source_directory: Path,
+    client: OpenSearch | None = None,
+) -> AdminDocumentStatsResponse:
+    """
+    Aggregate counts over the real indexed document catalog.
+
+    Deliberately built on top of list_indexed_documents() rather than
+    a second, independent OpenSearch aggregation - one source of truth
+    means stats can never silently drift from the list itself (mission
+    "ORDER 3": "Le calcul doit venir du catalogue réel. Pas
+    d'approximation.").
+    """
+
+    catalog = list_indexed_documents(
+        source_directory=source_directory,
+        client=client,
+    )
+
+    status_counts: dict[str, int] = {}
+
+    for document in catalog.documents:
+        status_counts[document.status] = (
+            status_counts.get(document.status, 0) + 1
+        )
+
+    return AdminDocumentStatsResponse(
+        total_documents=catalog.total,
+        total_countries=len(
+            {
+                document.country_code
+                for document in catalog.documents
+            }
+        ),
+        status_counts=status_counts,
     )

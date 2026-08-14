@@ -6,13 +6,18 @@ import re
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Final
 
 import pycountry
 
 from app.models.catalog import LegalCatalogResponse
 from app.models.chat import LegalChatRequest
+from app.services.jurisdiction_resolution import (
+    detect_unresolved_location_phrase,
+    resolve_city_country_codes,
+)
 from app.services.legal_catalog import (
     LegalCatalogError,
     get_legal_catalog,
@@ -197,6 +202,44 @@ def _build_global_country_data() -> (
 ) = _build_global_country_data()
 
 
+def _build_phrase_patterns() -> tuple[
+    tuple[str, re.Pattern[str], str], ...
+]:
+    """
+    Precompile every (phrase, pattern, country_code) triple exactly
+    once, longest phrase first, at import time.
+
+    Mission "ORDER 5C-GEO", section 22/23: detect_mentioned_country_
+    codes runs on every chat request; re-sorting ~400+ phrases and
+    re-compiling one regex per phrase on every single call (as this
+    used to do) is exactly the "mapping reconstruit à chaque request"
+    the mission asks to find and fix - a real, measured ~1.4ms per
+    call, almost entirely spent recompiling, not matching. The
+    dataset itself (pycountry's own country list) never changes at
+    runtime, so there is nothing to invalidate.
+    """
+
+    return tuple(
+        (
+            phrase,
+            re.compile(
+                rf"(?<!\w){re.escape(phrase)}(?!\w)"
+            ),
+            country_code,
+        )
+        for phrase, country_code in sorted(
+            _GLOBAL_COUNTRY_PHRASE_MAP.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+    )
+
+
+_COUNTRY_PHRASE_PATTERNS: Final[
+    tuple[tuple[str, re.Pattern[str], str], ...]
+] = _build_phrase_patterns()
+
+
 def get_country_name_variants(
     country_code: str,
 ) -> list[str]:
@@ -314,17 +357,7 @@ def detect_mentioned_country_codes(
         tuple[int, int, str]
     ] = []
 
-    sorted_phrases = sorted(
-        _GLOBAL_COUNTRY_PHRASE_MAP,
-        key=len,
-        reverse=True,
-    )
-
-    for phrase in sorted_phrases:
-        pattern = re.compile(
-            rf"(?<!\w){re.escape(phrase)}(?!\w)"
-        )
-
+    for phrase, pattern, country_code in _COUNTRY_PHRASE_PATTERNS:
         for match in pattern.finditer(
             normalized_question
         ):
@@ -334,9 +367,7 @@ def detect_mentioned_country_codes(
                     -len(
                         phrase
                     ),
-                    _GLOBAL_COUNTRY_PHRASE_MAP[
-                        phrase
-                    ],
+                    country_code,
                 )
             )
 
@@ -438,6 +469,132 @@ def is_country_only_followup(
     return country_codes
 
 
+class JurisdictionResolutionStatus(Enum):
+    """The four, and only four, outcomes resolve_jurisdiction returns."""
+
+    RESOLVED = "resolved"
+    AMBIGUOUS = "ambiguous"
+    UNKNOWN_LOCALITY = "unknown_locality"
+    NOT_FOUND = "not_found"
+
+
+@dataclass(frozen=True, slots=True)
+class JurisdictionResolution:
+    """
+    One resolved (or refused-to-guess) jurisdiction for a piece of text.
+
+    `candidate_country_codes` is populated only for AMBIGUOUS - the
+    real, distinct countries a matched city name (or, for two or more
+    explicit countries, the countries themselves) could plausibly
+    mean, never a guess at which one is "most likely". `matched_
+    location` is set for RESOLVED, AMBIGUOUS-by-city (never AMBIGUOUS-
+    by-multiple-explicit-countries, which sets only candidate_country_
+    codes), and UNKNOWN_LOCALITY - the last of these means the text
+    looks like it names a place ("employment law in <X>") that neither
+    an explicit country nor the city dataset recognizes; matched_
+    location then carries that phrase as written, for a caller to ask
+    which country it is in, never a fabricated country code.
+    """
+
+    status: JurisdictionResolutionStatus
+    country_code: str | None = None
+    country_name: str | None = None
+    matched_location: str | None = None
+    candidate_country_codes: tuple[str, ...] = field(
+        default_factory=tuple
+    )
+
+
+def resolve_jurisdiction(
+    text: str,
+) -> JurisdictionResolution:
+    """
+    Resolve the one jurisdiction `text` most likely refers to.
+
+    Priority (mission "ORDER 5C-GEO", section 10): an explicit country
+    name, alias, or demonym anywhere in the text always wins outright,
+    even when the same text also contains a city name ("Barcelona,
+    Spain" resolves to ES directly, never flagged ambiguous by
+    "Barcelona" alone). Only once zero explicit countries are found
+    does a city match (jurisdiction_resolution.resolve_city_country_
+    codes) get considered - and only when it resolves to exactly one
+    real country is that returned as RESOLVED; more than one candidate
+    country is AMBIGUOUS, never guessed.
+
+    A text naming two or more explicit countries (e.g. a country
+    comparison) is also AMBIGUOUS from this single-jurisdiction
+    primitive's own point of view - callers that need multi-country
+    handling (comparisons) already use detect_mentioned_country_codes
+    directly and never go through this function for that case.
+
+    A text that looks like it names a place ("employment law in
+    <X>") but resolves neither as an explicit country nor as a known
+    city is UNKNOWN_LOCALITY, not NOT_FOUND (corrective gate, section
+    11) - the two are genuinely different situations for a caller: no
+    location signal at all versus a location signal for a place this
+    dataset simply does not know, which deserves asking the user which
+    country it is in rather than the generic "specify a country"
+    prompt, and must never fabricate a country code for it.
+    """
+
+    explicit_codes = detect_mentioned_country_codes(text)
+
+    if len(explicit_codes) == 1:
+        code = explicit_codes[0]
+
+        return JurisdictionResolution(
+            status=JurisdictionResolutionStatus.RESOLVED,
+            country_code=code,
+            country_name=resolve_country_display_name(code),
+            matched_location=text.strip(),
+        )
+
+    if len(explicit_codes) > 1:
+        return JurisdictionResolution(
+            status=JurisdictionResolutionStatus.AMBIGUOUS,
+            candidate_country_codes=tuple(explicit_codes),
+        )
+
+    candidate_codes, matched_word = resolve_city_country_codes(
+        text
+    )
+
+    if not candidate_codes:
+        unresolved_phrase = detect_unresolved_location_phrase(
+            text
+        )
+
+        if unresolved_phrase is not None:
+            return JurisdictionResolution(
+                status=(
+                    JurisdictionResolutionStatus.UNKNOWN_LOCALITY
+                ),
+                matched_location=unresolved_phrase,
+            )
+
+        return JurisdictionResolution(
+            status=JurisdictionResolutionStatus.NOT_FOUND,
+        )
+
+    if len(candidate_codes) == 1:
+        code = next(iter(candidate_codes))
+
+        return JurisdictionResolution(
+            status=JurisdictionResolutionStatus.RESOLVED,
+            country_code=code,
+            country_name=resolve_country_display_name(code),
+            matched_location=matched_word,
+        )
+
+    return JurisdictionResolution(
+        status=JurisdictionResolutionStatus.AMBIGUOUS,
+        candidate_country_codes=tuple(
+            sorted(candidate_codes)
+        ),
+        matched_location=matched_word,
+    )
+
+
 def resolve_country_availability(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider = (
@@ -448,7 +605,15 @@ def resolve_country_availability(
     Split requested/mentioned countries into available and unavailable.
 
     Explicit country_codes always take priority over free-text
-    detection. Every mentioned code (explicit or detected) is checked
+    detection, which itself takes priority over a city-name fallback
+    (resolve_jurisdiction) - a question naming only a city
+    ("employment law in Lisbon") is treated exactly as if it had
+    named that city's country outright, but only when the city
+    resolves unambiguously; a genuinely ambiguous city name (e.g.
+    "Barcelona" alone) or no match at all contributes nothing here,
+    exactly as if no location had been mentioned (mission
+    "ORDER 5C-GEO", section 11: never guessed at this layer). Every
+    mentioned code (explicit, detected, or city-resolved) is checked
     against the indexed corpus, so a country outside the corpus is
     reported instead of triggering an unfiltered search.
     """
@@ -457,13 +622,36 @@ def resolve_country_availability(
         request.country_codes
     )
 
-    mentioned_codes = (
-        explicit_codes
-        if explicit_codes
-        else detect_mentioned_country_codes(
+    if explicit_codes:
+        mentioned_codes = explicit_codes
+
+    else:
+        # detect_mentioned_country_codes already supports naming
+        # several countries at once (a free-text comparison, e.g.
+        # "Compare France and Germany") - that multi-country result
+        # must flow through unchanged. The city fallback is only ever
+        # consulted when it finds NOTHING at all, and only ever
+        # contributes a single code (never several - a question
+        # naming two cities in two different countries is out of
+        # scope for this single-city fallback; see
+        # resolve_city_country_codes's own docstring).
+        detected_codes = detect_mentioned_country_codes(
             request.question
         )
-    )
+
+        if detected_codes:
+            mentioned_codes = detected_codes
+
+        else:
+            city_candidate_codes, _ = resolve_city_country_codes(
+                request.question
+            )
+
+            mentioned_codes = (
+                [next(iter(city_candidate_codes))]
+                if len(city_candidate_codes) == 1
+                else []
+            )
 
     if not mentioned_codes:
         return CountryAvailability(

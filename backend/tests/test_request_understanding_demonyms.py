@@ -411,7 +411,15 @@ class CityResolutionTests(unittest.TestCase):
     """
     An unambiguous city standing in for a supported country - the
     router trusts a validated country code the model resolves from a
-    city name, with no deterministic city dictionary of its own.
+    city name, PROVIDED the deterministic city resolver (mission
+    "ORDER 5C-GEO" corrective gate, app/services/jurisdiction_
+    resolution.py) has no objection of its own to raise first. That
+    deterministic layer only ever intercepts a request to ask its own
+    clarifying question when IT finds a genuine ambiguity or an
+    unrecognized-but-clearly-intended locality (see
+    AmbiguousCityInterceptsBeforeTheModelTests below) - it never
+    silently overrides a model-produced action for a city it
+    considers unambiguous, which is what these tests confirm.
     """
 
     def test_lima_resolves_to_peru_contact(self) -> None:
@@ -440,7 +448,16 @@ class CityResolutionTests(unittest.TestCase):
 
         self.assertTrue(response.grounded)
 
-    def test_barcelona_resolves_to_spain_contact(self) -> None:
+    def test_madrid_resolves_to_spain_contact(self) -> None:
+        # Deliberately not Barcelona: real geonamescache data shows a
+        # genuine, comparably-sized Barcelona, Venezuela alongside
+        # Barcelona, Spain, so the deterministic city resolver now
+        # (correctly) flags that one ambiguous before the model is
+        # ever consulted - see AmbiguousCityInterceptsBeforeTheModel
+        # Tests below. Madrid has no such real same-named rival on the
+        # dataset, so it is still a clean example of this class's own
+        # point: an unambiguous city, resolved by the model, executed
+        # as-is.
         understanding_client = FakeUnderstandingClient(
             payload=_understanding_result(
                 actions=[
@@ -457,7 +474,7 @@ class CityResolutionTests(unittest.TestCase):
         ):
             response = resolve_legal_chat_response(
                 request=LegalChatRequest(
-                    question="Who can help me in Barcelona?"
+                    question="Who can help me in Madrid?"
                 ),
                 catalog_provider=_catalog_provider,
                 search_function=_fail_if_called,
@@ -515,6 +532,78 @@ class CityResolutionTests(unittest.TestCase):
             response = resolve_legal_chat_response(
                 request=LegalChatRequest(
                     question="Is there somebody from your network in Sydney?"
+                ),
+                catalog_provider=_catalog_provider,
+                search_function=_fail_if_called,
+                understanding_client=understanding_client,
+            )
+
+        self.assertTrue(response.grounded)
+
+
+class AmbiguousCityInterceptsBeforeTheModelTests(unittest.TestCase):
+    """
+    Corrective gate, section 9 - a genuinely ambiguous city name is
+    caught by the deterministic layer and turned into a clarification
+    question BEFORE RequestUnderstanding (the model) is ever called,
+    regardless of what the model would have resolved it to. This is a
+    deliberate architecture change from CityResolutionTests' original
+    premise (there used to be no deterministic city dictionary at
+    all) - real geonamescache data shows Barcelona, Spain and
+    Barcelona, Venezuela at a ~2x population ratio, so this must never
+    be silently guessed either way.
+    """
+
+    def test_barcelona_alone_never_reaches_the_model(self) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "contact", country_codes=["ES"]
+                    )
+                ],
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="Who can help me in Barcelona?"
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_fail_if_called,
+            understanding_client=understanding_client,
+        )
+
+        self.assertEqual(understanding_client.call_count, 0)
+        self.assertFalse(response.grounded)
+        self.assertIn("Barcelona", response.answer)
+        self.assertIn("Spain", response.answer)
+        self.assertIn("Venezuela", response.answer)
+
+    def test_barcelona_spain_explicit_country_still_reaches_the_model(
+        self,
+    ) -> None:
+        # The explicit country resolves the ambiguity outright, so
+        # this is exactly the CityResolutionTests case again - the
+        # model is still trusted once the deterministic layer itself
+        # has nothing left to object to.
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "contact", country_codes=["ES"]
+                    )
+                ],
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=_fake_contact_search(expected_codes=["ES"]),
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="Who can help me in Barcelona, Spain?"
                 ),
                 catalog_provider=_catalog_provider,
                 search_function=_fail_if_called,

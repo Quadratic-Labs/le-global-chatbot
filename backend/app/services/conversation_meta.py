@@ -25,6 +25,11 @@ from app.services.country_detection import (
     detect_mentioned_country_codes,
     get_country_name_variants,
     resolve_country_display_name,
+    resolve_jurisdiction,
+)
+from app.services.jurisdiction_resolution import (
+    detect_unresolved_location_phrase,
+    resolve_city_country_codes,
 )
 from app.services.legal_topic_detection import (
     CANONICAL_LEGAL_TOPICS,
@@ -50,6 +55,9 @@ ConversationMetaIntent = Literal[
     "contact_catalogue",
     "country_suggestion",
     "unsupported_comparison",
+    "coverage_list_followup",
+    "ambiguous_city_clarification",
+    "unknown_locality_clarification",
 ]
 
 
@@ -300,6 +308,122 @@ def _history_country_suggestion_code(
     return None
 
 
+_COVERAGE_LIST_OFFER_MARKER: Final[str] = (
+    "would you like to see the countries currently covered"
+)
+
+
+def _history_offered_coverage_list(
+    history: Sequence[Any],
+) -> bool:
+    """
+    Return whether the assistant's own last message offered to show
+    the currently-covered countries (mission "ORDER 5C-GEO", sections
+    3/18) - the exact same marker-phrase-in-history technique
+    _history_country_suggestion_code already uses above, so a bare
+    "Yes" is interpreted purely by re-reading the conversation's own
+    text each turn, never a separate persisted flag that could be
+    left stuck on for an unrelated later turn.
+    """
+
+    recent_assistant_values = _history_values(
+        history, role="assistant", maximum=1
+    )
+
+    if not recent_assistant_values:
+        return False
+
+    normalized = _normalize(recent_assistant_values[0])
+
+    return _COVERAGE_LIST_OFFER_MARKER in normalized
+
+
+_AMBIGUOUS_CITY_OFFER_MARKER: Final[str] = (
+    "could refer to more than one country i can help with"
+)
+
+
+def resolve_ambiguous_city_followup_question(
+    question: str,
+    history: Sequence[Any],
+) -> str | None:
+    """
+    Resume an ambiguous-city clarification (corrective gate, section
+    9: "Barcelona" -> ambiguity -> ask -> "User: Spain" -> reprendre
+    la question avec ES) with a bare country-name reply.
+
+    Same self-expiring, text-only pattern as _history_offered_
+    coverage_list above: re-reads the assistant's own last message
+    rather than a persisted flag, so this only ever fires immediately
+    after that exact clarification and never lingers into an unrelated
+    later turn. This module has no access to RAG/retrieval, so it
+    never answers the resumed question itself - it only rebuilds the
+    effective question text (the originally-ambiguous question, with
+    the clarified country's name substituted for the city phrase that
+    was ambiguous) for the caller to run through the normal pipeline
+    exactly as if the user had asked it that way from the start.
+
+    Returns None whenever there is nothing to resume - including when
+    the current message names a country that was never actually
+    offered, so a reply naming an unrelated country is never silently
+    accepted as resolving someone else's ambiguity.
+    """
+
+    recent_assistant_values = _history_values(
+        history, role="assistant", maximum=1
+    )
+
+    if not recent_assistant_values:
+        return None
+
+    last_answer = recent_assistant_values[0]
+
+    if _AMBIGUOUS_CITY_OFFER_MARKER not in _normalize(last_answer):
+        return None
+
+    offered_codes = frozenset(
+        detect_mentioned_country_codes(last_answer)
+    )
+
+    if not offered_codes:
+        return None
+
+    detected_codes = detect_mentioned_country_codes(question)
+
+    if len(detected_codes) != 1 or detected_codes[0] not in offered_codes:
+        return None
+
+    previous_user_values = _history_values(
+        history, role="user", maximum=1
+    )
+
+    if not previous_user_values:
+        return None
+
+    previous_question = previous_user_values[0]
+    jurisdiction = resolve_jurisdiction(previous_question)
+
+    if jurisdiction.matched_location is None:
+        return None
+
+    clarified_name = resolve_country_display_name(
+        detected_codes[0]
+    )
+
+    resolved_question, substitution_count = re.subn(
+        rf"(?<!\w){re.escape(jurisdiction.matched_location)}(?!\w)",
+        clarified_name,
+        previous_question,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    if substitution_count == 0:
+        return None
+
+    return resolved_question
+
+
 def _history_values(
     history: Sequence[Any],
     *,
@@ -544,7 +668,11 @@ def _availability_answer(
             "the unavailable country or ask me to list the countries "
             "currently supported."
         )
-    elif not unavailable:
+    elif unavailable:
+        sections.append(
+            "Would you like to see the countries currently covered?"
+        )
+    else:
         sections.append(
             "You can now specify the employment-law topic you want "
             "to explore."
@@ -680,6 +808,25 @@ def _is_country_catalogue_query(text: str) -> bool:
     )
 
 
+_TARGETED_AVAILABILITY_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bdo you support\b",
+        r"\bdo you cover\b",
+        # A plain substring check here would miss the natural
+        # "is COUNTRY supported/available" word order (the country
+        # name sits between the verb and the adjective) - mirrors
+        # assistant_help.py's own _COUNTRIES_TARGETED_PATTERNS regex
+        # for the same phrasing, generalized to also match the
+        # country-before-verb ordering ("COUNTRY is supported").
+        r"\bis\b.*\b(?:supported|available)\b",
+        r"\bare\b.*\b(?:supported|available)\b",
+        r"\bdo you have (?:data|information|documents)\b",
+        r"\bcan you help with\b",
+    )
+)
+
+
 def _is_targeted_country_availability(
     text: str,
     country_codes: Sequence[str],
@@ -688,19 +835,8 @@ def _is_targeted_country_availability(
         return False
 
     return any(
-        phrase in text
-        for phrase in (
-            "do you support",
-            "do you cover",
-            "is available",
-            "are available",
-            "is supported",
-            "are supported",
-            "do you have data",
-            "do you have information",
-            "do you have documents",
-            "can you help with",
-        )
+        pattern.search(text)
+        for pattern in _TARGETED_AVAILABILITY_PATTERNS
     )
 
 
@@ -933,6 +1069,23 @@ def resolve_conversation_meta(
 
             return ConversationMetaResolution(
                 intent_type="targeted_country_availability",
+                answer=answer,
+                preserve_conversation_state=False,
+            )
+
+        if _history_offered_coverage_list(history):
+            catalog = _safe_catalog(catalog_provider)
+
+            if catalog is None:
+                answer = (
+                    "The supported-country catalogue is temporarily "
+                    "unavailable. Please try again shortly."
+                )
+            else:
+                answer = _country_catalogue_answer(catalog)
+
+            return ConversationMetaResolution(
+                intent_type="coverage_list_followup",
                 answer=answer,
                 preserve_conversation_state=False,
             )
@@ -1259,6 +1412,55 @@ def resolve_conversation_meta(
                         country_codes,
                         catalog,
                         comparison=False,
+                    ),
+                    preserve_conversation_state=False,
+                )
+
+    if not country_codes:
+        # country_codes is already confirmed empty here, so calling
+        # the full resolve_jurisdiction (which starts by re-deriving
+        # explicit countries from scratch) would only repeat the
+        # exact ~400-pattern scan this function's own country_codes
+        # line already ran - a real, measured ~2x-per-call redundancy
+        # found by adversarial review. Going straight to the city-only
+        # primitives below answers the same question without it, and,
+        # since neither primitive ever considers explicit countries at
+        # all, an ambiguity found here is structurally guaranteed to
+        # be city-caused - a real multi-country comparison (e.g.
+        # "Compare France and Germany") is detected via country_codes
+        # itself and never reaches this branch in the first place.
+        city_codes, matched_location = resolve_city_country_codes(
+            question
+        )
+
+        if len(city_codes) >= 2:
+            candidate_names = sorted(
+                resolve_country_display_name(code)
+                for code in city_codes
+            )
+
+            return ConversationMetaResolution(
+                intent_type="ambiguous_city_clarification",
+                answer=(
+                    f"{matched_location.title()} could "
+                    "refer to more than one country I can help with: "
+                    f"{_join_names(candidate_names)}. Which country "
+                    "do you mean?"
+                ),
+                preserve_conversation_state=False,
+            )
+
+        if not city_codes:
+            unresolved_locality = detect_unresolved_location_phrase(
+                question
+            )
+
+            if unresolved_locality is not None:
+                return ConversationMetaResolution(
+                    intent_type="unknown_locality_clarification",
+                    answer=(
+                        f"Which country is {unresolved_locality} "
+                        "in? I can help once I know the country."
                     ),
                     preserve_conversation_state=False,
                 )

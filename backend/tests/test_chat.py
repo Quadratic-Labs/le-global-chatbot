@@ -16,6 +16,10 @@ from app.clients.openai_responses import (
     GeneratedText,
     OpenAIResponseError,
 )
+from app.core.admin_country_policy import (
+    ADMIN_ALLOWED_COUNTRY_CODES,
+    is_admin_country_allowed,
+)
 from app.core.country_registry import COUNTRIES
 from app.models.catalog import (
     LegalCatalogCountry,
@@ -53,8 +57,25 @@ from app.services.rag_answer import (
 )
 
 
+# country_registry.COUNTRIES answers "can this country be detected/
+# named at all" (mission "ORDER 5C" grew it to include several
+# countries - France, Germany among them - registered only so an
+# admin upload for them resolves to "detected but not allowed"/
+# "detected and allowed" rather than "undetermined"; most of those
+# additions have no real indexed content yet). It is deliberately NOT
+# mirrored 1:1 into this fake catalog: doing so would silently claim
+# every registered country is indexed, which is exactly the France/
+# Germany-shaped bug this test suite exists to catch. France and
+# Germany are excluded here to represent their real, current
+# production state - registered and admin-upload-allowed, but not
+# (yet) indexed - which is also why they remain this suite's two
+# go-to examples of "recognized but unavailable" rather than
+# "unregistered" (Kenya/Nigeria cover that different case instead).
+_NOT_YET_INDEXED_CODES: frozenset[str] = frozenset({"FR", "DE"})
+
+
 def _build_catalog() -> LegalCatalogResponse:
-    """Build a catalog covering every country in the real corpus."""
+    """Build a catalog covering every actually-indexed real country."""
 
     return LegalCatalogResponse(
         countries=[
@@ -64,6 +85,7 @@ def _build_catalog() -> LegalCatalogResponse:
                 chunk_count=42,
             )
             for country in COUNTRIES
+            if country.code not in _NOT_YET_INDEXED_CODES
         ],
         legal_topics=[],
         subsections=[],
@@ -4293,6 +4315,295 @@ class ContactContentSanitizationTests(unittest.TestCase):
         self.assertEqual(answer_text.count("+44 20 1234 5678"), 1)
 
 
+class SlovakiaContactFallbackTests(unittest.TestCase):
+    """
+    Corrective gate, sections 16-20: Slovakia has no Employment Law
+    Overview of its own yet, so its member-firm contact is reached
+    through the Czechia office instead - a CONTACT-layer-only
+    routing rule, never a geography/policy/coverage substitution (SK
+    stays SK everywhere else - see test_country_detection.py/
+    test_admin_country_policy.py, neither of which this fallback
+    touches at all).
+    """
+
+    def _fake_search(
+        self,
+        hits_by_code: dict[str, list[LegalSearchHit]],
+    ):
+        def fake_search(
+            country_codes: list[str],
+            client: Any = None,
+        ) -> LegalSearchResponse:
+            hits = [
+                hit
+                for code in country_codes
+                for hit in hits_by_code.get(code.upper(), [])
+            ]
+
+            return LegalSearchResponse(
+                query="",
+                total=len(hits),
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=hits,
+            )
+
+        return fake_search
+
+    def test_a_slovakia_unavailable_legal_corpus_uses_czech_contact(
+        self,
+    ) -> None:
+        czech_hit = _build_contact_hit(
+            country_code="CZ",
+            country="Czechia",
+            content=(
+                "Member firm: Czech Test Firm\n"
+                "Email: contact@czech-firm.example"
+            ),
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=self._fake_search({"CZ": [czech_hit]}),
+        ):
+            answer_text, sources, _, _ = _build_contact_section(
+                country_codes=[],
+                unavailable_country_codes=["SK"],
+                citation_offset=0,
+            )
+
+        self.assertIn("Slovakia", answer_text)
+        self.assertIn("Czechia", answer_text)
+        self.assertIn("Czech Test Firm", answer_text)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].country_code, "CZ")
+
+    def test_b_contact_fallback_queries_the_czech_code(self) -> None:
+        observed_codes: list[list[str]] = []
+
+        def fake_search(
+            country_codes: list[str],
+            client: Any = None,
+        ) -> LegalSearchResponse:
+            observed_codes.append(sorted(country_codes))
+
+            return LegalSearchResponse(
+                query="",
+                total=0,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=fake_search,
+        ):
+            _build_contact_section(
+                country_codes=[],
+                unavailable_country_codes=["SK"],
+                citation_offset=0,
+            )
+
+        self.assertEqual(observed_codes, [["CZ"]])
+
+    def test_c_country_metadata_remains_slovakia_not_czech(
+        self,
+    ) -> None:
+        czech_hit = _build_contact_hit(
+            country_code="CZ",
+            country="Czechia",
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=self._fake_search({"CZ": [czech_hit]}),
+        ):
+            answer_text, sources, _, _ = _build_contact_section(
+                country_codes=[],
+                unavailable_country_codes=["SK"],
+                citation_offset=0,
+            )
+
+        # The section is still headed by Slovakia's own name - only
+        # the underlying source hit is Czech, never relabelled.
+        self.assertTrue(answer_text.startswith("Slovakia"))
+        self.assertEqual(sources[0].country, "Czechia")
+        self.assertEqual(sources[0].country_code, "CZ")
+
+    def test_d_slovakia_legal_information_never_uses_czech_corpus(
+        self,
+    ) -> None:
+        # The contact-layer fallback lives in _build_contact_section
+        # alone (chat.py) - the legal-information/RAG path
+        # (answer_legal_question) never imports or consults
+        # CONTACT_COUNTRY_FALLBACK_CODES at all, so a legal question
+        # about Slovakia gets the ordinary "not currently available"
+        # treatment, never Czech legal content presented as Slovak
+        # law.
+        def catalog_without_slovakia() -> LegalCatalogResponse:
+            catalog = _build_catalog()
+
+            return catalog.model_copy(
+                update={
+                    "countries": [
+                        country
+                        for country in catalog.countries
+                        if country.country_code != "SK"
+                    ]
+                }
+            )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["SK"],
+                        topic_text="notice period",
+                    )
+                ],
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What is the notice period in Slovakia?"
+            ),
+            catalog_provider=catalog_without_slovakia,
+            search_function=_unexpected_search,
+            understanding_client=understanding_client,
+        )
+
+        self.assertFalse(response.grounded)
+        self.assertIn("Slovakia", response.answer)
+        self.assertNotIn("Czech", response.answer)
+
+    def test_e_czech_contact_also_unavailable_is_a_safe_not_found(
+        self,
+    ) -> None:
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=self._fake_search({}),
+        ):
+            answer_text, sources, _, _ = _build_contact_section(
+                country_codes=[],
+                unavailable_country_codes=["SK"],
+                citation_offset=0,
+            )
+
+        self.assertIn("Slovakia", answer_text)
+        self.assertIn(
+            "I could not find a validated L&E Global contact",
+            answer_text,
+        )
+        self.assertNotIn("Czech", answer_text)
+        self.assertEqual(sources, [])
+
+    def test_f_combined_sk_and_cz_request_cites_the_chunk_once(
+        self,
+    ) -> None:
+        # Adversarial-review finding: requesting contact for both
+        # Slovakia and Czech Republic together (a realistic combined
+        # question) used to cite the one real Czech chunk twice, under
+        # two different citation numbers - once as Slovakia's
+        # fallback, once as Czechia's own. Both possible orderings
+        # (which country resolves as "available" first) must produce
+        # exactly one citation for the one underlying source.
+        czech_hit = _build_contact_hit(
+            country_code="CZ",
+            country="Czechia",
+        )
+
+        for country_codes, unavailable_codes in (
+            (["SK", "CZ"], []),
+            (["CZ"], ["SK"]),
+        ):
+            with self.subTest(
+                country_codes=country_codes,
+                unavailable_codes=unavailable_codes,
+            ):
+                with mock.patch(
+                    "app.routers.chat.search_contact_chunks",
+                    side_effect=self._fake_search(
+                        {"CZ": [czech_hit]}
+                    ),
+                ):
+                    answer_text, sources, _, _ = (
+                        _build_contact_section(
+                            country_codes=country_codes,
+                            unavailable_country_codes=(
+                                unavailable_codes
+                            ),
+                            citation_offset=0,
+                        )
+                    )
+
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(answer_text.count("[1]"), 2)
+                self.assertNotIn("[2]", answer_text)
+
+
+class OtherContactRoutingRegressionTests(unittest.TestCase):
+    """
+    Corrective gate, section 20 - the new SK-only fallback must never
+    change contact routing for any other country.
+    """
+
+    def test_other_countries_never_get_a_fallback_lookup(
+        self,
+    ) -> None:
+        observed_codes: list[list[str]] = []
+
+        def fake_search(
+            country_codes: list[str],
+            client: Any = None,
+        ) -> LegalSearchResponse:
+            observed_codes.append(sorted(country_codes))
+
+            return LegalSearchResponse(
+                query="",
+                total=0,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[],
+            )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=fake_search,
+        ):
+            for code in ("FR", "ES", "CA"):
+                with self.subTest(code=code):
+                    observed_codes.clear()
+
+                    _build_contact_section(
+                        country_codes=[code],
+                        unavailable_country_codes=[],
+                        citation_offset=0,
+                    )
+
+                    self.assertEqual(observed_codes, [[code]])
+
+    def test_unavailable_country_without_a_mapping_is_never_searched(
+        self,
+    ) -> None:
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+        ) as mocked_search:
+            answer_text, _, _, _ = _build_contact_section(
+                country_codes=[],
+                unavailable_country_codes=["DZ"],
+                citation_offset=0,
+            )
+
+        mocked_search.assert_not_called()
+        self.assertIn("Algeria", answer_text)
+
+
 class JurisdictionNeutralClientStateCompatibilityTests(unittest.TestCase):
     """
     Mission "DECOUPLAGE COMPLET DU SUJET JURIDIQUE ET DE LA
@@ -5279,28 +5590,48 @@ class AssistantHelpRouteTests(unittest.TestCase):
     def test_countries_general_names_exactly_the_registry_no_more_no_less(
         self,
     ) -> None:
-        # Mission "CONTINUATION PATCH 0.4.3", section 2: proves the
-        # help layer's country coverage is genuinely sourced from
-        # app.core.country_registry.COUNTRIES - the single, real
-        # registry, never a second/parallel or narrower/broader list -
-        # by checking every registered country's display name is named
-        # and nothing outside the registry (e.g. a country only ever
-        # present in a live OpenSearch catalog) leaks in. Canada is
-        # included here precisely because it is now a genuine COUNTRIES
-        # entry (added by this mission), not a hardcoded assumption.
+        # Originally mission "CONTINUATION PATCH 0.4.3", section 2 -
+        # updated by mission "ORDER 5C": the general country-coverage
+        # answer is genuinely sourced from the real indexed catalog
+        # (app.services.conversation_meta's own catalog_provider), not
+        # from app.core.country_registry.COUNTRIES directly - the
+        # registry now also holds several countries (France and
+        # Germany among them - see this file's own
+        # _NOT_YET_INDEXED_CODES) that are merely detectable/admin-
+        # upload-eligible but not yet actually indexed. This proves
+        # every catalog country's display name is named, and nothing
+        # outside the catalog - whether unregistered entirely or
+        # merely registered-but-not-indexed - leaks in. Canada is
+        # covered here precisely because it is a genuine catalog
+        # entry, not a hardcoded assumption.
         response = self._resolve("Which countries do you cover?")
         self._assert_clean_meta_response(response)
 
-        for country in COUNTRIES:
+        catalogued_countries = [
+            country
+            for country in COUNTRIES
+            if country.code not in _NOT_YET_INDEXED_CODES
+        ]
+
+        for country in catalogued_countries:
             with self.subTest(country=country.display_name):
                 self.assertIn(country.display_name, response.answer)
+
+        for excluded_code in _NOT_YET_INDEXED_CODES:
+            excluded_name = next(
+                country.display_name
+                for country in COUNTRIES
+                if country.code == excluded_code
+            )
+            with self.subTest(excluded=excluded_name):
+                self.assertNotIn(excluded_name, response.answer)
 
         named_country_count = sum(
             1
             for country in COUNTRIES
             if country.display_name in response.answer
         )
-        self.assertEqual(named_country_count, len(COUNTRIES))
+        self.assertEqual(named_country_count, len(catalogued_countries))
 
     def test_countries_targeted_supported(self) -> None:
         response = self._resolve("Do you cover Spain?")
@@ -5309,7 +5640,7 @@ class AssistantHelpRouteTests(unittest.TestCase):
         self.assertIn("Spain", response.answer)
 
     def test_countries_targeted_unsupported(self) -> None:
-        response = self._resolve("Do you cover France?")
+        response = self._resolve("Do you cover Kenya?")
         self._assert_clean_meta_response(response)
         self.assertIn("do not currently have", response.answer)
 
@@ -6080,6 +6411,400 @@ class FriendlyInvalidRequestHttpTests(unittest.TestCase):
             error_context.exception.detail,
             "Another invalid request.",
         )
+
+
+class ThreeAxisCountryAvailabilityContractTests(unittest.TestCase):
+    """
+    Mission "ORDER 5C" gate: three independent axes must never be
+    conflated -
+
+    1. country_registry.COUNTRIES - detectable at all.
+    2. admin_country_policy.ADMIN_ALLOWED_COUNTRY_CODES - accepted for
+       a NEW admin upload.
+    3. The real indexed catalog - does the chatbot actually have
+       content right now.
+
+    Each test below pins one concrete combination end-to-end through
+    resolve_legal_chat_response, independent of the other two tests'
+    fixtures/catalogs.
+    """
+
+    def test_registered_and_allowed_but_not_indexed_is_a_controlled_fallback(
+        self,
+    ) -> None:
+        # France: registered (COUNTRIES) and admin-upload-allowed
+        # (ADMIN_ALLOWED_COUNTRY_CODES), but absent from the indexed
+        # catalog (_catalog_provider's own _NOT_YET_INDEXED_CODES) -
+        # the chatbot must give an honest, controlled fallback, never
+        # fabricate an answer, and never attempt a search for it.
+        self.assertIn("FR", {country.code for country in COUNTRIES})
+        self.assertTrue(is_admin_country_allowed("FR"))
+        self.assertNotIn(
+            "FR",
+            {
+                country.country_code
+                for country in _catalog_provider().countries
+            },
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="clarification",
+                clarification_reason="missing_country",
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What are the overtime rules in France?"
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=_unexpected_search,
+            understanding_client=understanding_client,
+        )
+
+        self.assertFalse(response.grounded)
+        self.assertEqual(response.retrieval_total, 0)
+        self.assertEqual(response.sources, [])
+        self.assertIn("France", response.answer)
+
+    def test_registered_and_allowed_and_indexed_uses_the_normal_search_path(
+        self,
+    ) -> None:
+        # Same country (France) as the test above, but now genuinely
+        # present in the indexed catalog too - the normal grounded
+        # RAG path must proceed exactly as for any other available
+        # country, with no special-casing tied to the allowlist.
+        def catalog_with_france() -> LegalCatalogResponse:
+            return LegalCatalogResponse(
+                countries=[
+                    *_build_catalog().countries,
+                    LegalCatalogCountry(
+                        country_code="FR",
+                        country="France",
+                        chunk_count=12,
+                    ),
+                ],
+                legal_topics=[],
+                subsections=[],
+            )
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country_code="FR",
+                        country="France",
+                    )
+                ],
+            )
+
+        client = FakeGenerationClient(
+            answer="France\n- Supported by the top extract [1]."
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["FR"],
+                        topic_text="overtime rules",
+                    )
+                ],
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What are the overtime rules in France?",
+                country_codes=["FR"],
+            ),
+            catalog_provider=catalog_with_france,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+
+    def test_chat_availability_never_consults_the_admin_allowlist(
+        self,
+    ) -> None:
+        # Tunisia: registered but deliberately outside
+        # ADMIN_ALLOWED_COUNTRY_CODES (no new admin upload may target
+        # it). A legacy/pre-existing indexed document for it must
+        # still be served normally by chat - real indexed-catalog
+        # membership is the only thing that may ever govern chat
+        # availability, never the admin upload allowlist.
+        self.assertNotIn("TN", ADMIN_ALLOWED_COUNTRY_CODES)
+
+        def catalog_with_tunisia() -> LegalCatalogResponse:
+            return LegalCatalogResponse(
+                countries=[
+                    LegalCatalogCountry(
+                        country_code="TN",
+                        country="Tunisia",
+                        chunk_count=8,
+                    ),
+                ],
+                legal_topics=[],
+                subsections=[],
+            )
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country_code="TN",
+                        country="Tunisia",
+                    )
+                ],
+            )
+
+        client = FakeGenerationClient(
+            answer="Tunisia\n- Supported by the top extract [1]."
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["TN"],
+                        topic_text="overtime rules",
+                    )
+                ],
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What are the overtime rules in Tunisia?",
+                country_codes=["TN"],
+            ),
+            catalog_provider=catalog_with_tunisia,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+
+    def test_catalog_provider_is_called_at_most_once_per_request(
+        self,
+    ) -> None:
+        # Mission "ORDER 5C-GEO", sections 25/26: resolve_conversation_
+        # meta, _build_deterministic_hints (up to two calls internally
+        # - question and history), understand_request, and
+        # _execute_resolved_plan all consult the same real indexed-
+        # country catalog within one request - a request-scoped
+        # memoization must reduce that to a single real fetch, never
+        # a persistent/global cache.
+        call_count = 0
+
+        def counting_catalog_provider() -> LegalCatalogResponse:
+            nonlocal call_count
+            call_count += 1
+            return _build_catalog()
+
+        def fake_search(request: Any) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(country_code="ES", country="Spain")
+                ],
+            )
+
+        client = FakeGenerationClient(
+            answer="Spain\n- Supported by the top extract [1]."
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["ES"],
+                        topic_text="overtime rules",
+                    )
+                ],
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What are the overtime rules in Spain?",
+                history=[
+                    LegalChatHistoryMessage(
+                        role="user",
+                        content="What are the rules in Italy?",
+                    ),
+                    LegalChatHistoryMessage(
+                        role="assistant",
+                        content="Italy is currently available.",
+                    ),
+                ],
+            ),
+            catalog_provider=counting_catalog_provider,
+            search_function=fake_search,
+            generation_client=client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(call_count, 1)
+
+
+class EditRestoreConversationConsistencyTests(unittest.TestCase):
+    """
+    Mission "ORDER 7C": the reproduction investigation found no live
+    caching or conversation-history mechanism that could leak a
+    section's OLD content into an answer after an Edit/Restore -
+    resolve_legal_chat_response never reads request.history when
+    building retrieval or the generation context, and there is no
+    content-level cache anywhere in this pipeline (Redis is used only
+    for rate limiting). These tests pin that property down as a
+    permanent regression: the essential scenario the mission asks for
+    - old answer -> Edit -> same conversation -> answer reflects only
+    the current legal state, and a fresh conversation reaches the
+    exact same state - so a live caching/history-leak bug introduced
+    later would fail here immediately.
+    """
+
+    def _current_state_search(
+        self,
+        request: Any,
+    ) -> LegalSearchResponse:
+        """
+        Always returns exactly the CURRENT (post-Edit-or-Restore)
+        Italy chunk - a real search_function reads OpenSearch fresh
+        on every call, never anything cached from an earlier request
+        in the same or a different conversation.
+        """
+
+        return LegalSearchResponse(
+            query=request.query,
+            total=1,
+            limit=request.limit,
+            offset=0,
+            took_ms=1,
+            hits=[
+                _build_hit(
+                    country_code="IT",
+                    country="Italy",
+                    content=(
+                        "The current quota for non-EU subordinate "
+                        "workers is 180,000."
+                    ),
+                )
+            ],
+        )
+
+    def _understanding_client(self) -> "FakeUnderstandingClient":
+        return FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["IT"],
+                        legal_topics=["Hiring Practices"],
+                    )
+                ],
+            )
+        )
+
+    def test_same_conversation_history_never_leaks_the_old_answer_into_retrieval(
+        self,
+    ) -> None:
+        # The conversation's own history carries the OLD, pre-edit
+        # answer (164,850) as the assistant's prior turn - exactly
+        # what a real client resends on every follow-up call.
+        history = [
+            LegalChatHistoryMessage(
+                role="user",
+                content=(
+                    "What is the exact quota for non-EU subordinate "
+                    "workers in Italy for 2026?"
+                ),
+            ),
+            LegalChatHistoryMessage(
+                role="assistant",
+                content=(
+                    "Italy\n- The current quota is 164,850 [1]."
+                ),
+            ),
+        ]
+
+        client = FakeGenerationClient(
+            answer="Italy\n- The current quota is stated in [1].",
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What is the exact quota for non-EU subordinate "
+                    "workers in Italy for 2026?"
+                ),
+                history=history,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=self._current_state_search,
+            generation_client=client,
+            understanding_client=self._understanding_client(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(response.sources), 1)
+        self.assertEqual(
+            response.sources[0].chunk_id, "chunk-it"
+        )
+        # The stale "164,850" from history never reaches the answer -
+        # only the current search result's own content does.
+        self.assertNotIn("164,850", response.answer)
+
+    def test_fresh_conversation_reaches_the_exact_same_current_state(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Italy\n- The current quota is stated in [1].",
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What is the exact quota for non-EU subordinate "
+                    "workers in Italy for 2026?"
+                ),
+                history=[],
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=self._current_state_search,
+            generation_client=client,
+            understanding_client=self._understanding_client(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(response.sources), 1)
+        self.assertEqual(
+            response.sources[0].chunk_id, "chunk-it"
+        )
+        self.assertNotIn("164,850", response.answer)
+
 
 if __name__ == "__main__":
     unittest.main()

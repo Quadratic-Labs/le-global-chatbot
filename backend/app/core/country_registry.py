@@ -3,6 +3,8 @@ import re
 import unicodedata
 from typing import Final, Iterable
 
+import pycountry
+
 
 class CountryRegistryError(ValueError):
     """Base error raised by the country registry."""
@@ -96,8 +98,24 @@ COUNTRIES: Final[
         ),
     ),
     CountryDefinition(
+        code="FR",
+        display_name="France",
+    ),
+    CountryDefinition(
+        code="DE",
+        display_name="Germany",
+    ),
+    CountryDefinition(
         code="GR",
         display_name="Greece",
+    ),
+    CountryDefinition(
+        code="IN",
+        display_name="India",
+    ),
+    CountryDefinition(
+        code="ID",
+        display_name="Indonesia",
     ),
     CountryDefinition(
         code="IE",
@@ -127,6 +145,10 @@ COUNTRIES: Final[
         ),
     ),
     CountryDefinition(
+        code="NO",
+        display_name="Norway",
+    ),
+    CountryDefinition(
         code="PE",
         display_name="Peru",
     ),
@@ -143,12 +165,20 @@ COUNTRIES: Final[
         display_name="Poland",
     ),
     CountryDefinition(
+        code="PT",
+        display_name="Portugal",
+    ),
+    CountryDefinition(
         code="RO",
         display_name="Romania",
     ),
     CountryDefinition(
         code="SG",
         display_name="Singapore",
+    ),
+    CountryDefinition(
+        code="SK",
+        display_name="Slovakia",
     ),
     CountryDefinition(
         code="ES",
@@ -195,6 +225,7 @@ COUNTRIES: Final[
             "U.S.",
             "U.S.A.",
             "the United States",
+            "United States of America",
         ),
     ),
 )
@@ -204,6 +235,26 @@ _COUNTRY_CODE_PATTERN: Final[
     re.Pattern[str]
 ] = re.compile(
     r"^[A-Z]{2}$"
+)
+
+
+# A document's own front matter may or may not spell a country with
+# its English definite article ("the Czech Republic" vs "Czech
+# Republic") independently of which countries already happen to carry
+# an explicit "the X" alias below (mission "ORDER 2": Czech Republic's
+# real front matter used the article, had no such alias, and
+# country_code_from_name raised UnknownCountryNameError, masked by the
+# reindex router into a generic 502). Rather than requiring every
+# country whose common English name can take "the" to remember to
+# register that exact alias (Netherlands, Philippines, United Kingdom,
+# and United States already do; Czech Republic did not), the lookup
+# below tries the token as given first, then - only if that fails -
+# once more with a leading "the " stripped. Applied AFTER normalization
+# (already casefolded), so this is case-insensitive by construction.
+_LEADING_DEFINITE_ARTICLE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"^the\s+"
 )
 
 
@@ -349,6 +400,49 @@ def _build_country_indexes(
 )
 
 
+def _pycountry_code_from_name(
+    name: str,
+) -> str | None:
+    """
+    Generic ISO 3166-1 fallback for any world country this curated
+    registry does not specifically know about.
+
+    Mission "ORDER 5C-GEO", section 5: country_registry.py stays a
+    small, product-curated list (aliases, display names, historical
+    compatibility) - never an artisanal simulation of the whole
+    world's countries. That broader recognition already exists in
+    pycountry's own ISO 3166-1 dataset (the project's existing
+    dependency - see app/services/country_detection.py's own
+    worldwide phrase map), so a name this registry has no specific
+    entry for is resolved through it instead of a hand-added
+    CountryDefinition.
+    """
+
+    try:
+        country = pycountry.countries.lookup(name)
+
+    except LookupError:
+        return None
+
+    return country.alpha_2.upper()
+
+
+def _pycountry_display_name(
+    code: str,
+) -> str | None:
+    """The pycountry fallback's own display name for a country code
+    this registry has no curated CountryDefinition for."""
+
+    country = pycountry.countries.get(
+        alpha_2=code.upper()
+    )
+
+    if country is None:
+        return None
+
+    return country.name
+
+
 def normalize_country_code(
     country_code: str,
 ) -> str:
@@ -360,7 +454,10 @@ def normalize_country_code(
         .upper()
     )
 
-    if normalized_code not in _COUNTRIES_BY_CODE:
+    if (
+        normalized_code not in _COUNTRIES_BY_CODE
+        and _pycountry_display_name(normalized_code) is None
+    ):
         raise UnknownCountryCodeError(
             "Unknown country code: "
             f"{country_code!r}. "
@@ -375,7 +472,20 @@ def normalize_country_code(
 def country_code_from_name(
     country_name: str,
 ) -> str:
-    """Resolve a country name, alias, or filename token."""
+    """
+    Resolve a country name, alias, or filename token.
+
+    Falls back to stripping one leading definite article ("the ") when
+    the token does not otherwise match - a generic grammatical
+    normalization, not a per-country special case: it never widens
+    what counts as a known country, it only stops a real, already-
+    registered country's name from being missed merely because a
+    document happened to spell it with "the" and no exact alias for
+    that phrasing was registered. Only once both of those still fail
+    does the generic pycountry fallback run (_pycountry_code_from_name)
+    - so a curated alias always wins first for the countries this
+    product specifically knows about.
+    """
 
     normalized_name = (
         _normalize_country_token(
@@ -388,6 +498,33 @@ def country_code_from_name(
             normalized_name
         )
     )
+
+    name_without_article = (
+        _LEADING_DEFINITE_ARTICLE_PATTERN.sub(
+            "",
+            normalized_name,
+        )
+    )
+
+    if country_code is None and name_without_article != normalized_name:
+        country_code = (
+            _COUNTRY_CODES_BY_ALIAS.get(
+                name_without_article
+            )
+        )
+
+    if country_code is None:
+        # The generic pycountry fallback gets the same "the " stripping
+        # a curated alias already benefits from above - a real world
+        # country whose common name is casually written with a leading
+        # article ("the Gambia", "the Bahamas") must resolve exactly
+        # like "the Czech Republic" already does for a curated one,
+        # never only for the ~34 countries this registry curates.
+        country_code = _pycountry_code_from_name(
+            name_without_article
+        ) or _pycountry_code_from_name(
+            normalized_name
+        )
 
     if country_code is None:
         raise UnknownCountryNameError(
@@ -410,9 +547,23 @@ def canonical_country_name(
         country_code
     )
 
-    return _COUNTRIES_BY_CODE[
+    definition = _COUNTRIES_BY_CODE.get(
         normalized_code
-    ].display_name
+    )
+
+    if definition is not None:
+        return definition.display_name
+
+    # normalize_country_code above already proved this code resolves
+    # through the generic pycountry fallback when it is not one of
+    # the curated entries.
+    fallback_display_name = _pycountry_display_name(
+        normalized_code
+    )
+
+    assert fallback_display_name is not None
+
+    return fallback_display_name
 
 
 def country_name_and_aliases(
@@ -422,20 +573,30 @@ def country_name_and_aliases(
     Return the display name and every registered alias for one
     country code - the single, safe source other modules (for example
     legal_taxonomy's jurisdiction-suffix stripping) must reuse instead
-    of ever keeping a second, independent list of country names.
+    of ever keeping a second, independent list of country names. A
+    code outside the curated registry (resolved through the generic
+    pycountry fallback) has no curated aliases, so only its display
+    name is returned.
     """
 
     normalized_code = normalize_country_code(
         country_code
     )
 
-    definition = _COUNTRIES_BY_CODE[
+    definition = _COUNTRIES_BY_CODE.get(
         normalized_code
-    ]
+    )
+
+    if definition is not None:
+        return (
+            definition.display_name,
+            *definition.aliases,
+        )
 
     return (
-        definition.display_name,
-        *definition.aliases,
+        canonical_country_name(
+            normalized_code
+        ),
     )
 
 

@@ -1020,6 +1020,391 @@ class DocxParserTests(unittest.TestCase):
             )
 
 
+class CustomTopicRecognitionTests(unittest.TestCase):
+    """
+    ORDER 8A, section 12 - the parser must recognize a brand-new,
+    non-taxonomy top-level legal topic an admin adds, using only the
+    document's own real structure, generically (no topic name ever
+    hardcoded) - while never promoting front matter, an ordinary
+    subsection, or a stray list item that happens to share one weak
+    structural signal with the document's own real topics.
+    """
+
+    def _build(
+        self,
+        directory: Path,
+        blocks: list[tuple[str, str, int | None]],
+    ) -> Path:
+        """
+        blocks: (text, kind, heading_level) where kind is "heading" or
+        "paragraph"; heading_level is the Word heading style level (or
+        None for a plain paragraph).
+        """
+
+        file_path = directory / "sample.docx"
+        document = Document()
+
+        for text, kind, heading_level in blocks:
+            if kind == "heading":
+                document.add_heading(text, level=heading_level)
+            else:
+                document.add_paragraph(text)
+
+        document.save(file_path)
+        return file_path
+
+    def test_custom_topic_recognized_after_a_confirmed_topic(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            file_path = self._build(
+                Path(temp_dir),
+                [
+                    (
+                        "Employment Law Overview United Kingdom",
+                        "heading",
+                        1,
+                    ),
+                    ("Hiring Practices", "heading", 1),
+                    ("Real hiring content.", "paragraph", None),
+                    ("Remote Working", "heading", 1),
+                    (
+                        "Employees may work remotely. MARKER.",
+                        "paragraph",
+                        None,
+                    ),
+                ],
+            )
+
+            sections = parse_docx_sections(
+                file_path,
+                country="United Kingdom",
+            )
+
+            custom = [
+                section
+                for section in sections
+                if section.is_custom_legal_topic
+            ]
+
+            self.assertEqual(len(custom), 1)
+            self.assertEqual(custom[0].section, "Remote Working")
+            self.assertIn("MARKER", custom[0].content)
+
+    def test_custom_topic_not_recognized_before_any_confirmed_topic(
+        self,
+    ) -> None:
+        # A front-matter/introductory Heading 1 before the document's
+        # own overview or first real topic must never become a fake
+        # legal topic.
+        with TemporaryDirectory() as temp_dir:
+            file_path = self._build(
+                Path(temp_dir),
+                [
+                    ("Introduction", "heading", 1),
+                    (
+                        "Some introductory front matter text.",
+                        "paragraph",
+                        None,
+                    ),
+                    (
+                        "Employment Law Overview United Kingdom",
+                        "heading",
+                        1,
+                    ),
+                    ("Hiring Practices", "heading", 1),
+                    ("Real hiring content.", "paragraph", None),
+                ],
+            )
+
+            sections = parse_docx_sections(
+                file_path,
+                country="United Kingdom",
+            )
+
+            self.assertFalse(
+                any(
+                    section.is_custom_legal_topic
+                    for section in sections
+                )
+            )
+            self.assertNotIn(
+                "Introduction",
+                [section.section for section in sections],
+            )
+
+    def test_custom_topic_unsupported_when_real_topics_use_bold_only(
+        self,
+    ) -> None:
+        # Real topics recognized only via explicit bold (no Heading 1
+        # style, no numbering) give no reliable, unambiguous anchor to
+        # hold a candidate heading to - ordinary bold subsections are
+        # too common for that signal alone to be safe. Custom topics
+        # are simply unsupported for this document shape.
+        with TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "sample.docx"
+            document = Document()
+
+            document.add_heading(
+                "Employment Law Overview United Kingdom", level=1
+            )
+
+            bold_heading = document.add_paragraph()
+            bold_heading.add_run("Hiring Practices").bold = True
+            document.add_paragraph("Real hiring content.")
+
+            bold_custom = document.add_paragraph()
+            bold_custom.add_run("Remote Working").bold = True
+            document.add_paragraph("Remote work content.")
+
+            document.save(file_path)
+
+            sections = parse_docx_sections(
+                file_path,
+                country="United Kingdom",
+            )
+
+            self.assertFalse(
+                any(
+                    section.is_custom_legal_topic
+                    for section in sections
+                )
+            )
+
+    def test_custom_topic_requires_the_same_signal_as_confirmed_topics(
+        self,
+    ) -> None:
+        # Real topics here all carry BOTH Heading 1 AND list numbering
+        # - a heading_level-1-only candidate (no numbering) must not
+        # be promoted, even though it comes after a confirmed topic.
+        with TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "sample.docx"
+            document = Document()
+
+            document.add_heading(
+                "Employment Law Overview United Kingdom", level=1
+            )
+
+            hiring_heading = document.add_heading(
+                "Hiring Practices", level=1
+            )
+            _mark_as_numbered(hiring_heading)
+            document.add_paragraph("Real hiring content.")
+
+            document.add_heading(
+                "Key Points", level=1
+            )
+            document.add_paragraph(
+                "This is an ordinary sub-heading, not numbered like "
+                "the real topics."
+            )
+
+            document.save(file_path)
+
+            sections = parse_docx_sections(
+                file_path,
+                country="United Kingdom",
+            )
+
+            self.assertFalse(
+                any(
+                    section.is_custom_legal_topic
+                    for section in sections
+                )
+            )
+            self.assertNotIn(
+                "Key Points",
+                [section.section for section in sections],
+            )
+
+    def test_custom_topic_rejects_sentence_shaped_candidates(
+        self,
+    ) -> None:
+        # A numbered list item that happens to share the document's
+        # own (Heading 1 + numbering) signal, but reads like a clause
+        # in an enumerated sentence (lowercase start, trailing
+        # semicolon) rather than a title, must never be promoted.
+        with TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "sample.docx"
+            document = Document()
+
+            document.add_heading(
+                "Employment Law Overview United Kingdom", level=1
+            )
+
+            hiring_heading = document.add_heading(
+                "Hiring Practices", level=1
+            )
+            _mark_as_numbered(hiring_heading)
+            document.add_paragraph("Real hiring content.")
+
+            list_item_heading = document.add_heading(
+                "the Corporations Act;", level=1
+            )
+            _mark_as_numbered(list_item_heading)
+            document.add_paragraph("More content.")
+
+            document.save(file_path)
+
+            sections = parse_docx_sections(
+                file_path,
+                country="United Kingdom",
+            )
+
+            self.assertFalse(
+                any(
+                    section.is_custom_legal_topic
+                    for section in sections
+                )
+            )
+
+    def test_generic_mode_never_recognizes_custom_legal_topics(
+        self,
+    ) -> None:
+        # Custom-topic recognition is a strict L&E (country-supplied)
+        # concept only - generic mode's own Heading 1 handling is
+        # unrelated and must never mark anything is_custom_legal_topic.
+        with TemporaryDirectory() as temp_dir:
+            file_path = self._build(
+                Path(temp_dir),
+                [
+                    ("Some Section", "heading", 1),
+                    ("Some content.", "paragraph", None),
+                    ("Another Section", "heading", 1),
+                    ("More content.", "paragraph", None),
+                ],
+            )
+
+            sections = parse_docx_sections(file_path)
+
+            self.assertFalse(
+                any(
+                    section.is_custom_legal_topic
+                    for section in sections
+                )
+            )
+
+
+class AdminSectionMarkerRecognitionTests(unittest.TestCase):
+    """
+    ORDER 8A-C - the dedicated ADMIN-section marker style
+    (ADMIN_SECTION_STYLE_NAME) is the sole, deterministic identity a
+    reparse relies on for an admin-added top-level topic: it must work
+    regardless of the surrounding document's own native convention
+    (Heading 1, bold-only, or anything else), regardless of country,
+    and regardless of document position - unlike the older, structural-
+    signal-based custom-topic heuristic this supersedes for anything
+    the ADMIN Add feature itself creates.
+    """
+
+    def _add_marker_heading(
+        self,
+        document: Document,
+        title: str,
+    ) -> None:
+        from docx.enum.style import WD_STYLE_TYPE
+
+        from app.services.docx_parser import ADMIN_SECTION_STYLE_NAME
+
+        try:
+            style = document.styles[ADMIN_SECTION_STYLE_NAME]
+        except KeyError:
+            style = document.styles.add_style(
+                ADMIN_SECTION_STYLE_NAME,
+                WD_STYLE_TYPE.PARAGRAPH,
+            )
+            style.font.bold = True
+
+        document.add_paragraph(title, style=style.name)
+
+    def test_marker_recognized_in_bold_only_document(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "sample.docx"
+            document = Document()
+
+            document.add_paragraph(
+                "Employment Law Overview United Kingdom"
+            )
+
+            hiring = document.add_paragraph()
+            hiring.add_run("Hiring Practices").bold = True
+            document.add_paragraph("Real hiring content.")
+
+            self._add_marker_heading(document, "Remote Working")
+            document.add_paragraph("Remote work content. MARKER.")
+
+            document.save(file_path)
+
+            sections = parse_docx_sections(
+                file_path, country="United Kingdom"
+            )
+
+            custom = [s for s in sections if s.is_custom_legal_topic]
+            self.assertEqual(len(custom), 1)
+            self.assertEqual(custom[0].section, "Remote Working")
+            self.assertIn("MARKER", custom[0].content)
+
+            # native topic untouched
+            hiring_sections = [
+                s for s in sections if s.section == "Hiring Practices"
+            ]
+            self.assertEqual(len(hiring_sections), 1)
+            self.assertEqual(
+                hiring_sections[0].content, "Real hiring content."
+            )
+
+    def test_marker_recognized_with_no_native_topics_at_all(
+        self,
+    ) -> None:
+        # The marker never depends on any structural-signal-learning
+        # from the surrounding document - it must fire even when there
+        # is nothing else to learn a signal from.
+        with TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "sample.docx"
+            document = Document()
+
+            document.add_paragraph("Just some plain front matter.")
+            self._add_marker_heading(document, "Custom Only Section")
+            document.add_paragraph("Custom-only content.")
+
+            document.save(file_path)
+
+            sections = parse_docx_sections(
+                file_path, country="United Kingdom"
+            )
+
+            custom = [s for s in sections if s.is_custom_legal_topic]
+            self.assertEqual(len(custom), 1)
+            self.assertEqual(custom[0].section, "Custom Only Section")
+
+    def test_marker_style_alone_never_appears_on_native_content(
+        self,
+    ) -> None:
+        # Sanity check on the corpus-safety assumption the marker
+        # design depends on: an ordinary document (no marker style
+        # ever applied) never has any paragraph whose is_custom_legal_
+        # topic could be confused with the marker mechanism.
+        with TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "sample.docx"
+            document = Document()
+
+            document.add_heading(
+                "Employment Law Overview United Kingdom", level=1
+            )
+            document.add_heading("Hiring Practices", level=1)
+            document.add_paragraph("Real hiring content.")
+
+            document.save(file_path)
+
+            sections = parse_docx_sections(
+                file_path, country="United Kingdom"
+            )
+
+            self.assertFalse(
+                any(s.is_custom_legal_topic for s in sections)
+            )
+
+
 class ContactBlockParsingTests(unittest.TestCase):
     """
     Tests for parse_contact_blocks() against a synthetic paragraph

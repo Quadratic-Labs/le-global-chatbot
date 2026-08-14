@@ -24,7 +24,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.core.country_registry import COUNTRIES
+from app.core.country_registry import (
+    COUNTRIES,
+    UnknownCountryCodeError,
+    normalize_country_code,
+)
 from app.services.legal_topic_taxonomy import CANONICAL_LEGAL_TOPICS
 
 
@@ -64,10 +68,6 @@ MAX_CONCEPT_TERM_CHARACTERS = 80
 MAX_SUBJECT_TEXT_CHARACTERS = 300
 MAX_RESOLVED_QUESTION_CHARACTERS = 500
 MAX_CONVERSATION_STATE_JSON_CHARACTERS = 8000
-
-_SUPPORTED_COUNTRY_CODES: frozenset[str] = frozenset(
-    country.code for country in COUNTRIES
-)
 
 
 class ConversationSearchConcept(BaseModel):
@@ -169,12 +169,13 @@ class ConversationActionState(BaseModel):
         normalized_codes: list[str] = []
 
         for code in self.country_codes:
-            upper_code = code.strip().upper()
+            try:
+                upper_code = normalize_country_code(code)
 
-            if upper_code not in _SUPPORTED_COUNTRY_CODES:
+            except UnknownCountryCodeError as error:
                 raise ValueError(
                     f"Unsupported country code: {code!r}"
-                )
+                ) from error
 
             if upper_code not in normalized_codes:
                 normalized_codes.append(upper_code)
@@ -257,12 +258,13 @@ class ConversationPendingClarification(BaseModel):
         normalized_codes: list[str] = []
 
         for code in self.candidate_country_codes:
-            upper_code = code.strip().upper()
+            try:
+                upper_code = normalize_country_code(code)
 
-            if upper_code not in _SUPPORTED_COUNTRY_CODES:
+            except UnknownCountryCodeError as error:
                 raise ValueError(
                     f"Unsupported country code: {code!r}"
-                )
+                ) from error
 
             if upper_code not in normalized_codes:
                 normalized_codes.append(upper_code)

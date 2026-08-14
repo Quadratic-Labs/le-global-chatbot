@@ -20,7 +20,8 @@ from app.clients.openai_responses import (
     get_openai_rerank_client,
 )
 from app.core.country_registry import (
-    COUNTRIES,
+    UnknownCountryCodeError,
+    country_name_and_aliases,
 )
 from app.services.country_detection import (
     resolve_country_display_name,
@@ -526,21 +527,18 @@ def _country_name_variants_for_codes(
 
     variants: list[str] = []
 
-    for country in COUNTRIES:
-        if country.code not in normalized_codes:
+    for code in normalized_codes:
+        try:
+            names = country_name_and_aliases(code)
+
+        except UnknownCountryCodeError:
             continue
 
-        variants.append(
-            country.display_name
-        )
-
-        variants.extend(
-            country.aliases
-        )
+        variants.extend(names)
 
         variants.extend(
             COUNTRY_ADJECTIVES.get(
-                country.code,
+                code,
                 (),
             )
         )
@@ -1723,16 +1721,13 @@ def _country_heading_variants_for_code(
     "Australia" is).
     """
 
-    normalized_code = country_code.upper()
+    try:
+        return country_name_and_aliases(
+            country_code
+        )
 
-    for country in COUNTRIES:
-        if country.code == normalized_code:
-            return (
-                country.display_name,
-                *country.aliases,
-            )
-
-    return ()
+    except UnknownCountryCodeError:
+        return ()
 
 
 def _is_canonical_country_heading(
