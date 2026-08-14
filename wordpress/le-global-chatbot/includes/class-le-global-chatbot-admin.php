@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.4.10';
+    private const VERSION = '0.4.11';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -57,6 +57,10 @@ final class LE_Global_Chatbot_Admin
 
     private const SECTION_UPDATE_ACTION = (
         'le_global_chatbot_update_section'
+    );
+
+    private const SECTION_RESTORE_ACTION = (
+        'le_global_chatbot_restore_section'
     );
 
     private static ?string $page_hook = null;
@@ -111,6 +115,11 @@ final class LE_Global_Chatbot_Admin
         add_action(
             'admin_post_' . self::SECTION_UPDATE_ACTION,
             [self::class, 'handle_update_section']
+        );
+
+        add_action(
+            'admin_post_' . self::SECTION_RESTORE_ACTION,
+            [self::class, 'handle_restore_section']
         );
     }
 
@@ -464,6 +473,16 @@ final class LE_Global_Chatbot_Admin
                             )
                         );
                     ?>"
+                    data-section-restore-action="<?php
+                        echo esc_attr(self::SECTION_RESTORE_ACTION);
+                    ?>"
+                    data-section-restore-nonce="<?php
+                        echo esc_attr(
+                            wp_create_nonce(
+                                self::SECTION_RESTORE_ACTION
+                            )
+                        );
+                    ?>"
                 >
                     <div class="le-global-chatbot-admin__edit-field">
                         <label for="le-global-edit-country">
@@ -547,6 +566,15 @@ final class LE_Global_Chatbot_Admin
                             disabled
                         >
                             Cancel
+                        </button>
+
+                        <button
+                            type="button"
+                            id="le-global-edit-restore"
+                            class="button"
+                            disabled
+                        >
+                            Restore from document
                         </button>
 
                         <button
@@ -1818,10 +1846,51 @@ final class LE_Global_Chatbot_Admin
     }
 
     /**
-     * Shared JSON relay for the three section endpoints above - the
+     * Discard any persisted Edit for one section and restore it to
+     * the current source DOCX's own content (mission "ORDER 7C") -
+     * the only supported path back to the DOCX for a single section,
+     * never a full document Replace/Delete (which would also discard
+     * every OTHER section's own edits). Takes no content - the
+     * backend derives the restored content entirely from the
+     * document's own current source file.
+     */
+    public static function handle_restore_section(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::SECTION_RESTORE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $section_id = self::read_section_id_for_json();
+
+        $result = self::request_backend(
+            'POST',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/sections/'
+            . rawurlencode($section_id)
+            . '/restore',
+            null,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The section could not be restored.'
+        );
+    }
+
+    /**
+     * Shared JSON relay for the four section endpoints above - the
      * same is_wp_error/status_code/extract_message pattern
      * handle_refresh and the older form-based handlers each already
-     * used, factored out once these three needed it identically.
+     * used, factored out once these four needed it identically.
      */
     private static function relay_json_result(
         $result,

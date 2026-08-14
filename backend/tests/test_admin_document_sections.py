@@ -38,12 +38,16 @@ from opensearchpy.exceptions import OpenSearchException
 from app.services.admin_document_lifecycle import (
     AdminDocumentRollbackError,
 )
+from app.services.admin_document_lifecycle import (
+    _apply_persisted_section_edits,
+)
 from app.services.admin_document_sections import (
     AdminDocumentSectionInvalidError,
     AdminDocumentSectionNotFoundError,
     AdminDocumentSectionUpdateFailedError,
     get_effective_section,
     list_effective_sections,
+    restore_effective_section,
     update_effective_section,
 )
 from app.services.document_chunk_builder import (
@@ -1377,6 +1381,557 @@ class AdminDocumentSectionUpdateRollbackTests(unittest.TestCase):
             )
             self.assertEqual(
                 client.chunks["chunk-seed-ec"]["content"], "placeholder"
+            )
+
+
+def _write_docx_with_subsections(
+    path: Path,
+    heading: str,
+    subsections: list[tuple[str, str]],
+) -> None:
+    """
+    One minimal, real DOCX: a single Heading 1 (legal topic) followed
+    by several Heading 2 (subsection) + paragraph pairs - the genuine
+    multi-subsection cover shape restore_effective_section must
+    recover exactly, unlike update_effective_section's single-blob
+    Edit (mission "ORDER 7C").
+    """
+
+    document = Document()
+    document.add_heading(heading, level=1)
+
+    for subheading, content in subsections:
+        document.add_heading(subheading, level=2)
+        document.add_paragraph(content)
+
+    document.save(path)
+
+
+class AdminDocumentSectionRestoreTests(unittest.TestCase):
+    """
+    Mission "ORDER 7C": restore_effective_section is the only
+    supported path back to the current source DOCX's own content for
+    one section, without a full document Replace/Delete.
+    """
+
+    def test_restore_recovers_real_subsections(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx_with_subsections(
+                source_directory / "GB.docx",
+                "Hiring Practices",
+                [
+                    (
+                        "Limitations on Background Checks",
+                        "Credit checks are prohibited.",
+                    ),
+                    (
+                        "Requirement for Foreign Employees to Work",
+                        "The quota is 164,850.",
+                    ),
+                ],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-hp": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Hiring Practices",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                # An Edit first collapses both real subsections into
+                # one blob, exactly like a real admin pasting the
+                # whole topic's content back with one number changed.
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    new_content=(
+                        "Credit checks are prohibited.\n\n"
+                        "The quota is 180,000."
+                    ),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                response = restore_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(response.legal_topic, "Hiring Practices")
+            self.assertEqual(response.indexed_chunks, 2)
+
+            remaining = {
+                chunk["subsection"]: chunk["content"]
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Hiring Practices"
+            }
+            self.assertEqual(len(remaining), 2)
+            self.assertEqual(
+                remaining["Limitations on Background Checks"],
+                "Credit checks are prohibited.",
+            )
+            self.assertEqual(
+                remaining["Requirement for Foreign Employees to Work"],
+                "The quota is 164,850.",
+            )
+
+            # The single-blob Edit's own chunk (one subsection label
+            # borrowed for everything) is gone - restore genuinely
+            # replaced the whole topic, not merely added to it.
+            self.assertNotIn("chunk-seed-hp", client.chunks)
+
+    def test_restore_removes_only_the_targeted_override(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-ec": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Employment Contracts",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="An edit to discard.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                restore_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            state = read_section_edit_state(source_directory, DOCUMENT_ID)
+            self.assertEqual(state.sections, {})
+
+            response = get_effective_section(
+                document_id=DOCUMENT_ID,
+                section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(response.content, "Original DOCX text.")
+
+    def test_restore_preserves_other_sections_own_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [
+                    ("Employment Contracts", "Original contracts text."),
+                    ("Hiring Practices", "Original hiring text."),
+                ],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-ec": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Employment Contracts",
+                        content="placeholder",
+                    ),
+                    "chunk-seed-hp": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Hiring Practices",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Contracts edit that must survive.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    new_content="Hiring edit that will be discarded.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                restore_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            # The OTHER section's own edit, in both the durable state
+            # and OpenSearch, is completely untouched.
+            state = read_section_edit_state(source_directory, DOCUMENT_ID)
+            self.assertEqual(
+                set(state.sections), {EMPLOYMENT_CONTRACTS_SECTION_ID}
+            )
+            self.assertEqual(
+                state.sections[EMPLOYMENT_CONTRACTS_SECTION_ID].content,
+                "Contracts edit that must survive.",
+            )
+
+            contracts_response = get_effective_section(
+                document_id=DOCUMENT_ID,
+                section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(
+                contracts_response.content,
+                "Contracts edit that must survive.",
+            )
+
+            hiring_response = get_effective_section(
+                document_id=DOCUMENT_ID,
+                section_id=HIRING_PRACTICES_SECTION_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(
+                hiring_response.content, "Original hiring text."
+            )
+
+    def test_restore_without_any_override_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = FakeSectionOpenSearchClient(chunks={})
+
+            with _patched_indexer(client):
+                first = restore_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+                second = restore_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(first.indexed_chunks, 1)
+            self.assertEqual(second.indexed_chunks, 1)
+
+            state = read_section_edit_state(source_directory, DOCUMENT_ID)
+            self.assertEqual(state.sections, {})
+
+            response = get_effective_section(
+                document_id=DOCUMENT_ID,
+                section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(response.content, "Original DOCX text.")
+
+    def test_restore_opensearch_bulk_failure_never_touches_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-ec": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Employment Contracts",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="An edit that restore will try to undo.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            before = copy.deepcopy(client.chunks)
+            state_before = read_section_edit_state(
+                source_directory, DOCUMENT_ID
+            )
+
+            bulk_call_count = 0
+
+            def selective_bulk(
+                client: Any,
+                actions: Any,
+                **kwargs: Any,
+            ) -> tuple[int, list[dict[str, Any]]]:
+                nonlocal bulk_call_count
+
+                del kwargs
+                bulk_call_count += 1
+                action_list = list(actions)
+
+                if bulk_call_count == 1:
+                    return (
+                        0,
+                        [
+                            {
+                                "index": {
+                                    "_id": "whatever-id",
+                                    "status": 500,
+                                    "error": {
+                                        "type": "simulated_error",
+                                        "reason": (
+                                            "simulated bulk failure"
+                                        ),
+                                    },
+                                }
+                            }
+                        ],
+                    )
+
+                for action in action_list:
+                    client.chunks[action["_id"]] = dict(
+                        action["_source"]
+                    )
+
+                return (len(action_list), [])
+
+            with patch(
+                "app.services.document_indexer."
+                "ensure_legal_documents_index"
+            ), patch(
+                "app.services.document_indexer.bulk",
+                side_effect=selective_bulk,
+            ):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    restore_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            # Neither OpenSearch nor the durable state changed at all.
+            self.assertEqual(client.chunks, before)
+            self.assertEqual(
+                read_section_edit_state(source_directory, DOCUMENT_ID),
+                state_before,
+            )
+
+    def test_restore_state_file_write_failure_rolls_opensearch_back(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-ec": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Employment Contracts",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="An edit that restore will try to undo.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            before = copy.deepcopy(client.chunks)
+            state_before = read_section_edit_state(
+                source_directory, DOCUMENT_ID
+            )
+
+            with _patched_indexer(client), patch(
+                "app.services.admin_document_sections."
+                "write_section_edit_state_atomic",
+                side_effect=OSError("simulated disk failure"),
+            ):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    restore_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            # OpenSearch is rolled back to exactly the pre-restore
+            # (still-edited) state, and the durable state file still
+            # holds the original edit, untouched.
+            self.assertEqual(client.chunks, before)
+            self.assertEqual(
+                read_section_edit_state(source_directory, DOCUMENT_ID),
+                state_before,
+            )
+
+    def test_restore_state_commit_and_its_own_rollback_both_fail_surfaces_rollback_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-ec": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Employment Contracts",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="An edit that restore will try to undo.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            with _patched_indexer(client), patch(
+                "app.services.admin_document_sections."
+                "write_section_edit_state_atomic",
+                side_effect=OSError("simulated disk failure"),
+            ), patch(
+                "app.services.admin_document_sections."
+                "_restore_section_snapshot",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(AdminDocumentRollbackError):
+                    restore_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+    def test_reindex_after_restore_never_reapplies_the_discarded_override(
+        self,
+    ) -> None:
+        # The exact mechanism a real Reindex uses to overlay persisted
+        # edits (_apply_persisted_section_edits) must treat a document
+        # with zero remaining overrides - the state immediately after
+        # a restore - as a complete no-op, leaving freshly re-parsed
+        # DOCX chunks exactly as they are (mission "ORDER 7C", section
+        # 7: the discarded override must never resurface on the next
+        # Reindex).
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = FakeSectionOpenSearchClient(
+                chunks={
+                    "chunk-seed-ec": _seed_chunk(
+                        document_id=DOCUMENT_ID,
+                        legal_topic="Employment Contracts",
+                        content="placeholder",
+                    ),
+                }
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="An edit that must not survive reindex.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                restore_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            fresh_docx_chunks = build_document_chunks(
+                [
+                    ParsedSection(
+                        section="Employment Contracts",
+                        subsection=None,
+                        content="Original DOCX text.",
+                    ),
+                ],
+                DocumentMetadata(
+                    country="United Kingdom",
+                    country_code="GB",
+                    reference_year=None,
+                    language="en",
+                    source_filename="GB.docx",
+                ),
+            )
+
+            effective_chunks = _apply_persisted_section_edits(
+                chunks=fresh_docx_chunks,
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+            )
+
+            self.assertEqual(effective_chunks, fresh_docx_chunks)
+            self.assertTrue(
+                all(
+                    chunk.content == "Original DOCX text."
+                    for chunk in effective_chunks
+                )
             )
 
 

@@ -24,6 +24,7 @@ from app.core.legal_taxonomy import get_canonical_legal_topic
 from app.models.admin_document_sections import (
     AdminDocumentSectionListResponse,
     AdminDocumentSectionResponse,
+    AdminDocumentSectionRestoreResponse,
     AdminDocumentSectionSummary,
     AdminDocumentSectionUpdateResponse,
 )
@@ -617,6 +618,226 @@ def update_effective_section(
             ) from state_error
 
         return AdminDocumentSectionUpdateResponse(
+            document_id=document_id,
+            section_id=section_id,
+            legal_topic=legal_topic,
+            indexed_chunks=indexing_result.indexed_chunks,
+        )
+
+
+def restore_effective_section(
+    *,
+    document_id: str,
+    section_id: str,
+    source_directory: Path,
+    client: OpenSearch | None = None,
+    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> AdminDocumentSectionRestoreResponse:
+    """
+    Discard any persisted Edit for exactly this one section and
+    restore it to the current source DOCX's own real content -
+    mission "ORDER 7C": the only supported path back to the DOCX for a
+    single section, so recovering from a bad Edit never requires a
+    full document Replace/Delete (which would also discard every
+    OTHER section's own edits).
+
+    Every real subsection the DOCX currently has for this legal_topic
+    is rebuilt through the exact same chunking pipeline a fresh
+    upload/reindex uses (split_parsed_sections + build_document_chunks),
+    so restored chunks carry their own true subsection labels - never
+    the single borrowed label update_effective_section's one-blob
+    Edit uses. Follows the same transaction order as
+    update_effective_section (mutate OpenSearch first, then commit the
+    state file, rolling OpenSearch back if the state commit fails).
+
+    Idempotent: when section_id has no persisted override already, the
+    state file is simply rewritten unchanged and OpenSearch already
+    holds - or is harmlessly re-indexed to - exactly the DOCX's own
+    content; every OTHER section's own persisted edit is carried
+    forward untouched either way.
+    """
+
+    document_id = _validate_document_id(document_id)
+
+    legal_topic = legal_topic_for_section_id(section_id)
+
+    if legal_topic is None:
+        raise AdminDocumentSectionNotFoundError(
+            document_id=document_id,
+            section_id=section_id,
+        )
+
+    opensearch_client = client or get_opensearch_client()
+
+    preliminary_metadata = _get_document_metadata(
+        document_id=document_id,
+        client=opensearch_client,
+    )
+    country_code_for_lock = _required_string(
+        preliminary_metadata,
+        "country_code",
+    )
+
+    with country_lock(
+        source_directory,
+        country_code_for_lock,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        document_metadata = _get_document_metadata(
+            document_id=document_id,
+            client=opensearch_client,
+        )
+
+        country_code = _required_string(document_metadata, "country_code")
+
+        if country_code != country_code_for_lock:
+            raise AdminDocumentLifecycleError(
+                "The document's country changed during the "
+                "operation."
+            )
+
+        country = canonical_country_name(country_code)
+        source_filename = _required_string(
+            document_metadata, "source_filename"
+        )
+        reference_year = document_metadata.get("reference_year")
+
+        source_path = _resolve_current_source_path(
+            document_metadata=document_metadata,
+            source_directory=source_directory,
+        )
+
+        matching_sections = _parsed_sections_for_topic(
+            source_path=source_path,
+            country=country,
+            legal_topic=legal_topic,
+        )
+
+        if not matching_sections:
+            raise AdminDocumentSectionNotFoundError(
+                document_id=document_id,
+                section_id=section_id,
+            )
+
+        metadata = DocumentMetadata(
+            country=country,
+            country_code=country_code,
+            reference_year=(
+                int(reference_year)
+                if isinstance(reference_year, int)
+                else None
+            ),
+            language="en",
+            source_filename=source_filename,
+        )
+
+        parsed_sections = split_parsed_sections(
+            matching_sections,
+            max_chars=DEFAULT_MAX_CHARS,
+        )
+
+        new_chunks = build_document_chunks(parsed_sections, metadata)
+
+        actual_topics = {chunk.legal_topic for chunk in new_chunks}
+
+        if actual_topics != {legal_topic}:
+            raise AdminDocumentSectionUpdateFailedError(
+                message=(
+                    "The document's own content did not resolve back "
+                    "to the same section - nothing was restored."
+                )
+            )
+
+        try:
+            state = read_section_edit_state(source_directory, document_id)
+        except SectionStateError as error:
+            raise AdminDocumentLifecycleError(str(error)) from error
+
+        existing_sections = dict(state.sections) if state is not None else {}
+
+        # Captured BEFORE any mutation, exactly like
+        # update_effective_section's own pre-edit snapshot - this
+        # transaction rolls back to this if anything past this point
+        # fails.
+        try:
+            pre_restore_snapshot = [
+                item
+                for item in _snapshot_document_chunks(
+                    client=opensearch_client,
+                    document_id=document_id,
+                )
+                if item["_source"].get("legal_topic") == legal_topic
+            ]
+
+        except DocumentIndexingError as error:
+            raise AdminDocumentSectionUpdateFailedError(
+                message=(
+                    "The section's current content could not be "
+                    "read from the search index before restoring."
+                )
+            ) from error
+
+        try:
+            indexing_result = replace_document_section_chunks(
+                new_chunks,
+                legal_topic,
+                client=opensearch_client,
+            )
+
+        except DocumentIndexingError as error:
+            raise AdminDocumentSectionUpdateFailedError(
+                message=(
+                    "The section could not be restored in the "
+                    "search index."
+                )
+            ) from error
+
+        # Discard only this section_id's own override - every other
+        # persisted edit for this document is carried forward
+        # unchanged, and a section_id that never had an override
+        # simply leaves the dict unchanged (idempotent).
+        remaining_sections = {
+            key: value
+            for key, value in existing_sections.items()
+            if key != section_id
+        }
+
+        new_state = SectionEditState(
+            document_id=document_id,
+            country_code=country_code,
+            sections=remaining_sections,
+        )
+
+        try:
+            write_section_edit_state_atomic(source_directory, new_state)
+
+        except OSError as state_error:
+            try:
+                _restore_section_snapshot(
+                    client=opensearch_client,
+                    document_id=document_id,
+                    legal_topic=legal_topic,
+                    snapshot=pre_restore_snapshot,
+                    bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+                )
+
+            except Exception as rollback_error:
+                raise AdminDocumentRollbackError(
+                    "The section's durable state could not be "
+                    "saved, and rolling the search index back to "
+                    "its previous content afterward also failed - "
+                    "manual recovery is required."
+                ) from rollback_error
+
+            raise AdminDocumentSectionUpdateFailedError(
+                message=(
+                    "The section could not be restored: its durable "
+                    "state could not be written, so the search "
+                    "index was rolled back to its previous content."
+                )
+            ) from state_error
+
+        return AdminDocumentSectionRestoreResponse(
             document_id=document_id,
             section_id=section_id,
             legal_topic=legal_topic,

@@ -22,6 +22,7 @@ from app.models.admin_document_lifecycle import (
 from app.models.admin_document_sections import (
     AdminDocumentSectionListResponse,
     AdminDocumentSectionResponse,
+    AdminDocumentSectionRestoreResponse,
     AdminDocumentSectionUpdateRequest,
     AdminDocumentSectionUpdateResponse,
 )
@@ -45,6 +46,7 @@ from app.services.admin_document_sections import (
     AdminDocumentSectionUpdateFailedError,
     get_effective_section,
     list_effective_sections,
+    restore_effective_section,
     update_effective_section,
 )
 from app.services.country_lock import (
@@ -756,6 +758,141 @@ def update_admin_document_section(
                 code="document_catalog_unavailable",
                 message=str(error),
                 operation="section_update",
+                document_id=document_id,
+            ),
+        ) from error
+
+
+@router.post(
+    "/documents/{document_id}/sections/{section_id}/restore",
+    response_model=AdminDocumentSectionRestoreResponse,
+)
+def restore_admin_document_section(
+    document_id: str,
+    section_id: str,
+) -> AdminDocumentSectionRestoreResponse:
+    """Discard any persisted Edit for one section and restore it to
+    the current source DOCX's own content (mission "ORDER 7C") - the
+    only supported path back to the DOCX for a single section, never
+    a full document Replace/Delete."""
+
+    settings = get_settings()
+
+    try:
+        return restore_effective_section(
+            document_id=document_id,
+            section_id=section_id,
+            source_directory=settings.document_source_dir,
+        )
+
+    except InvalidAdminDocumentIdError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=admin_error_detail(
+                code="invalid_document_id",
+                message=str(error),
+                operation="section_restore",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentNotFoundError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=admin_error_detail(
+                code="document_not_found",
+                message=str(error),
+                operation="section_restore",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentSectionNotFoundError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentOperationInProgressError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=admin_error_detail(
+                code="document_operation_in_progress",
+                message=str(error),
+                operation="section_restore",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentSectionUpdateFailedError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentRollbackError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=admin_error_detail(
+                code="rollback_failed",
+                message=str(error),
+                operation="section_restore",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentLifecycleError as error:
+        log_admin_business_error(
+            operation="section_restore",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=admin_error_detail(
+                code="document_catalog_unavailable",
+                message=str(error),
+                operation="section_restore",
                 document_id=document_id,
             ),
         ) from error

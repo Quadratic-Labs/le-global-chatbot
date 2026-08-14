@@ -395,6 +395,77 @@ check(
     [false, 404, 'No section "sec-missing" exists for this document.']
 );
 
+// --- restore_section (mission "ORDER 7C") -----------------------------
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+$GLOBALS['__test_current_user_can'] = false;
+$halt = invoke_handler('handle_restore_section');
+check(
+    'unauthorized user gets a 403 and zero backend calls (restore_section)',
+    [$halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [403, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+$GLOBALS['__test_nonce_valid'] = false;
+$halt = invoke_handler('handle_restore_section');
+check(
+    'an invalid nonce halts before any backend call (restore_section)',
+    [$halt !== null, count($GLOBALS['__test_backend_calls'])],
+    [true, 0]
+);
+
+reset_state(['document_id' => 'not-a-real-id', 'section_id' => 'sec-1']);
+$halt = invoke_handler('handle_restore_section');
+check(
+    'an invalid document_id is rejected with 422 and zero backend calls (restore_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [false, 422, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => '']);
+$halt = invoke_handler('handle_restore_section');
+check(
+    'an empty section_id is rejected with 422 and zero backend calls (restore_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [false, 422, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'hiring_practices']);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
+    'document_id' => $VALID_DOCUMENT_ID,
+    'section_id' => 'hiring_practices',
+    'legal_topic' => 'Hiring Practices',
+    'indexed_chunks' => 4,
+]);
+$halt = invoke_handler('handle_restore_section');
+check(
+    'a successful restore is relayed via wp_send_json_success',
+    [$halt?->jsonSuccess, $halt?->jsonData['indexed_chunks'] ?? null],
+    [true, 4]
+);
+check(
+    'the restore is sent as a POST to the backend restore path, exactly once, with no content field',
+    [
+        $GLOBALS['__test_backend_calls'][0]['method'] ?? null,
+        str_ends_with($GLOBALS['__test_backend_calls'][0]['url'] ?? '', '/sections/hiring_practices/restore'),
+        $GLOBALS['__test_backend_calls'][0]['body'] ?? null,
+        count($GLOBALS['__test_backend_calls']),
+    ],
+    ['POST', true, null, 1]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-missing']);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(404, [
+    'detail' => ['code' => 'document_section_not_found', 'message' => 'No section "sec-missing" exists for this document.'],
+]);
+$halt = invoke_handler('handle_restore_section');
+check(
+    'a section-not-found backend error is propagated with its real message (restore_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, $halt?->jsonData['message'] ?? null],
+    [false, 404, 'No section "sec-missing" exists for this document.']
+);
+
 if ($failures > 0) {
     fwrite(STDERR, "\n{$failures} check(s) FAILED\n");
     exit(1);

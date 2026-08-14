@@ -58,3 +58,15 @@ class AdminDocumentSectionUpdateResponse(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+class AdminDocumentSectionRestoreResponse(BaseModel):
+    """Result of restoring one section back to the current DOCX's own content."""
+
+    document_id: str
+    section_id: str
+    legal_topic: str
+    indexed_chunks: int
+
+    class Config:
+        extra = "forbid"

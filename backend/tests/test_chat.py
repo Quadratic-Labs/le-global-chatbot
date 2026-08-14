@@ -6670,5 +6670,141 @@ class ThreeAxisCountryAvailabilityContractTests(unittest.TestCase):
         self.assertEqual(call_count, 1)
 
 
+class EditRestoreConversationConsistencyTests(unittest.TestCase):
+    """
+    Mission "ORDER 7C": the reproduction investigation found no live
+    caching or conversation-history mechanism that could leak a
+    section's OLD content into an answer after an Edit/Restore -
+    resolve_legal_chat_response never reads request.history when
+    building retrieval or the generation context, and there is no
+    content-level cache anywhere in this pipeline (Redis is used only
+    for rate limiting). These tests pin that property down as a
+    permanent regression: the essential scenario the mission asks for
+    - old answer -> Edit -> same conversation -> answer reflects only
+    the current legal state, and a fresh conversation reaches the
+    exact same state - so a live caching/history-leak bug introduced
+    later would fail here immediately.
+    """
+
+    def _current_state_search(
+        self,
+        request: Any,
+    ) -> LegalSearchResponse:
+        """
+        Always returns exactly the CURRENT (post-Edit-or-Restore)
+        Italy chunk - a real search_function reads OpenSearch fresh
+        on every call, never anything cached from an earlier request
+        in the same or a different conversation.
+        """
+
+        return LegalSearchResponse(
+            query=request.query,
+            total=1,
+            limit=request.limit,
+            offset=0,
+            took_ms=1,
+            hits=[
+                _build_hit(
+                    country_code="IT",
+                    country="Italy",
+                    content=(
+                        "The current quota for non-EU subordinate "
+                        "workers is 180,000."
+                    ),
+                )
+            ],
+        )
+
+    def _understanding_client(self) -> "FakeUnderstandingClient":
+        return FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["IT"],
+                        legal_topics=["Hiring Practices"],
+                    )
+                ],
+            )
+        )
+
+    def test_same_conversation_history_never_leaks_the_old_answer_into_retrieval(
+        self,
+    ) -> None:
+        # The conversation's own history carries the OLD, pre-edit
+        # answer (164,850) as the assistant's prior turn - exactly
+        # what a real client resends on every follow-up call.
+        history = [
+            LegalChatHistoryMessage(
+                role="user",
+                content=(
+                    "What is the exact quota for non-EU subordinate "
+                    "workers in Italy for 2026?"
+                ),
+            ),
+            LegalChatHistoryMessage(
+                role="assistant",
+                content=(
+                    "Italy\n- The current quota is 164,850 [1]."
+                ),
+            ),
+        ]
+
+        client = FakeGenerationClient(
+            answer="Italy\n- The current quota is stated in [1].",
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What is the exact quota for non-EU subordinate "
+                    "workers in Italy for 2026?"
+                ),
+                history=history,
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=self._current_state_search,
+            generation_client=client,
+            understanding_client=self._understanding_client(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(response.sources), 1)
+        self.assertEqual(
+            response.sources[0].chunk_id, "chunk-it"
+        )
+        # The stale "164,850" from history never reaches the answer -
+        # only the current search result's own content does.
+        self.assertNotIn("164,850", response.answer)
+
+    def test_fresh_conversation_reaches_the_exact_same_current_state(
+        self,
+    ) -> None:
+        client = FakeGenerationClient(
+            answer="Italy\n- The current quota is stated in [1].",
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What is the exact quota for non-EU subordinate "
+                    "workers in Italy for 2026?"
+                ),
+                history=[],
+            ),
+            catalog_provider=_catalog_provider,
+            search_function=self._current_state_search,
+            generation_client=client,
+            understanding_client=self._understanding_client(),
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertEqual(len(response.sources), 1)
+        self.assertEqual(
+            response.sources[0].chunk_id, "chunk-it"
+        )
+        self.assertNotIn("164,850", response.answer)
+
+
 if __name__ == "__main__":
     unittest.main()

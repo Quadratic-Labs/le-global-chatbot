@@ -1175,6 +1175,7 @@ describe("edit a section", () => {
         const messageEl = makeFakeMessageElement();
         const cancelButton = makeFakeButton();
         const saveButton = makeFakeButton();
+        const restoreButton = makeFakeButton();
 
         const editContainer = {
             dataset: {
@@ -1185,6 +1186,8 @@ describe("edit a section", () => {
                 sectionGetNonce: "section-get-nonce",
                 sectionUpdateAction: "le_global_chatbot_update_section",
                 sectionUpdateNonce: "section-update-nonce",
+                sectionRestoreAction: "le_global_chatbot_restore_section",
+                sectionRestoreNonce: "section-restore-nonce",
             },
         };
 
@@ -1196,6 +1199,7 @@ describe("edit a section", () => {
             "le-global-chatbot-edit-message": messageEl,
             "le-global-edit-cancel": cancelButton,
             "le-global-edit-save": saveButton,
+            "le-global-edit-restore": restoreButton,
         };
 
         global.document = {
@@ -1220,6 +1224,7 @@ describe("edit a section", () => {
             messageEl,
             cancelButton,
             saveButton,
+            restoreButton,
         };
     }
 
@@ -1265,6 +1270,10 @@ describe("edit a section", () => {
 
     async function clickSave() {
         return dom.saveButton._listeners.click();
+    }
+
+    async function clickRestore() {
+        return dom.restoreButton._listeners.click();
     }
 
     function clickCancel() {
@@ -1645,6 +1654,170 @@ describe("edit a section", () => {
 
         // The now-stale save's own continuation must not re-disable
         // (or otherwise touch) what Cancel already reset.
+        assert.equal(dom.countrySelect.disabled, false);
+        assert.equal(dom.countrySelect.value, "");
+    });
+
+    test("Restore posts to the real admin-post URL with the restore action/nonce, then re-fetches the persisted value", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "A manually edited draft the admin wants to discard.";
+        dom.saveButton.disabled = false;
+        dom.restoreButton.disabled = false;
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Working Time", indexed_chunks: 4 } },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Working Time", content: "The document's own real content." },
+                },
+            },
+        ]);
+
+        await clickRestore();
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].url, "https://example.test/wp-admin/admin-post.php");
+        assert.equal(fetchCalls[0].options.method, "POST");
+        assert.equal(fetchCalls[0].options.body.get("action"), "le_global_chatbot_restore_section");
+        assert.equal(fetchCalls[0].options.body.get("nonce"), "section-restore-nonce");
+        assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_aaa");
+        assert.equal(fetchCalls[0].options.body.get("section_id"), "sec-1");
+        assert.equal(fetchCalls[0].options.body.get("content"), null);
+        // Second call: the re-fetch, showing the value really persisted.
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_get_section/);
+        assert.equal(dom.textarea.value, "The document's own real content.");
+        assert.equal(dom.messageEl.className.includes("is-success"), true);
+        assert.equal(dom.saveButton.disabled, false);
+        assert.equal(dom.restoreButton.disabled, false);
+    });
+
+    test("Restore's confirmation dialog declined makes zero network calls and zero mutation", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "content the admin typed";
+        dom.saveButton.disabled = false;
+        dom.restoreButton.disabled = false;
+
+        global.window.confirm = () => false;
+
+        await clickRestore();
+
+        assert.equal(fetchCalls.length, 0);
+        assert.equal(dom.textarea.value, "content the admin typed");
+        assert.equal(dom.restoreButton.disabled, false);
+    });
+
+    test("Restore is a single mutation even under a double click", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "Some content.";
+        dom.saveButton.disabled = false;
+        dom.restoreButton.disabled = false;
+
+        let resolveFirstFetch;
+        let callCount = 0;
+
+        global.fetch = (url, options) => {
+            fetchCalls.push({ url, options });
+            callCount += 1;
+
+            if (callCount === 1) {
+                return new Promise((resolve) => {
+                    resolveFirstFetch = () => resolve(makeFakeResponse({
+                        ok: true,
+                        status: 200,
+                        payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", indexed_chunks: 4 } },
+                    }));
+                });
+            }
+
+            return Promise.resolve(makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", content: "Restored content." } },
+            }));
+        };
+
+        const firstRestore = clickRestore();
+        // The button is disabled synchronously before the first await
+        // yields - a second click while still in flight must be a
+        // true no-op, never a second mutation.
+        const secondRestore = clickRestore();
+
+        resolveFirstFetch();
+        await firstRestore;
+        await secondRestore;
+
+        assert.equal(
+            fetchCalls.filter((call) => call.options.method === "POST").length,
+            1
+        );
+    });
+
+    test("a structured backend error from Restore is surfaced verbatim, never the generic fallback", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "content";
+        dom.saveButton.disabled = false;
+        dom.restoreButton.disabled = false;
+
+        queueFetchResponses([
+            {
+                ok: false,
+                status: 502,
+                payload: { success: false, data: { message: "The section could not be restored: the source DOCX is missing." } },
+            },
+        ]);
+
+        await clickRestore();
+
+        assert.equal(dom.messageEl.textContent, "The section could not be restored: the source DOCX is missing.");
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+        assert.equal(dom.saveButton.disabled, false);
+        assert.equal(dom.restoreButton.disabled, false);
+    });
+
+    test("Cancel while a Restore is still in flight leaves the country dropdown usable, not stuck disabled", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.textarea.value = "content";
+        dom.saveButton.disabled = false;
+        dom.restoreButton.disabled = false;
+
+        let resolveRestore;
+
+        global.fetch = (url) => {
+            fetchCalls.push({ url });
+
+            return new Promise((resolve) => {
+                resolveRestore = () => resolve(makeFakeResponse({
+                    ok: true,
+                    status: 200,
+                    payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "x", indexed_chunks: 4 } },
+                }));
+            });
+        };
+
+        const restorePromise = clickRestore();
+
+        assert.equal(dom.countrySelect.disabled, true);
+
+        clickCancel();
+
+        assert.equal(dom.countrySelect.disabled, false);
+        assert.equal(dom.countrySelect.value, "");
+
+        resolveRestore();
+        await restorePromise;
+
         assert.equal(dom.countrySelect.disabled, false);
         assert.equal(dom.countrySelect.value, "");
     });

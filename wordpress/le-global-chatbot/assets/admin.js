@@ -528,6 +528,9 @@
         const saveButton = document.getElementById(
             "le-global-edit-save"
         );
+        const restoreButton = document.getElementById(
+            "le-global-edit-restore"
+        );
 
         if (
             !countrySelect
@@ -536,12 +539,14 @@
             || !messageEl
             || !cancelButton
             || !saveButton
+            || !restoreButton
         ) {
             return;
         }
 
         const config = container.dataset;
         let saving = false;
+        let restoring = false;
 
         // Messages/textarea content only ever go through .textContent
         // or .value - never innerHTML - so nothing rendered here can
@@ -626,6 +631,7 @@
             setMessage("", null);
             cancelButton.disabled = true;
             saveButton.disabled = true;
+            restoreButton.disabled = true;
         }
 
         async function onCountryChange() {
@@ -641,6 +647,7 @@
             setMessage("", null);
             cancelButton.disabled = documentId === "";
             saveButton.disabled = true;
+            restoreButton.disabled = true;
 
             if (documentId === "") {
                 setSectionOptions("Select a country first…", []);
@@ -703,6 +710,7 @@
             textarea.disabled = true;
             setMessage("", null);
             saveButton.disabled = true;
+            restoreButton.disabled = true;
 
             if (documentId === "" || sectionId === "") {
                 return;
@@ -744,10 +752,11 @@
             textarea.value = content;
             textarea.disabled = false;
             saveButton.disabled = false;
+            restoreButton.disabled = false;
         }
 
         async function onSave() {
-            if (saving || saveButton.disabled) {
+            if (saving || restoring || saveButton.disabled) {
                 return;
             }
 
@@ -760,6 +769,7 @@
 
             saving = true;
             saveButton.disabled = true;
+            restoreButton.disabled = true;
             countrySelect.disabled = true;
             sectionSelect.disabled = true;
             setMessage("Saving…", null);
@@ -795,6 +805,7 @@
             if (!isSuccessful(result)) {
                 saving = false;
                 saveButton.disabled = false;
+                restoreButton.disabled = false;
                 countrySelect.disabled = false;
                 sectionSelect.disabled = false;
                 setMessage(
@@ -830,6 +841,7 @@
             countrySelect.disabled = false;
             sectionSelect.disabled = false;
             saveButton.disabled = false;
+            restoreButton.disabled = false;
 
             if (
                 isSuccessful(refetch)
@@ -847,6 +859,122 @@
             }
         }
 
+        async function onRestore() {
+            if (restoring || saving || restoreButton.disabled) {
+                return;
+            }
+
+            const documentId = countrySelect.value;
+            const sectionId = sectionSelect.value;
+
+            if (documentId === "" || sectionId === "") {
+                return;
+            }
+
+            const confirmed = window.confirm(
+                "Restore this section from the current source "
+                + "document? Any Edit saved for this section will be "
+                + "discarded and replaced with the document's own "
+                + "content."
+            );
+
+            if (!confirmed) {
+                return;
+            }
+
+            restoring = true;
+            saveButton.disabled = true;
+            restoreButton.disabled = true;
+            countrySelect.disabled = true;
+            sectionSelect.disabled = true;
+            setMessage("Restoring…", null);
+
+            const generation = editSectionGeneration;
+
+            const formData = new FormData();
+            formData.set("action", config.sectionRestoreAction);
+            formData.set("nonce", config.sectionRestoreNonce);
+            formData.set("document_id", documentId);
+            formData.set("section_id", sectionId);
+
+            let result;
+
+            try {
+                result = await fetchJson(config.adminPostUrl, {
+                    method: "POST",
+                    body: formData,
+                });
+            } catch {
+                result = null;
+            }
+
+            if (generation !== editSectionGeneration) {
+                // Cancel (or a fresh country/section pick) already
+                // reset the UI while this restore was in flight -
+                // never touch controls it already reset or disabled.
+                restoring = false;
+                return;
+            }
+
+            if (!isSuccessful(result)) {
+                restoring = false;
+                saveButton.disabled = false;
+                restoreButton.disabled = false;
+                countrySelect.disabled = false;
+                sectionSelect.disabled = false;
+                setMessage(
+                    errorMessage(result ? result.payload : null),
+                    "is-error"
+                );
+                return;
+            }
+
+            // Re-fetch the section so the UI always shows the value
+            // really persisted, never just an assumed reset.
+            const url = buildQueryUrl(
+                config.sectionGetAction,
+                config.sectionGetNonce,
+                { document_id: documentId, section_id: sectionId }
+            );
+
+            let refetch;
+
+            try {
+                refetch = await fetchJson(url, { method: "GET" });
+            } catch {
+                refetch = null;
+            }
+
+            restoring = false;
+
+            if (generation !== editSectionGeneration) {
+                return;
+            }
+
+            countrySelect.disabled = false;
+            sectionSelect.disabled = false;
+            saveButton.disabled = false;
+            restoreButton.disabled = false;
+
+            if (
+                isSuccessful(refetch)
+                && refetch.payload.data
+                && typeof refetch.payload.data.content === "string"
+            ) {
+                textarea.value = refetch.payload.data.content;
+                setMessage(
+                    "Section restored from document successfully.",
+                    "is-success"
+                );
+            } else {
+                setMessage(
+                    "Restored, but the updated content could not be "
+                    + "re-loaded for confirmation.",
+                    "is-error"
+                );
+            }
+        }
+
         function onCancel() {
             resetToEmpty();
         }
@@ -854,6 +982,7 @@
         countrySelect.addEventListener("change", onCountryChange);
         sectionSelect.addEventListener("change", onSectionChange);
         saveButton.addEventListener("click", onSave);
+        restoreButton.addEventListener("click", onRestore);
         cancelButton.addEventListener("click", onCancel);
     }
 
