@@ -238,6 +238,76 @@ def _summarize_bulk_errors(
     )
 
 
+def _delete_chunks_except(
+    *,
+    client: OpenSearch,
+    filters: Sequence[dict[str, Any]],
+    keep_chunk_ids: Sequence[str],
+    context: str,
+) -> int:
+    """
+    Delete every chunk matching every filter in `filters` whose
+    chunk_id is not in `keep_chunk_ids`.
+
+    Mission "ORDER 5C" corrective gate, section 4: the single, shared
+    mechanism behind every staleness-cleanup AND every snapshot-
+    restore operation in this module - only the filters and which
+    chunk_ids to keep differ between callers. A raw OpenSearchException
+    (or any malformed response) is never allowed to escape this
+    boundary - every caller downstream (reindex, upload/replace,
+    section edit) can rely on catching DocumentIndexingError alone,
+    never a driver-level exception type.
+    """
+
+    query: dict[str, Any] = {
+        "bool": {
+            "filter": list(filters),
+        }
+    }
+
+    if keep_chunk_ids:
+        query["bool"]["must_not"] = [
+            {
+                "terms": {
+                    "chunk_id": list(keep_chunk_ids),
+                }
+            }
+        ]
+
+    try:
+        response = client.delete_by_query(
+            index=LEGAL_DOCUMENTS_ALIAS,
+            body={
+                "query": query,
+            },
+            conflicts="proceed",
+            refresh=True,
+        )
+
+    except OpenSearchException as error:
+        raise DocumentIndexingError(
+            f"OpenSearch cleanup failed ({context})."
+        ) from error
+
+    if not isinstance(response, dict):
+        raise DocumentIndexingError(
+            f"OpenSearch returned an invalid cleanup response ({context})."
+        )
+
+    try:
+        return int(
+            response.get(
+                "deleted",
+                0,
+            )
+        )
+
+    except (TypeError, ValueError) as error:
+        raise DocumentIndexingError(
+            f"OpenSearch returned an invalid cleanup count ({context})."
+        ) from error
+
+
 def _delete_stale_chunks(
     client: OpenSearch,
     document_id: str,
@@ -250,39 +320,17 @@ def _delete_stale_chunks(
     after the complete bulk operation succeeds.
     """
 
-    response = client.delete_by_query(
-        index=LEGAL_DOCUMENTS_ALIAS,
-        body={
-            "query": {
-                "bool": {
-                    "filter": [
-                        {
-                            "term": {
-                                "document_id": document_id,
-                            }
-                        }
-                    ],
-                    "must_not": [
-                        {
-                            "terms": {
-                                "chunk_id": list(
-                                    current_chunk_ids
-                                ),
-                            }
-                        }
-                    ],
+    return _delete_chunks_except(
+        client=client,
+        filters=[
+            {
+                "term": {
+                    "document_id": document_id,
                 }
             }
-        },
-        conflicts="proceed",
-        refresh=True,
-    )
-
-    return int(
-        response.get(
-            "deleted",
-            0,
-        )
+        ],
+        keep_chunk_ids=current_chunk_ids,
+        context=f"document {document_id!r}",
     )
 
 
@@ -292,15 +340,19 @@ def replace_document_chunks(
     bulk_chunk_size: int = DEFAULT_BULK_CHUNK_SIZE,
 ) -> DocumentIndexingResult:
     """
-    Replace one complete legal document in OpenSearch.
+    Replace one complete legal document in OpenSearch, atomically.
 
-    Behaviour:
-
-    1. validates that all chunks belong to one document;
-    2. creates the index and alias when necessary;
-    3. indexes every current chunk with its deterministic chunk ID;
-    4. stops immediately if one bulk item fails;
-    5. deletes obsolete chunks from the previous document version.
+    Mission "ORDER 5C" corrective gate, section 4: identical
+    transactional shape to replace_country_document_chunks and
+    replace_document_section_chunks - the document is snapshotted
+    BEFORE any mutation; new chunks are indexed; stale ones deleted;
+    on ANY failure past the snapshot (a bulk error, or the stale-
+    delete step itself failing), the document is restored to exactly
+    that snapshot before the error is raised. reindex_indexed_document
+    (the sole live caller) already wraps this in its own, broader,
+    country-level rollback - this inner layer means that outer one is
+    always restoring an already-consistent state, never masking a
+    document left half-migrated.
     """
 
     chunk_list = list(
@@ -326,48 +378,79 @@ def replace_document_chunks(
         client=opensearch_client
     )
 
-    indexed_count, errors = bulk(
-        client=opensearch_client,
-        actions=_build_bulk_actions(
-            chunk_list
-        ),
-        chunk_size=bulk_chunk_size,
-        max_retries=3,
-        initial_backoff=1,
-        max_backoff=8,
-        raise_on_error=False,
-        raise_on_exception=False,
-        refresh=True,
-    )
-
-    if errors:
-        raise DocumentIndexingError(
-            "OpenSearch bulk indexing failed for "
-            f"{len(errors)} chunk(s): "
-            f"{_summarize_bulk_errors(errors)}"
-        )
-
-    if indexed_count != len(
-        chunk_list
-    ):
-        raise DocumentIndexingError(
-            "OpenSearch returned an inconsistent indexed count: "
-            f"expected {len(chunk_list)}, "
-            f"received {indexed_count}."
-        )
-
     document_id = (
         chunk_list[0].document_id
     )
 
-    stale_chunks_deleted = _delete_stale_chunks(
+    document_snapshot = _snapshot_document_chunks(
         client=opensearch_client,
         document_id=document_id,
-        current_chunk_ids=[
-            chunk.chunk_id
-            for chunk in chunk_list
-        ],
     )
+
+    try:
+        indexed_count, errors = bulk(
+            client=opensearch_client,
+            actions=_build_bulk_actions(
+                chunk_list
+            ),
+            chunk_size=bulk_chunk_size,
+            max_retries=3,
+            initial_backoff=1,
+            max_backoff=8,
+            raise_on_error=False,
+            raise_on_exception=False,
+            refresh=True,
+        )
+
+        if errors:
+            raise DocumentIndexingError(
+                "OpenSearch bulk indexing failed for "
+                f"{len(errors)} chunk(s): "
+                f"{_summarize_bulk_errors(errors)}"
+            )
+
+        if indexed_count != len(
+            chunk_list
+        ):
+            raise DocumentIndexingError(
+                "OpenSearch returned an inconsistent indexed count: "
+                f"expected {len(chunk_list)}, "
+                f"received {indexed_count}."
+            )
+
+        stale_chunks_deleted = _delete_stale_chunks(
+            client=opensearch_client,
+            document_id=document_id,
+            current_chunk_ids=[
+                chunk.chunk_id
+                for chunk in chunk_list
+            ],
+        )
+
+    except Exception as original_error:
+        try:
+            _restore_document_snapshot(
+                client=opensearch_client,
+                document_id=document_id,
+                snapshot=document_snapshot,
+                bulk_chunk_size=bulk_chunk_size,
+            )
+
+        except Exception as rollback_error:
+            raise DocumentIndexingError(
+                f"Document replacement failed for {document_id!r}, "
+                "and its OpenSearch rollback also failed."
+            ) from rollback_error
+
+        if isinstance(
+            original_error,
+            DocumentIndexingError,
+        ):
+            raise
+
+        raise DocumentIndexingError(
+            f"OpenSearch document replacement failed for {document_id!r}."
+        ) from original_error
 
     return DocumentIndexingResult(
         index_alias=LEGAL_DOCUMENTS_ALIAS,
@@ -384,6 +467,476 @@ def replace_document_chunks(
         stale_chunks_deleted=stale_chunks_deleted,
     )
 
+
+def _delete_stale_section_chunks(
+    client: OpenSearch,
+    document_id: str,
+    legal_topic: str,
+    current_chunk_ids: Sequence[str],
+) -> int:
+    """
+    Delete chunks from an older version of the same (document_id,
+    legal_topic) section only - mission "ORDER 5C": scoped exactly
+    like _delete_stale_chunks, but with an additional legal_topic
+    filter, so an edit to ONE section can never delete or orphan any
+    OTHER topic's chunks for the same document.
+    """
+
+    return _delete_chunks_except(
+        client=client,
+        filters=[
+            {
+                "term": {
+                    "document_id": document_id,
+                }
+            },
+            {
+                "term": {
+                    "legal_topic": legal_topic,
+                }
+            },
+        ],
+        keep_chunk_ids=current_chunk_ids,
+        context=f"document {document_id!r} legal_topic {legal_topic!r}",
+    )
+
+
+def _snapshot_document_chunks(
+    *,
+    client: OpenSearch,
+    document_id: str,
+) -> list[dict[str, Any]]:
+    """Capture all currently-indexed chunks for one document_id."""
+
+    return _fetch_all_chunks(
+        client=client,
+        field="document_id",
+        value=document_id,
+    )
+
+
+def _restore_document_snapshot(
+    *,
+    client: OpenSearch,
+    document_id: str,
+    snapshot: Sequence[dict[str, Any]],
+    bulk_chunk_size: int,
+) -> None:
+    """
+    Restore document_id to exactly the WHOLE-DOCUMENT chunk set
+    captured in `snapshot` - every chunk currently indexed for this
+    document_id that the snapshot does not contain is deleted, and
+    every snapshot chunk is re-indexed. `snapshot` must be a complete
+    document-level snapshot (every legal_topic this document_id had
+    at capture time) - never a subset such as one section's own
+    chunks alone (see replace_document_section_chunks's own,
+    separately-scoped internal rollback for that case) - otherwise
+    every OTHER section's chunks would be wiped as "not in snapshot".
+    """
+
+    _reindex_snapshot_chunks(
+        client=client,
+        snapshot=snapshot,
+        bulk_chunk_size=bulk_chunk_size,
+        context=f"document {document_id!r}",
+    )
+
+    _delete_chunks_except(
+        client=client,
+        filters=[
+            {
+                "term": {
+                    "document_id": document_id,
+                }
+            }
+        ],
+        keep_chunk_ids=[item["_id"] for item in snapshot],
+        context=f"document {document_id!r} snapshot restore",
+    )
+
+
+def _restore_section_snapshot(
+    *,
+    client: OpenSearch,
+    document_id: str,
+    legal_topic: str,
+    snapshot: Sequence[dict[str, Any]],
+    bulk_chunk_size: int,
+) -> None:
+    """
+    Restore exactly one (document_id, legal_topic) section to the
+    chunk set captured in `snapshot`: wipe whatever currently exists
+    for this section (whatever mix of old/new chunks a failed
+    mutation left behind) and reindex the snapshot. Deliberately
+    scoped to document_id AND legal_topic together - never document-
+    wide - so every OTHER section for this same document is left
+    completely untouched. This is the shared rollback primitive
+    behind BOTH replace_document_section_chunks's own internal
+    atomicity AND update_effective_section's outer rollback when the
+    durable state-file commit fails after OpenSearch already
+    succeeded (mission "ORDER 5C" corrective gate, sections 1-2 and
+    4: one shared, generic mechanism, not two near-identical hacks).
+    """
+
+    context = f"document {document_id!r} legal_topic {legal_topic!r}"
+
+    _delete_chunks_except(
+        client=client,
+        filters=[
+            {"term": {"document_id": document_id}},
+            {"term": {"legal_topic": legal_topic}},
+        ],
+        keep_chunk_ids=[],
+        context=f"{context} rollback wipe",
+    )
+
+    _reindex_snapshot_chunks(
+        client=client,
+        snapshot=snapshot,
+        bulk_chunk_size=bulk_chunk_size,
+        context=f"{context} rollback restore",
+    )
+
+
+def replace_document_section_chunks(
+    chunks: Sequence[DocumentChunk],
+    legal_topic: str,
+    client: OpenSearch | None = None,
+    bulk_chunk_size: int = DEFAULT_BULK_CHUNK_SIZE,
+) -> DocumentIndexingResult:
+    """
+    Replace exactly one (document_id, legal_topic) section's chunks,
+    atomically.
+
+    Mission "ORDER 5C" corrective gate: identical transactional shape
+    to replace_country_document_chunks (snapshot the affected scope
+    BEFORE any mutation; index new chunks; delete stale ones; on ANY
+    failure past the snapshot, restore it exactly) - scoped to this
+    one (document_id, legal_topic) section instead of a whole country,
+    so every OTHER section/topic for this same document is never
+    touched, never re-indexed, never considered for deletion or
+    restoration. Every chunk passed in must already carry this exact
+    legal_topic (checked explicitly, since _validate_chunks itself
+    does not check topic consistency - real documents legitimately
+    span many topics, but a single section edit must never span more
+    than one).
+
+    On success, OpenSearch holds exactly the new section content. On
+    any failure, OpenSearch holds exactly what it held before this
+    call - never a partial mix of old and new chunks for this section.
+    """
+
+    chunk_list = list(
+        chunks
+    )
+
+    _validate_chunks(
+        chunk_list
+    )
+
+    mismatched_topics = {
+        chunk.legal_topic
+        for chunk in chunk_list
+        if chunk.legal_topic != legal_topic
+    }
+
+    if mismatched_topics:
+        raise InvalidDocumentChunksError(
+            "All chunks must share the requested legal_topic "
+            f"{legal_topic!r}; found {sorted(mismatched_topics)!r}."
+        )
+
+    if bulk_chunk_size <= 0:
+        raise ValueError(
+            "bulk_chunk_size must be greater than zero."
+        )
+
+    opensearch_client = (
+        client
+        if client is not None
+        else get_opensearch_client()
+    )
+
+    ensure_legal_documents_index(
+        client=opensearch_client
+    )
+
+    document_id = (
+        chunk_list[0].document_id
+    )
+
+    section_snapshot = [
+        item
+        for item in _snapshot_document_chunks(
+            client=opensearch_client,
+            document_id=document_id,
+        )
+        if item["_source"].get("legal_topic") == legal_topic
+    ]
+
+    current_chunk_ids = [
+        chunk.chunk_id
+        for chunk in chunk_list
+    ]
+
+    try:
+        indexed_count, errors = bulk(
+            client=opensearch_client,
+            actions=_build_bulk_actions(
+                chunk_list
+            ),
+            chunk_size=bulk_chunk_size,
+            max_retries=3,
+            initial_backoff=1,
+            max_backoff=8,
+            raise_on_error=False,
+            raise_on_exception=False,
+            refresh=True,
+        )
+
+        if errors:
+            raise DocumentIndexingError(
+                "OpenSearch bulk indexing failed for "
+                f"{len(errors)} chunk(s): "
+                f"{_summarize_bulk_errors(errors)}"
+            )
+
+        if indexed_count != len(
+            chunk_list
+        ):
+            raise DocumentIndexingError(
+                "OpenSearch returned an inconsistent indexed count: "
+                f"expected {len(chunk_list)}, "
+                f"received {indexed_count}."
+            )
+
+        stale_chunks_deleted = _delete_stale_section_chunks(
+            client=opensearch_client,
+            document_id=document_id,
+            legal_topic=legal_topic,
+            current_chunk_ids=current_chunk_ids,
+        )
+
+    except Exception as original_error:
+        try:
+            _restore_section_snapshot(
+                client=opensearch_client,
+                document_id=document_id,
+                legal_topic=legal_topic,
+                snapshot=section_snapshot,
+                bulk_chunk_size=bulk_chunk_size,
+            )
+
+        except Exception as rollback_error:
+            raise DocumentIndexingError(
+                "Section replacement failed for document "
+                f"{document_id!r}, legal_topic {legal_topic!r}, and "
+                "its OpenSearch rollback also failed."
+            ) from rollback_error
+
+        if isinstance(
+            original_error,
+            DocumentIndexingError,
+        ):
+            raise
+
+        raise DocumentIndexingError(
+            "OpenSearch section replacement failed for document "
+            f"{document_id!r}, legal_topic {legal_topic!r}."
+        ) from original_error
+
+    return DocumentIndexingResult(
+        index_alias=LEGAL_DOCUMENTS_ALIAS,
+        document_id=document_id,
+        source_filename=(
+            chunk_list[0].source_filename
+        ),
+        requested_chunks=len(
+            chunk_list
+        ),
+        indexed_chunks=int(
+            indexed_count
+        ),
+        stale_chunks_deleted=stale_chunks_deleted,
+    )
+
+# Mission "ORDER 3B" root cause: a single client.search(size=10000, ...)
+# with no explicit track_total_hits reports hits.total as {"value":
+# 10000, "relation": "gte"} once a query genuinely matches 10,000 or
+# more documents - OpenSearch's own default total-hit-tracking ceiling,
+# which coincides exactly with index.max_result_window's own default
+# (10,000). The pre-existing safety check here compared total.value
+# against len(hits) without ever looking at total.relation, so a
+# "gte 10000" lower bound was silently accepted as if it were the
+# real, exact total (10000 == 10000, the check never fires) - the
+# actual bug was invisible precisely because both ceilings are the
+# same number. Fixed by paginating exhaustively (never trusting a
+# single bounded search for a real total) rather than by raising
+# index.max_result_window (explicitly out of scope) or capping
+# documents below 25 MiB/whatever chunk count they happen to produce.
+_EXHAUSTIVE_FETCH_PAGE_SIZE: Final[int] = 5000
+
+
+def _fetch_all_chunks(
+    *,
+    client: OpenSearch,
+    field: str,
+    value: str,
+) -> list[dict[str, Any]]:
+    """
+    Fetch every chunk matching one term query (field=value),
+    exhaustively - the single, centralized mechanism every caller that
+    needs a complete chunk set (country snapshot, existing-country
+    lookup) must use, instead of each hand-rolling its own bounded
+    search (mission "ORDER 3B", section 4).
+
+    Paginates via search_after on chunk_id - a real, verified-unique,
+    sortable "keyword" field in the production mapping (never assumed;
+    confirmed against the real index while building this fix). Always
+    requests track_total_hits=True so the total this function checks
+    itself against is always the real, exact count, never OpenSearch's
+    own default "at least N" lower bound. Detects a duplicate hit
+    across pages (an unstable sort would produce one) and, when
+    finished, verifies the number of chunks actually retrieved against
+    OpenSearch's own reported total - never returns a silently
+    truncated result.
+    """
+
+    all_hits: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    search_after: list[Any] | None = None
+    expected_total: int | None = None
+
+    while True:
+        body: dict[str, Any] = {
+            "size": _EXHAUSTIVE_FETCH_PAGE_SIZE,
+            "track_total_hits": True,
+            "sort": [
+                {"chunk_id": "asc"},
+            ],
+            "query": {
+                "term": {
+                    field: value,
+                },
+            },
+        }
+
+        if search_after is not None:
+            body["search_after"] = search_after
+
+        try:
+            response = client.search(
+                index=LEGAL_DOCUMENTS_ALIAS,
+                body=body,
+            )
+
+        except NotFoundError:
+            return []
+
+        except OpenSearchException as error:
+            raise DocumentIndexingError(
+                "OpenSearch exhaustive chunk fetch failed for "
+                f"{field}={value!r}."
+            ) from error
+
+        if not isinstance(response, dict):
+            raise DocumentIndexingError(
+                "OpenSearch returned an invalid exhaustive fetch "
+                "response."
+            )
+
+        hits_container = response.get("hits")
+
+        if not isinstance(hits_container, dict):
+            raise DocumentIndexingError(
+                "OpenSearch returned invalid exhaustive fetch results."
+            )
+
+        page_hits = hits_container.get("hits")
+
+        if not isinstance(page_hits, list):
+            raise DocumentIndexingError(
+                "OpenSearch returned an invalid exhaustive fetch "
+                "hit list."
+            )
+
+        if expected_total is None:
+            total = hits_container.get("total")
+
+            if isinstance(total, dict):
+                total = total.get("value")
+
+            try:
+                expected_total = int(total)
+
+            except (TypeError, ValueError) as error:
+                raise DocumentIndexingError(
+                    "OpenSearch returned an invalid exhaustive "
+                    "fetch total."
+                ) from error
+
+        if not page_hits:
+            break
+
+        for hit in page_hits:
+            if not isinstance(hit, dict):
+                raise DocumentIndexingError(
+                    "OpenSearch returned an invalid exhaustive "
+                    "fetch hit."
+                )
+
+            hit_id = hit.get("_id")
+            source = hit.get("_source")
+
+            if (
+                not isinstance(hit_id, str)
+                or not hit_id
+                or not isinstance(source, dict)
+            ):
+                raise DocumentIndexingError(
+                    "OpenSearch returned incomplete exhaustive "
+                    "fetch data."
+                )
+
+            if hit_id in seen_ids:
+                raise DocumentIndexingError(
+                    "OpenSearch exhaustive fetch returned the same "
+                    f"chunk twice across pages ({hit_id!r}) - "
+                    "pagination is not stable."
+                )
+
+            seen_ids.add(hit_id)
+            all_hits.append(
+                {
+                    "_id": hit_id,
+                    "_source": source,
+                }
+            )
+
+        sort_values = page_hits[-1].get("sort")
+
+        if not isinstance(sort_values, list) or not sort_values:
+            raise DocumentIndexingError(
+                "OpenSearch returned no sort values to paginate "
+                "the exhaustive chunk fetch."
+            )
+
+        search_after = sort_values
+
+        if len(page_hits) < _EXHAUSTIVE_FETCH_PAGE_SIZE:
+            break
+
+    if expected_total is not None and len(all_hits) != expected_total:
+        raise DocumentIndexingError(
+            "OpenSearch exhaustive fetch retrieved "
+            f"{len(all_hits)} chunk(s) for {field}={value!r}, but the "
+            f"real total was {expected_total} - pagination did not "
+            "exhaust the result set."
+        )
+
+    return all_hits
+
+
 def _snapshot_country_chunks(
     *,
     client: OpenSearch,
@@ -391,92 +944,11 @@ def _snapshot_country_chunks(
 ) -> list[dict[str, Any]]:
     """Capture all active chunks for one country before replacement."""
 
-    try:
-        response = client.search(
-            index=LEGAL_DOCUMENTS_ALIAS,
-            body={
-                "size": 10000,
-                "query": {
-                    "term": {
-                        "country_code": country_code,
-                    }
-                },
-            },
-        )
-
-    except NotFoundError:
-        return []
-
-    except OpenSearchException as error:
-        raise DocumentIndexingError(
-            "OpenSearch country snapshot failed."
-        ) from error
-
-    if not isinstance(response, dict):
-        raise DocumentIndexingError(
-            "OpenSearch returned an invalid country snapshot."
-        )
-
-    hits_container = response.get("hits")
-
-    if not isinstance(hits_container, dict):
-        raise DocumentIndexingError(
-            "OpenSearch returned invalid country snapshot results."
-        )
-
-    hits = hits_container.get("hits")
-
-    if not isinstance(hits, list):
-        raise DocumentIndexingError(
-            "OpenSearch returned an invalid country snapshot hit list."
-        )
-
-    total = hits_container.get("total", len(hits))
-
-    if isinstance(total, dict):
-        total = total.get("value", len(hits))
-
-    try:
-        total_count = int(total)
-
-    except (TypeError, ValueError) as error:
-        raise DocumentIndexingError(
-            "OpenSearch returned an invalid country snapshot count."
-        ) from error
-
-    if total_count > len(hits):
-        raise DocumentIndexingError(
-            "The country snapshot exceeded the safe replacement limit."
-        )
-
-    snapshot: list[dict[str, Any]] = []
-
-    for hit in hits:
-        if not isinstance(hit, dict):
-            raise DocumentIndexingError(
-                "OpenSearch returned an invalid country snapshot hit."
-            )
-
-        hit_id = hit.get("_id")
-        source = hit.get("_source")
-
-        if (
-            not isinstance(hit_id, str)
-            or not hit_id
-            or not isinstance(source, dict)
-        ):
-            raise DocumentIndexingError(
-                "OpenSearch returned incomplete country snapshot data."
-            )
-
-        snapshot.append(
-            {
-                "_id": hit_id,
-                "_source": source,
-            }
-        )
-
-    return snapshot
+    return _fetch_all_chunks(
+        client=client,
+        field="country_code",
+        value=country_code,
+    )
 
 
 def _delete_country_chunks(
@@ -487,68 +959,43 @@ def _delete_country_chunks(
 ) -> int:
     """Delete country chunks, optionally preserving the current IDs."""
 
-    query: dict[str, Any] = {
-        "term": {
-            "country_code": country_code,
-        }
-    }
-
-    if keep_chunk_ids:
-        query = {
-            "bool": {
-                "filter": [
-                    {
-                        "term": {
-                            "country_code": country_code,
-                        }
-                    }
-                ],
-                "must_not": [
-                    {
-                        "terms": {
-                            "chunk_id": list(keep_chunk_ids),
-                        }
-                    }
-                ],
+    return _delete_chunks_except(
+        client=client,
+        filters=[
+            {
+                "term": {
+                    "country_code": country_code,
+                }
             }
-        }
-
-    try:
-        response = client.delete_by_query(
-            index=LEGAL_DOCUMENTS_ALIAS,
-            body={
-                "query": query,
-            },
-            conflicts="proceed",
-            refresh=True,
-        )
-
-    except OpenSearchException as error:
-        raise DocumentIndexingError(
-            "OpenSearch country cleanup failed."
-        ) from error
-
-    if not isinstance(response, dict):
-        raise DocumentIndexingError(
-            "OpenSearch returned an invalid country cleanup response."
-        )
-
-    try:
-        return int(response.get("deleted", 0))
-
-    except (TypeError, ValueError) as error:
-        raise DocumentIndexingError(
-            "OpenSearch returned an invalid country cleanup count."
-        ) from error
+        ],
+        keep_chunk_ids=keep_chunk_ids,
+        context=f"country {country_code!r}",
+    )
 
 
-def _restore_country_snapshot(
+def _reindex_snapshot_chunks(
     *,
     client: OpenSearch,
     snapshot: Sequence[dict[str, Any]],
     bulk_chunk_size: int,
+    context: str,
 ) -> None:
-    """Restore a previously captured country snapshot."""
+    """
+    Re-index every chunk captured in `snapshot` verbatim.
+
+    The shared, reindex-only half of every snapshot restore in this
+    module (mission "ORDER 5C" corrective gate, section 4) - never
+    deletes anything itself. Every chunk_id is deterministic, so
+    re-indexing one that is still present is a harmless overwrite.
+    A caller that needs "the scope now holds exactly this snapshot,
+    nothing more" combines this with its own appropriately-scoped
+    _delete_chunks_except call - the two are never fused into one
+    function, because "appropriately scoped" differs by caller (a
+    whole country, a whole document, or one document's single
+    section) and fusing them was the exact bug this corrective gate
+    caught: a section-scoped snapshot restored through a document-
+    wide delete-except would wipe every OTHER section's chunks too.
+    """
 
     if not snapshot:
         return
@@ -577,8 +1024,24 @@ def _restore_country_snapshot(
 
     if errors or restored_count != len(actions):
         raise DocumentIndexingError(
-            "OpenSearch country snapshot restoration failed."
+            f"OpenSearch snapshot restoration failed ({context})."
         )
+
+
+def _restore_country_snapshot(
+    *,
+    client: OpenSearch,
+    snapshot: Sequence[dict[str, Any]],
+    bulk_chunk_size: int,
+) -> None:
+    """Restore a previously captured country snapshot."""
+
+    _reindex_snapshot_chunks(
+        client=client,
+        snapshot=snapshot,
+        bulk_chunk_size=bulk_chunk_size,
+        context="country snapshot",
+    )
 
 
 def replace_country_document_chunks(

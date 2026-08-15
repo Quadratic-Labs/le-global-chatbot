@@ -23,6 +23,7 @@ from app.services.document_chunk_builder import (
     metadata_from_content,
     validate_docx_format,
 )
+from app.services.docx_country_marker import write_country_marker
 from app.services.docx_parser import ParsedSection
 
 
@@ -433,6 +434,31 @@ class DocumentChunkBuilderTests(unittest.TestCase):
             ):
                 metadata_from_content(file_path=file_path)
 
+    def test_title_with_leading_definite_article_resolves_country(
+        self,
+    ) -> None:
+        # Mission "ORDER 2": Czech Republic's real production source
+        # reads "Labour and employment law in the Czech Republic" -
+        # with the article - and the registry had no "the Czech
+        # Republic" alias, so this raised
+        # UndeterminableDocumentCountryError on Reindex (masked by the
+        # router into a generic 502). Reproduces the exact title
+        # phrasing, not just the country name in isolation.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                [
+                    "Labour and employment law in the Czech Republic"
+                ],
+            )
+
+            metadata = metadata_from_content(
+                file_path=file_path
+            )
+
+        self.assertEqual(metadata.country, "Czech Republic")
+        self.assertEqual(metadata.country_code, "CZ")
+
     def test_uk_content_uses_canonical_country_name(
         self,
     ) -> None:
@@ -836,6 +862,67 @@ class RealDocumentStructureTests(unittest.TestCase):
         self.assertEqual(metadata.country, "Philippines")
         self.assertEqual(metadata.country_code, "PH")
 
+    def test_reversed_cover_country_then_plural_heading_with_year_range(
+        self,
+    ) -> None:
+        # The real France document's own cover: a bare country name,
+        # then a heading with a plural "Overviews" and a year range -
+        # the reverse order and wording of the usual two-line cover.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["FRANCE", "EMPLOYMENT LAW OVERVIEWS 2025 - 2026"],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "France")
+        self.assertEqual(metadata.country_code, "FR")
+
+    def test_reversed_cover_country_then_heading_with_template_boilerplate(
+        self,
+    ) -> None:
+        # The real Portugal document's own cover: a bare country
+        # name, then a heading wrapped in unrelated boilerplate words
+        # on both sides ("Country-Specific ... Template").
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                [
+                    "PORTUGAL",
+                    "COUNTRY-SPECIFIC EMPLOYMENT LAW OVERVIEWS 2026 TEMPLATE",
+                ],
+            )
+
+            metadata = metadata_from_content(file_path=file_path)
+
+        self.assertEqual(metadata.country, "Portugal")
+        self.assertEqual(metadata.country_code, "PT")
+
+    def test_reversed_cover_fallback_never_silently_misdetects_an_unrelated_country(
+        self,
+    ) -> None:
+        # The reversed-order fallback's "next line merely contains
+        # the family heading phrase" check is deliberately loose - an
+        # unrelated bare country name sitting directly before some
+        # other line that happens to contain "Employment Law
+        # Overview" (e.g. a real cover's own one-line title for the
+        # actual country) must never be silently accepted as *the*
+        # document's country. The pre-existing ambiguity refusal
+        # (more than one distinct country code found in the front
+        # matter) is what has to catch this - proven here rather than
+        # merely assumed.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Spain", "Employment Law Overview Canada"],
+            )
+
+            with self.assertRaises(
+                AmbiguousDocumentCountryError
+            ):
+                metadata_from_content(file_path=file_path)
+
     def test_document_with_no_standard_cover_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
             file_path = _build_docx(
@@ -1025,6 +1112,162 @@ class RealDocumentStructureTests(unittest.TestCase):
             matching_chunks[0].section,
             "06. Social Media and Data Privacy in the USA",
         )
+
+
+class CountryMarkerPriorityTests(unittest.TestCase):
+    """
+    Mission "ORDER 8E-A1", section 11 - a valid DOCX-native country
+    marker always takes priority over content detection, but never
+    prevents content from being scanned for a reference_year, and
+    never disturbs detection for a document that has no marker at all
+    (every one of the 33 real production documents today).
+    """
+
+    def test_marker_resolves_a_document_with_no_detectable_country(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            countryless = _build_docx(
+                Path(directory),
+                ["Some heading with no recognizable country."],
+                body_paragraphs=["Body content."],
+            )
+
+            with self.assertRaises(UndeterminableDocumentCountryError):
+                metadata_from_content(countryless)
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                countryless,
+                marked,
+                country_code="fr",
+                country_name="France",
+            )
+
+            metadata = metadata_from_content(marked)
+
+            self.assertEqual(metadata.country_code, "FR")
+            self.assertEqual(metadata.country, "France")
+
+    def test_marker_wins_even_when_content_would_detect_differently(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Canada"],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                file_path,
+                marked,
+                country_code="de",
+                country_name="Germany",
+            )
+
+            metadata = metadata_from_content(marked)
+
+            self.assertEqual(metadata.country_code, "DE")
+
+    def test_marker_does_not_prevent_year_detection_from_content(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            # "Elbonia" is title-shaped but not a real registered
+            # country - content detection alone would fail here
+            # (UnknownCountryNameError, silently skipped), yet the
+            # year itself is still worth capturing once a marker has
+            # already settled the country from elsewhere.
+            countryless_with_year = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Elbonia 2027"],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                countryless_with_year,
+                marked,
+                country_code="jp",
+                country_name="Japan",
+            )
+
+            metadata = metadata_from_content(marked)
+
+            self.assertEqual(metadata.country_code, "JP")
+            self.assertEqual(metadata.reference_year, 2027)
+
+    def test_documents_without_a_marker_are_completely_unaffected(
+        self,
+    ) -> None:
+        # Every one of the 33 real production documents has no marker
+        # at all - detection for them must be byte-for-byte the same
+        # code path as before this mission.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Spain 2026"],
+            )
+
+            metadata = metadata_from_content(file_path)
+
+            self.assertEqual(metadata.country_code, "ES")
+            self.assertEqual(metadata.reference_year, 2026)
+
+    def test_explicit_country_code_mismatch_against_a_marker_is_rejected(
+        self,
+    ) -> None:
+        # Reuses the same CountryMetadataMismatchError contract a
+        # caller-supplied country_code already gets against content
+        # detection (see admin_document_sections.py's re-validation) -
+        # a marker is not a special case exempt from that check.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Some heading with no recognizable country."],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                file_path,
+                marked,
+                country_code="fr",
+                country_name="France",
+            )
+
+            with self.assertRaises(CountryMetadataMismatchError):
+                metadata_from_content(marked, country_code="DE")
+
+    def test_marker_survives_full_chunk_building_end_to_end(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            countryless = _build_docx(
+                Path(directory),
+                ["Some heading with no recognizable country."],
+                body_paragraphs=[
+                    "01. Hiring Practices",
+                    "Content about hiring.",
+                ],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                countryless,
+                marked,
+                country_code="be",
+                country_name="Belgium",
+            )
+
+            chunks = build_document_chunks_from_docx(marked)
+
+            self.assertTrue(chunks)
+            self.assertTrue(
+                all(
+                    chunk.country_code == "BE"
+                    for chunk in chunks
+                )
+            )
 
 
 if __name__ == "__main__":

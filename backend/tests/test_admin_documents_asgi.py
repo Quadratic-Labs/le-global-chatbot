@@ -329,11 +329,17 @@ class FakeOpenSearch:
         term = body["query"].get("term") or {}
 
         if "country_code" in term:
-            by_document: dict[str, dict[str, Any]] = {}
-            for chunk in self.chunks.values():
-                if chunk["country_code"] == term["country_code"]:
-                    by_document.setdefault(chunk["document_id"], chunk)
-            hits = list(by_document.values())
+            # One hit per real chunk (never deduplicated by
+            # document_id) - matches real OpenSearch's own per-chunk
+            # granularity; callers that want distinct documents
+            # already deduplicate client-side (mission "ORDER 3B",
+            # section 6 - keep this fake's shape faithful to what
+            # test_admin_documents_router_integration.py's own
+            # FakeOpenSearch already documents).
+            hits = [
+                c for c in self.chunks.values()
+                if c["country_code"] == term["country_code"]
+            ]
         elif "document_id" in term:
             hits = [
                 c for c in self.chunks.values()
@@ -346,7 +352,19 @@ class FakeOpenSearch:
             "hits": {
                 "total": {"value": len(hits)},
                 "hits": [
-                    {"_id": h["chunk_id"], "_source": h} for h in hits
+                    {
+                        "_id": h["chunk_id"],
+                        "_source": h,
+                        # Mission "ORDER 3B": real OpenSearch 3.7
+                        # includes a "sort" array whenever the request
+                        # itself carries a "sort" clause, as
+                        # _fetch_all_chunks's search_after pagination
+                        # always does.
+                        "sort": [h["chunk_id"]],
+                    }
+                    for h in sorted(
+                        hits, key=lambda c: c["chunk_id"]
+                    )
                 ],
             }
         }
@@ -485,7 +503,11 @@ class FreshUploadAsgiTests(AdminAsgiTestCase):
             file_field="file",
             filename="Chile.docx",
             file_content=_CL_DOCX_BYTES,
-            extra_fields={"replace_existing": "false"},
+            extra_fields={
+                "replace_existing": "false",
+                "confirm_warnings": "true",
+                "country_confirmed": "true",
+            },
         )
 
         response = asgi_request(
@@ -526,7 +548,11 @@ class ExistingCountryAsgiTests(AdminAsgiTestCase):
             file_field="file",
             filename="Chile.docx",
             file_content=_CL_DOCX_BYTES,
-            extra_fields={"replace_existing": "false"},
+            extra_fields={
+                "replace_existing": "false",
+                "confirm_warnings": "true",
+                "country_confirmed": "true",
+            },
         )
 
         response = asgi_request(
@@ -573,7 +599,10 @@ class FastApiValidationAsgiTests(AdminAsgiTestCase):
             file_field="file",
             filename="unused.docx",
             file_content=b"unused",
-            extra_fields={"replace_existing": "false"},
+            extra_fields={
+                "replace_existing": "false",
+                "confirm_warnings": "true",
+            },
             include_file=False,
         )
 

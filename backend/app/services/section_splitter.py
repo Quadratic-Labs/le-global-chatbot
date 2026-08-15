@@ -345,6 +345,7 @@ def split_parsed_sections(
                     section=parsed_section.section,
                     subsection=parsed_section.subsection,
                     content=content_part,
+                    is_custom_legal_topic=parsed_section.is_custom_legal_topic,
                 )
             )
 

@@ -26,6 +26,7 @@ from app.core.subsection_taxonomy import (
     get_subsection_topic_override,
 )
 from app.models.document import DocumentChunk
+from app.services.docx_country_marker import read_country_marker
 from app.services.docx_parser import (
     ParsedSection,
     build_contact_chunk_content,
@@ -75,6 +76,20 @@ _TITLE_LINE_PATTERNS: Final[
 # fallback pairs with the following line.
 _BARE_FAMILY_HEADING_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:Labour and Employment Law|Employment Law Overview)\s*/?\s*$",
+    re.IGNORECASE,
+)
+
+# A looser, "contains" signal for the same document family - some
+# real covers (e.g. France's "EMPLOYMENT LAW OVERVIEWS 2025 - 2026",
+# Portugal's "COUNTRY-SPECIFIC EMPLOYMENT LAW OVERVIEWS 2026
+# TEMPLATE") wrap the family phrase in extra words the exact
+# _BARE_FAMILY_HEADING_PATTERN never anticipated (a plural, a year
+# range, template boilerplate). Used only to recognize *that a line
+# is heading-shaped*, in the reversed two-line cover below - the
+# actual country token still has to pass resolve_country() downstream,
+# so a loose match here never by itself accepts a non-country line.
+_FAMILY_HEADING_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"Labour and Employment Law|Employment Law Overview",
     re.IGNORECASE,
 )
 
@@ -363,10 +378,12 @@ def _match_title_line(
     """
     One candidate (raw country token, optional year) from a single
     title/cover line, or from that line paired with the one right
-    after it - covers both a one-line cover ("Employment Law
-    Overview Canada 2026", "Labour and Employment Law / Canada") and
-    a two-line cover (a bare "Labour and Employment Law" heading
-    immediately followed by a "Canada" line).
+    after it - covers a one-line cover ("Employment Law Overview
+    Canada 2026", "Labour and Employment Law / Canada") and a
+    two-line cover in either order: a bare "Labour and Employment
+    Law" heading immediately followed by a "Canada" line, or a bare
+    "France" / "Portugal" country line immediately followed by a
+    heading line (some real covers put the country first).
     """
 
     line = _normalize_front_matter_line(line)
@@ -407,6 +424,47 @@ def _match_title_line(
     ):
         return next_line.strip(), None
 
+    if (
+        next_line
+        and _FAMILY_HEADING_TOKEN_PATTERN.search(next_line)
+        and not _FAMILY_HEADING_TOKEN_PATTERN.search(line)
+        and line
+    ):
+        return line.strip(), None
+
+    return None
+
+
+def _detect_year_only_from_content(
+    file_path: Path,
+) -> int | None:
+    """
+    Best-effort reference_year from the document's own title/cover
+    content, independent of whether a country resolves there at all.
+
+    Used only when a DOCX-native country marker (see
+    docx_country_marker.py) already settled the country - the marker
+    takes priority for country (mission "ORDER 8E-A1", section 11),
+    but a title line's year is still worth capturing rather than
+    losing it just because country resolution is skipped.
+    """
+
+    lines = _leading_front_matter_blocks(file_path)
+
+    for index, line in enumerate(lines):
+        next_line = (
+            lines[index + 1] if index + 1 < len(lines) else None
+        )
+        candidate = _match_title_line(line, next_line)
+
+        if candidate is None:
+            continue
+
+        _, year = candidate
+
+        if year is not None:
+            return year
+
     return None
 
 
@@ -418,6 +476,16 @@ def _detect_country_and_year_from_content(
     Resolve (country, country_code, reference_year) from the
     document's own title/cover content - never from its filename.
 
+    A valid DOCX-native country marker (see docx_country_marker.py)
+    always takes priority over content detection (mission "ORDER
+    8E-A1", section 11): an Admin's manually-selected country, once
+    persisted into the DOCX itself, must keep being recognized on
+    every future Download/Reindex/re-upload, even if the document's
+    own content still can't be resolved to a country on its own. The
+    marker only ever settles *which* country was detected - it is
+    never a bypass of the confirmation the upload flow always
+    requires (see admin_document_replacement.py).
+
     Only the leading front matter is scanned (see
     _leading_front_matter_blocks). Candidates are deduplicated by
     resolved country *code*, not raw text, so trivially different
@@ -425,6 +493,25 @@ def _detect_country_and_year_from_content(
     one distinct country code found there - a genuinely ambiguous
     cover - is refused rather than guessed at (section 7).
     """
+
+    marker = read_country_marker(file_path)
+
+    if marker is not None:
+        # Reuses resolve_country's own caller-supplied-code mismatch
+        # check (CountryMetadataMismatchError) rather than duplicating
+        # it - marker.country_name is already a canonical registry
+        # display name, so this always resolves back to
+        # marker.country_code when country_code is None.
+        country, resolved_code = resolve_country(
+            raw_country=marker.country_name,
+            country_code=country_code,
+        )
+
+        return (
+            country,
+            resolved_code,
+            _detect_year_only_from_content(file_path),
+        )
 
     lines = _leading_front_matter_blocks(file_path)
 
@@ -645,6 +732,58 @@ def metadata_from_content(
     )
 
 
+def resolve_effective_legal_topic(
+    *,
+    parsed_section: ParsedSection,
+    section: str,
+    country: str,
+) -> tuple[str, str | None]:
+    """
+    Return (document_type, legal_topic) for one parsed section - the
+    single rule every caller that needs a section's effective topic
+    must share (the chunk builder, and the admin section-editing
+    service that reads the current DOCX as authority), so a section
+    is never classified two different ways in two different places.
+
+    Raises UnknownLegalTopicError for a heading-like section that
+    resolves to neither the fixed taxonomy, a one-off subsection
+    override, nor a parser-confirmed custom top-level topic - a real
+    parser bug, never silently swallowed.
+    """
+
+    if is_overview_section(
+        section=section,
+        country=country,
+    ):
+        return "overview", None
+
+    legal_topic = (
+        get_canonical_legal_topic(
+            section=section,
+            country=country,
+        )
+        or get_subsection_topic_override(
+            section
+        )
+    )
+
+    if (
+        legal_topic is None
+        and parsed_section.is_custom_legal_topic
+    ):
+        legal_topic = section
+
+    if legal_topic is None:
+        raise UnknownLegalTopicError(
+            "Unknown legal topic detected. "
+            f"Section: {section!r}. "
+            "The document was not indexed because "
+            "the topic is outside the approved taxonomy."
+        )
+
+    return "comparator", legal_topic
+
+
 def build_document_chunks(
     parsed_sections: Sequence[
         ParsedSection
@@ -720,33 +859,11 @@ def build_document_chunks(
         if not content:
             continue
 
-        if is_overview_section(
+        document_type, legal_topic = resolve_effective_legal_topic(
+            parsed_section=parsed_section,
             section=section,
             country=country,
-        ):
-            document_type = "overview"
-            legal_topic = None
-
-        else:
-            document_type = "comparator"
-
-            legal_topic = (
-                get_canonical_legal_topic(
-                    section=section,
-                    country=country,
-                )
-                or get_subsection_topic_override(
-                    section
-                )
-            )
-
-            if legal_topic is None:
-                raise UnknownLegalTopicError(
-                    "Unknown legal topic detected. "
-                    f"Section: {section!r}. "
-                    "The document was not indexed because "
-                    "the topic is outside the approved taxonomy."
-                )
+        )
 
         path_key = (
             document_type,

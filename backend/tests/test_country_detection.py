@@ -388,6 +388,121 @@ class CountryAvailabilityTests(unittest.TestCase):
                 catalog_provider=failing_catalog_provider,
             )
 
+    def test_city_only_question_resolves_to_its_country(
+        self,
+    ) -> None:
+        # Mission "ORDER 5C-GEO", section 15/21 - a question naming
+        # only a city, with the city's country genuinely indexed,
+        # must be treated exactly as if that country had been named
+        # outright.
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question="What is the law in Madrid?"
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(availability.available_codes, ["ES"])
+        self.assertEqual(availability.unavailable_codes, [])
+
+    def test_city_only_question_for_an_unindexed_country(
+        self,
+    ) -> None:
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question="What is the law in Lisbon?"
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(availability.available_codes, [])
+        self.assertEqual(availability.unavailable_codes, ["PT"])
+
+    def test_ambiguous_city_alone_contributes_nothing(
+        self,
+    ) -> None:
+        # Barcelona alone (no explicit country) must never be guessed
+        # - this is exactly as if no location had been mentioned at
+        # all, never a silently-picked candidate.
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question="What is the law in Barcelona?"
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(availability.available_codes, [])
+        self.assertEqual(availability.unavailable_codes, [])
+
+    def test_explicit_country_beats_an_unrelated_city_mention(
+        self,
+    ) -> None:
+        # An explicit country name already answers the question in
+        # full (mission section 10) - the city fallback must never
+        # even run, let alone add anything.
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question=(
+                    "Compare notice periods in Spain and Canada, "
+                    "for a client based in Barcelona."
+                )
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(availability.available_codes, ["ES"])
+        self.assertEqual(availability.unavailable_codes, ["CA"])
+
+    def test_legacy_country_indexed_outside_the_admin_allowlist_is_visible(
+        self,
+    ) -> None:
+        # Mission "ORDER 5C-GEO", section 16 - the ADMIN upload
+        # allowlist must never hide a country the real catalog
+        # already has content for, even one this registry only
+        # resolves through the generic pycountry fallback (Algeria is
+        # not curated, and is not part of ADMIN_ALLOWED_COUNTRY_CODES
+        # either).
+        def catalog_with_legacy_algeria() -> LegalCatalogResponse:
+            return LegalCatalogResponse(
+                countries=[
+                    LegalCatalogCountry(
+                        country_code="DZ",
+                        country="Algeria",
+                        chunk_count=12,
+                    ),
+                ],
+                legal_topics=[],
+                subsections=[],
+            )
+
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question="What is the law in Algeria?"
+            ),
+            catalog_provider=catalog_with_legacy_algeria,
+        )
+
+        self.assertEqual(availability.available_codes, ["DZ"])
+        self.assertEqual(availability.unavailable_codes, [])
+
+    def test_slovakia_without_an_indexed_document_is_unavailable(
+        self,
+    ) -> None:
+        # Mission "ORDER 5C-GEO", section 19 - Slovakia is recognized
+        # and admin-upload-allowed, but with no indexed document (not
+        # in this test's catalog) chat availability must say so, and
+        # must never be conflated with the separate Czech contact-
+        # mapping question this mission also asks about.
+        availability = resolve_country_availability(
+            request=LegalChatRequest(
+                question="What is the law in Slovakia?"
+            ),
+            catalog_provider=_catalog_provider,
+        )
+
+        self.assertEqual(availability.available_codes, [])
+        self.assertEqual(availability.unavailable_codes, ["SK"])
+
 
 class CountryDisplayNameTests(unittest.TestCase):
     """Tests for resolving readable country names from codes."""

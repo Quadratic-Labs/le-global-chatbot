@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -26,6 +27,9 @@ from app.services.admin_document_replacement import (
     ExistingCountryDocument,
     lookup_existing_country_documents,
 )
+from app.services.country_lock import (
+    country_lock,
+)
 from app.services.document_chunk_builder import (
     build_document_chunks_from_docx,
 )
@@ -35,6 +39,9 @@ from app.services.document_indexer import (
     _restore_country_snapshot,
     _snapshot_country_chunks,
     replace_document_chunks,
+)
+from app.services.document_section_state import (
+    delete_section_edit_state,
 )
 from app.services.document_source_resolver import (
     DocumentSourceConflictError,
@@ -97,6 +104,111 @@ class AdminDocumentSourceConflictError(RuntimeError):
 
 class AdminDocumentLifecycleError(RuntimeError):
     """Raised when a document lifecycle operation fails."""
+
+
+class AdminDocumentRollbackError(AdminDocumentLifecycleError):
+    """
+    Raised when a lifecycle operation failed AND the rollback attempted
+    afterwards was itself incomplete - the indexed/filesystem state may
+    now differ from both the pre-operation and the intended post-
+    operation state, and needs manual verification. Always a subclass
+    of AdminDocumentLifecycleError, so a caller matching only the
+    parent class still catches this - but a caller matching this
+    subclass specifically (mission "ORDER 2": the admin router does)
+    can flag it as the more urgent condition it actually is.
+    """
+
+
+class AdminDocumentCountryConflictError(RuntimeError):
+    """
+    Raised when more than one active document_id already exists for a
+    document's country before a normal mutation - Edit/Add/Reindex
+    must never arbitrarily pick one of them (ORDER 8A, section 23).
+    Protects legacy duplicate-country states (e.g. Italy today) from
+    being silently mutated through only one of their two IDs. A
+    confirmed Upload/Replace is the one legitimate way to resolve such
+    a conflict (it retires every candidate source and chunk for the
+    country atomically) and is deliberately not gated by this check.
+    """
+
+    def __init__(
+        self,
+        *,
+        country_code: str,
+        document_ids: Sequence[str],
+        operation: str = "section_update",
+    ) -> None:
+        self.country_code = country_code
+        self.document_ids = tuple(document_ids)
+        self.operation = operation
+
+        super().__init__(
+            f"Country {country_code!r} has {len(self.document_ids)} "
+            "active documents - refusing to mutate any single one "
+            "until the conflict is resolved."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        return {
+            "code": "country_document_conflict",
+            "message": str(self),
+            "operation": self.operation,
+            "country_code": self.country_code,
+            "document_ids": list(self.document_ids),
+        }
+
+
+def _ensure_no_country_conflict(
+    *,
+    country_code: str,
+    client: OpenSearch,
+    operation: str = "section_update",
+) -> None:
+    """
+    ORDER 8A section 23: refuse any normal mutation, with zero effect,
+    when more than one active document_id already exists for this
+    country - never guess which one is "the real one".
+    """
+
+    try:
+        existing_documents = lookup_existing_country_documents(
+            country_code,
+            client,
+        )
+
+    except Exception as error:
+        raise AdminDocumentLifecycleError(
+            "The country catalog could not be checked before this "
+            "operation."
+        ) from error
+
+    if len(existing_documents) > 1:
+        raise AdminDocumentCountryConflictError(
+            country_code=country_code,
+            operation=operation,
+            document_ids=[
+                document.document_id
+                for document in existing_documents
+            ],
+        )
+
+
+def _tag_country_code(
+    error: Exception,
+    country_code: str | None,
+) -> Exception:
+    """
+    Attach country_code to a business exception for structured
+    logging (mission "ORDER 2"), without changing any exception
+    class's constructor signature. A plain attribute, not a new
+    __init__ parameter: every one of these exception types is also
+    constructed directly in existing tests with just a message, and
+    this must never require touching those call sites.
+    """
+
+    error.country_code = country_code  # type: ignore[attr-defined]
+
+    return error
 
 
 class DeleteBackupRestoreError(RuntimeError):
@@ -275,6 +387,84 @@ def _get_document_metadata(
         )
 
     return source
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDownload:
+    """The resolved, real on-disk source file backing one document_id."""
+
+    path: Path
+    download_filename: str
+
+
+def get_document_download(
+    *,
+    document_id: str,
+    source_directory: Path,
+    client: OpenSearch | None = None,
+) -> DocumentDownload:
+    """
+    Resolve the one real source DOCX backing document_id, for GET
+    .../download (mission "ORDER 3", section 25).
+
+    Reuses exactly the same resolver reindex/delete already trust
+    (resolve_document_source_path) - never a second, independent way
+    to pick a source file, and never a client-supplied path: the
+    client provides only document_id, this function does the rest.
+    Read-only - never acquires the per-country lock, since a download
+    does not mutate anything and must not be serialized behind writes.
+    """
+
+    validated_document_id = _validate_document_id(
+        document_id
+    )
+
+    opensearch_client = _get_client(
+        client
+    )
+
+    metadata = _get_document_metadata(
+        document_id=validated_document_id,
+        client=opensearch_client,
+    )
+
+    source_filename = _required_string(
+        metadata,
+        "source_filename",
+    )
+
+    country_code = _required_string(
+        metadata,
+        "country_code",
+    )
+
+    try:
+        resolved_source = resolve_document_source_path(
+            source_root=source_directory,
+            country_code=country_code,
+            source_filename=source_filename,
+        )
+
+    except DocumentSourceConflictError as error:
+        raise _tag_country_code(
+            AdminDocumentSourceConflictError(
+                str(error)
+            ),
+            country_code,
+        ) from error
+
+    if resolved_source.path is None:
+        raise _tag_country_code(
+            AdminDocumentSourceMissingError(
+                "The source DOCX file is missing."
+            ),
+            country_code,
+        )
+
+    return DocumentDownload(
+        path=resolved_source.path,
+        download_filename=source_filename,
+    )
 
 
 def _validate_delete_by_query_response(
@@ -546,6 +736,13 @@ def reindex_indexed_document(
     the ID-changed case (the new document_id's chunks) and the
     ID-unchanged case (stray new chunk_ids under the same document_id
     from a document_indexer step that failed partway through).
+
+    Mission "ORDER 3", section 17: held under a per-country lock so a
+    concurrent upload/reindex/delete for the same country can never
+    interleave with this one. A cheap, unlocked metadata read only
+    learns which country to lock (document_id alone does not encode
+    it) - the authoritative read _reindex_indexed_document_locked
+    performs happens again, fresh, once the lock is held.
     """
 
     validated_document_id = (
@@ -557,6 +754,40 @@ def reindex_indexed_document(
     opensearch_client = _get_client(
         client
     )
+
+    preliminary_metadata = _get_document_metadata(
+        document_id=validated_document_id,
+        client=opensearch_client,
+    )
+
+    country_code_for_lock = _required_string(
+        preliminary_metadata,
+        "country_code",
+    )
+
+    with country_lock(
+        source_directory,
+        country_code_for_lock,
+    ):
+        return _reindex_indexed_document_locked(
+            validated_document_id=validated_document_id,
+            source_directory=source_directory,
+            opensearch_client=opensearch_client,
+            chunk_builder=chunk_builder,
+            document_indexer=document_indexer,
+        )
+
+
+def _reindex_indexed_document_locked(
+    *,
+    validated_document_id: str,
+    source_directory: Path,
+    opensearch_client: OpenSearch,
+    chunk_builder: ChunkBuilder,
+    document_indexer: DocumentIndexer,
+) -> AdminDocumentReindexResponse:
+    """The real reindex logic - always called with the country's lock
+    already held by reindex_indexed_document."""
 
     metadata = _get_document_metadata(
         document_id=validated_document_id,
@@ -573,6 +804,12 @@ def reindex_indexed_document(
         "country_code",
     )
 
+    _ensure_no_country_conflict(
+        country_code=old_country_code,
+        client=opensearch_client,
+        operation="reindex",
+    )
+
     try:
         resolved_source = resolve_document_source_path(
             source_root=source_directory,
@@ -581,13 +818,19 @@ def reindex_indexed_document(
         )
 
     except DocumentSourceConflictError as error:
-        raise AdminDocumentSourceConflictError(
-            str(error)
+        raise _tag_country_code(
+            AdminDocumentSourceConflictError(
+                str(error)
+            ),
+            old_country_code,
         ) from error
 
     if resolved_source.path is None:
-        raise AdminDocumentSourceMissingError(
-            "The source DOCX file is missing."
+        raise _tag_country_code(
+            AdminDocumentSourceMissingError(
+                "The source DOCX file is missing."
+            ),
+            old_country_code,
         )
 
     source_path = resolved_source.path
@@ -598,8 +841,12 @@ def reindex_indexed_document(
         )
 
     except Exception as error:
-        raise AdminDocumentLifecycleError(
-            "The source DOCX could not be parsed."
+        raise _tag_country_code(
+            AdminDocumentLifecycleError(
+                "The source DOCX could not be parsed: "
+                f"{error}"
+            ),
+            old_country_code,
         ) from error
 
     if not chunks:
@@ -617,10 +864,14 @@ def reindex_indexed_document(
         # the rollback model simple and avoids ever restoring only
         # one of two countries. Upload/Replace already has its own,
         # separately-guarded workflow for a genuine country change.
-        raise AdminDocumentLifecycleError(
-            "Reindexing this document would change its country from "
-            f"{old_country_code} to {new_country_code}, which "
-            "Reindex does not support - use Upload/Replace instead."
+        raise _tag_country_code(
+            AdminDocumentLifecycleError(
+                "Reindexing this document would change its country "
+                f"from {old_country_code} to {new_country_code}, "
+                "which Reindex does not support - use Upload/Replace "
+                "instead."
+            ),
+            old_country_code,
         )
 
     chunk_snapshot = _snapshot_country_chunks(
@@ -716,21 +967,24 @@ def reindex_indexed_document(
             extra_chunks_removed = False
 
         if not index_restored or not extra_chunks_removed:
-            raise AdminDocumentLifecycleError(
-                "Reindexing failed, and the rollback afterwards was "
-                "incomplete (previous index state "
-                + (
-                    "restored"
-                    if index_restored
-                    else "NOT restored"
-                )
-                + ", extra chunks "
-                + (
-                    "removed"
-                    if extra_chunks_removed
-                    else "NOT removed"
-                )
-                + ") - manual recovery is required."
+            raise _tag_country_code(
+                AdminDocumentRollbackError(
+                    "Reindexing failed, and the rollback afterwards was "
+                    "incomplete (previous index state "
+                    + (
+                        "restored"
+                        if index_restored
+                        else "NOT restored"
+                    )
+                    + ", extra chunks "
+                    + (
+                        "removed"
+                        if extra_chunks_removed
+                        else "NOT removed"
+                    )
+                    + ") - manual recovery is required."
+                ),
+                old_country_code,
             ) from reindex_error
 
         raise
@@ -838,6 +1092,11 @@ def delete_indexed_document(
     production, and os.replace() cannot perform an atomic rename
     across mount points (OSError: Invalid cross-device link).
     processed_directory is kept only for public-signature stability.
+
+    Mission "ORDER 3", section 17: held under a per-country lock, for
+    the same reason and in the same shape as reindex_indexed_document
+    - a cheap, unlocked metadata read only learns which country to
+    lock; the authoritative read happens again once the lock is held.
     """
 
     validated_document_id = (
@@ -849,6 +1108,41 @@ def delete_indexed_document(
     opensearch_client = _get_client(
         client
     )
+
+    preliminary_metadata = _get_document_metadata(
+        document_id=validated_document_id,
+        client=opensearch_client,
+    )
+
+    country_code_for_lock = _required_string(
+        preliminary_metadata,
+        "country_code",
+    )
+
+    with country_lock(
+        source_directory,
+        country_code_for_lock,
+    ):
+        return _delete_indexed_document_locked(
+            validated_document_id=validated_document_id,
+            source_directory=source_directory,
+            opensearch_client=opensearch_client,
+            country_document_lookup=country_document_lookup,
+        )
+
+
+def _delete_indexed_document_locked(
+    *,
+    validated_document_id: str,
+    source_directory: Path,
+    opensearch_client: OpenSearch,
+    country_document_lookup: Callable[
+        [str, OpenSearch | None],
+        list[ExistingCountryDocument],
+    ],
+) -> AdminDocumentDeleteResponse:
+    """The real delete logic - always called with the country's lock
+    already held by delete_indexed_document."""
 
     metadata = _get_document_metadata(
         document_id=validated_document_id,
@@ -942,14 +1236,63 @@ def delete_indexed_document(
                 index_restored = False
 
             if not index_restored:
-                raise AdminDocumentLifecycleError(
-                    "The document could not be deleted, and "
-                    "restoring the country's indexed chunks "
-                    "afterwards also failed - manual recovery is "
-                    "required."
+                raise _tag_country_code(
+                    AdminDocumentRollbackError(
+                        "The document could not be deleted, and "
+                        "restoring the country's indexed chunks "
+                        "afterwards also failed - manual recovery is "
+                        "required."
+                    ),
+                    country_code,
                 ) from index_error
 
             raise
+
+        # Mission "ORDER 5C", section 38: Delete removes the document,
+        # its chunks, its source, AND any persisted section-edit state
+        # - never leaving an orphan edit behind (NO_ORPHAN_SECTION_
+        # STATE). Only reached once the OpenSearch delete has already
+        # succeeded; a failure here is still fully recoverable by
+        # restoring the very snapshot just captured, exactly like an
+        # index_error above.
+        try:
+            delete_section_edit_state(
+                source_directory,
+                validated_document_id,
+            )
+
+        except OSError as state_error:
+            index_restored = True
+
+            try:
+                _restore_country_snapshot(
+                    client=opensearch_client,
+                    snapshot=chunk_snapshot,
+                    bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+                )
+
+            except Exception:
+                index_restored = False
+
+            if not index_restored:
+                raise _tag_country_code(
+                    AdminDocumentRollbackError(
+                        "The document was deleted, but clearing its "
+                        "section-edit state afterwards failed, and "
+                        "restoring the country's indexed chunks "
+                        "afterwards also failed - manual recovery is "
+                        "required."
+                    ),
+                    country_code,
+                ) from state_error
+
+            raise _tag_country_code(
+                AdminDocumentLifecycleError(
+                    "The document could not be deleted: its "
+                    "section-edit state could not be cleared."
+                ),
+                country_code,
+            ) from state_error
 
         return AdminDocumentDeleteResponse(
             status="deleted",
@@ -1064,15 +1407,21 @@ def delete_indexed_document(
             # unexpected exception type here must still be reported
             # as an explicit, controlled failure - never left to
             # propagate uncontrolled past this handler.
-            raise AdminDocumentLifecycleError(
-                "The source DOCX could not be prepared for deletion, "
-                "and restoring the source(s) already moved also "
-                "failed - manual recovery is required."
+            raise _tag_country_code(
+                AdminDocumentRollbackError(
+                    "The source DOCX could not be prepared for "
+                    "deletion, and restoring the source(s) already "
+                    "moved also failed - manual recovery is required."
+                ),
+                country_code,
             ) from restore_error
 
-        raise AdminDocumentLifecycleError(
-            "The source DOCX could not be "
-            "prepared for deletion."
+        raise _tag_country_code(
+            AdminDocumentLifecycleError(
+                "The source DOCX could not be "
+                "prepared for deletion."
+            ),
+            country_code,
         ) from staging_error
 
     try:
@@ -1114,16 +1463,89 @@ def delete_indexed_document(
             index_restored = False
 
         if not files_restored or not index_restored:
-            raise AdminDocumentLifecycleError(
-                "The document could not be deleted, and the rollback "
-                "afterwards was incomplete (source files "
-                + ("restored" if files_restored else "NOT restored")
-                + ", index "
-                + ("restored" if index_restored else "NOT restored")
-                + ") - manual recovery is required."
+            raise _tag_country_code(
+                AdminDocumentRollbackError(
+                    "The document could not be deleted, and the "
+                    "rollback afterwards was incomplete (source files "
+                    + (
+                        "restored"
+                        if files_restored
+                        else "NOT restored"
+                    )
+                    + ", index "
+                    + (
+                        "restored"
+                        if index_restored
+                        else "NOT restored"
+                    )
+                    + ") - manual recovery is required."
+                ),
+                country_code,
             ) from index_error
 
         raise
+
+    # Mission "ORDER 5C", section 38: clearing the section-edit state
+    # is still part of the critical, rollback-guarded commit sequence
+    # (unlike the best-effort backup finalization just below) - an
+    # orphaned edit-state file is a correctness bug (NO_ORPHAN_SECTION
+    # _STATE), never a cosmetic cleanup failure.
+    try:
+        delete_section_edit_state(
+            source_directory,
+            validated_document_id,
+        )
+
+    except OSError as state_error:
+        files_restored = True
+
+        try:
+            _restore_delete_backups(backups)
+
+        except Exception:
+            files_restored = False
+
+        index_restored = True
+
+        try:
+            _restore_country_snapshot(
+                client=opensearch_client,
+                snapshot=chunk_snapshot,
+                bulk_chunk_size=DEFAULT_BULK_CHUNK_SIZE,
+            )
+
+        except Exception:
+            index_restored = False
+
+        if not files_restored or not index_restored:
+            raise _tag_country_code(
+                AdminDocumentRollbackError(
+                    "The document was deleted, but clearing its "
+                    "section-edit state afterwards failed, and the "
+                    "rollback afterwards was incomplete (source files "
+                    + (
+                        "restored"
+                        if files_restored
+                        else "NOT restored"
+                    )
+                    + ", index "
+                    + (
+                        "restored"
+                        if index_restored
+                        else "NOT restored"
+                    )
+                    + ") - manual recovery is required."
+                ),
+                country_code,
+            ) from state_error
+
+        raise _tag_country_code(
+            AdminDocumentLifecycleError(
+                "The document could not be deleted: its "
+                "section-edit state could not be cleared."
+            ),
+            country_code,
+        ) from state_error
 
     # Commit point reached - the index delete succeeded. Finalization
     # is best-effort: every backup is still attempted even after an

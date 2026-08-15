@@ -31,6 +31,14 @@ from fastapi import HTTPException, UploadFile
 from app.core.config import get_settings
 from app.routers import admin_document_lifecycle as lifecycle_router
 from app.routers import admin_documents as documents_router
+from tests.admin_invariants import (
+    assert_chunk_count_matches,
+    assert_no_orphan_chunks,
+    assert_one_active_document_per_country,
+    assert_one_active_source,
+    assert_zero_mutation,
+    real_source_entries,
+)
 
 
 _SETTINGS_ENV_KEYS = (
@@ -82,6 +90,8 @@ class FakeOpenSearch:
         country_code: str,
         source_filename: str,
         chunk_id: str | None = None,
+        language: str = "en",
+        document_type: str = "overview",
     ) -> None:
         resolved_chunk_id = chunk_id or f"{document_id}-chunk-0"
         self.chunks[resolved_chunk_id] = {
@@ -91,6 +101,8 @@ class FakeOpenSearch:
             "source_filename": source_filename,
             "country": "Argentina" if country_code == "AR" else "Other",
             "reference_year": 2026,
+            "language": language,
+            "document_type": document_type,
         }
 
     def document_ids_for_country(self, country_code: str) -> set[str]:
@@ -102,6 +114,42 @@ class FakeOpenSearch:
 
     def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
         del index
+
+        if "query" not in body:
+            # build_admin_document_catalog_body()'s aggregation shape
+            # (list_indexed_documents/get_admin_document_stats) - one
+            # bucket per distinct document_id, built from the real
+            # in-memory chunks rather than a second, hardcoded fixture.
+            by_document: dict[str, list[dict[str, Any]]] = {}
+
+            for chunk in self.chunks.values():
+                by_document.setdefault(
+                    chunk["document_id"], []
+                ).append(chunk)
+
+            buckets = [
+                {
+                    "key": document_id,
+                    "doc_count": len(chunks),
+                    "metadata": {
+                        "hits": {
+                            "hits": [
+                                {"_source": chunks[0]}
+                            ]
+                        }
+                    },
+                }
+                for document_id, chunks in sorted(
+                    by_document.items()
+                )
+            ]
+
+            return {
+                "aggregations": {
+                    "documents": {"buckets": buckets}
+                }
+            }
+
         term = body["query"].get("term") or {}
 
         if "country_code" in term:
@@ -129,7 +177,19 @@ class FakeOpenSearch:
             "hits": {
                 "total": {"value": len(hits)},
                 "hits": [
-                    {"_id": h["chunk_id"], "_source": h} for h in hits
+                    {
+                        "_id": h["chunk_id"],
+                        "_source": h,
+                        # Mission "ORDER 3B": real OpenSearch 3.7
+                        # includes a "sort" array per hit whenever the
+                        # request itself carries a "sort" clause (as
+                        # _fetch_all_chunks's search_after pagination
+                        # always does) - never omitted here.
+                        "sort": [h["chunk_id"]],
+                    }
+                    for h in sorted(
+                        hits, key=lambda c: c["chunk_id"]
+                    )
                 ],
             }
         }
@@ -273,7 +333,11 @@ class FreshUploadHttpContractTests(AdminRouterIntegrationTestCase):
         upload = _make_upload_file("Argentina.docx", _AR_BYTES)
 
         response = documents_router.upload_admin_document(
-            file=upload, replace_existing=False
+            file=upload,
+            replace_existing=False,
+            confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
 
         self.assertEqual(response.status, "uploaded")
@@ -290,6 +354,9 @@ class FreshUploadHttpContractTests(AdminRouterIntegrationTestCase):
         first = documents_router.upload_admin_document(
             file=_make_upload_file("Argentina.docx", _AR_BYTES),
             replace_existing=False,
+            confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
         self.assertEqual(first.status, "uploaded")
 
@@ -307,6 +374,9 @@ class FreshUploadHttpContractTests(AdminRouterIntegrationTestCase):
                 "random-file-name.docx", _AR_BYTES
             ),
             replace_existing=False,
+            confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
 
         self.assertEqual(second.status, "uploaded")
@@ -336,6 +406,9 @@ class ExistingCountryHttpContractTests(AdminRouterIntegrationTestCase):
             documents_router.upload_admin_document(
                 file=_make_upload_file("Argentina.docx", _AR_BYTES),
                 replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         error = context.exception
@@ -364,6 +437,9 @@ class ExistingCountryHttpContractTests(AdminRouterIntegrationTestCase):
                     "Legal-update-final-v7.docx", _AR_BYTES
                 ),
                 replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         error = context.exception
@@ -456,7 +532,7 @@ class DeleteHttpContractTests(AdminRouterIntegrationTestCase):
         self.assertEqual(response.status, "deleted")
         self.assertFalse(response.source_cleanup_deferred)
         self.assertTrue(response.source_file_deleted)
-        self.assertEqual(list(self.source_dir.iterdir()), [])
+        self.assertEqual(real_source_entries(self.source_dir), [])
         self.assertEqual(
             self.fake.document_ids_for_country("AR"), set()
         )
@@ -485,3 +561,466 @@ class DeleteHttpContractTests(AdminRouterIntegrationTestCase):
             )
 
         self.assertEqual(context.exception.status_code, 404)
+
+        # Mission "ORDER 2": the detail must be the structured
+        # {"code", "message", "operation", "document_id"} contract,
+        # not a bare string a caller has to parse by hand.
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "document_not_found")
+        self.assertEqual(detail["operation"], "delete")
+        self.assertEqual(detail["document_id"], "doc_" + "f" * 64)
+        self.assertTrue(detail["message"])
+
+
+class ReindexHttpContractTests(AdminRouterIntegrationTestCase):
+    """
+    Mission "ORDER 2": every reindex failure path must return the
+    structured {"code", "message", "operation", "document_id"}
+    contract instead of one fixed, generic sentence - this is what
+    let Czech Republic's real UndeterminableDocumentCountryError
+    reach WordPress/the logs as a generic 502 with no actionable
+    detail (see backend/app/core/country_registry.py's leading-
+    definite-article fallback for the actual Czech fix; this class
+    only covers the observability contract, not that fix).
+    """
+
+    def test_reindex_unknown_document_id_returns_structured_404(
+        self,
+    ) -> None:
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.reindex_admin_document(
+                document_id="doc_" + "f" * 64
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "document_not_found")
+        self.assertEqual(detail["operation"], "reindex")
+        self.assertEqual(detail["document_id"], "doc_" + "f" * 64)
+
+    def test_reindex_with_source_missing_returns_structured_409(
+        self,
+    ) -> None:
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        # No physical file at all, canonical or historical.
+
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.reindex_admin_document(
+                document_id=document_id
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "source_missing")
+        self.assertEqual(detail["operation"], "reindex")
+        self.assertEqual(detail["document_id"], document_id)
+        self.assertIn("missing", detail["message"].casefold())
+
+    def test_reindex_unparseable_source_returns_structured_502(
+        self,
+    ) -> None:
+        # A source DOCX whose content names no supported country at
+        # all - the same class of chunk_builder failure Czech
+        # Republic's real front matter hit (an unregistered phrasing
+        # of a real country), reproduced generically here rather than
+        # depending on any one country's exact wording.
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        (self.source_dir / "Argentina.docx").write_bytes(
+            _build_real_docx_bytes(
+                "Some random legal memo with no title structure."
+            )
+        )
+
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.reindex_admin_document(
+                document_id=document_id
+            )
+
+        self.assertEqual(context.exception.status_code, 502)
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "document_reindex_failed")
+        self.assertEqual(detail["operation"], "reindex")
+        self.assertEqual(detail["document_id"], document_id)
+        # The real underlying reason must survive to the client, not
+        # just a fixed "could not be reindexed" sentence.
+        self.assertIn(
+            "supported country", detail["message"].casefold()
+        )
+
+    def test_reindex_with_country_conflict_returns_structured_409(
+        self,
+    ) -> None:
+        # ORDER 8A, section 23 - a country with more than one active
+        # document_id must refuse Reindex with a structured
+        # country_document_conflict, never an unmapped raw exception.
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        self.fake.add(
+            document_id="doc_" + "b" * 64,
+            country_code="AR",
+            source_filename="Argentina-legacy.docx",
+            chunk_id="doc_" + "b" * 64 + "-chunk-0",
+        )
+
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.reindex_admin_document(
+                document_id=document_id
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "country_document_conflict")
+        self.assertEqual(detail["operation"], "reindex")
+        self.assertEqual(detail["country_code"], "AR")
+
+
+class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
+    """Mission "ORDER 3", sections 8/9/27 - every technical upload
+    failure returns its own specific, structured code."""
+
+    def test_wrong_extension_returns_invalid_document_type(
+        self,
+    ) -> None:
+        with self.assertRaises(HTTPException) as context:
+            documents_router.upload_admin_document(
+                file=_make_upload_file(
+                    "not-a-docx.txt", _AR_BYTES
+                ),
+                replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
+            )
+
+        self.assertEqual(context.exception.status_code, 422)
+        self.assertEqual(
+            context.exception.detail["code"],
+            "invalid_document_type",
+        )
+
+    def test_empty_file_returns_document_empty(self) -> None:
+        with self.assertRaises(HTTPException) as context:
+            documents_router.upload_admin_document(
+                file=_make_upload_file("Argentina.docx", b""),
+                replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
+            )
+
+        self.assertEqual(context.exception.status_code, 422)
+        self.assertEqual(
+            context.exception.detail["code"], "document_empty"
+        )
+
+    def test_oversized_file_returns_413_document_too_large(
+        self,
+    ) -> None:
+        os.environ["DOCUMENT_UPLOAD_MAX_BYTES"] = "100"
+        get_settings.cache_clear()
+        try:
+            with self.assertRaises(HTTPException) as context:
+                documents_router.upload_admin_document(
+                    file=_make_upload_file(
+                        "Argentina.docx", _AR_BYTES
+                    ),
+                    replace_existing=False,
+                    confirm_warnings=True,
+                    country_confirmed=True,
+                    selected_country_code=None,
+                )
+        finally:
+            os.environ.pop("DOCUMENT_UPLOAD_MAX_BYTES", None)
+            get_settings.cache_clear()
+
+        self.assertEqual(context.exception.status_code, 413)
+        detail = context.exception.detail
+        self.assertEqual(detail["code"], "document_too_large")
+        self.assertEqual(detail["max_bytes"], 100)
+        self.assertIn("max_mb", detail)
+
+    def test_corrupt_zip_returns_document_corrupt(self) -> None:
+        with self.assertRaises(HTTPException) as context:
+            documents_router.upload_admin_document(
+                file=_make_upload_file(
+                    "Argentina.docx", b"not a real docx file at all"
+                ),
+                replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
+            )
+
+        self.assertEqual(context.exception.status_code, 422)
+        self.assertEqual(
+            context.exception.detail["code"], "document_corrupt"
+        )
+
+    def test_no_identifiable_country_returns_selection_required(
+        self,
+    ) -> None:
+        # Mission "ORDER 8E-A1", section 8: an otherwise-processable
+        # DOCX with no identifiable country is no longer a hard
+        # 422 failure - it is a 409 SELECT_COUNTRY decision carrying
+        # the allowed country list (superseded from "ORDER 3"'s
+        # original document_country_undetermined/422 expectation).
+        no_country_bytes = _build_real_docx_bytes(
+            "Some random legal memo with no title structure."
+        )
+
+        with self.assertRaises(HTTPException) as context:
+            documents_router.upload_admin_document(
+                file=_make_upload_file(
+                    "mystery.docx", no_country_bytes
+                ),
+                replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        detail = context.exception.detail
+        self.assertEqual(
+            detail["code"],
+            "document_country_selection_required",
+        )
+        self.assertTrue(detail["allowed_countries"])
+
+
+class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
+    """Mission "ORDER 3", section 25 - GET .../download."""
+
+    def test_download_returns_the_real_source_bytes(self) -> None:
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        real_bytes = b"the-real-argentina-source-bytes"
+        (self.source_dir / "AR.docx").write_bytes(real_bytes)
+
+        response = lifecycle_router.download_admin_document(
+            document_id=document_id
+        )
+
+        self.assertEqual(
+            Path(response.path).read_bytes(), real_bytes
+        )
+        self.assertEqual(
+            response.filename, "Argentina.docx"
+        )
+
+    def test_download_unknown_document_id_returns_404(self) -> None:
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.download_admin_document(
+                document_id="doc_" + "f" * 64
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+        self.assertEqual(
+            context.exception.detail["code"], "document_not_found"
+        )
+
+    def test_download_with_missing_source_returns_409(self) -> None:
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        # No physical file at all.
+
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.download_admin_document(
+                document_id=document_id
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(
+            context.exception.detail["code"], "source_missing"
+        )
+
+    def test_download_with_source_conflict_returns_409(self) -> None:
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        # Both the canonical AND the historical name exist - two
+        # distinct real files resolve for the same document.
+        (self.source_dir / "AR.docx").write_bytes(b"canonical")
+        (self.source_dir / "Argentina.docx").write_bytes(b"legacy")
+
+        with self.assertRaises(HTTPException) as context:
+            lifecycle_router.download_admin_document(
+                document_id=document_id
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(
+            context.exception.detail["code"], "source_conflict"
+        )
+
+
+class StatsHttpContractTests(AdminRouterIntegrationTestCase):
+    """Mission "ORDER 3", section 26 - GET .../documents/stats."""
+
+    def test_stats_reflect_the_real_catalog_exactly(self) -> None:
+        self.fake.add(
+            document_id="doc_" + "a" * 64,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        self.fake.add(
+            document_id="doc_" + "b" * 64,
+            country_code="BR",
+            source_filename="Brazil.docx",
+        )
+        self.fake.add(
+            document_id="doc_" + "c" * 64,
+            country_code="CO",
+            source_filename="Colombia.docx",
+            chunk_id="doc_" + "c" * 64 + "-chunk-0",
+        )
+        # AR and BR have a real source on disk; CO does not - a
+        # deliberately mixed status set, and each country_code has
+        # exactly one document (avoids resolve_document_source_path's
+        # own canonical-name fallback complicating the scenario).
+        (self.source_dir / "AR.docx").write_bytes(b"argentina")
+        (self.source_dir / "BR.docx").write_bytes(b"brazil")
+
+        stats = documents_router.get_admin_document_stats_route()
+
+        self.assertEqual(stats.total_documents, 3)
+        self.assertEqual(stats.total_countries, 3)
+        self.assertEqual(
+            stats.status_counts.get("indexed"), 2
+        )
+        self.assertEqual(
+            stats.status_counts.get("indexed_source_missing"), 1
+        )
+
+
+class SharedInvariantHelperUsageTests(AdminRouterIntegrationTestCase):
+    """Mission "ORDER 3", section 7 - demonstrates the shared,
+    reusable invariant helpers (admin_invariants.py) against a real
+    catalog listing, rather than each caller re-deriving these checks."""
+
+    def test_clean_catalog_satisfies_every_generic_invariant(
+        self,
+    ) -> None:
+        first = documents_router.upload_admin_document(
+            file=_make_upload_file("Argentina.docx", _AR_BYTES),
+            replace_existing=False,
+            confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
+        )
+
+        catalog = documents_router.get_admin_documents()
+        documents = [d.model_dump() for d in catalog.documents]
+
+        assert_one_active_document_per_country(documents, "AR")
+        assert_one_active_source(documents, "AR")
+
+        real_count = self.fake.search(
+            index="unused",
+            body={"query": {"term": {"country_code": "AR"}}},
+        )["hits"]["total"]["value"]
+
+        assert_chunk_count_matches(
+            first.indexed_chunks, real_count, country_code="AR"
+        )
+
+        total_catalog_chunks = sum(
+            d["chunk_count"] for d in documents
+        )
+        total_real_chunks = len(self.fake.chunks)
+        assert_no_orphan_chunks(
+            total_catalog_chunks, total_real_chunks
+        )
+
+    def test_rejected_replacement_is_zero_mutation_via_shared_helper(
+        self,
+    ) -> None:
+        self.fake.add(
+            document_id="doc_" + "a" * 64,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        (self.source_dir / "AR.docx").write_bytes(b"existing-ar-bytes")
+
+        before = [
+            d.model_dump()
+            for d in documents_router.get_admin_documents().documents
+        ]
+
+        with self.assertRaises(HTTPException):
+            documents_router.upload_admin_document(
+                file=_make_upload_file(
+                    "Legal-update-final-v7.docx", _AR_BYTES
+                ),
+                replace_existing=False,
+                confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
+            )
+
+        after = [
+            d.model_dump()
+            for d in documents_router.get_admin_documents().documents
+        ]
+
+        assert_zero_mutation(before, after)
+
+
+class RestoreEndpointRemovedTests(unittest.TestCase):
+    """
+    ORDER 8A, section 5: the ORDER 7C "Restore from document" endpoint
+    is now moot (Edit itself mutates the current DOCX) and must be
+    fully removed from the runtime - never merely hidden.
+    """
+
+    def test_no_restore_route_is_registered(self) -> None:
+        restore_paths = [
+            route.path
+            for route in lifecycle_router.router.routes
+            if route.path.endswith("/restore")
+        ]
+
+        self.assertEqual(restore_paths, [])
+
+    def test_add_section_route_is_registered_instead(self) -> None:
+        add_section_routes = [
+            route
+            for route in lifecycle_router.router.routes
+            if route.path
+            == "/api/v1/admin/documents/{document_id}/sections"
+            and "POST" in route.methods
+        ]
+
+        self.assertEqual(len(add_section_routes), 1)
+
+    def test_restore_effective_section_no_longer_exists(self) -> None:
+        import app.services.admin_document_sections as sections_service
+
+        self.assertFalse(
+            hasattr(sections_service, "restore_effective_section")
+        )

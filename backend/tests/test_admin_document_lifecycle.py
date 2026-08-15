@@ -7,6 +7,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.admin_invariants import real_source_entries
 from typing import Any
 from unittest.mock import patch
 
@@ -16,6 +18,7 @@ from app.models.document import DocumentChunk
 from app.services.admin_document_lifecycle import (
     AdminDocumentLifecycleError,
     AdminDocumentNotFoundError,
+    AdminDocumentRollbackError,
     AdminDocumentSourceConflictError,
     AdminDocumentSourceMissingError,
     DeleteBackupRestoreError,
@@ -29,6 +32,14 @@ from app.services.admin_document_replacement import (
 from app.services.document_indexer import (
     DocumentIndexingError,
     DocumentIndexingResult,
+    replace_document_chunks,
+)
+from app.services.document_section_state import (
+    SectionEdit,
+    SectionEditState,
+    read_section_edit_state,
+    section_id_for_legal_topic,
+    write_section_edit_state_atomic,
 )
 
 
@@ -148,10 +159,19 @@ class FakeOpenSearchClient:
         term = body["query"]["term"]
 
         if "country_code" in term:
+            # Real OpenSearch 3.7 shape (mission "ORDER 3B"): a sorted
+            # search_after page reports an exact total and includes a
+            # "sort" array per hit - both required by the real,
+            # centralized _fetch_all_chunks() this fake now stands in
+            # for.
+            sorted_document_ids = sorted(
+                self.country_document_ids
+            )
+
             return {
                 "hits": {
                     "total": {
-                        "value": len(self.country_document_ids),
+                        "value": len(sorted_document_ids),
                     },
                     "hits": [
                         {
@@ -170,9 +190,12 @@ class FakeOpenSearchClient:
                                 "country": "United Kingdom",
                                 "country_code": "GB",
                                 "reference_year": 2026,
-                            }
+                            },
+                            "sort": [
+                                f"{document_id}-snapshot-chunk"
+                            ],
                         }
-                        for document_id in self.country_document_ids
+                        for document_id in sorted_document_ids
                     ]
                 }
             }
@@ -266,7 +289,7 @@ class BackupInspectingOpenSearchClient(FakeOpenSearchClient):
     ) -> dict[str, Any]:
         backups = [
             path
-            for path in self.source_directory.iterdir()
+            for path in real_source_entries(self.source_directory)
             if path.name.startswith(".delete-backup-")
         ]
 
@@ -451,6 +474,7 @@ class MultiChunkConfigurableDeleteResponseClient(FakeOpenSearchClient):
                     "country_code": "GB",
                     "reference_year": 2026,
                 },
+                "sort": [f"{document_id}-chunk-{position}"],
             }
             for document_id, count in self.chunk_counts.items()
             for position in range(count)
@@ -530,8 +554,14 @@ class ReindexTransactionOpenSearchClient:
 
         if "country_code" in term:
             hits = [
-                {"_id": chunk_id, "_source": source}
-                for chunk_id, source in self.chunks.items()
+                {
+                    "_id": chunk_id,
+                    "_source": source,
+                    "sort": [chunk_id],
+                }
+                for chunk_id, source in sorted(
+                    self.chunks.items()
+                )
                 if source["country_code"] == term["country_code"]
             ]
 
@@ -967,7 +997,7 @@ class AdminDocumentLifecycleTests(
             # completely empty, not just missing the original name.
             self.assertEqual(
                 list(
-                    source_directory.iterdir()
+                    real_source_entries(source_directory)
                 ),
                 [],
             )
@@ -1130,7 +1160,7 @@ class AdminDocumentLifecycleTests(
 
             self.assertEqual(
                 list(
-                    source_directory.iterdir()
+                    real_source_entries(source_directory)
                 ),
                 [
                     source_path,
@@ -1429,7 +1459,7 @@ class LegacySourceResolutionTests(unittest.TestCase):
 
             # Both candidate files are gone, with no leftover backup.
             self.assertEqual(
-                list(source_directory.iterdir()),
+                list(real_source_entries(source_directory)),
                 [],
             )
 
@@ -1583,7 +1613,7 @@ class LegacySourceResolutionTests(unittest.TestCase):
             self.assertTrue(response.source_file_deleted)
             self.assertFalse(response.source_cleanup_deferred)
             self.assertEqual(
-                list(source_directory.iterdir()),
+                list(real_source_entries(source_directory)),
                 [],
             )
 
@@ -1661,7 +1691,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
             # Nothing was touched at all: no .bak/.incoming residue,
             # both original files present with their original bytes.
             self.assertEqual(
-                sorted(p.name for p in source_directory.iterdir()),
+                sorted(p.name for p in real_source_entries(source_directory)),
                 sorted([self.LEGACY_FILENAME, "GB.docx"]),
             )
             self.assertEqual(
@@ -1729,7 +1759,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
             # Both files back at their original paths, byte-identical
             # - no backup residue, no OpenSearch mutation attempted.
             self.assertEqual(
-                sorted(p.name for p in source_directory.iterdir()),
+                sorted(p.name for p in real_source_entries(source_directory)),
                 sorted([self.LEGACY_FILENAME, "GB.docx"]),
             )
             self.assertEqual(
@@ -1803,7 +1833,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
 
             # Files restored exactly.
             self.assertEqual(
-                sorted(p.name for p in source_directory.iterdir()),
+                sorted(p.name for p in real_source_entries(source_directory)),
                 sorted([self.LEGACY_FILENAME, "GB.docx"]),
             )
             self.assertEqual(
@@ -1891,7 +1921,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
             # remains under its hidden name - never restored, never
             # re-presented as active, and the response never claims
             # every file was cleaned up.
-            remaining = list(source_directory.iterdir())
+            remaining = list(real_source_entries(source_directory))
             self.assertEqual(len(remaining), 1)
             self.assertTrue(remaining[0].name.endswith(".bak"))
 
@@ -1950,7 +1980,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
             self.assertFalse(response.source_file_deleted)
             self.assertFalse(source_path.exists())
 
-            remaining = list(source_directory.iterdir())
+            remaining = list(real_source_entries(source_directory))
             self.assertEqual(len(remaining), 1)
             self.assertTrue(remaining[0].name.endswith(".bak"))
 
@@ -2068,11 +2098,29 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
                             "other documents remain for the country"
                         )
 
+                    # Mission "ORDER 5C": deleting the target
+                    # document_id's own section-edit state file (an
+                    # unambiguous, per-document_id path nested inside
+                    # source_directory - never one of the ambiguous
+                    # candidate source files this test guards) is a
+                    # legitimate unlink even in this branch. Only a
+                    # real candidate source file may never be
+                    # unlinked here.
+                    guarded_source_names = {
+                        self.LEGACY_FILENAME,
+                        "GB.docx",
+                    }
+                    original_unlink = Path.unlink
+
                     def unlink_must_not_be_called(self_path, *a, **kw):
-                        raise AssertionError(
-                            "Path.unlink must never be called when "
-                            "other documents remain for the country"
-                        )
+                        if self_path.name in guarded_source_names:
+                            raise AssertionError(
+                                "Path.unlink must never be called on "
+                                "a source file when other documents "
+                                "remain for the country"
+                            )
+
+                        return original_unlink(self_path, *a, **kw)
 
                     with patch(
                         "app.services.admin_document_lifecycle."
@@ -2202,7 +2250,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
                     self.assertEqual(
                         sorted(
                             p.name
-                            for p in source_directory.iterdir()
+                            for p in real_source_entries(source_directory)
                         ),
                         sorted(
                             [self.LEGACY_FILENAME, "GB.docx"]
@@ -2449,7 +2497,7 @@ class DeleteTransactionalIntegrityTests(unittest.TestCase):
 
             self.assertEqual(
                 sorted(
-                    p.name for p in source_directory.iterdir()
+                    p.name for p in real_source_entries(source_directory)
                 ),
                 sorted([self.LEGACY_FILENAME, "GB.docx"]),
             )
@@ -3339,6 +3387,609 @@ class ReindexTransactionalIntegrityTests(unittest.TestCase):
         # chunk, no delete_by_query attempted.
         self.assertEqual(len(fake_client.chunks), 1)
         self.assertEqual(fake_client.deleted_document_ids, [])
+
+
+class SectionEditLifecycleIntegrationTests(unittest.TestCase):
+    """
+    Mission "ORDER 5C" - wiring the persisted section-edit state
+    (document_section_state.py) into the pre-existing Reindex/Delete
+    lifecycle: a Reindex must never silently revert an Edit (section
+    2), and a successful Delete must never leave an orphaned
+    section-edit state file behind (sections 34/38, NO_ORPHAN_SECTION_
+    STATE).
+    """
+
+    def test_reindex_ignores_legacy_persisted_edit_state(
+        self,
+    ) -> None:
+        """
+        ORDER 8A, sections 5/19: the current DOCX is the unique source
+        of truth - Reindex must NEVER apply a legacy .admin-state
+        override anymore, even if one is still present on disk from
+        before this architecture change. Every topic's fresh,
+        DOCX-derived content wins, including the one a stale override
+        file claims to have edited.
+        """
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            (source_directory / "GB.docx").write_bytes(b"docx-bytes")
+
+            document_id = OLD_DOCUMENT_ID
+
+            def fresh_chunk_builder(
+                path: Path,
+            ) -> list[DocumentChunk]:
+                del path
+
+                return [
+                    DocumentChunk(
+                        document_id=document_id,
+                        chunk_id="chunk-fresh-ec",
+                        country="United Kingdom",
+                        country_code="GB",
+                        legal_topic="Employment Contracts",
+                        document_type="comparator",
+                        language="en",
+                        section="Employment Contracts",
+                        subsection=None,
+                        content=(
+                            "FRESH DOCX content - must be replaced "
+                            "by the persisted edit."
+                        ),
+                        source_filename="UK 2026.docx",
+                        source_format="docx",
+                        content_hash="fresh-ec-hash",
+                        reference_year=2026,
+                    ),
+                    DocumentChunk(
+                        document_id=document_id,
+                        chunk_id="chunk-fresh-hp",
+                        country="United Kingdom",
+                        country_code="GB",
+                        legal_topic="Hiring Practices",
+                        document_type="comparator",
+                        language="en",
+                        section="Hiring Practices",
+                        subsection=None,
+                        content=(
+                            "FRESH DOCX content - unaffected, no "
+                            "persisted edit exists for this topic."
+                        ),
+                        source_filename="UK 2026.docx",
+                        source_format="docx",
+                        content_hash="fresh-hp-hash",
+                        reference_year=2026,
+                    ),
+                ]
+
+            write_section_edit_state_atomic(
+                source_directory,
+                SectionEditState(
+                    document_id=document_id,
+                    country_code="GB",
+                    sections={
+                        section_id_for_legal_topic(
+                            "Employment Contracts"
+                        ): SectionEdit(
+                            legal_topic="Employment Contracts",
+                            section="Employment Contracts",
+                            subsection=None,
+                            content=(
+                                "EDITED content - must survive "
+                                "Reindex."
+                            ),
+                        ),
+                    },
+                ),
+            )
+
+            captured_chunks: list[list[DocumentChunk]] = []
+
+            def spy_document_indexer(
+                *,
+                chunks,
+                client=None,
+            ) -> DocumentIndexingResult:
+                del client
+                captured_chunks.append(chunks)
+
+                return DocumentIndexingResult(
+                    index_alias="legal-documents",
+                    document_id=chunks[0].document_id,
+                    source_filename=chunks[0].source_filename,
+                    requested_chunks=len(chunks),
+                    indexed_chunks=len(chunks),
+                    stale_chunks_deleted=0,
+                )
+
+            client = FakeOpenSearchClient(
+                source_filename="UK 2026.docx",
+                country_document_ids=[document_id],
+            )
+
+            response = reindex_indexed_document(
+                document_id=document_id,
+                source_directory=source_directory,
+                client=client,
+                chunk_builder=fresh_chunk_builder,
+                document_indexer=spy_document_indexer,
+            )
+
+            self.assertEqual(response.status, "reindexed")
+            self.assertFalse(response.document_id_changed)
+
+            self.assertEqual(len(captured_chunks), 1)
+
+            by_topic = {
+                chunk.legal_topic: chunk
+                for chunk in captured_chunks[0]
+            }
+
+            self.assertEqual(
+                by_topic["Employment Contracts"].content,
+                (
+                    "FRESH DOCX content - must be replaced "
+                    "by the persisted edit."
+                ),
+            )
+            self.assertEqual(
+                by_topic["Hiring Practices"].content,
+                (
+                    "FRESH DOCX content - unaffected, no persisted "
+                    "edit exists for this topic."
+                ),
+            )
+
+            # The legacy override file itself is left physically
+            # untouched by Reindex (no auto-migration/deletion) - only
+            # no longer READ.
+            legacy_state = read_section_edit_state(
+                source_directory,
+                document_id,
+            )
+            self.assertIsNotNone(legacy_state)
+            self.assertIn(
+                section_id_for_legal_topic("Employment Contracts"),
+                legacy_state.sections,
+            )
+
+    def test_delete_last_document_clears_section_edit_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir()
+
+            (source_directory / "GB.docx").write_bytes(b"docx-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename="UK 2026.docx"
+            )
+
+            write_section_edit_state_atomic(
+                source_directory,
+                SectionEditState(
+                    document_id=OLD_DOCUMENT_ID,
+                    country_code="GB",
+                    sections={
+                        section_id_for_legal_topic(
+                            "Employment Contracts"
+                        ): SectionEdit(
+                            legal_topic="Employment Contracts",
+                            section="Employment Contracts",
+                            subsection=None,
+                            content=(
+                                "An edit that must not outlive its "
+                                "own document."
+                            ),
+                        ),
+                    },
+                ),
+            )
+
+            self.assertIsNotNone(
+                read_section_edit_state(
+                    source_directory, OLD_DOCUMENT_ID
+                )
+            )
+
+            response = delete_indexed_document(
+                document_id=OLD_DOCUMENT_ID,
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                client=client,
+            )
+
+            self.assertEqual(response.status, "deleted")
+            self.assertIsNone(
+                read_section_edit_state(
+                    source_directory, OLD_DOCUMENT_ID
+                )
+            )
+
+    def test_delete_other_documents_remain_clears_section_edit_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir()
+
+            (source_directory / "GB.docx").write_bytes(b"docx-bytes")
+
+            sibling_id = "doc_" + "e" * 64
+
+            client = FakeOpenSearchClient(
+                source_filename="UK 2026.docx",
+                country_document_ids=[OLD_DOCUMENT_ID, sibling_id],
+            )
+
+            write_section_edit_state_atomic(
+                source_directory,
+                SectionEditState(
+                    document_id=OLD_DOCUMENT_ID,
+                    country_code="GB",
+                    sections={
+                        section_id_for_legal_topic(
+                            "Hiring Practices"
+                        ): SectionEdit(
+                            legal_topic="Hiring Practices",
+                            section="Hiring Practices",
+                            subsection=None,
+                            content=(
+                                "An edit for the deleted document only."
+                            ),
+                        ),
+                    },
+                ),
+            )
+
+            # A sibling document's own edit state must never be
+            # touched by deleting a DIFFERENT document_id.
+            write_section_edit_state_atomic(
+                source_directory,
+                SectionEditState(
+                    document_id=sibling_id,
+                    country_code="GB",
+                    sections={
+                        section_id_for_legal_topic(
+                            "Employee Benefits"
+                        ): SectionEdit(
+                            legal_topic="Employee Benefits",
+                            section="Employee Benefits",
+                            subsection=None,
+                            content="Sibling's own edit - must survive.",
+                        ),
+                    },
+                ),
+            )
+
+            response = delete_indexed_document(
+                document_id=OLD_DOCUMENT_ID,
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                client=client,
+            )
+
+            self.assertEqual(response.status, "deleted")
+            self.assertTrue(response.source_cleanup_deferred)
+            self.assertIsNone(
+                read_section_edit_state(
+                    source_directory, OLD_DOCUMENT_ID
+                )
+            )
+            self.assertIsNotNone(
+                read_section_edit_state(source_directory, sibling_id)
+            )
+
+    def test_delete_state_clear_failure_with_successful_restore_raises_plain_error(
+        self,
+    ) -> None:
+        # The OpenSearch delete had already fully succeeded before the
+        # state-clear step ran; when the rollback triggered by that
+        # state-clear failure itself fully succeeds (files and index
+        # both restored), the operation is fully recovered - this
+        # must raise the plain AdminDocumentLifecycleError, never the
+        # more urgent AdminDocumentRollbackError (mission "ORDER 5C",
+        # section 38).
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir()
+
+            source_path = source_directory / "GB.docx"
+            source_path.write_bytes(b"docx-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename="UK 2026.docx"
+            )
+
+            write_section_edit_state_atomic(
+                source_directory,
+                SectionEditState(
+                    document_id=OLD_DOCUMENT_ID,
+                    country_code="GB",
+                    sections={
+                        section_id_for_legal_topic(
+                            "Employment Contracts"
+                        ): SectionEdit(
+                            legal_topic="Employment Contracts",
+                            section="Employment Contracts",
+                            subsection=None,
+                            content="Some edit.",
+                        ),
+                    },
+                ),
+            )
+
+            restore_bulk_calls: list[Any] = []
+
+            def fake_bulk(client, actions, **kwargs):
+                del client
+                action_list = list(actions)
+                restore_bulk_calls.append(action_list)
+                return (len(action_list), [])
+
+            with patch(
+                "app.services.admin_document_lifecycle."
+                "delete_section_edit_state",
+                side_effect=OSError("simulated disk failure"),
+            ), patch(
+                "app.services.document_indexer.bulk",
+                side_effect=fake_bulk,
+            ), patch(
+                "app.services.document_indexer."
+                "ensure_legal_documents_index"
+            ):
+                with self.assertRaises(
+                    AdminDocumentLifecycleError
+                ) as context:
+                    delete_indexed_document(
+                        document_id=OLD_DOCUMENT_ID,
+                        source_directory=source_directory,
+                        processed_directory=processed_directory,
+                        client=client,
+                    )
+
+            self.assertEqual(
+                client.deleted_document_ids, [OLD_DOCUMENT_ID]
+            )
+            self.assertEqual(len(restore_bulk_calls), 1)
+            self.assertNotIsInstance(
+                context.exception, AdminDocumentRollbackError
+            )
+            self.assertIn(
+                "section-edit state could not be cleared",
+                str(context.exception),
+            )
+
+            # The source file was moved to a backup during deletion
+            # staging, but the failed state-clear's own rollback
+            # restored it byte-for-byte, exactly like a fully
+            # successful delete's own rollback would.
+            self.assertEqual(
+                source_path.read_bytes(), b"docx-bytes"
+            )
+
+    def test_delete_state_clear_failure_with_failed_restore_raises_rollback_error(
+        self,
+    ) -> None:
+        # Both the state-clear AND its own attempted rollback fail -
+        # the indexed/filesystem state may now differ from both the
+        # pre- and post-operation state, so this must raise the more
+        # urgent AdminDocumentRollbackError, never the plain
+        # AdminDocumentLifecycleError a fully-recovered failure gets.
+        sibling_id = "doc_" + "e" * 64
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir()
+
+            (source_directory / "GB.docx").write_bytes(b"docx-bytes")
+
+            client = FakeOpenSearchClient(
+                source_filename="UK 2026.docx",
+                country_document_ids=[OLD_DOCUMENT_ID, sibling_id],
+            )
+
+            write_section_edit_state_atomic(
+                source_directory,
+                SectionEditState(
+                    document_id=OLD_DOCUMENT_ID,
+                    country_code="GB",
+                    sections={
+                        section_id_for_legal_topic(
+                            "Employment Contracts"
+                        ): SectionEdit(
+                            legal_topic="Employment Contracts",
+                            section="Employment Contracts",
+                            subsection=None,
+                            content="Some edit.",
+                        ),
+                    },
+                ),
+            )
+
+            with patch(
+                "app.services.admin_document_lifecycle."
+                "delete_section_edit_state",
+                side_effect=OSError("simulated disk failure"),
+            ), patch(
+                "app.services.admin_document_lifecycle."
+                "_restore_country_snapshot",
+                side_effect=RuntimeError("simulated restore failure"),
+            ):
+                with self.assertRaises(
+                    AdminDocumentRollbackError
+                ) as context:
+                    delete_indexed_document(
+                        document_id=OLD_DOCUMENT_ID,
+                        source_directory=source_directory,
+                        processed_directory=processed_directory,
+                        client=client,
+                    )
+
+            self.assertIn(
+                "manual recovery",
+                str(context.exception).casefold(),
+            )
+            self.assertEqual(
+                client.deleted_document_ids, [OLD_DOCUMENT_ID]
+            )
+
+
+AU_DOCUMENT_ID = "doc_" + "a" * 64
+
+
+class FakeWholeDocumentOpenSearch:
+    """
+    Minimal OpenSearch test double for replace_document_chunks itself
+    (not the outer reindex/lifecycle plumbing) - mirrors
+    test_admin_document_replacement.py's own FakeCountryOpenSearch
+    exactly, scoped to one document_id instead of one country_code.
+
+    Mission "ORDER 5C" corrective gate, section 4 (WHOLE_DOCUMENT_
+    STALE_DELETE_GAP): proves replace_document_chunks - the reindex
+    path's own indexer, previously the one sibling of
+    replace_country_document_chunks with no internal snapshot/
+    rollback of its own - now restores the exact pre-call chunk set
+    when the stale-chunk cleanup step fails after a successful bulk.
+    """
+
+    def __init__(self, *, fail_cleanup: bool = False) -> None:
+        self.fail_cleanup = fail_cleanup
+        self.delete_calls = 0
+
+    def search(self, *, index, body):
+        del index
+        del body
+
+        return {
+            "hits": {
+                "total": {
+                    "value": 1,
+                },
+                "hits": [
+                    {
+                        "_id": "chunk-old-1",
+                        "_source": {
+                            "document_id": AU_DOCUMENT_ID,
+                            "chunk_id": "chunk-old-1",
+                            "country": "Australia",
+                            "country_code": "AU",
+                            "legal_topic": "Employment Contracts",
+                        },
+                        "sort": ["chunk-old-1"],
+                    }
+                ],
+            }
+        }
+
+    def delete_by_query(self, **kwargs):
+        del kwargs
+        self.delete_calls += 1
+
+        if self.fail_cleanup and self.delete_calls == 1:
+            raise RuntimeError("simulated stale-chunk cleanup failure")
+
+        return {
+            "deleted": 1,
+        }
+
+
+class WholeDocumentIndexerAtomicityTests(unittest.TestCase):
+    @patch(
+        "app.services.document_indexer.ensure_legal_documents_index"
+    )
+    @patch("app.services.document_indexer.bulk")
+    def test_document_indexer_removes_stale_chunk_on_success(
+        self,
+        bulk_mock,
+        ensure_mock,
+    ) -> None:
+        del ensure_mock
+        bulk_mock.return_value = (1, [])
+
+        result = replace_document_chunks(
+            chunks=[
+                DocumentChunk(
+                    document_id=AU_DOCUMENT_ID,
+                    chunk_id="chunk-new-1",
+                    country="Australia",
+                    country_code="AU",
+                    legal_topic="Employment Contracts",
+                    document_type="comparator",
+                    language="en",
+                    section="Employment Contracts",
+                    subsection="Trial Period",
+                    content="New content.",
+                    source_filename="Australia 2026.docx",
+                    source_format="docx",
+                    content_hash="new-content-hash",
+                    reference_year=2026,
+                )
+            ],
+            client=FakeWholeDocumentOpenSearch(),
+        )
+
+        self.assertEqual(result.indexed_chunks, 1)
+        self.assertEqual(result.stale_chunks_deleted, 1)
+        self.assertEqual(bulk_mock.call_count, 1)
+
+    @patch(
+        "app.services.document_indexer.ensure_legal_documents_index"
+    )
+    @patch("app.services.document_indexer.bulk")
+    def test_document_indexer_restores_snapshot_on_stale_delete_failure(
+        self,
+        bulk_mock,
+        ensure_mock,
+    ) -> None:
+        del ensure_mock
+        # Call #1: the edit's own bulk write, succeeds. Call #2: the
+        # internal rollback's own reindex-snapshot bulk call, also
+        # succeeds - exactly like
+        # CountryIndexerTests.test_country_indexer_restores_
+        # snapshot_on_cleanup_failure's own proven shape.
+        bulk_mock.side_effect = [
+            (1, []),
+            (1, []),
+        ]
+
+        client = FakeWholeDocumentOpenSearch(fail_cleanup=True)
+
+        with self.assertRaises(DocumentIndexingError):
+            replace_document_chunks(
+                chunks=[
+                    DocumentChunk(
+                        document_id=AU_DOCUMENT_ID,
+                        chunk_id="chunk-new-1",
+                        country="Australia",
+                        country_code="AU",
+                        legal_topic="Employment Contracts",
+                        document_type="comparator",
+                        language="en",
+                        section="Employment Contracts",
+                        subsection="Trial Period",
+                        content="New content that never sticks.",
+                        source_filename="Australia 2026.docx",
+                        source_format="docx",
+                        content_hash="new-content-hash",
+                        reference_year=2026,
+                    )
+                ],
+                client=client,
+            )
+
+        # The stale-cleanup call (#1, fails) and the internal
+        # rollback's own wipe-then-restore delete_by_query call (#2,
+        # succeeds) both ran.
+        self.assertEqual(client.delete_calls, 2)
+        self.assertEqual(bulk_mock.call_count, 2)
 
 
 if __name__ == "__main__":

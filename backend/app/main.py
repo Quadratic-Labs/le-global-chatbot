@@ -16,6 +16,9 @@ from app.core.config import env_csv
 from app.middleware.api_protection import (
     ApiProtectionMiddleware,
 )
+from app.routers.admin_document_conflicts import (
+    router as admin_document_conflicts_router,
+)
 from app.routers.admin_document_lifecycle import (
     router as admin_document_lifecycle_router,
 )
@@ -132,6 +135,10 @@ app.include_router(
 
 app.include_router(
     admin_document_lifecycle_router
+)
+
+app.include_router(
+    admin_document_conflicts_router
 )
 
 
