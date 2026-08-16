@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.7.1';
+    private const VERSION = '0.8.0';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -65,6 +65,25 @@ final class LE_Global_Chatbot_Admin
 
     private const SECTION_DELETE_ACTION = (
         'le_global_chatbot_delete_section'
+    );
+
+    // Mission "ORDER 8G-B2" - Contact Management proxy actions, one
+    // per Admin Contact CRUD endpoint the backend already exposes
+    // (ORDER 8G-B1) - mirrors the section actions' own shape exactly.
+    private const CONTACTS_LIST_ACTION = (
+        'le_global_chatbot_list_contacts'
+    );
+
+    private const CONTACT_ADD_ACTION = (
+        'le_global_chatbot_add_contact'
+    );
+
+    private const CONTACT_UPDATE_ACTION = (
+        'le_global_chatbot_update_contact'
+    );
+
+    private const CONTACT_DELETE_ACTION = (
+        'le_global_chatbot_delete_contact'
     );
 
     // Mission "ORDER 8E-A2" - the country-conflict review/resolution
@@ -147,6 +166,26 @@ final class LE_Global_Chatbot_Admin
         add_action(
             'admin_post_' . self::SECTION_DELETE_ACTION,
             [self::class, 'handle_delete_section']
+        );
+
+        add_action(
+            'admin_post_' . self::CONTACTS_LIST_ACTION,
+            [self::class, 'handle_list_contacts']
+        );
+
+        add_action(
+            'admin_post_' . self::CONTACT_ADD_ACTION,
+            [self::class, 'handle_add_contact']
+        );
+
+        add_action(
+            'admin_post_' . self::CONTACT_UPDATE_ACTION,
+            [self::class, 'handle_update_contact']
+        );
+
+        add_action(
+            'admin_post_' . self::CONTACT_DELETE_ACTION,
+            [self::class, 'handle_delete_contact']
         );
 
         add_action(
@@ -284,6 +323,13 @@ final class LE_Global_Chatbot_Admin
 
             <?php
             self::render_section_editor_panel(
+                $documents,
+                $conflicted_country_codes
+            );
+            ?>
+
+            <?php
+            self::render_contacts_panel(
                 $documents,
                 $conflicted_country_codes
             );
@@ -482,6 +528,17 @@ final class LE_Global_Chatbot_Admin
                         section.
                     </p>
                 </div>
+
+                <button
+                    type="button"
+                    id="le-global-edit-collapse"
+                    class="button le-global-chatbot-admin__collapse-button"
+                    aria-label="Collapse section form"
+                    title="Collapse section form"
+                    hidden
+                >
+                    <span aria-hidden="true">&#9650;</span>
+                </button>
             </div>
 
             <div
@@ -810,6 +867,395 @@ final class LE_Global_Chatbot_Admin
                         hidden
                     >
                         + Add section
+                    </button>
+                </div>
+            </div>
+        </section>
+        <?php
+    }
+
+    /**
+     * Mission "ORDER 8G-B2" - the Contacts Admin panel: View/Add/Edit/
+     * Delete L&E Global contacts per country, backed by ORDER 8G-B1's
+     * structured contact CRUD API. Reuses the exact same collapsed-by-
+     * default segmented Edit/Add pattern the section editor panel
+     * above already establishes (le-global-chatbot-admin__panel-
+     * header/segmented/edit/edit-field/edit-message/edit-actions
+     * classes, a dedicated ▲ collapse control, one shared country
+     * select) - never a second, unrelated UX paradigm.
+     *
+     * View mode has two sub-states toggled purely in JS (never a
+     * second server round-trip to switch between them): a list of
+     * every contact for the selected country (le-global-contact-list,
+     * built by admin.js from the real list response - never
+     * innerHTML), and - once "Edit contact" is clicked on one of
+     * them - a single-contact edit form
+     * (le-global-contact-edit-fields) pre-populated with that
+     * contact's six current values. A country with contacts=[]
+     * shows the zero-contact warning and reveals the Add form
+     * directly (mode switches to "add" programmatically - no second
+     * click required).
+     */
+    private static function render_contacts_panel(
+        array $documents,
+        array $conflicted_country_codes
+    ): void {
+        ?>
+        <section class="le-global-chatbot-admin__panel">
+            <div class="le-global-chatbot-admin__panel-header">
+                <div>
+                    <h2>Contacts</h2>
+
+                    <p>
+                        Manage L&amp;E Global contacts by country.
+                    </p>
+                </div>
+
+                <button
+                    type="button"
+                    id="le-global-contact-collapse"
+                    class="button le-global-chatbot-admin__collapse-button"
+                    aria-label="Collapse contacts form"
+                    title="Collapse contacts form"
+                    hidden
+                >
+                    <span aria-hidden="true">&#9650;</span>
+                </button>
+            </div>
+
+            <div
+                class="le-global-chatbot-admin__segmented"
+                role="tablist"
+                aria-label="Contacts mode"
+            >
+                <button
+                    type="button"
+                    id="le-global-contact-mode-view"
+                    class="le-global-chatbot-admin__segmented-option is-active"
+                    role="tab"
+                    aria-selected="true"
+                >
+                    View contacts
+                </button>
+
+                <button
+                    type="button"
+                    id="le-global-contact-mode-add"
+                    class="le-global-chatbot-admin__segmented-option"
+                    role="tab"
+                    aria-selected="false"
+                >
+                    + Add a contact
+                </button>
+            </div>
+
+            <div
+                id="le-global-chatbot-contacts"
+                class="le-global-chatbot-admin__edit"
+                hidden
+                data-admin-post-url="<?php
+                    echo esc_url(
+                        admin_url('admin-post.php')
+                    );
+                ?>"
+                data-contacts-list-action="<?php
+                    echo esc_attr(self::CONTACTS_LIST_ACTION);
+                ?>"
+                data-contacts-list-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::CONTACTS_LIST_ACTION
+                        )
+                    );
+                ?>"
+                data-contact-add-action="<?php
+                    echo esc_attr(self::CONTACT_ADD_ACTION);
+                ?>"
+                data-contact-add-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::CONTACT_ADD_ACTION
+                        )
+                    );
+                ?>"
+                data-contact-update-action="<?php
+                    echo esc_attr(self::CONTACT_UPDATE_ACTION);
+                ?>"
+                data-contact-update-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::CONTACT_UPDATE_ACTION
+                        )
+                    );
+                ?>"
+                data-contact-delete-action="<?php
+                    echo esc_attr(self::CONTACT_DELETE_ACTION);
+                ?>"
+                data-contact-delete-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::CONTACT_DELETE_ACTION
+                        )
+                    );
+                ?>"
+            >
+                <div class="le-global-chatbot-admin__edit-field">
+                    <label for="le-global-contact-country">
+                        Country
+                    </label>
+
+                    <select id="le-global-contact-country">
+                        <option value="">
+                            Select a country…
+                        </option>
+
+                        <?php
+                        foreach (
+                            self::sorted_documents_for_edit(
+                                $documents,
+                                $conflicted_country_codes
+                            ) as $edit_document
+                        ) :
+                            ?>
+                            <option
+                                value="<?php
+                                    echo esc_attr(
+                                        $edit_document[
+                                            'document_id'
+                                        ]
+                                    );
+                                ?>"
+                            >
+                                <?php
+                                echo esc_html(
+                                    $edit_document['country']
+                                    . ' ('
+                                    . $edit_document[
+                                        'country_code'
+                                    ]
+                                    . ')'
+                                );
+                                ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div
+                    id="le-global-contact-view-only-fields"
+                    class="le-global-chatbot-admin__mode-fields"
+                >
+                    <div
+                        id="le-global-contact-zero-warning"
+                        class="le-global-chatbot-admin__duplicate-warning"
+                        hidden
+                    ></div>
+
+                    <div
+                        id="le-global-contact-list"
+                        aria-live="polite"
+                    ></div>
+
+                    <button
+                        type="button"
+                        id="le-global-contact-add-another"
+                        class="button"
+                        hidden
+                    >
+                        + Add another contact
+                    </button>
+
+                    <div
+                        id="le-global-contact-edit-fields"
+                        hidden
+                    >
+                        <input
+                            type="hidden"
+                            id="le-global-contact-edit-id"
+                            value=""
+                        >
+
+                        <div class="le-global-chatbot-admin__edit-field">
+                            <label for="le-global-contact-edit-member-firm">
+                                Member firm
+                            </label>
+                            <input
+                                type="text"
+                                id="le-global-contact-edit-member-firm"
+                                disabled
+                            >
+                        </div>
+
+                        <div class="le-global-chatbot-admin__edit-field">
+                            <label for="le-global-contact-edit-contact-person">
+                                Contact person
+                            </label>
+                            <input
+                                type="text"
+                                id="le-global-contact-edit-contact-person"
+                                disabled
+                            >
+                        </div>
+
+                        <div class="le-global-chatbot-admin__edit-field">
+                            <label for="le-global-contact-edit-email">
+                                Email
+                            </label>
+                            <input
+                                type="text"
+                                id="le-global-contact-edit-email"
+                                disabled
+                            >
+                        </div>
+
+                        <div class="le-global-chatbot-admin__edit-field">
+                            <label for="le-global-contact-edit-phone">
+                                Phone
+                            </label>
+                            <input
+                                type="text"
+                                id="le-global-contact-edit-phone"
+                                disabled
+                            >
+                        </div>
+
+                        <div class="le-global-chatbot-admin__edit-field">
+                            <label for="le-global-contact-edit-address">
+                                Address
+                            </label>
+                            <input
+                                type="text"
+                                id="le-global-contact-edit-address"
+                                disabled
+                            >
+                        </div>
+
+                        <div class="le-global-chatbot-admin__edit-field">
+                            <label for="le-global-contact-edit-website">
+                                Website
+                            </label>
+                            <input
+                                type="text"
+                                id="le-global-contact-edit-website"
+                                disabled
+                            >
+                        </div>
+
+                        <button
+                            type="button"
+                            id="le-global-contact-back-to-list"
+                            class="button-link le-global-chatbot-admin__back-link"
+                        >
+                            &larr; Back to list
+                        </button>
+                    </div>
+                </div>
+
+                <div
+                    id="le-global-contact-add-only-fields"
+                    class="le-global-chatbot-admin__mode-fields"
+                    hidden
+                >
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-contact-add-member-firm">
+                            Member firm
+                        </label>
+                        <input
+                            type="text"
+                            id="le-global-contact-add-member-firm"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-contact-add-contact-person">
+                            Contact person
+                        </label>
+                        <input
+                            type="text"
+                            id="le-global-contact-add-contact-person"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-contact-add-email">
+                            Email
+                        </label>
+                        <input
+                            type="text"
+                            id="le-global-contact-add-email"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-contact-add-phone">
+                            Phone
+                        </label>
+                        <input
+                            type="text"
+                            id="le-global-contact-add-phone"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-contact-add-address">
+                            Address
+                        </label>
+                        <input
+                            type="text"
+                            id="le-global-contact-add-address"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-contact-add-website">
+                            Website
+                        </label>
+                        <input
+                            type="text"
+                            id="le-global-contact-add-website"
+                            disabled
+                        >
+                    </div>
+                </div>
+
+                <div
+                    id="le-global-chatbot-contact-message"
+                    class="le-global-chatbot-admin__edit-message"
+                    aria-live="polite"
+                ></div>
+
+                <div class="le-global-chatbot-admin__edit-actions">
+                    <button
+                        type="button"
+                        id="le-global-contact-cancel"
+                        class="button"
+                        disabled
+                    >
+                        Cancel
+                    </button>
+
+                    <button
+                        type="button"
+                        id="le-global-contact-save"
+                        class="button button-primary"
+                        disabled
+                        hidden
+                    >
+                        Save changes
+                    </button>
+
+                    <button
+                        type="button"
+                        id="le-global-contact-add-submit"
+                        class="button button-primary"
+                        disabled
+                    >
+                        Add contact
                     </button>
                 </div>
             </div>
@@ -1648,6 +2094,20 @@ final class LE_Global_Chatbot_Admin
             )
             : '';
 
+        // Mission "ORDER 8G-B2", section 14 - forwarded exactly like
+        // the other decision flags above: a fresh full resubmission of
+        // the same file, confirming the Admin wants to discard this
+        // country's Admin contact changes and reseed them from the
+        // (possibly byte-identical) DOCX just supplied.
+        $confirm_contact_reseed = (
+            isset($_POST['confirm_contact_reseed'])
+            && sanitize_text_field(
+                wp_unslash(
+                    (string) $_POST['confirm_contact_reseed']
+                )
+            ) === '1'
+        );
+
         $fail = static function (
             string $message,
             int $status_code = 400,
@@ -1681,6 +2141,9 @@ final class LE_Global_Chatbot_Admin
                 'confirm_warnings' => $confirm_warnings ? 'true' : 'false',
                 'country_confirmed' => $country_confirmed ? 'true' : 'false',
                 'selected_country_code' => $selected_country_code,
+                'confirm_contact_reseed' => (
+                    $confirm_contact_reseed ? 'true' : 'false'
+                ),
             ],
             $original_filename,
             $file_content
@@ -1751,15 +2214,41 @@ final class LE_Global_Chatbot_Admin
             ? (string) $result['body']['status']
             : 'indexed';
 
-        $success_message = sprintf(
-            (
-                $result_status === 'replaced'
-                ? '%s replaced the previous country document '
-                    . 'successfully.'
-                : '%s was added successfully.'
-            ),
-            $indexed_filename
+        // Mission "ORDER 8G-B2", section 14 - the "identical bytes,
+        // confirmed contact reseed" success path never touched the
+        // DOCX or its legal content at all; it deserves its own
+        // business-facing message rather than reusing "replaced"/
+        // "added" language that would misleadingly imply the document
+        // itself changed.
+        $success_message = (
+            $result_status === 'contacts_reseeded'
+            ? sprintf(
+                '%s\'s contacts were reseeded from the current '
+                    . 'document; Admin changes to them were discarded.',
+                $indexed_filename
+            )
+            : sprintf(
+                (
+                    $result_status === 'replaced'
+                    ? '%s replaced the previous country document '
+                        . 'successfully.'
+                    : '%s was added successfully.'
+                ),
+                $indexed_filename
+            )
         );
+
+        // Mission "ORDER 8G-B2", section 18 - the post-upload zero-
+        // contact warning needs the actual resulting count; admin.js
+        // decides whether/how to show it, this proxy only relays the
+        // real number the backend just computed.
+        $contact_count = isset(
+            $result['body']['contact_count']
+        )
+            ? (int) (
+                $result['body']['contact_count']
+            )
+            : 0;
 
         if ($is_ajax) {
             wp_send_json_success(
@@ -1768,6 +2257,7 @@ final class LE_Global_Chatbot_Admin
                     'status' => $result_status,
                     'source_filename' => $indexed_filename,
                     'indexed_chunks' => $indexed_chunks,
+                    'contact_count' => $contact_count,
                 ],
                 201
             );
@@ -2790,6 +3280,158 @@ final class LE_Global_Chatbot_Admin
     }
 
     /**
+     * Mission "ORDER 8G-B2" - List every structured contact currently
+     * configured for one document/country (ORDER 8G-B1's own Admin
+     * Contact API) - stable persisted order, exactly as the backend
+     * returns it.
+     */
+    public static function handle_list_contacts(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACTS_LIST_ACTION,
+            'nonce'
+        );
+
+        $document_id = self::read_document_id_for_json();
+
+        $result = self::request_backend(
+            'GET',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts',
+            null,
+            30
+        );
+
+        self::relay_json_result(
+            $result,
+            'The contacts could not be loaded.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8G-B2" - Add one new contact. All six real
+     * business fields are required (the backend is the final
+     * authority - this is only a friendlier, earlier client-side
+     * rejection of the same rule); duplicates of an existing contact's
+     * exact field values are explicitly allowed, never rejected here.
+     * Every field is unslashed only, never sanitize_text_field()'d,
+     * for the same reason handle_update_section leaves section content
+     * alone - a member firm/address may legitimately contain
+     * characters that helper would silently mangle.
+     */
+    public static function handle_add_contact(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACT_ADD_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $fields = self::read_contact_fields_for_json();
+
+        $result = self::request_backend(
+            'POST',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts',
+            $fields,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The contact could not be added.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8G-B2" - Save new field values for one existing
+     * contact - contact_id and its position among the document's
+     * contacts are both preserved by the backend; this proxy only
+     * forwards which one to update.
+     */
+    public static function handle_update_contact(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACT_UPDATE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $contact_id = self::read_contact_id_for_json();
+        $fields = self::read_contact_fields_for_json();
+
+        $result = self::request_backend(
+            'PUT',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts/'
+            . rawurlencode($contact_id),
+            $fields,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The contact could not be saved.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8G-B2" - Remove exactly one contact by its
+     * contact_id. Confirmation is enforced client-side (admin.js) -
+     * this performs the authorized deletion directly, with no
+     * confirmation step of its own; the backend itself never blocks
+     * deleting a country's last remaining contact (unlike the last-
+     * remaining-SECTION rule, which is a wholly separate, unrelated
+     * business rule this proxy never touches).
+     */
+    public static function handle_delete_contact(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACT_DELETE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $contact_id = self::read_contact_id_for_json();
+
+        $result = self::request_backend(
+            'DELETE',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts/'
+            . rawurlencode($contact_id),
+            null,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The contact could not be deleted.'
+        );
+    }
+
+    /**
      * Shared JSON relay for the section endpoints above - the same
      * is_wp_error/status_code/extract_message pattern handle_refresh
      * and the older form-based handlers each already used, factored
@@ -2889,6 +3531,72 @@ final class LE_Global_Chatbot_Admin
         }
 
         return $section_id;
+    }
+
+    /**
+     * Mission "ORDER 8G-B2" - a stable contact_id (an opaque uuid4 hex
+     * string, ORDER 8G-B1) is only checked for non-emptiness here,
+     * exactly like read_section_id_for_json's own shape check - the
+     * backend is the final authority on whether it actually resolves
+     * to a real, current contact.
+     */
+    private static function read_contact_id_for_json(): string
+    {
+        $contact_id = isset($_REQUEST['contact_id'])
+            ? sanitize_text_field(
+                wp_unslash(
+                    (string) $_REQUEST['contact_id']
+                )
+            )
+            : '';
+
+        if ($contact_id === '') {
+            wp_send_json_error(
+                [
+                    'message' => (
+                        'The contact identifier is invalid.'
+                    ),
+                ],
+                422
+            );
+        }
+
+        return $contact_id;
+    }
+
+    /**
+     * Mission "ORDER 8G-B2" - read the six real business contact
+     * fields for Add/Update. Trims only outer whitespace (never
+     * sanitize_text_field(), which would also collapse internal
+     * whitespace/strip characters a legitimate firm name, address, or
+     * phone number may legitimately contain) - the backend itself
+     * enforces "all six required, non-empty after trimming"; this is
+     * only a plain, honest relay of whatever the Admin typed.
+     */
+    private static function read_contact_fields_for_json(): array
+    {
+        $field_names = [
+            'member_firm',
+            'contact_person',
+            'email',
+            'phone',
+            'address',
+            'website',
+        ];
+
+        $fields = [];
+
+        foreach ($field_names as $field_name) {
+            $fields[$field_name] = isset($_POST[$field_name])
+                ? trim(
+                    wp_unslash(
+                        (string) $_POST[$field_name]
+                    )
+                )
+                : '';
+        }
+
+        return $fields;
     }
 
     /**

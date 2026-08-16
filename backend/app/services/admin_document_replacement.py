@@ -42,6 +42,9 @@ from app.services.admin_documents import (
     _sanitize_filename,
     _write_upload,
 )
+from app.services.admin_modification_marker import (
+    is_admin_modified_since_upload,
+)
 from app.services.country_lock import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     country_lock,
@@ -67,6 +70,9 @@ from app.services.document_indexer import (
 )
 from app.services.document_section_state import (
     delete_section_edit_state,
+)
+from app.services.docx_parser import (
+    extract_contacts_from_docx,
 )
 from app.services.document_source_resolver import (
     DocumentSourceConflictError,
@@ -205,10 +211,12 @@ class AdminDocumentReplacementRequiredError(ValueError):
         country: str,
         country_code: str,
         existing_documents: Sequence[ExistingCountryDocument],
+        admin_modified: bool = False,
     ) -> None:
         self.country = country
         self.country_code = country_code
         self.existing_documents = tuple(existing_documents)
+        self.admin_modified = admin_modified
 
         super().__init__(
             f"A document already exists for {country}. "
@@ -217,7 +225,17 @@ class AdminDocumentReplacementRequiredError(ValueError):
         )
 
     def to_detail(self) -> dict[str, object]:
-        """Return a structured HTTP 409 payload."""
+        """
+        Return a structured HTTP 409 payload.
+
+        admin_modified (mission "ORDER 8G-B2", section 12) - True when
+        ANY existing document for this country has been changed
+        through Admin (a section or contact mutation) since its last
+        accepted DOCX upload. Lets the ONE existing replacement-
+        confirmation dialog compose the additional "this will discard
+        your Admin changes" warning, rather than a second, separate
+        modal.
+        """
 
         return {
             "code": "document_replacement_required",
@@ -228,6 +246,7 @@ class AdminDocumentReplacementRequiredError(ValueError):
                 document.document_id
                 for document in self.existing_documents
             ],
+            "admin_modified": self.admin_modified,
         }
 
 
@@ -256,6 +275,53 @@ class AdminDocumentAlreadyCurrentError(ValueError):
             "message": str(self),
             "country": self.country,
             "country_code": self.country_code,
+        }
+
+
+class AdminDocumentIdenticalButAdminModifiedError(ValueError):
+    """
+    Raised instead of AdminDocumentAlreadyCurrentError when the
+    uploaded bytes are byte-identical to the active source, but the
+    country's document has Admin changes recorded since that source
+    was last accepted (mission "ORDER 8G-B2", section 14).
+
+    The ordinary "already up to date" short-circuit would otherwise
+    silently end the workflow before the Admin can decide whether to
+    discard those changes - this error carries exactly what the
+    replacement-confirmation dialog needs to offer that decision
+    instead. confirm_contact_reseed=True on a resubmission proceeds
+    via reseed_contacts_from_current_docx (never re-touching the DOCX
+    bytes, which are already correct).
+    """
+
+    def __init__(
+        self,
+        *,
+        country: str,
+        country_code: str,
+        document_id: str,
+    ) -> None:
+        self.country = country
+        self.country_code = country_code
+        self.document_id = document_id
+
+        super().__init__(
+            f"The uploaded DOCX is identical to the current {country} "
+            "source, but this document has changes made in the Admin. "
+            "Confirm to discard those changes and reseed from this "
+            "DOCX, or cancel to keep them."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 409 payload."""
+
+        return {
+            "code": "document_identical_but_admin_modified",
+            "message": str(self),
+            "country": self.country,
+            "country_code": self.country_code,
+            "document_id": self.document_id,
+            "admin_modified": True,
         }
 
 
@@ -702,6 +768,7 @@ def safe_upload_and_index_document(
     country_confirmed: bool = False,
     selected_country_code: str | None = None,
     resolve_country_conflict: bool = False,
+    confirm_contact_reseed: bool = False,
     expected_country_code: str | None = None,
     client: OpenSearch | None = None,
     chunk_builder: ChunkBuilder = build_document_chunks_from_docx,
@@ -1034,6 +1101,74 @@ def safe_upload_and_index_document(
                     and _sha256_file(candidate_path)
                     == _sha256_file(existing_paths[0])
                 ):
+                    # Mission "ORDER 8G-B2", section 14 - byte-identical
+                    # bytes alone must never be treated as "nothing to
+                    # decide" once Admin Contact/Section changes exist
+                    # for this document: the ordinary short-circuit
+                    # below would otherwise silently end the workflow
+                    # before the Admin can choose to discard them.
+                    existing_document_id = next(
+                        iter(unique_document_ids)
+                    )
+
+                    if is_admin_modified_since_upload(
+                        source_directory,
+                        existing_document_id,
+                    ):
+                        if not confirm_contact_reseed:
+                            raise AdminDocumentIdenticalButAdminModifiedError(
+                                country=first_chunk.country,
+                                country_code=country_code,
+                                document_id=existing_document_id,
+                            )
+
+                        # This branch already runs inside this
+                        # function's own country_lock (acquired above)
+                        # - the locked internal helper is called
+                        # directly, never the public, lock-ACQUIRING
+                        # reseed_contacts_from_current_docx, which
+                        # would self-deadlock on the same country's
+                        # already-held flock().
+                        from app.services.admin_contacts import (
+                            _reseed_contacts_from_current_docx_locked,
+                        )
+
+                        contacts_response = (
+                            _reseed_contacts_from_current_docx_locked(
+                                validated_document_id=(
+                                    existing_document_id
+                                ),
+                                source_directory=source_directory,
+                                opensearch_client=(
+                                    client
+                                    if client is not None
+                                    else get_opensearch_client()
+                                ),
+                            )
+                        )
+
+                        return AdminDocumentUploadResponse(
+                            status="contacts_reseeded",
+                            document_id=existing_document_id,
+                            source_filename=(
+                                existing_documents[0].source_filename
+                            ),
+                            country=first_chunk.country,
+                            country_code=country_code,
+                            reference_year=(
+                                existing_documents[0].reference_year
+                            ),
+                            document_family=DOCUMENT_FAMILY,
+                            uploaded_bytes=uploaded_bytes,
+                            indexed_chunks=0,
+                            stale_chunks_deleted=0,
+                            replaced_source_file=False,
+                            replaced_document_ids=[],
+                            contact_count=len(
+                                contacts_response.contacts
+                            ),
+                        )
+
                     raise AdminDocumentAlreadyCurrentError(
                         country=first_chunk.country,
                         country_code=country_code,
@@ -1062,6 +1197,13 @@ def safe_upload_and_index_document(
                         country=first_chunk.country,
                         country_code=country_code,
                         existing_documents=existing_documents,
+                        admin_modified=any(
+                            is_admin_modified_since_upload(
+                                source_directory,
+                                document.document_id,
+                            )
+                            for document in existing_documents
+                        ),
                     )
 
                 operation_id = uuid.uuid4().hex
@@ -1146,6 +1288,44 @@ def safe_upload_and_index_document(
                             "be fully cleared."
                         ) from error
 
+                # Mission "ORDER 8G-B1": "new DOCX always wins" for
+                # contacts too - a confirmed upload/replace entirely
+                # reseeds the structured contact state (and resets the
+                # admin-modified marker) from the SAME DOCX bytes just
+                # accepted, discarding whatever Admin Contact CRUD had
+                # previously recorded, with no merge. Deferred import
+                # (function-local, not module-level) to avoid a real
+                # circular import: admin_contacts imports from
+                # admin_document_lifecycle, which itself imports from
+                # this module. Reached only after the DOCX file and its
+                # legal/auto-contact OpenSearch chunks are already
+                # fully committed above - a failure here is reported
+                # narrowly, exactly like the section-edit-state cleanup
+                # immediately above it, rather than attempting to undo
+                # that already-successful commit.
+                from app.services.admin_contacts import (
+                    reseed_contact_state_from_parsed_contacts,
+                )
+
+                newly_parsed_contacts = extract_contacts_from_docx(
+                    candidate_path,
+                    country=first_chunk.country,
+                )
+
+                try:
+                    reseed_contact_state_from_parsed_contacts(
+                        document_id=indexing_result.document_id,
+                        country_code=country_code,
+                        source_directory=source_directory,
+                        contacts=newly_parsed_contacts,
+                    )
+
+                except OSError as error:
+                    raise AdminDocumentStorageError(
+                        "The document was uploaded, but its contact "
+                        "state could not be seeded from the new DOCX."
+                    ) from error
+
             return AdminDocumentUploadResponse(
                 status=(
                     "replaced"
@@ -1167,6 +1347,7 @@ def safe_upload_and_index_document(
                 replaced_document_ids=sorted(
                     unique_document_ids
                 ),
+                contact_count=len(newly_parsed_contacts),
             )
 
     except (

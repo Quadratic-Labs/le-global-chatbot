@@ -20,6 +20,7 @@ from app.services.admin_document_replacement import (
     AdminDocumentCountryNotAllowedError,
     AdminDocumentCountrySelectionInvalidError,
     AdminDocumentCountrySelectionRequiredError,
+    AdminDocumentIdenticalButAdminModifiedError,
     AdminDocumentReplacementRequiredError,
     AdminDocumentWarningConfirmationRequiredError,
     ExistingCountryDocument,
@@ -2438,6 +2439,595 @@ class CountryConflictReviewCandidateTests(unittest.TestCase):
             self.assertIn(
                 "document_id",
                 candidates["Australia-legacy-v2.docx"],
+            )
+
+
+class _FakeReseedMetadataClient:
+    """
+    Minimal OpenSearch double for the "identical bytes, explicit
+    confirmed reseed" tests below - just enough for
+    reseed_contacts_from_current_docx's own metadata fetch
+    (_get_document_metadata's plain, non-"sort" shape) plus a
+    country-wide conflict check (_ensure_no_country_conflict's own
+    "sort" shape). Never a full FakeCountryOpenSearch/FakeSection
+    OpenSearchClient - those exist for OTHER tests' own different
+    metadata shapes.
+    """
+
+    def __init__(
+        self,
+        *,
+        document_id: str,
+        country_code: str = "AU",
+        country: str = "Australia",
+        source_filename: str = (
+            "Employment Law Overview Australia.docx"
+        ),
+        reference_year: int | None = None,
+    ) -> None:
+        self.document_id = document_id
+        self.country_code = country_code
+        self.country = country
+        self.source_filename = source_filename
+        self.reference_year = reference_year
+
+    def search(self, index, body):
+        del index
+
+        if "sort" in body:
+            return {"hits": {"total": {"value": 0}, "hits": []}}
+
+        term = body.get("query", {}).get("term", {})
+
+        if term.get("document_id") != self.document_id:
+            return {"hits": {"hits": []}}
+
+        return {
+            "hits": {
+                "hits": [
+                    {
+                        "_source": {
+                            "document_id": self.document_id,
+                            "source_filename": self.source_filename,
+                            "country": self.country,
+                            "country_code": self.country_code,
+                            "reference_year": self.reference_year,
+                        }
+                    }
+                ]
+            }
+        }
+
+
+class AdminModifiedReplacementWarningTests(unittest.TestCase):
+    """
+    Mission "ORDER 8G-B2", sections 12/14/15/16/17 - the
+    admin_modified-aware replacement warning integration. Does not
+    duplicate ORDER 8G-B1's own 35 CRUD/state tests - only the NEW
+    behavior added on top of them here.
+    """
+
+    def test_clean_document_replacement_flow_is_unchanged(self) -> None:
+        # marker=False (never touched by Admin) - the existing
+        # replacement-required flow must be byte-for-byte unchanged:
+        # admin_modified is explicitly False in the detail.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"legacy-australia")
+
+            with self.assertRaises(
+                AdminDocumentReplacementRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"new-australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+            self.assertFalse(
+                context.exception.to_detail()["admin_modified"]
+            )
+
+    def test_dirty_document_replacement_flags_admin_modified(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"legacy-australia")
+
+            from app.services.admin_modification_marker import (
+                mark_admin_modified,
+            )
+
+            mark_admin_modified(source_directory, AU_OLD_ID)
+
+            with self.assertRaises(
+                AdminDocumentReplacementRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"new-australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+            self.assertTrue(
+                context.exception.to_detail()["admin_modified"]
+            )
+
+    def test_identical_bytes_clean_still_raises_already_current(
+        self,
+    ) -> None:
+        # marker=False - the pre-existing short-circuit is completely
+        # unchanged.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"same-australia")
+
+            with self.assertRaises(AdminDocumentAlreadyCurrentError):
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"same-australia"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+    def test_identical_bytes_dirty_requires_explicit_reseed_confirmation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"same-australia")
+
+            from app.services.admin_modification_marker import (
+                mark_admin_modified,
+            )
+
+            mark_admin_modified(source_directory, AU_OLD_ID)
+
+            with self.assertRaises(
+                AdminDocumentIdenticalButAdminModifiedError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"same-australia"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+            self.assertEqual(
+                context.exception.to_detail()["document_id"],
+                AU_OLD_ID,
+            )
+
+    def test_identical_bytes_dirty_cancel_leaves_zero_mutation(
+        self,
+    ) -> None:
+        # "Cancel" is simply never resubmitting with
+        # confirm_contact_reseed=True - proven here as zero mutation to
+        # the structured contact state after the warning is raised.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"same-australia")
+
+            from app.services.admin_modification_marker import (
+                mark_admin_modified,
+            )
+            from app.services.contact_state import (
+                ContactState,
+                read_contact_state,
+                write_contact_state_atomic,
+            )
+            from app.services.contact_state import ContactRecord
+
+            mark_admin_modified(source_directory, AU_OLD_ID)
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=AU_OLD_ID,
+                    country_code="AU",
+                    contacts=(
+                        ContactRecord(
+                            contact_id="admin-edit-1",
+                            member_firm="Admin Edited Firm",
+                        ),
+                    ),
+                ),
+            )
+
+            with self.assertRaises(
+                AdminDocumentIdenticalButAdminModifiedError
+            ):
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"same-australia"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+            state = read_contact_state(source_directory, AU_OLD_ID)
+            self.assertEqual(
+                state.contacts[0].member_firm, "Admin Edited Firm"
+            )
+
+    def test_identical_bytes_dirty_confirmed_reseeds_contacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"same-australia")
+
+            from app.services.admin_modification_marker import (
+                is_admin_modified_since_upload,
+                mark_admin_modified,
+            )
+            from app.services.contact_state import (
+                ContactRecord,
+                ContactState,
+                read_contact_state,
+                write_contact_state_atomic,
+            )
+            from app.services.docx_parser import ExtractedContact
+
+            mark_admin_modified(source_directory, AU_OLD_ID)
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=AU_OLD_ID,
+                    country_code="AU",
+                    contacts=(
+                        ContactRecord(
+                            contact_id="admin-edit-1",
+                            member_firm="Admin Edited Firm",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch(
+                "app.services.admin_contacts."
+                "extract_contacts_from_docx",
+                return_value=[
+                    ExtractedContact(member_firm="Parsed DOCX Firm"),
+                ],
+            ), patch(
+                "app.services.document_indexer.ensure_legal_documents_index"
+            ), patch(
+                "app.services.document_indexer.bulk",
+                return_value=(1, []),
+            ), patch(
+                "app.services.document_indexer._snapshot_document_chunks",
+                return_value=[],
+            ), patch(
+                "app.services.document_indexer._delete_chunks_except",
+                return_value=0,
+            ):
+                response = safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"same-australia"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    confirm_contact_reseed=True,
+                    client=_FakeReseedMetadataClient(document_id=AU_OLD_ID),
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+            self.assertEqual(response.status, "contacts_reseeded")
+            self.assertEqual(response.contact_count, 1)
+
+            state = read_contact_state(source_directory, AU_OLD_ID)
+            self.assertEqual(
+                state.contacts[0].member_firm, "Parsed DOCX Firm"
+            )
+            self.assertFalse(
+                is_admin_modified_since_upload(
+                    source_directory, AU_OLD_ID
+                )
+            )
+
+    def test_confirmed_different_docx_resets_marker_and_reseeds(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"legacy-australia")
+
+            from app.services.admin_modification_marker import (
+                is_admin_modified_since_upload,
+                mark_admin_modified,
+            )
+            from app.services.contact_state import (
+                ContactRecord,
+                ContactState,
+                read_contact_state,
+                write_contact_state_atomic,
+            )
+            from app.services.docx_parser import ExtractedContact
+
+            mark_admin_modified(source_directory, AU_NEW_ID)
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=AU_NEW_ID,
+                    country_code="AU",
+                    contacts=(
+                        ContactRecord(
+                            contact_id="admin-edit-1",
+                            member_firm="Old Admin Contact",
+                        ),
+                        ContactRecord(
+                            contact_id="admin-edit-2",
+                            member_firm="Old Admin Contact 2",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch(
+                "app.services.admin_document_replacement."
+                "extract_contacts_from_docx",
+                return_value=[
+                    ExtractedContact(member_firm="New DOCX Firm"),
+                ],
+            ):
+                response = safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"brand-new-australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    replace_existing=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                    country_document_indexer=_fake_indexer,
+                )
+
+            self.assertEqual(response.contact_count, 1)
+
+            state = read_contact_state(source_directory, AU_NEW_ID)
+            self.assertEqual(len(state.contacts), 1)
+            self.assertEqual(
+                state.contacts[0].member_firm, "New DOCX Firm"
+            )
+            self.assertFalse(
+                is_admin_modified_since_upload(
+                    source_directory, AU_NEW_ID
+                )
+            )
+
+    def test_confirmed_different_docx_with_zero_contacts_is_explicit_empty(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"legacy-australia")
+
+            from app.services.contact_state import (
+                ContactRecord,
+                ContactState,
+                read_contact_state,
+                write_contact_state_atomic,
+            )
+
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=AU_NEW_ID,
+                    country_code="AU",
+                    contacts=(
+                        ContactRecord(
+                            contact_id="admin-edit-1",
+                            member_firm="Old Admin Contact",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch(
+                "app.services.admin_document_replacement."
+                "extract_contacts_from_docx",
+                return_value=[],
+            ):
+                response = safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"brand-new-australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    replace_existing=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                    country_document_indexer=_fake_indexer,
+                )
+
+            self.assertEqual(response.contact_count, 0)
+
+            state = read_contact_state(source_directory, AU_NEW_ID)
+            self.assertIsNotNone(state)
+            self.assertEqual(state.contacts, ())
+
+    def test_reseed_failure_restores_marker_and_state(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"same-australia")
+
+            from app.services.admin_modification_marker import (
+                is_admin_modified_since_upload,
+                mark_admin_modified,
+            )
+            from app.services.contact_state import (
+                ContactRecord,
+                ContactState,
+                read_contact_state,
+                write_contact_state_atomic,
+            )
+            from app.services.docx_parser import ExtractedContact
+
+            mark_admin_modified(source_directory, AU_OLD_ID)
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=AU_OLD_ID,
+                    country_code="AU",
+                    contacts=(
+                        ContactRecord(
+                            contact_id="admin-edit-1",
+                            member_firm="Admin Edited Firm",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch(
+                "app.services.admin_contacts."
+                "extract_contacts_from_docx",
+                return_value=[
+                    ExtractedContact(member_firm="Parsed DOCX Firm"),
+                ],
+            ), patch(
+                "app.services.admin_contacts.write_contact_state_atomic",
+                side_effect=OSError("simulated disk failure"),
+            ), patch(
+                "app.services.document_indexer.ensure_legal_documents_index"
+            ), patch(
+                "app.services.document_indexer.bulk",
+                return_value=(1, []),
+            ), patch(
+                "app.services.document_indexer._snapshot_document_chunks",
+                return_value=[],
+            ), patch(
+                "app.services.document_indexer._delete_chunks_except",
+                return_value=0,
+            ):
+                with self.assertRaises(Exception):
+                    safe_upload_and_index_document(
+                        filename="Australia 2026.docx",
+                        file_stream=BytesIO(b"same-australia"),
+                        source_directory=source_directory,
+                        processed_directory=processed_directory,
+                        maximum_bytes=1000,
+                        country_confirmed=True,
+                        confirm_warnings=True,
+                        confirm_contact_reseed=True,
+                        client=_FakeReseedMetadataClient(document_id=AU_OLD_ID),
+                        chunk_builder=lambda path: [
+                            _build_au_chunk(path.name)
+                        ],
+                        country_document_lookup=_existing_documents,
+                    )
+
+            state = read_contact_state(source_directory, AU_OLD_ID)
+            self.assertEqual(
+                state.contacts[0].member_firm, "Admin Edited Firm"
+            )
+            self.assertTrue(
+                is_admin_modified_since_upload(
+                    source_directory, AU_OLD_ID
+                )
             )
 
 

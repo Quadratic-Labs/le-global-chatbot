@@ -146,6 +146,7 @@ class AdminDocumentUploadResponse(BaseModel):
     replaced_document_ids: list[str] = Field(
         default_factory=list
     )
+    contact_count: int = 0
 
     class Config:
         extra = "forbid"

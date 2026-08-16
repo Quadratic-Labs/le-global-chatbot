@@ -874,6 +874,28 @@ def _reindex_indexed_document_locked(
             old_country_code,
         )
 
+    # Mission "ORDER 8G-B1", section 10: an ordinary Refresh/Reindex of
+    # the SAME DOCX must never silently replace Admin-edited contacts
+    # with stale contact text re-parsed straight from that DOCX. When
+    # a structured contact state already exists for this document_id,
+    # its Contact chunk (built the same way Admin Contact CRUD builds
+    # it) replaces whatever chunk_builder just parsed fresh from the
+    # DOCX; every legal/topic chunk chunk_builder produced is returned
+    # completely untouched either way. No sidecar is created merely
+    # because Reindex ran - a legacy document with no structured state
+    # yet keeps today's existing parsed-DOCX contact behavior exactly.
+    # Deferred import (function-local) to avoid a real circular
+    # import: admin_contacts imports from this module.
+    from app.services.admin_contacts import (
+        apply_structured_contact_state_to_chunks,
+    )
+
+    chunks = apply_structured_contact_state_to_chunks(
+        chunks=chunks,
+        document_id=validated_document_id,
+        source_directory=source_directory,
+    )
+
     chunk_snapshot = _snapshot_country_chunks(
         client=opensearch_client,
         country_code=old_country_code,

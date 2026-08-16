@@ -91,6 +91,14 @@
     margin-bottom: 1.25rem;
 }
 
+.le-global-chatbot-admin__collapse-button {
+    flex-shrink: 0;
+    align-self: flex-start;
+    padding: 0 0.6rem;
+    line-height: 1.9;
+    font-size: 0.8rem;
+}
+
 .le-global-chatbot-admin__panel-header h2 {
     margin: 0;
     display: flex;
@@ -389,6 +397,33 @@
 .le-global-chatbot-admin__delete-button:disabled {
     color: #a7aaad;
     border-color: #dcdcde;
+}
+
+/* --- Contacts panel (mission "ORDER 8G-B2") -------------------------- */
+
+.le-global-chatbot-admin__contact-card {
+    padding: 0.9rem 1.1rem;
+    margin-bottom: 0.9rem;
+    border: 1px solid #dcdcde;
+    border-radius: 6px;
+    background: #fff;
+}
+
+.le-global-chatbot-admin__contact-card:last-child {
+    margin-bottom: 0;
+}
+
+.le-global-chatbot-admin__contact-field {
+    margin: 0 0 0.4rem;
+}
+
+.le-global-chatbot-admin__contact-field:last-of-type {
+    margin-bottom: 0.75rem;
+}
+
+.le-global-chatbot-admin__contact-card-actions {
+    display: flex;
+    gap: 0.75rem;
 }
 
 /* --- Documents toolbar (search + status filter) --------------------- */

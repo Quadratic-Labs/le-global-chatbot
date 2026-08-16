@@ -1024,3 +1024,55 @@ class RestoreEndpointRemovedTests(unittest.TestCase):
         self.assertFalse(
             hasattr(sections_service, "restore_effective_section")
         )
+
+
+class IdenticalButAdminModifiedHttpContractTests(
+    AdminRouterIntegrationTestCase
+):
+    """
+    Mission "ORDER 8G-B2", section 14 - the router's own new exception
+    -> HTTP mapping for AdminDocumentIdenticalButAdminModifiedError.
+    Deliberately does not extend FakeOpenSearch's own query shapes for
+    this (its delete_by_query double is hard-coded to the country-wide
+    cleanup shape, not the Contact-chunk-scoped one) - the service-level
+    behavior this maps is already exhaustively covered in
+    test_admin_document_replacement.py; this proves only the NEW
+    router-level mapping itself.
+    """
+
+    def test_maps_to_409_with_structured_detail(self) -> None:
+        from app.services.admin_document_replacement import (
+            AdminDocumentIdenticalButAdminModifiedError,
+        )
+
+        def _raise(**kwargs):
+            del kwargs
+            raise AdminDocumentIdenticalButAdminModifiedError(
+                country="Argentina",
+                country_code="AR",
+                document_id="doc_" + "a" * 64,
+            )
+
+        with patch(
+            "app.routers.admin_documents.safe_upload_and_index_document",
+            side_effect=_raise,
+        ):
+            with self.assertRaises(HTTPException) as context:
+                documents_router.upload_admin_document(
+                    file=_make_upload_file("Argentina.docx", _AR_BYTES),
+                    replace_existing=False,
+                    confirm_warnings=True,
+                    country_confirmed=True,
+                    selected_country_code=None,
+                )
+
+        error = context.exception
+        self.assertEqual(error.status_code, 409)
+        self.assertEqual(
+            error.detail["code"],
+            "document_identical_but_admin_modified",
+        )
+        self.assertTrue(error.detail["admin_modified"])
+        self.assertEqual(
+            error.detail["document_id"], "doc_" + "a" * 64
+        )

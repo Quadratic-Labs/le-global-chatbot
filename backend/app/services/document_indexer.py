@@ -18,6 +18,9 @@ from app.clients.opensearch import (
     get_opensearch_client,
 )
 from app.models.document import DocumentChunk
+from app.services.document_chunk_builder import (
+    CONTACT_SUBSECTION,
+)
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
     ensure_legal_documents_index,
@@ -595,6 +598,192 @@ def _restore_section_snapshot(
         snapshot=snapshot,
         bulk_chunk_size=bulk_chunk_size,
         context=f"{context} rollback restore",
+    )
+
+
+def replace_document_contact_chunk(
+    document_id: str,
+    chunk: DocumentChunk | None,
+    client: OpenSearch | None = None,
+    bulk_chunk_size: int = DEFAULT_BULK_CHUNK_SIZE,
+) -> DocumentIndexingResult:
+    """
+    Replace (or remove) the one Contact-subsection chunk for one
+    document_id, atomically (mission "ORDER 8G-B1", section 9).
+
+    chunk=None means "this document currently has zero contacts" - any
+    existing indexed Contact chunk is deleted, nothing new is indexed.
+    Scoped to subsection == CONTACT_SUBSECTION only via
+    "subsection.keyword" (the mapped exact-match sub-field - see
+    opensearch_index.py; "subsection" itself is "type": "text") - every
+    legal-topic chunk for this document is left completely untouched,
+    exactly like replace_document_section_chunks's own topic scoping.
+
+    Deliberately a separate function rather than a call into
+    replace_document_section_chunks: that function's own stale-chunk
+    filter is a "term" query on the required-string "legal_topic"
+    field, which the Contact chunk always carries as None - a query
+    value replace_document_section_chunks's own filter was never built
+    to represent safely.
+    """
+
+    opensearch_client = (
+        client
+        if client is not None
+        else get_opensearch_client()
+    )
+
+    ensure_legal_documents_index(
+        client=opensearch_client
+    )
+
+    contact_snapshot = [
+        item
+        for item in _snapshot_document_chunks(
+            client=opensearch_client,
+            document_id=document_id,
+        )
+        if item["_source"].get("subsection") == CONTACT_SUBSECTION
+    ]
+
+    chunk_list = (
+        [chunk]
+        if chunk is not None
+        else []
+    )
+
+    if chunk_list:
+        _validate_chunks(
+            chunk_list
+        )
+
+        mismatched_subsections = {
+            item.subsection
+            for item in chunk_list
+            if item.subsection != CONTACT_SUBSECTION
+        }
+
+        if mismatched_subsections:
+            raise InvalidDocumentChunksError(
+                "All chunks must have subsection "
+                f"{CONTACT_SUBSECTION!r}; found "
+                f"{sorted(mismatched_subsections)!r}."
+            )
+
+    if bulk_chunk_size <= 0:
+        raise ValueError(
+            "bulk_chunk_size must be greater than zero."
+        )
+
+    contact_filters: list[dict[str, Any]] = [
+        {
+            "term": {
+                "document_id": document_id,
+            }
+        },
+        {
+            "term": {
+                "subsection.keyword": CONTACT_SUBSECTION,
+            }
+        },
+    ]
+
+    context = f"document {document_id!r} contact chunk"
+
+    try:
+        if chunk_list:
+            indexed_count, errors = bulk(
+                client=opensearch_client,
+                actions=_build_bulk_actions(
+                    chunk_list
+                ),
+                chunk_size=bulk_chunk_size,
+                max_retries=3,
+                initial_backoff=1,
+                max_backoff=8,
+                raise_on_error=False,
+                raise_on_exception=False,
+                refresh=True,
+            )
+
+            if errors:
+                raise DocumentIndexingError(
+                    "OpenSearch bulk indexing failed for "
+                    f"{len(errors)} chunk(s): "
+                    f"{_summarize_bulk_errors(errors)}"
+                )
+
+            if indexed_count != len(
+                chunk_list
+            ):
+                raise DocumentIndexingError(
+                    "OpenSearch returned an inconsistent indexed "
+                    f"count: expected {len(chunk_list)}, received "
+                    f"{indexed_count}."
+                )
+
+        else:
+            indexed_count = 0
+
+        stale_chunks_deleted = _delete_chunks_except(
+            client=opensearch_client,
+            filters=contact_filters,
+            keep_chunk_ids=[
+                item.chunk_id
+                for item in chunk_list
+            ],
+            context=context,
+        )
+
+    except Exception as original_error:
+        try:
+            _delete_chunks_except(
+                client=opensearch_client,
+                filters=contact_filters,
+                keep_chunk_ids=[],
+                context=f"{context} rollback wipe",
+            )
+
+            _reindex_snapshot_chunks(
+                client=opensearch_client,
+                snapshot=contact_snapshot,
+                bulk_chunk_size=bulk_chunk_size,
+                context=f"{context} rollback restore",
+            )
+
+        except Exception as rollback_error:
+            raise DocumentIndexingError(
+                f"Contact chunk replacement failed for document "
+                f"{document_id!r}, and its OpenSearch rollback also "
+                "failed."
+            ) from rollback_error
+
+        if isinstance(
+            original_error,
+            DocumentIndexingError,
+        ):
+            raise
+
+        raise DocumentIndexingError(
+            "OpenSearch contact chunk replacement failed for "
+            f"document {document_id!r}."
+        ) from original_error
+
+    return DocumentIndexingResult(
+        index_alias=LEGAL_DOCUMENTS_ALIAS,
+        document_id=document_id,
+        source_filename=(
+            chunk_list[0].source_filename
+            if chunk_list
+            else ""
+        ),
+        requested_chunks=len(
+            chunk_list
+        ),
+        indexed_chunks=int(
+            indexed_count
+        ),
+        stale_chunks_deleted=stale_chunks_deleted,
     )
 
 

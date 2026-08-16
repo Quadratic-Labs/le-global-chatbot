@@ -45,6 +45,7 @@ from app.services.admin_document_replacement import (
     AdminDocumentCountryNotAllowedError,
     AdminDocumentCountrySelectionInvalidError,
     AdminDocumentCountrySelectionRequiredError,
+    AdminDocumentIdenticalButAdminModifiedError,
     AdminDocumentReplacementRequiredError,
     AdminDocumentWarningConfirmationRequiredError,
     safe_upload_and_index_document,
@@ -145,6 +146,7 @@ def upload_admin_document(
     confirm_warnings: bool = Form(False),
     country_confirmed: bool = Form(False),
     selected_country_code: str | None = Form(None),
+    confirm_contact_reseed: bool = Form(False),
 ) -> AdminDocumentUploadResponse:
     """Validate, persist, and index one DOCX document."""
 
@@ -167,7 +169,14 @@ def upload_admin_document(
             confirm_warnings=confirm_warnings,
             country_confirmed=country_confirmed,
             selected_country_code=selected_country_code,
+            confirm_contact_reseed=confirm_contact_reseed,
         )
+
+    except AdminDocumentIdenticalButAdminModifiedError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
 
     except AdminDocumentCountryConflictReviewRequiredError as error:
         raise HTTPException(

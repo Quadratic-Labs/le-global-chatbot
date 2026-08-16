@@ -40,6 +40,9 @@ from app.services.admin_document_lifecycle import (
     _required_string,
     _validate_document_id,
 )
+from app.services.admin_modification_marker import (
+    mark_admin_modified,
+)
 from app.services.country_lock import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     country_lock,
@@ -1026,6 +1029,12 @@ def update_effective_section(
                         original_source_bytes=original_bytes,
                     )
 
+            # Mission "ORDER 8G-B2", section 11 - reached only once the
+            # rename/edit is truly committed (every rollback-triggering
+            # step above already passed): a genuine Admin content
+            # change since the last accepted DOCX upload.
+            mark_admin_modified(source_directory, document_id)
+
             return AdminDocumentSectionUpdateResponse(
                 document_id=document_id,
                 section_id=section_id_for_legal_topic(
@@ -1746,6 +1755,10 @@ def add_new_section(
                     original_source_bytes=original_bytes,
                 )
 
+            # Mission "ORDER 8G-B2", section 11 - reached only once the
+            # new section is truly committed.
+            mark_admin_modified(source_directory, document_id)
+
             return AdminDocumentSectionAddResponse(
                 document_id=document_id,
                 section_id=section_id_for_legal_topic(legal_topic),
@@ -2025,6 +2038,10 @@ def delete_section(
                     source_path=source_path,
                     original_source_bytes=original_bytes,
                 )
+
+            # Mission "ORDER 8G-B2", section 11 - reached only once the
+            # deletion is truly committed.
+            mark_admin_modified(source_directory, document_id)
 
             return AdminDocumentSectionDeleteResponse(
                 document_id=document_id,

@@ -28,6 +28,9 @@ from unittest.mock import patch
 from docx import Document
 from opensearchpy.exceptions import OpenSearchException
 
+from app.services.admin_modification_marker import (
+    is_admin_modified_since_upload,
+)
 from app.services.admin_document_lifecycle import (
     AdminDocumentCountryConflictError,
     AdminDocumentRollbackError,
@@ -2535,6 +2538,257 @@ class AdminDocumentSectionDeleteTests(unittest.TestCase):
 
             self.assertNotIn("Hiring Practices", listed_topics)
             self.assertIn("Employment Contracts", listed_topics)
+
+
+class AdminModifiedMarkerHookTests(unittest.TestCase):
+    """
+    Mission "ORDER 8G-B2", section 11 - the generic admin-modified-
+    since-upload marker (built in ORDER 8G-B1 for contacts) now also
+    marks dirty on a successful Section mutation, and stays untouched
+    on a failed one. Does not retest Section business behavior itself
+    (already covered exhaustively by the classes above).
+    """
+
+    def test_edit_marks_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder")]
+            )
+
+            self.assertFalse(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="New effective content.",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertTrue(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+    def test_rename_marks_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "Original DOCX text."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Renamed section content.",
+                    new_title="Remote Work Equipment Requirements",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertTrue(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+    def test_add_marks_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "EC content.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder")]
+            )
+
+            with _patched_indexer(client):
+                add_new_section(
+                    document_id=DOCUMENT_ID,
+                    title="Remote Working",
+                    content="Employees may work remotely.",
+                    position="end",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertTrue(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+    def test_delete_marks_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                delete_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertTrue(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+    def test_failed_edit_does_not_mark_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder")]
+            )
+
+            with _patched_indexer(client, fail_bulk=True):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    update_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        new_content="should roll back",
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertFalse(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+    def test_failed_add_does_not_mark_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "EC content.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder")]
+            )
+
+            with _patched_indexer(client, fail_bulk=True):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    add_new_section(
+                        document_id=DOCUMENT_ID,
+                        title="Remote Working",
+                        content="should roll back",
+                        position="end",
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertFalse(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
+
+    def test_failed_delete_does_not_mark_admin_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+            client.fail_delete_by_query_calls = 1
+            client.delete_by_query_failure = OpenSearchException(
+                "simulated delete failure"
+            )
+
+            with _patched_indexer(client):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    delete_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=HIRING_PRACTICES_SECTION_ID,
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertFalse(
+                is_admin_modified_since_upload(
+                    source_directory, DOCUMENT_ID
+                )
+            )
 
 
 if __name__ == "__main__":
