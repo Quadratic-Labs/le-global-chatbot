@@ -126,6 +126,10 @@
             "This section already exists. Use \"Edit a section\" to "
             + "update it."
         ),
+        section_is_last_remaining: (
+            "This section cannot be deleted because it is the only "
+            + "remaining section in this document."
+        ),
         country_document_conflict: (
             "This country has conflicting document records. Please "
             + "contact support before making changes."
@@ -1719,10 +1723,16 @@
         const sectionSelect = document.getElementById(
             "le-global-edit-section"
         );
+        const titleInput = document.getElementById(
+            "le-global-edit-title"
+        );
         const textarea = document.getElementById(
             "le-global-edit-content"
         );
         const editHintEl = document.getElementById("le-global-edit-hint");
+        const deleteButton = document.getElementById(
+            "le-global-edit-delete"
+        );
         const addOnlyFields = document.getElementById(
             "le-global-add-only-fields"
         );
@@ -1751,7 +1761,8 @@
 
         if (
             !modeEditButton || !modeAddButton || !countrySelect
-            || !editOnlyFields || !sectionSelect || !textarea || !editHintEl
+            || !editOnlyFields || !sectionSelect || !titleInput || !textarea
+            || !editHintEl || !deleteButton
             || !addOnlyFields || !addTitleInput || !addPositionSelect
             || !duplicateWarningEl || !addContentTextarea || !messageEl
             || !cancelButton || !saveButton || !addSubmitButton
@@ -1764,10 +1775,12 @@
         let mode = "edit";
         let saving = false;
         let adding = false;
+        let deleting = false;
         let previousCountryValue = "";
         let previousSectionValue = "";
         let currentSections = [];
         let editBaselineContent = null;
+        let editBaselineTitle = null;
 
         // Messages/textarea content only ever go through .textContent
         // or .value - never innerHTML - so nothing rendered here can
@@ -1886,7 +1899,10 @@
         function isEditDirty() {
             return (
                 editBaselineContent !== null
-                && textarea.value !== editBaselineContent
+                && (
+                    textarea.value !== editBaselineContent
+                    || titleInput.value !== editBaselineTitle
+                )
             );
         }
 
@@ -1902,11 +1918,21 @@
         }
 
         function updateSaveAvailability() {
+            // Mission "ORDER 8G-A" - one Save now supports content
+            // only, title only, or both: ready whenever either
+            // differs from its own loaded baseline, never only content
+            // as before. Title must never be saved empty even if
+            // content alone changed.
+            const contentChanged = textarea.value !== editBaselineContent;
+            const titleChanged = titleInput.value !== editBaselineTitle;
+
             const ready = (
                 !saving
+                && !deleting
                 && editBaselineContent !== null
-                && textarea.value !== editBaselineContent
                 && textarea.value.trim() !== ""
+                && titleInput.value.trim() !== ""
+                && (contentChanged || titleChanged)
             );
 
             saveButton.disabled = !ready;
@@ -1940,7 +1966,11 @@
         }
 
         function setMode(nextMode) {
-            if (mode === nextMode || saving || adding) {
+            if (saving || adding || deleting) {
+                return;
+            }
+
+            if (mode === nextMode) {
                 return;
             }
 
@@ -1951,6 +1981,20 @@
             mode = nextMode;
             setMessage("", null);
             renderModeUI();
+        }
+
+        // Mission "ORDER 8G-A", section 9 - the panel is collapsed by
+        // default (server-rendered `hidden` on #le-global-chatbot-edit
+        // itself); expand()/collapse() are deliberately independent of
+        // setMode()'s own no-op guard (mode === nextMode), since
+        // clicking "Edit a section" while already in edit mode must
+        // still reveal the panel the very first time.
+        function expand() {
+            container.hidden = false;
+        }
+
+        function collapse() {
+            container.hidden = true;
         }
 
         function buildQueryUrl(action, nonce, params) {
@@ -2007,10 +2051,14 @@
             setSectionOptions("Select a country first…", []);
             sectionSelect.disabled = true;
             previousSectionValue = "";
+            titleInput.value = "";
+            titleInput.disabled = true;
+            editBaselineTitle = null;
             textarea.value = "";
             textarea.disabled = true;
             editBaselineContent = null;
             editHintEl.textContent = "";
+            deleteButton.disabled = true;
 
             addTitleInput.value = "";
             addTitleInput.disabled = true;
@@ -2035,10 +2083,14 @@
             currentSections = [];
             setSectionOptions("Loading sections…", []);
             sectionSelect.disabled = true;
+            titleInput.value = "";
+            titleInput.disabled = true;
+            editBaselineTitle = null;
             textarea.value = "";
             textarea.disabled = true;
             editBaselineContent = null;
             editHintEl.textContent = "";
+            deleteButton.disabled = true;
 
             addTitleInput.value = "";
             addTitleInput.disabled = true;
@@ -2125,12 +2177,16 @@
             editSectionGeneration += 1;
             const generation = editSectionGeneration;
 
+            titleInput.value = "";
+            titleInput.disabled = true;
+            editBaselineTitle = null;
             textarea.value = "";
             textarea.disabled = true;
             editBaselineContent = null;
             editHintEl.textContent = "";
             setMessage("", null);
             saveButton.disabled = true;
+            deleteButton.disabled = true;
 
             if (documentId === "" || sectionId === "") {
                 return;
@@ -2172,16 +2228,27 @@
                 ? result.payload.data.content
                 : "";
 
+            const sectionTitle = (
+                result.payload.data
+                && typeof result.payload.data.legal_topic === "string"
+            )
+                ? result.payload.data.legal_topic
+                : (
+                    sectionSelect.options[sectionSelect.selectedIndex]
+                        ? sectionSelect.options[
+                            sectionSelect.selectedIndex
+                        ].textContent
+                        : "this section"
+                );
+
             textarea.value = content;
             textarea.disabled = false;
             editBaselineContent = content;
+            titleInput.value = sectionTitle;
+            titleInput.disabled = false;
+            editBaselineTitle = sectionTitle;
             saveButton.disabled = true;
-
-            const sectionTitle = sectionSelect.options[
-                sectionSelect.selectedIndex
-            ]
-                ? sectionSelect.options[sectionSelect.selectedIndex].textContent
-                : "this section";
+            deleteButton.disabled = false;
 
             editHintEl.textContent = (
                 `Saving will replace the current content of "${sectionTitle}" `
@@ -2190,7 +2257,7 @@
         }
 
         async function onSave() {
-            if (saving || adding || saveButton.disabled) {
+            if (saving || adding || deleting || saveButton.disabled) {
                 return;
             }
 
@@ -2201,11 +2268,7 @@
                 return;
             }
 
-            const sectionTitle = sectionSelect.options[
-                sectionSelect.selectedIndex
-            ]
-                ? sectionSelect.options[sectionSelect.selectedIndex].textContent
-                : "This section";
+            const submittedTitle = titleInput.value.trim();
             const countryName = selectedCountryName();
 
             saving = true;
@@ -2214,6 +2277,8 @@
             cancelButton.disabled = true;
             countrySelect.disabled = true;
             sectionSelect.disabled = true;
+            titleInput.disabled = true;
+            deleteButton.disabled = true;
             modeEditButton.disabled = true;
             modeAddButton.disabled = true;
             setMessage("Saving…", null);
@@ -2226,6 +2291,7 @@
             formData.set("document_id", documentId);
             formData.set("section_id", sectionId);
             formData.set("content", textarea.value);
+            formData.set("title", submittedTitle);
 
             let result;
 
@@ -2252,6 +2318,8 @@
                 cancelButton.disabled = false;
                 countrySelect.disabled = false;
                 sectionSelect.disabled = false;
+                titleInput.disabled = false;
+                deleteButton.disabled = false;
                 modeEditButton.disabled = false;
                 modeAddButton.disabled = false;
                 setMessage(
@@ -2267,13 +2335,62 @@
                 return;
             }
 
-            // Re-fetch the section so the UI always shows the value
-            // really persisted, never just the value that was sent
-            // (mission "ORDER 5D", section 2).
+            // A rename changes the section's own identity - the
+            // update response's own document_id/section_id/legal_topic
+            // are the one authoritative source for what to refetch and
+            // re-select next, never the (possibly now-stale) sectionId
+            // this save was originally submitted against.
+            const savedSectionId = (
+                result.payload.data
+                && typeof result.payload.data.section_id === "string"
+            )
+                ? result.payload.data.section_id
+                : sectionId;
+            const savedTitle = (
+                result.payload.data
+                && typeof result.payload.data.legal_topic === "string"
+            )
+                ? result.payload.data.legal_topic
+                : submittedTitle;
+
+            // Refresh the full sections list so a renamed section's
+            // new title/section_id is immediately reflected in the
+            // dropdown too (mirrors onAddSubmit's own confirmation
+            // refetch).
+            const listUrl = buildQueryUrl(
+                config.sectionsListAction,
+                config.sectionsListNonce,
+                { document_id: documentId }
+            );
+
+            let listRefetch;
+
+            try {
+                listRefetch = await fetchJson(listUrl, { method: "GET" });
+            } catch {
+                listRefetch = null;
+            }
+
+            if (
+                generation === editSectionGeneration
+                && isSuccessful(listRefetch)
+                && listRefetch.payload.data
+                && Array.isArray(listRefetch.payload.data.sections)
+            ) {
+                currentSections = listRefetch.payload.data.sections;
+                setSectionOptions("Select a section…", currentSections);
+                sectionSelect.value = savedSectionId;
+                previousSectionValue = savedSectionId;
+                populatePositionOptions(currentSections);
+            }
+
+            // Re-fetch the section itself so the UI always shows the
+            // value really persisted, never just the value that was
+            // sent (mission "ORDER 5D", section 2).
             const url = buildQueryUrl(
                 config.sectionGetAction,
                 config.sectionGetNonce,
-                { document_id: documentId, section_id: sectionId }
+                { document_id: documentId, section_id: savedSectionId }
             );
 
             let refetch;
@@ -2294,6 +2411,8 @@
             cancelButton.disabled = false;
             countrySelect.disabled = false;
             sectionSelect.disabled = false;
+            titleInput.disabled = false;
+            deleteButton.disabled = false;
             modeEditButton.disabled = false;
             modeAddButton.disabled = false;
 
@@ -2304,14 +2423,21 @@
             ) {
                 textarea.value = refetch.payload.data.content;
                 editBaselineContent = refetch.payload.data.content;
+                titleInput.value = (
+                    typeof refetch.payload.data.legal_topic === "string"
+                        ? refetch.payload.data.legal_topic
+                        : savedTitle
+                );
+                editBaselineTitle = titleInput.value;
                 setMessage(
-                    `✓ ${sectionTitle} was updated successfully. The `
+                    `✓ "${savedTitle}" was updated successfully. The `
                     + `${countryName} document and chatbot content `
                     + "are now up to date.",
                     "is-success"
                 );
             } else {
                 editBaselineContent = textarea.value;
+                editBaselineTitle = titleInput.value;
                 setMessage(
                     "Saved, but the updated content could not be "
                     + "re-loaded for confirmation.",
@@ -2322,8 +2448,152 @@
             updateSaveAvailability();
         }
 
+        // Mission "ORDER 8G-A", section 6/7 - a confirmation dialog
+        // stands between the button click and the real delete, using
+        // the exact same "confirm first, only proceed if accepted"
+        // shape wireDeleteForms() already establishes for whole-
+        // document delete elsewhere on this page.
+        async function onDelete() {
+            if (saving || adding || deleting || deleteButton.disabled) {
+                return;
+            }
+
+            const documentId = countrySelect.value;
+            const sectionId = sectionSelect.value;
+
+            if (documentId === "" || sectionId === "") {
+                return;
+            }
+
+            const sectionTitle = titleInput.value.trim() || "this section";
+            const countryName = selectedCountryName();
+
+            const confirmed = window.confirm(
+                `Delete "${sectionTitle}"?\n\nThis section will be `
+                + `removed from the ${countryName} document and will `
+                + "no longer be available to the chatbot."
+            );
+
+            if (!confirmed) {
+                return;
+            }
+
+            deleting = true;
+            deleteButton.disabled = true;
+            deleteButton.textContent = "Deleting…";
+            cancelButton.disabled = true;
+            saveButton.disabled = true;
+            countrySelect.disabled = true;
+            sectionSelect.disabled = true;
+            titleInput.disabled = true;
+            textarea.disabled = true;
+            modeEditButton.disabled = true;
+            modeAddButton.disabled = true;
+            setMessage("Deleting…", null);
+
+            const generation = editSectionGeneration;
+
+            const formData = new FormData();
+            formData.set("action", config.sectionDeleteAction);
+            formData.set("nonce", config.sectionDeleteNonce);
+            formData.set("document_id", documentId);
+            formData.set("section_id", sectionId);
+
+            let result;
+
+            try {
+                result = await fetchJson(config.adminPostUrl, {
+                    method: "POST",
+                    body: formData,
+                });
+            } catch {
+                result = null;
+            }
+
+            deleting = false;
+            deleteButton.textContent = "Delete section";
+
+            if (generation !== editSectionGeneration) {
+                return;
+            }
+
+            if (!isSuccessful(result)) {
+                cancelButton.disabled = false;
+                countrySelect.disabled = false;
+                sectionSelect.disabled = false;
+                titleInput.disabled = false;
+                textarea.disabled = false;
+                deleteButton.disabled = false;
+                modeEditButton.disabled = false;
+                modeAddButton.disabled = false;
+                setMessage(
+                    businessMessage(
+                        result ? result.payload : null,
+                        "We couldn't delete this section. Nothing has "
+                        + "been confirmed as completed. Please try "
+                        + "again or contact support."
+                    ),
+                    "is-error"
+                );
+                updateSaveAvailability();
+                return;
+            }
+
+            // Refresh the sections list so the deleted section
+            // disappears immediately (mirrors onAddSubmit's own
+            // confirmation refetch).
+            const url = buildQueryUrl(
+                config.sectionsListAction,
+                config.sectionsListNonce,
+                { document_id: documentId }
+            );
+
+            let refetch;
+
+            try {
+                refetch = await fetchJson(url, { method: "GET" });
+            } catch {
+                refetch = null;
+            }
+
+            cancelButton.disabled = false;
+            countrySelect.disabled = false;
+            modeEditButton.disabled = false;
+            modeAddButton.disabled = false;
+
+            if (
+                isSuccessful(refetch)
+                && refetch.payload.data
+                && Array.isArray(refetch.payload.data.sections)
+            ) {
+                currentSections = refetch.payload.data.sections;
+                setSectionOptions("Select a section…", currentSections);
+                sectionSelect.disabled = currentSections.length === 0;
+                populatePositionOptions(currentSections);
+            }
+
+            sectionSelect.value = "";
+            previousSectionValue = "";
+            textarea.value = "";
+            textarea.disabled = true;
+            editBaselineContent = null;
+            titleInput.value = "";
+            titleInput.disabled = true;
+            editBaselineTitle = null;
+            editHintEl.textContent = "";
+            deleteButton.disabled = true;
+            saveButton.disabled = true;
+
+            setMessage(
+                `✓ "${sectionTitle}" was deleted successfully. The `
+                + `${countryName} document and chatbot content are `
+                + "now up to date.",
+                "is-success"
+            );
+        }
+
         async function onAddSubmit() {
-            if (saving || adding || addSubmitButton.disabled) {
+            if (saving || adding || deleting || addSubmitButton.disabled) {
                 return;
             }
 
@@ -2470,6 +2740,7 @@
             }
 
             resetToEmpty();
+            collapse();
         }
 
         countrySelect.addEventListener("change", () => {
@@ -2492,8 +2763,10 @@
             return onSectionChange();
         });
 
+        titleInput.addEventListener("input", updateSaveAvailability);
         textarea.addEventListener("input", updateSaveAvailability);
         saveButton.addEventListener("click", onSave);
+        deleteButton.addEventListener("click", onDelete);
 
         addTitleInput.addEventListener("input", () => {
             checkDuplicateTitle();
@@ -2504,8 +2777,14 @@
         addSubmitButton.addEventListener("click", onAddSubmit);
 
         cancelButton.addEventListener("click", onCancel);
-        modeEditButton.addEventListener("click", () => setMode("edit"));
-        modeAddButton.addEventListener("click", () => setMode("add"));
+        modeEditButton.addEventListener("click", () => {
+            setMode("edit");
+            expand();
+        });
+        modeAddButton.addEventListener("click", () => {
+            setMode("add");
+            expand();
+        });
 
         renderModeUI();
     }

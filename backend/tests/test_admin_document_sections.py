@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import patch
 
 from docx import Document
+from opensearchpy.exceptions import OpenSearchException
 
 from app.services.admin_document_lifecycle import (
     AdminDocumentCountryConflictError,
@@ -35,10 +36,12 @@ from app.services.admin_document_lifecycle import (
 from app.services.admin_document_sections import (
     AdminDocumentSectionAlreadyExistsError,
     AdminDocumentSectionInvalidError,
+    AdminDocumentSectionLastRemainingError,
     AdminDocumentSectionNotFoundError,
     AdminDocumentSectionPositionError,
     AdminDocumentSectionUpdateFailedError,
     add_new_section,
+    delete_section,
     get_effective_section,
     list_effective_sections,
     section_id_for_legal_topic,
@@ -1640,6 +1643,898 @@ class AdminSectionBoldOnlyDocumentAddTests(unittest.TestCase):
                     source_directory=source_directory,
                     client=client,
                 )
+
+
+class AdminDocumentSectionRenameTests(unittest.TestCase):
+    """
+    Mission "ORDER 8G-A", sections 2-5: Rename extends the same Edit
+    Section transaction - an omitted or effectively-unchanged title is
+    a normal content-only edit, never a fake rename; a genuine title
+    change re-validates the reparsed document (old title gone, new
+    title exactly once, topic count/other topics unchanged) before
+    touching OpenSearch, then removes the old topic's chunks once the
+    new ones are safely indexed, atomically replaces the source, and
+    verifies both invariants (new topic present, old topic absent).
+    """
+
+    def test_native_canonical_section_rename_with_new_content(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            # A second, untouched canonical topic must remain so the
+            # reparse can still LEARN the document's own heading-level-1
+            # structural signal (docx_parser._learn_custom_topic_signal_
+            # requirement) to recognize the renamed heading afterward -
+            # a document with only one canonical topic being renamed
+            # away has nothing left to learn from by construction.
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "Original DOCX text."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                response = update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Renamed section content.",
+                    new_title="Remote Work Equipment Requirements",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(
+                response.legal_topic,
+                "Remote Work Equipment Requirements",
+            )
+            self.assertEqual(
+                response.section_id,
+                section_id_for_legal_topic(
+                    "Remote Work Equipment Requirements"
+                ),
+            )
+
+            paragraphs = [
+                p.text for p in Document(source_path).paragraphs
+            ]
+            self.assertIn(
+                "Remote Work Equipment Requirements", paragraphs
+            )
+            self.assertNotIn("Employment Contracts", paragraphs)
+            self.assertIn("Renamed section content.", paragraphs)
+
+            remaining_new = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"]
+                == "Remote Work Equipment Requirements"
+            ]
+            self.assertEqual(len(remaining_new), 1)
+
+            remaining_old = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Employment Contracts"
+            ]
+            self.assertEqual(remaining_old, [])
+
+    def test_custom_section_rename_title_only_content_preserved(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "EC content.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder EC")]
+            )
+
+            with _patched_indexer(client):
+                add_new_section(
+                    document_id=DOCUMENT_ID,
+                    title="Remote Working",
+                    content="Original custom content, unchanged.",
+                    position="end",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                response = update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=section_id_for_legal_topic(
+                        "Remote Working"
+                    ),
+                    new_content="Original custom content, unchanged.",
+                    new_title="Remote Working Policy",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(
+                response.legal_topic, "Remote Working Policy"
+            )
+
+            reparsed = get_effective_section(
+                document_id=DOCUMENT_ID,
+                section_id=section_id_for_legal_topic(
+                    "Remote Working Policy"
+                ),
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(
+                reparsed.content,
+                "Original custom content, unchanged.",
+            )
+
+    def test_duplicate_title_is_rejected_with_zero_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with self.assertRaises(
+                AdminDocumentSectionAlreadyExistsError
+            ) as context:
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="whatever",
+                    new_title="Hiring Practices",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(
+                context.exception.to_detail()["operation"],
+                "section_update",
+            )
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+            self.assertEqual(len(client.chunks), 2)
+
+    def test_normalized_duplicate_title_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with self.assertRaises(
+                AdminDocumentSectionAlreadyExistsError
+            ):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="whatever",
+                    new_title="  hiring   PRACTICES  ",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+    def test_unchanged_effective_title_is_a_normal_edit_not_a_rename(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "Original DOCX text.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder")]
+            )
+
+            with _patched_indexer(client):
+                response = update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Edited content only.",
+                    new_title="  employment   contracts  ",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(
+                response.legal_topic, "Employment Contracts"
+            )
+            self.assertEqual(
+                response.section_id,
+                EMPLOYMENT_CONTRACTS_SECTION_ID,
+            )
+
+            paragraphs = [
+                p.text for p in Document(source_path).paragraphs
+            ]
+            self.assertIn("Employment Contracts", paragraphs)
+
+    def test_stale_section_id_after_rename_is_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Renamed away.",
+                    new_title="Something Else Entirely",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                with self.assertRaises(
+                    AdminDocumentSectionNotFoundError
+                ):
+                    update_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        new_content="should not apply",
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+    def test_other_topics_unchanged_by_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Renamed content.",
+                    new_title="Something Else Entirely",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            hp_chunks = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Hiring Practices"
+            ]
+            self.assertEqual(len(hp_chunks), 1)
+            self.assertEqual(hp_chunks[0]["content"], "placeholder HP")
+
+            paragraphs = [
+                p.text for p in Document(source_path).paragraphs
+            ]
+            self.assertIn("HP content.", paragraphs)
+
+    def test_new_topic_index_failure_rolls_back_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "Original DOCX text."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client, fail_bulk=True):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    update_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        new_content="should roll back",
+                        new_title="Something Else Entirely",
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+            self.assertEqual(
+                client.chunks["chunk-seed-0"]["legal_topic"],
+                "Employment Contracts",
+            )
+            self.assertEqual(
+                client.chunks["chunk-seed-0"]["content"],
+                "placeholder",
+            )
+
+            leftover_temps = list(
+                source_directory.glob(".*tmp.docx")
+            )
+            self.assertEqual(leftover_temps, [])
+
+    def test_old_topic_cleanup_failure_rolls_back_new_topic_too(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "Original DOCX text."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            # Fail specifically the SECOND delete_by_query call - the
+            # first belongs to replace_document_section_chunks' own
+            # internal staleness cleanup for the NEW topic (which must
+            # succeed for this scenario to actually reach the OLD-
+            # topic cleanup step this test targets).
+            real_delete_by_query = client.delete_by_query
+            call_count = {"n": 0}
+
+            def delete_by_query_fail_second(**kwargs: Any) -> Any:
+                call_count["n"] += 1
+
+                if call_count["n"] == 2:
+                    raise OpenSearchException(
+                        "simulated old-topic cleanup failure"
+                    )
+
+                return real_delete_by_query(**kwargs)
+
+            client.delete_by_query = delete_by_query_fail_second
+
+            with _patched_indexer(client):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    update_effective_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                        new_content="should roll back",
+                        new_title="Something Else Entirely",
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+
+            remaining = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Employment Contracts"
+            ]
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["content"], "placeholder")
+
+            leftover_new = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Something Else Entirely"
+            ]
+            self.assertEqual(leftover_new, [])
+
+    def test_docx_replace_failure_rolls_back_rename_entirely(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "Original DOCX text."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                with patch(
+                    "app.services.admin_document_sections.os.replace",
+                    side_effect=OSError("simulated disk failure"),
+                ):
+                    with self.assertRaises(
+                        AdminDocumentSectionUpdateFailedError
+                    ):
+                        update_effective_section(
+                            document_id=DOCUMENT_ID,
+                            section_id=(
+                                EMPLOYMENT_CONTRACTS_SECTION_ID
+                            ),
+                            new_content="should roll back",
+                            new_title="Something Else Entirely",
+                            source_directory=source_directory,
+                            client=client,
+                        )
+
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+
+            remaining = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Employment Contracts"
+            ]
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["content"], "placeholder")
+
+            leftover_new = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Something Else Entirely"
+            ]
+            self.assertEqual(leftover_new, [])
+
+            leftover_temps = list(
+                source_directory.glob(".*tmp.docx")
+            )
+            self.assertEqual(leftover_temps, [])
+
+    def test_live_topic_vocabulary_updates_immediately_after_rename(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [
+                    ("Employment Contracts", "Original DOCX text."),
+                    ("Hiring Practices", "Unrelated HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                update_effective_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    new_content="Renamed content.",
+                    new_title="Something Else Entirely",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            listing = list_effective_sections(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            listed_topics = [s.legal_topic for s in listing.sections]
+
+            self.assertIn("Something Else Entirely", listed_topics)
+            self.assertNotIn("Employment Contracts", listed_topics)
+
+
+class AdminDocumentSectionDeleteTests(unittest.TestCase):
+    """
+    Mission "ORDER 8G-A", sections 6-8: Delete mirrors Edit/Rename's
+    exact transaction shape for one already-known legal_topic (no new
+    chunks are ever built) - lock, snapshot, mutate a temp copy,
+    reparse-validate (target gone, every other topic unchanged),
+    delete the target's chunks, atomically replace the source, verify.
+    Blocks deleting the document's last remaining usable section.
+    """
+
+    def test_custom_section_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "EC content.")],
+            )
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder EC")]
+            )
+
+            with _patched_indexer(client):
+                add_new_section(
+                    document_id=DOCUMENT_ID,
+                    title="Remote Working",
+                    content="Custom content.",
+                    position="end",
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+                response = delete_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=section_id_for_legal_topic(
+                        "Remote Working"
+                    ),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(response.legal_topic, "Remote Working")
+
+            paragraphs = [
+                p.text for p in Document(source_path).paragraphs
+            ]
+            self.assertNotIn("Remote Working", paragraphs)
+            self.assertNotIn("Custom content.", paragraphs)
+            self.assertIn("EC content.", paragraphs)
+
+            remaining = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Remote Working"
+            ]
+            self.assertEqual(remaining, [])
+
+    def test_native_canonical_section_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                response = delete_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(response.legal_topic, "Hiring Practices")
+
+            paragraphs = [
+                p.text for p in Document(source_path).paragraphs
+            ]
+            self.assertNotIn("Hiring Practices", paragraphs)
+            self.assertNotIn("HP content.", paragraphs)
+            self.assertIn("Employment Contracts", paragraphs)
+            self.assertIn("EC content.", paragraphs)
+
+            hp_chunks = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Hiring Practices"
+            ]
+            self.assertEqual(hp_chunks, [])
+
+            ec_chunks = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Employment Contracts"
+            ]
+            self.assertEqual(len(ec_chunks), 1)
+
+    def test_last_remaining_section_delete_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [("Employment Contracts", "EC content.")],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[("Employment Contracts", "placeholder")]
+            )
+
+            with self.assertRaises(
+                AdminDocumentSectionLastRemainingError
+            ) as context:
+                delete_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            self.assertEqual(
+                context.exception.to_detail()["code"],
+                "section_is_last_remaining",
+            )
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+            self.assertEqual(len(client.chunks), 1)
+
+    def test_other_topics_unchanged_by_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                delete_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            # get_effective_section reads the CURRENT DOCX directly,
+            # never OpenSearch - "placeholder EC" is only the fake
+            # index's own seed value.
+            reparsed = get_effective_section(
+                document_id=DOCUMENT_ID,
+                section_id=EMPLOYMENT_CONTRACTS_SECTION_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(reparsed.content, "EC content.")
+
+    def test_opensearch_delete_failure_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+            client.fail_delete_by_query_calls = 1
+            client.delete_by_query_failure = OpenSearchException(
+                "simulated delete failure"
+            )
+
+            with _patched_indexer(client):
+                with self.assertRaises(
+                    AdminDocumentSectionUpdateFailedError
+                ):
+                    delete_section(
+                        document_id=DOCUMENT_ID,
+                        section_id=HIRING_PRACTICES_SECTION_ID,
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+
+            remaining = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Hiring Practices"
+            ]
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["content"], "placeholder HP")
+
+    def test_docx_replace_failure_rolls_back_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            source_path = source_directory / "GB.docx"
+
+            _write_docx(
+                source_path,
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+            original_bytes = source_path.read_bytes()
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                with patch(
+                    "app.services.admin_document_sections.os.replace",
+                    side_effect=OSError("simulated disk failure"),
+                ):
+                    with self.assertRaises(
+                        AdminDocumentSectionUpdateFailedError
+                    ):
+                        delete_section(
+                            document_id=DOCUMENT_ID,
+                            section_id=HIRING_PRACTICES_SECTION_ID,
+                            source_directory=source_directory,
+                            client=client,
+                        )
+
+            self.assertEqual(
+                source_path.read_bytes(), original_bytes
+            )
+
+            remaining = [
+                chunk
+                for chunk in client.chunks.values()
+                if chunk["legal_topic"] == "Hiring Practices"
+            ]
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["content"], "placeholder HP")
+
+            leftover_temps = list(
+                source_directory.glob(".*tmp.docx")
+            )
+            self.assertEqual(leftover_temps, [])
+
+    def test_live_topic_vocabulary_removes_deleted_title(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+
+            _write_docx(
+                source_directory / "GB.docx",
+                [
+                    ("Employment Contracts", "EC content."),
+                    ("Hiring Practices", "HP content."),
+                ],
+            )
+
+            client = _seeded_client(
+                topics=[
+                    ("Employment Contracts", "placeholder EC"),
+                    ("Hiring Practices", "placeholder HP"),
+                ]
+            )
+
+            with _patched_indexer(client):
+                delete_section(
+                    document_id=DOCUMENT_ID,
+                    section_id=HIRING_PRACTICES_SECTION_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            listing = list_effective_sections(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            listed_topics = [s.legal_topic for s in listing.sections]
+
+            self.assertNotIn("Hiring Practices", listed_topics)
+            self.assertIn("Employment Contracts", listed_topics)
 
 
 if __name__ == "__main__":

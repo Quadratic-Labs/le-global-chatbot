@@ -40,21 +40,45 @@ class AdminDocumentSectionResponse(BaseModel):
 
 
 class AdminDocumentSectionUpdateRequest(BaseModel):
-    """The new effective content an admin wants to save for a section."""
+    """
+    The new effective content an admin wants to save for a section -
+    and, optionally, a new title (mission "ORDER 8G-A": one Save
+    supports content only, title only, or both; an omitted or
+    unchanged-after-normalization title is a normal content-only edit,
+    never a rename).
+    """
 
     content: str = Field(min_length=1)
+    title: str | None = Field(default=None, min_length=1)
 
     class Config:
         extra = "forbid"
 
 
 class AdminDocumentSectionUpdateResponse(BaseModel):
-    """Result of successfully saving a new effective section content."""
+    """
+    Result of successfully saving a new effective section content.
+
+    section_id/legal_topic reflect the section's NEW identity when
+    this save was a rename - a caller that treats section_id as stable
+    across a save must re-resolve it from this response.
+    """
 
     document_id: str
     section_id: str
     legal_topic: str
     indexed_chunks: int
+
+    class Config:
+        extra = "forbid"
+
+
+class AdminDocumentSectionDeleteResponse(BaseModel):
+    """Result of successfully deleting one top-level legal section."""
+
+    document_id: str
+    section_id: str
+    legal_topic: str
 
     class Config:
         extra = "forbid"

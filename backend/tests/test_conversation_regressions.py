@@ -65,6 +65,19 @@ from app.services.country_detection import resolve_country_display_name
 from app.services.rag_answer import answer_legal_question
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 def _catalog_provider() -> LegalCatalogResponse:
     return LegalCatalogResponse(
         countries=[
@@ -354,6 +367,7 @@ class SequenceABLastStateAndPreciseSubjectTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_dismissal_sick_leave_search_function(),
             generation_client=turn_one_generation,
             understanding_client=turn_one_client,
@@ -413,6 +427,7 @@ class SequenceABLastStateAndPreciseSubjectTests(unittest.TestCase):
                 conversation_state=turn_one_response.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_dismissal_sick_leave_search_function(),
             generation_client=turn_two_generation,
             understanding_client=turn_two_client,
@@ -507,6 +522,7 @@ class SameInformationCountryFollowUpTests(unittest.TestCase):
                 conversation_state=state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_dismissal_sick_leave_search_function(),
             generation_client=generation_client,
             understanding_client=understanding_client,
@@ -568,6 +584,7 @@ class SequenceDContactFollowUpStabilityTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=(
                     lambda request: (_ for _ in ()).throw(
                         AssertionError(
@@ -613,6 +630,7 @@ class SequenceDContactFollowUpStabilityTests(unittest.TestCase):
                     ),
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=(
                     lambda request: (_ for _ in ()).throw(
                         AssertionError(
@@ -671,6 +689,7 @@ class SequenceEStateReplacementNotAccumulationTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_dismissal_sick_leave_search_function(),
             generation_client=turn_one_generation,
             understanding_client=turn_one_client,
@@ -710,6 +729,7 @@ class SequenceEStateReplacementNotAccumulationTests(unittest.TestCase):
                     ),
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=(
                     lambda request: (_ for _ in ()).throw(
                         AssertionError(
@@ -821,6 +841,7 @@ class SequenceFContextualClarificationTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=two_country_search,
             generation_client=turn_one_generation,
             understanding_client=turn_one_client,
@@ -853,6 +874,7 @@ class SequenceFContextualClarificationTests(unittest.TestCase):
                 conversation_state=state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=(
                 lambda request: (_ for _ in ()).throw(
                     AssertionError(
@@ -910,6 +932,7 @@ class SequenceGDisclaimerSignalAfterOutOfScopeTests(unittest.TestCase):
                 question="What is the weather like today?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=(
                 lambda request: (_ for _ in ()).throw(
                     AssertionError(
@@ -954,6 +977,7 @@ class RequestUnderstandingCallBudgetTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_dismissal_sick_leave_search_function(),
             generation_client=CapturingGenerationClient(
                 answer=(
@@ -993,6 +1017,7 @@ class RequestUnderstandingCallBudgetTests(unittest.TestCase):
                 conversation_state=turn_one_response.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_dismissal_sick_leave_search_function(),
             generation_client=CapturingGenerationClient(
                 answer=(
@@ -1312,6 +1337,7 @@ class JurisdictionNeutralSubjectRegressionTests(unittest.TestCase):
                 question="What are the rules on remote work in Spain?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=turn_one_search,
             understanding_client=turn_one_client,
         )
@@ -1361,6 +1387,7 @@ class JurisdictionNeutralSubjectRegressionTests(unittest.TestCase):
                 conversation_state=turn_one_response.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=turn_two_search,
             understanding_client=turn_two_client,
         )

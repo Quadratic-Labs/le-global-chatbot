@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any, Final
 
 from opensearchpy import OpenSearch
@@ -284,6 +285,158 @@ def _extract_catalog_values(
         )
 
     return values
+
+
+def build_document_legal_topics_body(
+    country_codes: Sequence[str],
+) -> dict[str, Any]:
+    """
+    Build a compact, country-scoped aggregation for the LIVE legal_topic
+    vocabulary actually indexed for the given countries.
+
+    This is deliberately distinct from get_legal_catalog's own global
+    legal_topics aggregation (mission "ORDER 8F-A", section 3): that one
+    is unscoped and answers "what topic values exist anywhere"; this
+    one answers "what topic values exist for THIS country" - the
+    country-aware, Admin-extensible complement to the fixed
+    CANONICAL_LEGAL_TOPICS taxonomy (legal_topic_taxonomy.py), which
+    this function never reads from or reasons about - it only ever
+    reports whatever is actually indexed, canonical or custom alike.
+    """
+
+    normalized_codes = sorted(
+        {
+            code.strip().upper()
+            for code in country_codes
+            if code and code.strip()
+        }
+    )
+
+    return {
+        "size": 0,
+        "query": {
+            "terms": {
+                "country_code": normalized_codes,
+            }
+        },
+        "aggs": {
+            "countries": {
+                "terms": {
+                    "field": "country_code",
+                    "size": max(len(normalized_codes), 1),
+                },
+                "aggs": {
+                    "legal_topics": {
+                        "terms": {
+                            "field": "legal_topic",
+                            "size": MAX_LEGAL_TOPICS,
+                            "order": {
+                                "_key": "asc",
+                            },
+                        }
+                    }
+                },
+            },
+        },
+    }
+
+
+DocumentLegalTopicsProvider = Callable[
+    [Sequence[str]],
+    dict[str, list[str]],
+]
+
+
+def get_document_legal_topics_by_country(
+    country_codes: Sequence[str],
+    client: OpenSearch | None = None,
+) -> dict[str, list[str]]:
+    """
+    Return the actual legal_topic values currently indexed for each of
+    the given countries, keyed by country code.
+
+    One compact OpenSearch aggregation (never a DOCX parse, never a
+    per-request database or other external state - mission "ORDER 8F-A",
+    section 3/12) scoped to only the requested countries. Empty
+    country_codes short-circuits to {} without any OpenSearch call.
+    """
+
+    normalized_codes = sorted(
+        {
+            code.strip().upper()
+            for code in country_codes
+            if code and code.strip()
+        }
+    )
+
+    if not normalized_codes:
+        return {}
+
+    opensearch_client = (
+        client
+        if client is not None
+        else get_opensearch_client()
+    )
+
+    try:
+        response = opensearch_client.search(
+            index=LEGAL_DOCUMENTS_ALIAS,
+            body=build_document_legal_topics_body(
+                normalized_codes
+            ),
+        )
+
+    except OpenSearchException as error:
+        raise LegalCatalogError(
+            "OpenSearch document-topic request failed."
+        ) from error
+
+    if not isinstance(
+        response,
+        dict,
+    ):
+        raise LegalCatalogError(
+            "OpenSearch returned an invalid document-topic response."
+        )
+
+    aggregations = response.get(
+        "aggregations"
+    )
+
+    if not isinstance(
+        aggregations,
+        dict,
+    ):
+        raise LegalCatalogError(
+            "OpenSearch returned no valid document-topic aggregations."
+        )
+
+    country_buckets = _get_aggregation_buckets(
+        aggregations=aggregations,
+        aggregation_name="countries",
+    )
+
+    result: dict[str, list[str]] = {}
+
+    for bucket in country_buckets:
+        country_code = bucket.get("key")
+
+        if not isinstance(country_code, str) or not country_code.strip():
+            continue
+
+        normalized_country_code = country_code.strip().upper()
+
+        topics = [
+            value.value
+            for value in _extract_catalog_values(
+                aggregations=bucket,
+                aggregation_name="legal_topics",
+            )
+        ]
+
+        result[normalized_country_code] = topics
+
+    return result
 
 
 def get_legal_catalog(

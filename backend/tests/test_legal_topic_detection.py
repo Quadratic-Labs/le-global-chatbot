@@ -9,6 +9,7 @@ from app.services.country_detection import (
     detect_mentioned_country_codes,
 )
 from app.services.legal_topic_detection import (
+    detect_document_legal_topics,
     detect_legal_topics,
     is_overview_question,
     resolve_legal_scope,
@@ -466,6 +467,116 @@ class LegalScopeTests(unittest.TestCase):
 
         self.assertFalse(
             scope.is_supported
+        )
+
+
+class DocumentLegalTopicDetectionTests(unittest.TestCase):
+    """
+    Tests for detect_document_legal_topics (mission "ORDER 8F-A") -
+    deterministic, exact-substring detection of LIVE, currently-indexed
+    legal_topic titles (canonical or Admin-created custom section
+    alike), distinct from detect_legal_topics' fixed-taxonomy keyword
+    matching. Must survive being the ONLY signal available when
+    RequestUnderstanding's own LLM call fails entirely.
+    """
+
+    def test_exact_custom_title_is_detected(self) -> None:
+        topics = detect_document_legal_topics(
+            "Tell me about the V060 Temporary Validation Section "
+            "for Australia.",
+            [
+                "Hiring Practices",
+                "V060 Temporary Validation Section",
+            ],
+        )
+
+        self.assertEqual(
+            topics,
+            ["V060 Temporary Validation Section"],
+        )
+
+    def test_no_match_returns_empty(self) -> None:
+        topics = detect_document_legal_topics(
+            "What are the overtime rules?",
+            [
+                "Hiring Practices",
+                "V060 Temporary Validation Section",
+            ],
+        )
+
+        self.assertEqual(topics, [])
+
+    def test_case_and_punctuation_insensitive(self) -> None:
+        topics = detect_document_legal_topics(
+            "what about foreign employee work-eligibility, checks?",
+            ["Foreign Employee Work Eligibility Checks"],
+        )
+
+        self.assertEqual(
+            topics,
+            ["Foreign Employee Work Eligibility Checks"],
+        )
+
+    def test_single_word_topic_is_never_matched(self) -> None:
+        """
+        A single common word indexed as its own legal_topic (e.g. a
+        one-word custom section title) is never enough to
+        deterministically claim an explicit match - only a genuinely
+        multi-word, specific title is (MIN_DOCUMENT_TOPIC_WORDS).
+        """
+
+        topics = detect_document_legal_topics(
+            "What are the benefits available to employees?",
+            ["Benefits"],
+        )
+
+        self.assertEqual(topics, [])
+
+    def test_empty_question_returns_empty(self) -> None:
+        topics = detect_document_legal_topics(
+            "",
+            ["V060 Temporary Validation Section"],
+        )
+
+        self.assertEqual(topics, [])
+
+    def test_empty_document_topics_returns_empty(self) -> None:
+        topics = detect_document_legal_topics(
+            "Tell me about the V060 Temporary Validation Section.",
+            [],
+        )
+
+        self.assertEqual(topics, [])
+
+    def test_multiple_distinct_titles_are_all_detected(self) -> None:
+        topics = detect_document_legal_topics(
+            "Compare the V060 Temporary Validation Section with the "
+            "Foreign Employee Work Eligibility Checks.",
+            [
+                "V060 Temporary Validation Section",
+                "Foreign Employee Work Eligibility Checks",
+                "Hiring Practices",
+            ],
+        )
+
+        self.assertEqual(
+            topics,
+            [
+                "V060 Temporary Validation Section",
+                "Foreign Employee Work Eligibility Checks",
+            ],
+        )
+
+    def test_duplicate_document_topics_are_deduplicated(self) -> None:
+        topics = detect_document_legal_topics(
+            "V060 Temporary Validation Section, "
+            "V060 Temporary Validation Section.",
+            ["V060 Temporary Validation Section"],
+        )
+
+        self.assertEqual(
+            topics,
+            ["V060 Temporary Validation Section"],
         )
 
 

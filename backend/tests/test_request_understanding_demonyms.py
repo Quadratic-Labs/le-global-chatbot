@@ -38,6 +38,19 @@ from app.routers.chat import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 def _catalog_provider() -> LegalCatalogResponse:
     return LegalCatalogResponse(
         countries=[
@@ -282,6 +295,7 @@ class DemonymIsNeverDeterministicallyDetectedTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
         )
 
         self.assertEqual(hints.current_country_codes, [])
@@ -296,6 +310,7 @@ class DemonymIsNeverDeterministicallyDetectedTests(unittest.TestCase):
                 question="What is the notice period for a Peruvian worker?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
         )
 
         self.assertEqual(hints.current_country_codes, [])
@@ -337,6 +352,7 @@ class DemonymRoutingTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "ES", "Spain", "Dismissal procedure content."
                 ),
@@ -370,6 +386,7 @@ class DemonymRoutingTests(unittest.TestCase):
                 question="What is the notice period for a Peruvian worker?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_legal_search(
                 "PE", "Peru", "Notice period content."
             ),
@@ -399,6 +416,7 @@ class DemonymRoutingTests(unittest.TestCase):
                     question="I need to speak with an Australian adviser."
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 understanding_client=understanding_client,
             )
@@ -442,6 +460,7 @@ class CityResolutionTests(unittest.TestCase):
                     question="Can you connect me with your team in Lima?"
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 understanding_client=understanding_client,
             )
@@ -477,6 +496,7 @@ class CityResolutionTests(unittest.TestCase):
                     question="Who can help me in Madrid?"
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 understanding_client=understanding_client,
             )
@@ -505,6 +525,7 @@ class CityResolutionTests(unittest.TestCase):
                 question="What are the redundancy rules for our London office?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_legal_search(
                 "GB", "United Kingdom", "Redundancy content."
             ),
@@ -534,6 +555,7 @@ class CityResolutionTests(unittest.TestCase):
                     question="Is there somebody from your network in Sydney?"
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 understanding_client=understanding_client,
             )
@@ -570,6 +592,7 @@ class AmbiguousCityInterceptsBeforeTheModelTests(unittest.TestCase):
                 question="Who can help me in Barcelona?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -606,6 +629,7 @@ class AmbiguousCityInterceptsBeforeTheModelTests(unittest.TestCase):
                     question="Who can help me in Barcelona, Spain?"
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 understanding_client=understanding_client,
             )
@@ -652,6 +676,7 @@ class ContactVerbFalsePositiveTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "PE", "Peru", "Sick leave rules content."
                 ),
@@ -693,6 +718,7 @@ class ContactVerbFalsePositiveTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "BE", "Belgium", "Communication rules content."
                 ),
@@ -739,6 +765,7 @@ class ContactVerbFalsePositiveTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "ES", "Spain", "Accident reporting content."
                 ),
@@ -780,6 +807,7 @@ class ContactVerbFalsePositiveTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "BE", "Belgium", "Employment contract content."
                 ),

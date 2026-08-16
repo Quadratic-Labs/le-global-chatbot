@@ -3041,8 +3041,10 @@ describe("add / edit a section", () => {
         const countrySelect = makeFakeSelect();
         const editOnlyFields = { hidden: false };
         const sectionSelect = makeFakeSelect();
+        const titleInput = makeFakeTextarea();
         const textarea = makeFakeTextarea();
         const editHintEl = { textContent: "" };
+        const deleteButton = makeFakeButton();
         const addOnlyFields = { hidden: true };
         const addTitleInput = makeFakeTextarea();
         const addPositionSelect = makeFakeSelect();
@@ -3054,6 +3056,7 @@ describe("add / edit a section", () => {
         const addSubmitButton = makeFakeButton();
 
         const editContainer = {
+            hidden: true,
             dataset: {
                 adminPostUrl: "https://example.test/wp-admin/admin-post.php",
                 sectionsListAction: "le_global_chatbot_list_sections",
@@ -3062,6 +3065,8 @@ describe("add / edit a section", () => {
                 sectionGetNonce: "section-get-nonce",
                 sectionUpdateAction: "le_global_chatbot_update_section",
                 sectionUpdateNonce: "section-update-nonce",
+                sectionDeleteAction: "le_global_chatbot_delete_section",
+                sectionDeleteNonce: "section-delete-nonce",
                 sectionAddAction: "le_global_chatbot_add_section",
                 sectionAddNonce: "section-add-nonce",
             },
@@ -3074,8 +3079,10 @@ describe("add / edit a section", () => {
             "le-global-edit-country": countrySelect,
             "le-global-edit-only-fields": editOnlyFields,
             "le-global-edit-section": sectionSelect,
+            "le-global-edit-title": titleInput,
             "le-global-edit-content": textarea,
             "le-global-edit-hint": editHintEl,
+            "le-global-edit-delete": deleteButton,
             "le-global-add-only-fields": addOnlyFields,
             "le-global-add-title": addTitleInput,
             "le-global-add-position": addPositionSelect,
@@ -3109,9 +3116,12 @@ describe("add / edit a section", () => {
             modeAddButton,
             countrySelect,
             editOnlyFields,
+            editContainer,
             sectionSelect,
+            titleInput,
             textarea,
             editHintEl,
+            deleteButton,
             addOnlyFields,
             addTitleInput,
             addPositionSelect,
@@ -3340,6 +3350,17 @@ describe("add / edit a section", () => {
                 status: 200,
                 payload: {
                     success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        sections: [{ section_id: "sec-1", legal_topic: "Hiring Practices" }],
+                    },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
                     data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Hiring Practices", content: "Draft text the admin just typed." },
                 },
             },
@@ -3347,16 +3368,17 @@ describe("add / edit a section", () => {
 
         await clickSave();
 
-        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls.length, 3);
         assert.equal(fetchCalls[0].options.method, "POST");
         assert.equal(fetchCalls[0].options.body.get("content"), "Draft text the admin just typed.");
         assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_aaa");
         assert.equal(fetchCalls[0].options.body.get("section_id"), "sec-1");
-        assert.match(fetchCalls[1].url, /action=le_global_chatbot_get_section/);
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_sections/);
+        assert.match(fetchCalls[2].url, /action=le_global_chatbot_get_section/);
         assert.equal(dom.textarea.value, "Draft text the admin just typed.");
         assert.equal(
             dom.messageEl.textContent,
-            "✓ Hiring Practices was updated successfully. The Italy document and chatbot content are now up to date."
+            "✓ \"Hiring Practices\" was updated successfully. The Italy document and chatbot content are now up to date."
         );
         assert.equal(dom.messageEl.className.includes("is-success"), true);
         assert.equal(/chunk/i.test(dom.messageEl.textContent), false);
@@ -3882,5 +3904,356 @@ describe("add / edit a section", () => {
         clickCancel();
 
         assert.equal(dom.addTitleInput.value, "Draft", "declining must never discard the draft");
+    });
+
+    // --- Collapsed-by-default panel (mission "ORDER 8G-A", section 9) -
+
+    test("the panel is collapsed by default and expands only once a mode button is clicked", () => {
+        assert.equal(dom.editContainer.hidden, true);
+
+        clickModeEdit();
+
+        assert.equal(dom.editContainer.hidden, false);
+    });
+
+    test("clicking + Add a new section also expands the panel", () => {
+        assert.equal(dom.editContainer.hidden, true);
+
+        clickModeAdd();
+
+        assert.equal(dom.editContainer.hidden, false);
+    });
+
+    test("expand() does not depend on setMode's own no-op guard - Edit is already the default mode, but the panel still starts collapsed", () => {
+        assert.equal(dom.editContainer.hidden, true);
+
+        clickModeEdit();
+
+        assert.equal(dom.editContainer.hidden, false);
+    });
+
+    test("Cancel collapses the panel back to its default state", () => {
+        clickModeEdit();
+        assert.equal(dom.editContainer.hidden, false);
+
+        clickCancel();
+
+        assert.equal(dom.editContainer.hidden, true);
+    });
+
+    // --- Section title / Rename (mission "ORDER 8G-A", sections 2-5) --
+
+    test("selecting a section loads its current title, and changing only the title enables Save", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Some content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.equal(dom.titleInput.value, "Working Time");
+        assert.equal(dom.titleInput.disabled, false);
+        assert.equal(dom.saveButton.disabled, true);
+
+        dom.titleInput.value = "Working Hours";
+        dom.titleInput._listeners.input();
+
+        assert.equal(dom.saveButton.disabled, false);
+    });
+
+    test("Save is disabled if the title is cleared to empty, even with edited content", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Some content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        dom.textarea.value = "Edited content.";
+        dom.textarea._listeners.input();
+        assert.equal(dom.saveButton.disabled, false);
+
+        dom.titleInput.value = "   ";
+        dom.titleInput._listeners.input();
+        assert.equal(dom.saveButton.disabled, true);
+    });
+
+    test("Rename: Save posts the changed title, and the response's own new section_id/title drive the re-selection", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.countrySelect.options = [{ value: "doc_aaa", textContent: "Australia (AU)" }];
+        dom.countrySelect.selectedIndex = 0;
+        dom.sectionSelect.value = "sec-hiring";
+        dom.titleInput.value = "Remote Work Equipment Requirements";
+        dom.textarea.value = "Some content.";
+        dom.saveButton.disabled = false;
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-remote-work",
+                        legal_topic: "Remote Work Equipment Requirements",
+                    },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        sections: [
+                            { section_id: "sec-remote-work", legal_topic: "Remote Work Equipment Requirements" },
+                        ],
+                    },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-remote-work",
+                        legal_topic: "Remote Work Equipment Requirements",
+                        content: "Some content.",
+                    },
+                },
+            },
+        ]);
+
+        await clickSave();
+
+        assert.equal(
+            fetchCalls[0].options.body.get("title"),
+            "Remote Work Equipment Requirements"
+        );
+        assert.equal(dom.sectionSelect.value, "sec-remote-work");
+        assert.equal(dom.titleInput.value, "Remote Work Equipment Requirements");
+        assert.match(
+            dom.messageEl.textContent,
+            /"Remote Work Equipment Requirements" was updated successfully/
+        );
+    });
+
+    test("a duplicate title from a rename attempt maps to the business-friendly message, not the raw code", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.titleInput.value = "Hiring Practices";
+        dom.textarea.value = "Some content.";
+        dom.saveButton.disabled = false;
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 409,
+            payload: {
+                success: false,
+                data: { detail: { code: "section_already_exists" } },
+            },
+        });
+
+        await clickSave();
+
+        assert.equal(
+            dom.messageEl.textContent,
+            "This section already exists. Use \"Edit a section\" to update it."
+        );
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+    });
+
+    test("Cancel prompts for confirmation when only the title changed (content unchanged), and declining keeps the panel expanded", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Same content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        dom.titleInput.value = "Working Hours";
+        dom.titleInput._listeners.input();
+
+        let confirmCalled = false;
+        global.window.confirm = () => {
+            confirmCalled = true;
+            return false;
+        };
+
+        clickCancel();
+
+        assert.equal(confirmCalled, true);
+        assert.equal(dom.titleInput.value, "Working Hours", "declining must never discard the edit");
+    });
+
+    // --- Delete section (mission "ORDER 8G-A", sections 6-8) ----------
+
+    test("Delete: declining the confirmation makes zero network calls", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "x",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.equal(dom.deleteButton.disabled, false);
+        assert.equal(fetchCalls.length, 1);
+
+        global.window.confirm = () => false;
+
+        await dom.deleteButton._listeners.click();
+
+        assert.equal(fetchCalls.length, 1, "Delete must never call fetch when declined");
+    });
+
+    test("Delete: confirming shows the exact required wording, removes the section, and shows a success message", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "x",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        dom.countrySelect.options = [{ value: "doc_aaa", textContent: "Italy (IT)" }];
+        dom.countrySelect.selectedIndex = 0;
+        await changeSection("sec-1");
+
+        let confirmMessage = null;
+        global.window.confirm = (message) => {
+            confirmMessage = message;
+            return true;
+        };
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Working Time" },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", sections: [] } },
+            },
+        ]);
+
+        await dom.deleteButton._listeners.click();
+
+        assert.match(confirmMessage, /Delete "Working Time"\?/);
+        assert.match(
+            confirmMessage,
+            /This section will be removed from the Italy document and will no longer be available to the chatbot\./
+        );
+        assert.equal(dom.sectionSelect.value, "");
+        assert.equal(dom.titleInput.value, "");
+        assert.equal(dom.deleteButton.disabled, true);
+        assert.match(dom.messageEl.textContent, /"Working Time" was deleted successfully/);
+    });
+
+    test("Delete: a section_is_last_remaining error maps to the friendly business message and re-enables Delete", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "x",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 409,
+            payload: {
+                success: false,
+                data: { detail: { code: "section_is_last_remaining" } },
+            },
+        });
+
+        await dom.deleteButton._listeners.click();
+
+        assert.equal(
+            dom.messageEl.textContent,
+            "This section cannot be deleted because it is the only remaining section in this document."
+        );
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+        assert.equal(dom.deleteButton.disabled, false, "must re-enable Delete after a failed attempt");
+        // The section must not have been discarded from the UI on a
+        // failed delete - the admin can still see/edit it.
+        assert.equal(dom.sectionSelect.value, "sec-1");
     });
 });

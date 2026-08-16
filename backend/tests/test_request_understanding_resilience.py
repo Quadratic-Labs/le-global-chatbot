@@ -37,6 +37,19 @@ from app.routers.chat import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 # See test_chat.py's _NOT_YET_INDEXED_CODES for the full rationale:
 # country_registry.COUNTRIES now includes several countries (France,
 # Germany among them) registered purely for detection/admin-allowlist
@@ -286,6 +299,7 @@ class ConservativeFallbackForClearCutCasesTests(unittest.TestCase):
                     question="Give me a lawyer contact in Peru."
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 generation_client=NoCallGenerationClient(),
                 understanding_client=_FailingUnderstandingClient(),
@@ -308,6 +322,7 @@ class ConservativeFallbackForClearCutCasesTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_legal_search(
                 "ES", "Spain", "Overtime content."
             ),
@@ -337,6 +352,7 @@ class ConservativeFallbackForClearCutCasesTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             generation_client=NoCallGenerationClient(),
             understanding_client=_FailingUnderstandingClient(),
@@ -353,6 +369,7 @@ class ConservativeFallbackForClearCutCasesTests(unittest.TestCase):
                 question="What are the termination rules?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             generation_client=NoCallGenerationClient(),
             understanding_client=_FailingUnderstandingClient(),
@@ -384,6 +401,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="What is the notice period in Peru?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_legal_search(
                 "PE", "Peru", "Notice period content."
             ),
@@ -417,6 +435,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                     question="Give me a lawyer contact in Peru."
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 generation_client=NoCallGenerationClient(),
                 understanding_client=_RawJSONUnderstandingClient(
@@ -437,6 +456,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="What are the termination rules?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             generation_client=NoCallGenerationClient(),
             understanding_client=_RawJSONUnderstandingClient(payload),
@@ -466,6 +486,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="What is the notice period in Zubrowka?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             generation_client=NoCallGenerationClient(),
             understanding_client=_RawJSONUnderstandingClient(payload),
@@ -485,6 +506,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="What are the termination rules in Peru?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_legal_search(
                 "PE", "Peru", "Termination content."
             ),
@@ -520,6 +542,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="What are the termination rules?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             generation_client=NoCallGenerationClient(),
             understanding_client=_RawJSONUnderstandingClient(payload),
@@ -580,6 +603,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="Give me contacts in Peru, Spain, Australia and the UK."
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             generation_client=NoCallGenerationClient(),
             understanding_client=_RawJSONUnderstandingClient(payload),
@@ -627,6 +651,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                     question="Give me a lawyer contact in Peru."
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 generation_client=NoCallGenerationClient(),
                 understanding_client=_RawJSONUnderstandingClient(
@@ -681,6 +706,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                 question="What is the notice period in Peru?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=FakeGenerationClient(
                 answer="Peru\n- Notice period content. [1]"

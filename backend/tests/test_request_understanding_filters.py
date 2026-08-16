@@ -36,6 +36,19 @@ from app.routers.chat import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 def _catalog_provider() -> LegalCatalogResponse:
     return LegalCatalogResponse(
         countries=[
@@ -226,6 +239,7 @@ class ExplicitLegalTopicsBindingTests(unittest.TestCase):
                 legal_topics=["Termination"],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=generation_client,
             understanding_client=understanding_client,
@@ -279,6 +293,7 @@ class ExplicitLegalTopicsBindingTests(unittest.TestCase):
                 question="What are the working conditions in Peru?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=generation_client,
             understanding_client=understanding_client,
@@ -332,6 +347,7 @@ class ExplicitSubsectionsBindingTests(unittest.TestCase):
                 subsections=["Overtime"],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=generation_client,
             understanding_client=understanding_client,
@@ -378,6 +394,7 @@ class ExplicitCountryFilterConflictTests(unittest.TestCase):
                 country_codes=["ES"],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -432,6 +449,7 @@ class ExplicitCountryFilterConflictTests(unittest.TestCase):
                 country_codes=["ES"],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=generation_client,
             understanding_client=understanding_client,

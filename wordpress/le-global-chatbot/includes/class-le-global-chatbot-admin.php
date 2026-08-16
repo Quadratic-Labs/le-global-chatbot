@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.6.0';
+    private const VERSION = '0.7.1';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -61,6 +61,10 @@ final class LE_Global_Chatbot_Admin
 
     private const SECTION_ADD_ACTION = (
         'le_global_chatbot_add_section'
+    );
+
+    private const SECTION_DELETE_ACTION = (
+        'le_global_chatbot_delete_section'
     );
 
     // Mission "ORDER 8E-A2" - the country-conflict review/resolution
@@ -138,6 +142,11 @@ final class LE_Global_Chatbot_Admin
         add_action(
             'admin_post_' . self::SECTION_ADD_ACTION,
             [self::class, 'handle_add_section']
+        );
+
+        add_action(
+            'admin_post_' . self::SECTION_DELETE_ACTION,
+            [self::class, 'handle_delete_section']
         );
 
         add_action(
@@ -504,6 +513,7 @@ final class LE_Global_Chatbot_Admin
             <div
                 id="le-global-chatbot-edit"
                 class="le-global-chatbot-admin__edit"
+                hidden
                 data-admin-post-url="<?php
                     echo esc_url(
                         admin_url('admin-post.php')
@@ -536,6 +546,16 @@ final class LE_Global_Chatbot_Admin
                     echo esc_attr(
                         wp_create_nonce(
                             self::SECTION_UPDATE_ACTION
+                        )
+                    );
+                ?>"
+                data-section-delete-action="<?php
+                    echo esc_attr(self::SECTION_DELETE_ACTION);
+                ?>"
+                data-section-delete-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::SECTION_DELETE_ACTION
                         )
                     );
                 ?>"
@@ -665,6 +685,18 @@ final class LE_Global_Chatbot_Admin
                     </div>
 
                     <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-edit-title">
+                            Section title
+                        </label>
+
+                        <input
+                            type="text"
+                            id="le-global-edit-title"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
                         <label for="le-global-edit-content">
                             Section content
                         </label>
@@ -680,6 +712,17 @@ final class LE_Global_Chatbot_Admin
                         id="le-global-edit-hint"
                         class="le-global-chatbot-admin__edit-hint"
                     ></p>
+
+                    <div class="le-global-chatbot-admin__edit-delete">
+                        <button
+                            type="button"
+                            id="le-global-edit-delete"
+                            class="button le-global-chatbot-admin__delete-button is-destructive"
+                            disabled
+                        >
+                            Delete section
+                        </button>
+                    </div>
                 </div>
 
                 <div
@@ -2388,6 +2431,26 @@ final class LE_Global_Chatbot_Admin
             $document_id . '.docx'
         );
 
+        // Mission "ORDER 8G-A", section 10 - the reported bug ("the
+        // file downloads correctly, but a red failure notice also
+        // appears") matches the classic browser-level symptom of a
+        // declared Content-Length no longer matching the bytes
+        // actually placed on the wire (an active output buffer
+        // appending bytes after this point, or a compression layer
+        // altering the byte count post-hoc) - the browser still
+        // reconstructs the complete file, but flags the transfer as
+        // failed. Never self-compute Content-Length for this
+        // response: discard any active output buffering first, ask
+        // Apache to skip compressing this one response, and let the
+        // web server determine and send the real length itself.
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+
+        if (function_exists('apache_setenv')) {
+            @apache_setenv('no-gzip', '1');
+        }
+
         nocache_headers();
 
         header(
@@ -2399,10 +2462,6 @@ final class LE_Global_Chatbot_Admin
             'Content-Disposition: attachment; filename="'
             . $filename
             . '"'
-        );
-
-        header(
-            'Content-Length: ' . strlen($body)
         );
 
         // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
@@ -2581,6 +2640,22 @@ final class LE_Global_Chatbot_Admin
             );
         }
 
+        // Mission "ORDER 8G-A" - one Save now supports content only,
+        // title only, or both: an omitted (or blank) title simply
+        // means no rename was requested, exactly the pre-existing
+        // content-only behavior. Title, like content, is unslashed
+        // only - never sanitize_text_field()'d - the backend itself
+        // is the sole authority on trimming/validating it.
+        $title = isset($_POST['title'])
+            ? wp_unslash((string) $_POST['title'])
+            : '';
+
+        $payload = ['content' => $content];
+
+        if (trim($title) !== '') {
+            $payload['title'] = $title;
+        }
+
         $result = self::request_backend(
             'PUT',
             self::DOCUMENTS_PATH
@@ -2588,13 +2663,51 @@ final class LE_Global_Chatbot_Admin
             . rawurlencode($document_id)
             . '/sections/'
             . rawurlencode($section_id),
-            ['content' => $content],
+            $payload,
             60
         );
 
         self::relay_json_result(
             $result,
             'The section could not be saved.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8G-A", section 7 - permanently remove one
+     * top-level legal section from the current DOCX. The backend
+     * blocks deleting the document's last remaining usable section
+     * (surfaced to the browser as the section_is_last_remaining
+     * business error, mapped to a friendly message in admin.js).
+     */
+    public static function handle_delete_section(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::SECTION_DELETE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $section_id = self::read_section_id_for_json();
+
+        $result = self::request_backend(
+            'DELETE',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/sections/'
+            . rawurlencode($section_id),
+            null,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The section could not be deleted.'
         );
     }
 
@@ -3506,6 +3619,17 @@ final class LE_Global_Chatbot_Admin
                 ?>
             </p>
         </div>
+        <script>
+            ( function () {
+                if ( ! window.history || ! window.history.replaceState ) {
+                    return;
+                }
+                var url = new URL( window.location.href );
+                url.searchParams.delete( 'le_global_notice' );
+                url.searchParams.delete( 'le_global_message' );
+                window.history.replaceState( null, '', url.toString() );
+            } )();
+        </script>
         <?php
     }
 

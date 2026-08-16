@@ -23,6 +23,19 @@ from app.services.conversation_meta import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 class _FakeUnderstandingClient:
     """Minimal test double for the semantic-understanding client -
     only what AmbiguousCityFollowupResumeTests' own end-to-end test
@@ -745,6 +758,7 @@ class RouterIntegrationTests(unittest.TestCase):
                 language="en",
             ),
             catalog_provider=forbidden_catalog,
+            document_topic_provider=_document_topic_provider,
         )
 
         self.assertEqual(response.grounded, False)
@@ -761,6 +775,7 @@ class RouterIntegrationTests(unittest.TestCase):
                 language="en",
             ),
             catalog_provider=_catalog,
+            document_topic_provider=_document_topic_provider,
         )
 
         self.assertEqual(response.grounded, False)
@@ -965,6 +980,7 @@ class AmbiguousCityFollowupResumeTests(unittest.TestCase):
                 question="Who can help me in Barcelona?"
             ),
             catalog_provider=_catalog,
+            document_topic_provider=_document_topic_provider,
         )
 
         self.assertIn("Barcelona", offer_response.answer)
@@ -1020,6 +1036,7 @@ class AmbiguousCityFollowupResumeTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog,
+                document_topic_provider=_document_topic_provider,
                 understanding_client=understanding_client,
             )
 

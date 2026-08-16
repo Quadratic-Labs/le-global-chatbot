@@ -43,6 +43,19 @@ from app.routers.chat import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 # See test_chat.py's _NOT_YET_INDEXED_CODES for the full rationale:
 # country_registry.COUNTRIES now includes several countries (France,
 # Germany among them) registered purely for detection/admin-allowlist
@@ -385,6 +398,7 @@ class BasicSingleActionRoutingTests(unittest.TestCase):
                     question="I need someone in Peru."
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fail_if_called,
                 understanding_client=understanding_client,
             )
@@ -421,6 +435,7 @@ class BasicSingleActionRoutingTests(unittest.TestCase):
                     question="What is the notice period in Peru?"
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "PE", "Peru", "Notice period content."
                 ),
@@ -467,6 +482,7 @@ class BasicSingleActionRoutingTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_multi_country_legal_search(
                     countries, "Dismissal comparison content."
                 ),
@@ -530,6 +546,7 @@ class CriticalMixedRequestRegressionTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_multi_country_legal_search(
                     countries, "Dismissal comparison content."
                 ),
@@ -576,6 +593,7 @@ class CriticalMixedRequestRegressionTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_legal_search(
                     "GB",
                     "United Kingdom",
@@ -631,6 +649,7 @@ class CriticalMixedRequestRegressionTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_fake_multi_country_legal_search(
                     countries, "Notice period comparison content."
                 ),
@@ -678,6 +697,7 @@ class ClarificationWordingTests(unittest.TestCase):
                 question="What are the termination rules?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -705,6 +725,7 @@ class ClarificationWordingTests(unittest.TestCase):
                 question="Can you give me a lawyer contact?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -735,6 +756,7 @@ class ClarificationWordingTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -767,6 +789,7 @@ class ClarificationWordingTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -789,6 +812,7 @@ class ClarificationWordingTests(unittest.TestCase):
         response = resolve_legal_chat_response(
             request=LegalChatRequest(question="Which country is better?"),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -818,6 +842,7 @@ class ClarificationWordingTests(unittest.TestCase):
         response = resolve_legal_chat_response(
             request=LegalChatRequest(question="I need help in Peru."),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -844,6 +869,7 @@ class ClarificationWordingTests(unittest.TestCase):
                 question="Tell me about taxes in Peru."
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -884,6 +910,7 @@ class ExplicitFilterConflictTests(unittest.TestCase):
                 country_codes=["ES"],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -919,6 +946,7 @@ class ExplicitFilterConflictTests(unittest.TestCase):
                 country_codes=["ES"],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_legal_search(
                 "ES", "Spain", "Notice period content."
             ),
@@ -962,6 +990,7 @@ class DeterministicUnavailableCountryRefinementTests(unittest.TestCase):
                 question="What are the overtime rules in France?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -992,6 +1021,7 @@ class DeterministicUnavailableCountryRefinementTests(unittest.TestCase):
                 question="What are the tax rules in Germany?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -1041,6 +1071,7 @@ class DeterministicUnavailableCountryRefinementTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -1070,6 +1101,7 @@ class UnderstandingResilienceTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -1102,6 +1134,7 @@ class UnderstandingResilienceTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=GarbageClient(),
         )

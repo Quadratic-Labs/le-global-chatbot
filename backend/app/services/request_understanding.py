@@ -147,6 +147,16 @@ class RequestUnderstandingAction(BaseModel):
     type: str
     country_codes: list[str] = Field(default_factory=list)
     legal_topics: list[str] = Field(default_factory=list)
+    # Mission "ORDER 8F-A" - a LIVE, currently-indexed legal_topic
+    # value (canonical or Admin-created custom section alike) that
+    # this action explicitly concerns, distinct from legal_topics
+    # (fixed CANONICAL_LEGAL_TOPICS values only) and topic_text (free
+    # text used only when neither the canonical taxonomy nor a live
+    # document topic applies). Single-country ("legal_information")
+    # actions only - see _validate_comparison_has_no_document_topics -
+    # a comparison spans more than one country and a document topic is
+    # inherently one country's own section.
+    document_legal_topics: list[str] = Field(default_factory=list)
     topic_text: str | None = Field(
         default=None,
         max_length=MAX_TOPIC_TEXT_CHARACTERS,
@@ -221,7 +231,7 @@ class RequestUnderstandingAction(BaseModel):
 
         return normalized
 
-    @field_validator("legal_topics")
+    @field_validator("legal_topics", "document_legal_topics")
     @classmethod
     def _normalize_legal_topics(cls, value: list[str]) -> list[str]:
         normalized: list[str] = []
@@ -233,6 +243,24 @@ class RequestUnderstandingAction(BaseModel):
                 normalized.append(stripped_topic)
 
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_comparison_has_no_document_topics(
+        self,
+    ) -> "RequestUnderstandingAction":
+        # Mission "ORDER 8F-A", section 9 (comparison safety) - a
+        # document_legal_topics value is inherently one specific
+        # country's own live section; a comparison action spans two or
+        # more countries by definition, so it must never carry one -
+        # enforced here, at the model itself, rather than trusted to
+        # every downstream caller to remember.
+        if self.type == "comparison" and self.document_legal_topics:
+            raise ValueError(
+                "A comparison action must not carry "
+                "document_legal_topics."
+            )
+
+        return self
 
     @field_validator("topic_text", "resolved_question", "subject_text")
     @classmethod
@@ -534,6 +562,7 @@ class RequestUnderstandingResult(BaseModel):
 
                 if (
                     action.legal_topics
+                    or action.document_legal_topics
                     or action.topic_text
                     or action.subject_text
                     or action.search_concepts
@@ -552,10 +581,15 @@ class RequestUnderstandingResult(BaseModel):
                         "requires at least one country."
                     )
 
-                if not action.legal_topics and not action.topic_text:
+                if (
+                    not action.legal_topics
+                    and not action.document_legal_topics
+                    and not action.topic_text
+                ):
                     raise ValueError(
                         "A resolved legal_information action "
-                        "requires legal_topics or topic_text."
+                        "requires legal_topics, document_legal_topics, "
+                        "or topic_text."
                     )
 
             elif action.type == "comparison":
@@ -663,6 +697,21 @@ class DeterministicHints:
     explicit_country_codes: list[str] = field(default_factory=list)
     explicit_legal_topics: list[str] = field(default_factory=list)
     explicit_subsections: list[str] = field(default_factory=list)
+    # Mission "ORDER 8F-A" - the LIVE, country-scoped legal_topic
+    # vocabulary actually indexed right now (canonical or Admin-
+    # created custom sections alike), keyed by country code. Computed
+    # once in _build_deterministic_hints (routers/chat.py) via
+    # legal_catalog.get_document_legal_topics_by_country, scoped to
+    # whichever countries the deterministic hints already consider in
+    # play - never a fresh OpenSearch call per understanding attempt,
+    # and never confused with CANONICAL_LEGAL_TOPICS, which this field
+    # has no relationship to at all. Fed to the model as context (see
+    # _build_understanding_input) and reused, unchanged, by
+    # _resolve_conservative_fallback's own deterministic exact-title
+    # check when the model call fails outright.
+    current_document_legal_topics: dict[str, list[str]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -833,6 +882,21 @@ legal topics, or subsections, treat them as binding constraints, not
 suggestions - never invent a country outside an explicit country-code
 list, never silently replace an explicit legal topic.
 
+Document topics: document_legal_topics_by_country (in the deterministic
+hints below) lists the section titles ACTUALLY indexed right now for a
+country - this always includes every value in legal_topics below, plus
+any Admin-created custom section (a real, retrievable part of that
+country's document, just not one of the fixed legal_topics values).
+When a single-country legal_information question clearly concerns one
+of those custom, non-canonical titles - named explicitly (e.g. quoted,
+or "the X section") or unmistakably its actual subject - put that exact
+title (copied verbatim, never paraphrased or invented) in
+document_legal_topics instead of guessing the nearest legal_topics
+value. Never populate document_legal_topics with a value that is not
+listed there for that country, and never for a comparison action (a
+document topic is always one specific country's own section - see
+comparison's own country requirement below).
+
 Output shape:
 
 {
@@ -842,6 +906,7 @@ Output shape:
       "type": "contact" | "legal_information" | "comparison",
       "country_codes": ["XX", ...],
       "legal_topics": [...],
+      "document_legal_topics": [...],
       "topic_text": "..." or null,
       "resolved_question": "..." or null,
       "subject_text": "..." or null,
@@ -875,16 +940,22 @@ Field rules:
 - actions: 0 to 3 entries, one per distinct action requested. For
   "resolved": each action must be complete (a contact action needs at
   least one country; a legal_information action needs at least one
-  country and either legal_topics or topic_text; a comparison action
-  needs at least two countries and either legal_topics or topic_text).
+  country and at least one of legal_topics, document_legal_topics, or
+  topic_text; a comparison action needs at least two countries and
+  either legal_topics or topic_text - never document_legal_topics).
   For "clarification": at most one action, which may be partial (e.g.
   type="contact" with no country yet) purely to indicate which kind of
   result was being sought. For "unsupported": always empty.
 - legal_topics: only values from this exact list, when they clearly
   apply: {legal_topics}. Leave empty otherwise.
+- document_legal_topics: only an exact title from
+  document_legal_topics_by_country (see "Document topics" above), for
+  the single country this legal_information action concerns. Empty for
+  every other case, and always empty for a comparison action.
 - topic_text: a short (a few words), free-text label of the real legal
-  topic, taken only from the question, used only when no value in the
-  list above applies. Null for a contact action.
+  topic, taken only from the question, used only when neither
+  legal_topics nor document_legal_topics applies. Null for a contact
+  action.
 - resolved_question: for a legal_information/comparison action, the
   question rewritten to be self-contained (folding in only what the
   history actually established) - never invents a country, topic, or
@@ -949,7 +1020,11 @@ def _build_understanding_input(
         "resolution). The *_unavailable_country_codes hints name a "
         "country that was recognized in the text but is outside the "
         "supported-country list above - treat it the same as any "
-        "other unsupported country, never invent documents for it:"
+        "other unsupported country, never invent documents for it. "
+        "document_legal_topics_by_country lists the LIVE section "
+        "titles actually indexed right now for whichever countries "
+        "are already in play (current/history/explicit) - see the "
+        "document_legal_topics field rule below for how to use it:"
     )
     lines.append(
         json.dumps(
@@ -984,6 +1059,9 @@ def _build_understanding_input(
                 ),
                 "explicit_subsections": (
                     hints.explicit_subsections
+                ),
+                "document_legal_topics_by_country": (
+                    hints.current_document_legal_topics
                 ),
             }
         )
@@ -1021,6 +1099,10 @@ _ACTION_JSON_SCHEMA: Final[dict[str, Any]] = {
             "type": "array",
             "items": {"type": "string"},
         },
+        "document_legal_topics": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
         "topic_text": {"type": ["string", "null"]},
         "resolved_question": {"type": ["string", "null"]},
         "subject_text": {"type": ["string", "null"]},
@@ -1042,6 +1124,7 @@ _ACTION_JSON_SCHEMA: Final[dict[str, Any]] = {
         "type",
         "country_codes",
         "legal_topics",
+        "document_legal_topics",
         "topic_text",
         "resolved_question",
         "subject_text",

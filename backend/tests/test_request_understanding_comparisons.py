@@ -24,6 +24,19 @@ from app.routers.chat import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 def _catalog_provider() -> LegalCatalogResponse:
     return LegalCatalogResponse(
         countries=[
@@ -255,6 +268,7 @@ class IndirectComparisonRoutingTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_multi_country_legal_search(
                 countries, "Notice period comparison content."
             ),
@@ -293,6 +307,7 @@ class IndirectComparisonRoutingTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_multi_country_legal_search(
                 countries, "Dismissal protection content."
             ),
@@ -331,6 +346,7 @@ class IndirectComparisonRoutingTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_multi_country_legal_search(
                 countries, "Overtime comparison content."
             ),
@@ -377,6 +393,7 @@ class MultiCountryComparisonTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_multi_country_legal_search(
                 countries, "Notice period comparison content."
             ),
@@ -424,6 +441,7 @@ class ComparisonTopicRepresentationTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_multi_country_legal_search(
                 countries, "Termination content."
             ),
@@ -468,6 +486,7 @@ class ComparisonTopicRepresentationTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fake_multi_country_legal_search(
                 countries, "Maternity rights content."
             ),
@@ -506,6 +525,7 @@ class ComparisonClarificationTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -540,6 +560,7 @@ class ComparisonClarificationTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )
@@ -585,6 +606,7 @@ class ComparisonSchemaSafetyNetTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_fail_if_called,
             understanding_client=understanding_client,
         )

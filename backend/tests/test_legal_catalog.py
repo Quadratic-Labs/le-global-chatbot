@@ -11,7 +11,9 @@ from opensearchpy.exceptions import (
 
 from app.services.legal_catalog import (
     LegalCatalogError,
+    build_document_legal_topics_body,
     build_legal_catalog_body,
+    get_document_legal_topics_by_country,
     get_legal_catalog,
 )
 from app.services.opensearch_index import (
@@ -221,6 +223,142 @@ class LegalCatalogTests(unittest.TestCase):
         ):
             get_legal_catalog(
                 client=client
+            )
+
+
+class DocumentLegalTopicsByCountryTests(unittest.TestCase):
+    """
+    Tests for get_document_legal_topics_by_country (mission
+    "ORDER 8F-A") - one compact, country-scoped aggregation for the
+    LIVE legal_topic vocabulary actually indexed, distinct from
+    get_legal_catalog's own global, unscoped aggregation.
+    """
+
+    def test_empty_country_codes_makes_no_opensearch_call(self) -> None:
+        client = FakeOpenSearchClient()
+
+        result = get_document_legal_topics_by_country(
+            [],
+            client=client,
+        )
+
+        self.assertEqual(result, {})
+        self.assertIsNone(client.index)
+
+    def test_body_is_scoped_to_requested_countries(self) -> None:
+        body = build_document_legal_topics_body(["au", "AU", " be "])
+
+        self.assertEqual(body["size"], 0)
+        self.assertEqual(
+            body["query"]["terms"]["country_code"],
+            ["AU", "BE"],
+        )
+        self.assertIn("countries", body["aggs"])
+        self.assertIn(
+            "legal_topics", body["aggs"]["countries"]["aggs"]
+        )
+
+    def test_returns_canonical_and_custom_topics_per_country(
+        self,
+    ) -> None:
+        client = FakeOpenSearchClient(
+            response={
+                "aggregations": {
+                    "countries": {
+                        "buckets": [
+                            {
+                                "key": "AU",
+                                "doc_count": 3,
+                                "legal_topics": {
+                                    "buckets": [
+                                        {
+                                            "key": "Hiring Practices",
+                                            "doc_count": 1,
+                                        },
+                                        {
+                                            "key": (
+                                                "V060 Temporary "
+                                                "Validation Section"
+                                            ),
+                                            "doc_count": 1,
+                                        },
+                                        {
+                                            "key": (
+                                                "Foreign Employee Work "
+                                                "Eligibility Checks"
+                                            ),
+                                            "doc_count": 1,
+                                        },
+                                    ]
+                                },
+                            },
+                            {
+                                "key": "BE",
+                                "doc_count": 1,
+                                "legal_topics": {
+                                    "buckets": [
+                                        {
+                                            "key": "Hiring Practices",
+                                            "doc_count": 1,
+                                        },
+                                    ]
+                                },
+                            },
+                        ]
+                    },
+                }
+            }
+        )
+
+        result = get_document_legal_topics_by_country(
+            ["AU", "BE"],
+            client=client,
+        )
+
+        self.assertEqual(
+            client.index,
+            LEGAL_DOCUMENTS_ALIAS,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "AU": [
+                    "Hiring Practices",
+                    "V060 Temporary Validation Section",
+                    "Foreign Employee Work Eligibility Checks",
+                ],
+                "BE": ["Hiring Practices"],
+            },
+        )
+
+    def test_country_with_no_indexed_topics_is_absent(self) -> None:
+        client = FakeOpenSearchClient(
+            response={
+                "aggregations": {
+                    "countries": {
+                        "buckets": [],
+                    },
+                }
+            }
+        )
+
+        result = get_document_legal_topics_by_country(
+            ["ZZ"],
+            client=client,
+        )
+
+        self.assertEqual(result, {})
+
+    def test_opensearch_error_is_wrapped(self) -> None:
+        client = FakeOpenSearchClient(
+            error=OpenSearchException("Unavailable")
+        )
+
+        with self.assertRaises(LegalCatalogError):
+            get_document_legal_topics_by_country(
+                ["AU"],
+                client=client,
             )
 
 

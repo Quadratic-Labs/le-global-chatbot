@@ -173,6 +173,11 @@ function esc_html(string $text): string
     return $text;
 }
 
+function esc_attr(string $text): string
+{
+    return $text;
+}
+
 function sanitize_key(string $value): string
 {
     return strtolower(preg_replace('/[^a-z0-9_\-]/', '', strtolower($value)) ?? '');
@@ -641,6 +646,151 @@ check(
     'handle_reindex generic failure fallback is business-friendly',
     $halt?->jsonData['message'] ?? null,
     'The chatbot data could not be refreshed.'
+);
+
+// --- handle_download (mission "ORDER 8G-A", section 10) ---------------
+//
+// A real download response is not reproducible in this CLI script:
+// success falls through to a bare `exit;` after streaming binary
+// bytes (never wp_die/wp_send_json_*, so nothing here can intercept
+// it without terminating the test script itself), and the real fix
+// (removing the previously-declared Content-Length header, discarding
+// any active output buffer, and asking Apache to skip compressing
+// this one response) is about the EXACT BYTES/headers a real HTTP
+// response carries - only observable end-to-end. This file's own
+// upload tests already establish the same precedent for exactly this
+// class of limitation (see the file docstring). What IS verified
+// here: the two gates that fire before any of that (capability,
+// nonce) - both real, reachable, wp_die()-based halts - plus a
+// structural check (via reflection over the real method source) that
+// the fix is actually present. The full real success-with-no-false-
+// error / real-failure-shows-error contract is proven by the mission's
+// own real Chromium canary pass instead.
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID]);
+$GLOBALS['__test_current_user_can'] = false;
+$halt = invoke_handler('handle_download');
+check(
+    'unauthorized user gets a wp_die halt and zero backend calls (handle_download)',
+    [$halt !== null, count($GLOBALS['__test_backend_calls'])],
+    [true, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID]);
+$GLOBALS['__test_nonce_valid'] = false;
+$halt = invoke_handler('handle_download');
+check(
+    'an invalid nonce halts handle_download before any backend call',
+    [$halt !== null, count($GLOBALS['__test_backend_calls'])],
+    [true, 0]
+);
+
+$download_reflection = new ReflectionMethod('LE_Global_Chatbot_Admin', 'handle_download');
+$download_source_lines = array_slice(
+    file($download_reflection->getFileName()),
+    $download_reflection->getStartLine() - 1,
+    $download_reflection->getEndLine() - $download_reflection->getStartLine() + 1
+);
+$download_source = implode('', $download_source_lines);
+
+check(
+    'handle_download no longer declares its own (potentially stale) Content-Length header',
+    str_contains($download_source, "'Content-Length:"),
+    false
+);
+check(
+    'handle_download discards any active output buffering before streaming the file',
+    str_contains($download_source, 'ob_end_clean'),
+    true
+);
+check(
+    'handle_download asks Apache to skip compressing this one response',
+    str_contains($download_source, "apache_setenv('no-gzip'"),
+    true
+);
+check(
+    'handle_download still declares the correct DOCX Content-Type',
+    str_contains(
+        $download_source,
+        'application/vnd.openxmlformats-'
+    ),
+    true
+);
+
+// =====================================================================
+// render_notice (ORDER 8G-A.1 - the PRG notice must not persist across
+// a plain reload of the same URL once it has been shown once)
+// =====================================================================
+
+function invoke_render_notice(array $get): string
+{
+    $_GET = $get;
+
+    $reflection = new ReflectionClass('LE_Global_Chatbot_Admin');
+    $method = $reflection->getMethod('render_notice');
+    $method->setAccessible(true);
+
+    ob_start();
+    $method->invoke(null);
+
+    return ob_get_clean();
+}
+
+$output = invoke_render_notice([]);
+check(
+    'a clean page load (no notice query params) renders nothing',
+    $output,
+    ''
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'error',
+    'le_global_message' => 'The document identifier is invalid.',
+]);
+check(
+    'a genuinely present error notice still shows its message',
+    str_contains($output, 'The document identifier is invalid.'),
+    true
+);
+check(
+    'the shown notice self-clears its own URL query params via history.replaceState',
+    str_contains($output, 'history.replaceState') && str_contains($output, "'le_global_notice'") && str_contains($output, "'le_global_message'"),
+    true
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'success',
+    'le_global_message' => 'The section was saved.',
+]);
+check(
+    'a success notice also shows its message',
+    str_contains($output, 'The section was saved.'),
+    true
+);
+check(
+    'a success notice also self-clears its URL query params',
+    str_contains($output, 'history.replaceState'),
+    true
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'not-a-real-type',
+    'le_global_message' => 'Should never show.',
+]);
+check(
+    'an unrecognized notice type renders nothing (unchanged behavior)',
+    $output,
+    ''
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'error',
+    'le_global_message' => '',
+]);
+check(
+    'an empty message renders nothing (unchanged behavior)',
+    $output,
+    ''
 );
 
 if ($failures > 0) {

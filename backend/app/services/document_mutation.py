@@ -243,6 +243,140 @@ def replace_top_level_topic(
     )
 
 
+def rename_top_level_topic(
+    file_path: Path,
+    output_path: Path,
+    country: str,
+    legal_topic: str,
+    new_title: str,
+    new_content: str | None = None,
+) -> None:
+    """
+    Rename an existing top-level legal topic's heading text - and,
+    optionally, replace its content too - and save the result to
+    output_path.
+
+    The heading paragraph's own style/formatting is left completely
+    unchanged; only its visible run text is replaced. This is what
+    lets a renamed CANONICAL heading still be recognized as a valid
+    (now custom-labelled) top-level topic afterward by the same
+    structural signals the document's other canonical headings
+    already carry (see docx_parser._learn_custom_topic_signal_
+    requirement) - never by reassigning it a different style. A
+    previously admin-added heading simply stays on
+    ADMIN_SECTION_STYLE_NAME, exactly as before.
+    """
+
+    file_path = file_path.resolve()
+
+    document = Document(
+        file_path
+    )
+
+    locations = locate_top_level_topics(
+        document,
+        country=country,
+    )
+
+    target = _find_topic(
+        locations,
+        legal_topic,
+    )
+
+    heading_paragraph = Paragraph(
+        target.heading_element,
+        document,
+    )
+
+    for run in list(heading_paragraph.runs):
+        run._r.getparent().remove(
+            run._r
+        )
+
+    heading_paragraph.add_run(
+        new_title
+    )
+
+    if new_content is not None:
+        new_elements = _new_body_paragraph_elements(
+            document,
+            new_content,
+        )
+
+        anchor = target.heading_element
+
+        for old_element in target.body_elements:
+            old_element.getparent().remove(
+                old_element
+            )
+
+        for new_element in new_elements:
+            anchor.addnext(
+                new_element
+            )
+            anchor = new_element
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    document.save(
+        output_path
+    )
+
+
+def remove_top_level_topic(
+    file_path: Path,
+    output_path: Path,
+    country: str,
+    legal_topic: str,
+) -> None:
+    """
+    Remove an existing top-level legal topic entirely - its heading
+    and every body element (paragraphs, tables) between it and the
+    next top-level heading - and save the result to output_path.
+
+    Uses the exact same structural boundary (TopicLocation) that Edit
+    already relies on, so no separate boundary-detection logic exists
+    for Delete. Everything else in the document - other sections,
+    their order, front matter, styles - is left completely untouched.
+    """
+
+    file_path = file_path.resolve()
+
+    document = Document(
+        file_path
+    )
+
+    locations = locate_top_level_topics(
+        document,
+        country=country,
+    )
+
+    target = _find_topic(
+        locations,
+        legal_topic,
+    )
+
+    for element in (
+        target.heading_element,
+        *target.body_elements,
+    ):
+        element.getparent().remove(
+            element
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    document.save(
+        output_path
+    )
+
+
 def _derive_admin_section_font(
     document: DocxDocument,
     reference_paragraph: Paragraph | None,

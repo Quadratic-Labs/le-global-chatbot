@@ -370,6 +370,27 @@
     gap: 0.75rem;
 }
 
+.le-global-chatbot-admin__edit-delete {
+    margin-top: 0.5rem;
+}
+
+.le-global-chatbot-admin__delete-button {
+    color: #d63638;
+    border-color: #d63638;
+}
+
+.le-global-chatbot-admin__delete-button:hover:not(:disabled),
+.le-global-chatbot-admin__delete-button:focus-visible {
+    color: #fff;
+    background: #d63638;
+    border-color: #d63638;
+}
+
+.le-global-chatbot-admin__delete-button:disabled {
+    color: #a7aaad;
+    border-color: #dcdcde;
+}
+
 /* --- Documents toolbar (search + status filter) --------------------- */
 
 .le-global-chatbot-admin__toolbar {

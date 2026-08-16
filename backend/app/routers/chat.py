@@ -58,6 +58,8 @@ from app.services.country_detection import (
     resolve_country_display_name,
 )
 from app.services.legal_catalog import (
+    DocumentLegalTopicsProvider,
+    get_document_legal_topics_by_country,
     get_legal_catalog,
 )
 from app.services.legal_search import (
@@ -69,6 +71,7 @@ from app.services.legal_subject_scope import canonicalize_legal_subject
 from app.services.legal_topic_detection import (
     CANONICAL_LEGAL_TOPICS,
     LegalScope,
+    detect_document_legal_topics,
     detect_legal_topics,
     resolve_legal_scope,
 )
@@ -578,6 +581,7 @@ def _has_comparison_signal(
 def _build_deterministic_hints(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider,
+    document_topic_provider: DocumentLegalTopicsProvider,
 ) -> tuple[DeterministicHints, CountryAvailability, LegalScope]:
     """
     Build the deterministic hints passed to RequestUnderstanding.
@@ -621,6 +625,30 @@ def _build_deterministic_hints(
         history_unavailable_country_codes = []
         history_legal_topics = []
 
+    # Mission "ORDER 8F-A" - one compact, country-scoped aggregation
+    # covering every country this request could plausibly concern
+    # (current, explicit, and recent-history alike), so the live
+    # document-topic vocabulary is available both to the model prompt
+    # and to _resolve_conservative_fallback's own deterministic check,
+    # without a second OpenSearch call later.
+    explicit_country_codes_upper = (
+        code.strip().upper()
+        for code in request.country_codes
+        if code.strip()
+    )
+
+    document_topic_country_codes = sorted(
+        {
+            *current_country_scope.available_codes,
+            *explicit_country_codes_upper,
+            *history_country_codes,
+        }
+    )
+
+    current_document_legal_topics = document_topic_provider(
+        document_topic_country_codes
+    )
+
     hints = DeterministicHints(
         current_country_codes=current_country_scope.available_codes,
         current_unavailable_country_codes=(
@@ -640,6 +668,7 @@ def _build_deterministic_hints(
         explicit_country_codes=list(request.country_codes),
         explicit_legal_topics=list(request.legal_topics),
         explicit_subsections=list(request.subsections),
+        current_document_legal_topics=current_document_legal_topics,
     )
 
     return hints, current_country_scope, current_legal_scope
@@ -1027,6 +1056,82 @@ def _resolve_conservative_fallback(
         and current_legal_scope.is_supported
     )
 
+    # Mission "ORDER 8F-A", section 10 - an exact, single-country live
+    # document-topic title (canonical or Admin-created custom section
+    # alike) is a MORE specific deterministic signal than a canonical
+    # keyword match, and must be checked first: an understanding-call
+    # failure must never force a generic "please specify country and
+    # topic" clarification when the question already names one exact,
+    # currently-indexed section title outright. Deliberately restricted
+    # to a single resolved country (document topics are always one
+    # country's own section - never a comparison) and never when a
+    # contact signal already claimed the request.
+    if (
+        not hints.strong_contact_signal
+        and len(current_country_scope.available_codes) == 1
+    ):
+        single_country_code = current_country_scope.available_codes[0]
+
+        resolved_document_topics = detect_document_legal_topics(
+            request.question,
+            hints.current_document_legal_topics.get(
+                single_country_code, []
+            ),
+        )
+
+        if resolved_document_topics:
+            prepared_request = request.model_copy(
+                update={
+                    "country_codes": (
+                        current_country_scope.available_codes
+                    ),
+                    "legal_topics": resolved_document_topics,
+                }
+            )
+
+            response = answer_legal_question(
+                prepared_request,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                max_context_characters=max_context_characters,
+                max_source_characters=max_source_characters,
+                metrics=metrics,
+                known_excluded_country_codes=(
+                    current_country_scope.unavailable_codes or None
+                ),
+            )
+
+            if current_country_scope.unavailable_codes:
+                response = response.model_copy(
+                    update={
+                        "answer": (
+                            response.answer
+                            + "\n\nNote: "
+                            + _unavailable_countries_answer(
+                                current_country_scope.unavailable_codes
+                            )
+                        ),
+                    }
+                )
+
+            metrics.request_actions = ["legal_information"]
+            metrics.resolved_action_countries = [
+                {
+                    "type": "legal_information",
+                    "country_codes": (
+                        current_country_scope.available_codes
+                    ),
+                }
+            ]
+            metrics.resolved_country_codes = (
+                current_country_scope.available_codes
+            )
+            metrics.resolved_legal_topics = resolved_document_topics
+
+            return response
+
     if (
         hints.strong_contact_signal
         and country_resolved
@@ -1194,6 +1299,7 @@ def _aggregate_action_legal_topics(
 def _execute_resolved_plan(
     request: LegalChatRequest,
     result: RequestUnderstandingResult,
+    hints: DeterministicHints,
     metrics: LegalChatMetrics,
     catalog_provider: CountryCatalogProvider,
     search_function: SearchFunction,
@@ -1254,11 +1360,57 @@ def _execute_resolved_plan(
                 if code not in merged_unavailable_codes:
                     merged_unavailable_codes.append(code)
 
+            # Mission "ORDER 8F-A", section 7/9 - never trust the
+            # model's document_legal_topics blindly: validate against
+            # the ACTUAL live legal_topic vocabulary indexed for this
+            # action's own resolved countries (never comparison
+            # actions - guaranteed empty at the model already, checked
+            # again here as belt-and-suspenders).
+            live_document_topics_for_action = {
+                topic
+                for code in action_scope.available_codes
+                for topic in hints.current_document_legal_topics.get(
+                    code, []
+                )
+            }
+
+            # Mission "ORDER 8G-A", section 4 - a canonical topic that
+            # was renamed away (Rename) is no longer part of a
+            # country's live legal_topic vocabulary; a hard filter on
+            # it would then retrieve structurally nothing, even though
+            # the model still recognized the question as being about
+            # that canonical concept in plain language. Only suppress
+            # the canonical filter given POSITIVE evidence it is not
+            # live (a non-empty live-topic set that specifically omits
+            # it) - never merely because no live-topic data is
+            # available at all, which proves nothing either way and
+            # must fall back to the pre-existing canonical-membership
+            # check. Scoped deliberately to single-country legal_
+            # information only - comparison behavior (which may
+            # legitimately span a country where a canonical topic was
+            # never live at all) is untouched, and explicit/dynamic
+            # document-topic priority (above) is unaffected either way.
             validated_topics = [
                 topic
                 for topic in action.legal_topics
                 if topic in CANONICAL_LEGAL_TOPICS
+                and (
+                    action.type != "legal_information"
+                    or len(action_scope.available_codes) != 1
+                    or not live_document_topics_for_action
+                    or topic in live_document_topics_for_action
+                )
             ]
+
+            validated_document_topics = (
+                [
+                    topic
+                    for topic in action.document_legal_topics
+                    if topic in live_document_topics_for_action
+                ]
+                if action.type != "comparison"
+                else []
+            )
 
             for topic in validated_topics:
                 if topic not in merged_legal_topics:
@@ -1274,6 +1426,7 @@ def _execute_resolved_plan(
                 {
                     "type": action.type,
                     "legal_topics": validated_topics,
+                    "document_legal_topics": validated_document_topics,
                     "topic_text": action.topic_text,
                 }
             )
@@ -1331,14 +1484,28 @@ def _execute_resolved_plan(
                             action_scope.available_codes
                         ),
                         # Explicit legal_topics on the original
-                        # request are a binding retrieval constraint
-                        # for every action, not just a representative
-                        # one - matching effective_legal_topics'
-                        # override rule above, applied per action.
+                        # request are a binding, canonical-only client
+                        # override - matching effective_legal_topics'
+                        # override rule above, applied per action -
+                        # and take priority over everything else here,
+                        # exactly as before "ORDER 8F-A". Only when the
+                        # client left legal_topics unset does the new
+                        # retrieval-filter priority (mission section 7)
+                        # apply: A. an explicit/dynamic document topic
+                        # resolved for this action -> filter on its
+                        # exact live value(s), never the nearest
+                        # canonical guess; B. otherwise, the existing
+                        # canonical-topic behavior; C. neither ->
+                        # no fabricated hard filter (topic_text-only
+                        # free-text retrieval).
                         legal_topics=(
                             list(request.legal_topics)
                             if request.legal_topics
-                            else validated_topics
+                            else (
+                                validated_document_topics
+                                if validated_document_topics
+                                else validated_topics
+                            )
                         ),
                         subject_text=canonicalized_subject.subject_text,
                         search_concepts=(
@@ -1541,6 +1708,9 @@ def resolve_legal_chat_response(
     catalog_provider: CountryCatalogProvider = (
         get_legal_catalog
     ),
+    document_topic_provider: DocumentLegalTopicsProvider = (
+        get_document_legal_topics_by_country
+    ),
     search_function: SearchFunction = (
         search_legal_documents
     ),
@@ -1705,6 +1875,7 @@ def resolve_legal_chat_response(
         ) = _build_deterministic_hints(
             request=request,
             catalog_provider=memoized_catalog_provider,
+            document_topic_provider=document_topic_provider,
         )
 
         history_turns = [
@@ -1994,6 +2165,7 @@ def resolve_legal_chat_response(
         response = _execute_resolved_plan(
             request=request,
             result=final_result,
+            hints=hints,
             metrics=metrics,
             catalog_provider=memoized_catalog_provider,
             search_function=search_function,

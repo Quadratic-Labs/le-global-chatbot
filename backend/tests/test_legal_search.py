@@ -626,5 +626,101 @@ class LegalSearchTests(
             )
 
 
+class DocumentLegalTopicFilterTests(unittest.TestCase):
+    """
+    Retrieval tests for mission "ORDER 8F-A", section 14 - the
+    legal_topic terms filter is completely generic (any string value),
+    so a live, Admin-created custom section title must filter exactly
+    like a canonical topic - no special-casing required anywhere in
+    this module. These four scenarios mirror a realistic, seeded
+    Australia corpus: one canonical topic and two custom section
+    titles, one of which (section B) deliberately overlaps a canonical
+    trigger phrase's semantics without being collapsed to it.
+    """
+
+    def test_canonical_topic_filters_exactly(self) -> None:
+        request = LegalSearchRequest(
+            query="hiring rules",
+            country_codes=["AU"],
+            legal_topics=["Hiring Practices"],
+        )
+
+        body = build_legal_search_body(request)
+
+        self.assertIn(
+            {"terms": {"legal_topic": ["Hiring Practices"]}},
+            body["query"]["bool"]["filter"],
+        )
+
+    def test_custom_section_title_filters_exactly(self) -> None:
+        request = LegalSearchRequest(
+            query="foreign employee work eligibility checks",
+            country_codes=["AU"],
+            legal_topics=[
+                "Foreign Employee Work Eligibility Checks"
+            ],
+        )
+
+        body = build_legal_search_body(request)
+
+        self.assertIn(
+            {
+                "terms": {
+                    "legal_topic": [
+                        "Foreign Employee Work Eligibility Checks"
+                    ]
+                }
+            },
+            body["query"]["bool"]["filter"],
+        )
+
+    def test_other_custom_section_title_filters_exactly(self) -> None:
+        request = LegalSearchRequest(
+            query="V060 Temporary Validation Section",
+            country_codes=["AU"],
+            legal_topics=[
+                "V060 Temporary Validation Section"
+            ],
+        )
+
+        body = build_legal_search_body(request)
+
+        self.assertIn(
+            {
+                "terms": {
+                    "legal_topic": [
+                        "V060 Temporary Validation Section"
+                    ]
+                }
+            },
+            body["query"]["bool"]["filter"],
+        )
+
+    def test_topic_text_only_omits_any_topic_filter(self) -> None:
+        """
+        Scenario C from the mission's own retrieval-filter priority
+        (section 7): when neither a canonical nor a document topic
+        resolved, no hard legal_topic filter is fabricated at all -
+        retrieval stays country-scoped free text across every section,
+        canonical or custom.
+        """
+
+        request = LegalSearchRequest(
+            query="temporary validation",
+            country_codes=["AU"],
+        )
+
+        body = build_legal_search_body(request)
+
+        filters = body["query"]["bool"]["filter"]
+
+        self.assertFalse(
+            any(
+                "legal_topic" in one_filter.get("terms", {})
+                for one_filter in filters
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
