@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.5.0';
+    private const VERSION = '0.7.0';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -61,6 +61,28 @@ final class LE_Global_Chatbot_Admin
 
     private const SECTION_ADD_ACTION = (
         'le_global_chatbot_add_section'
+    );
+
+    private const SECTION_DELETE_ACTION = (
+        'le_global_chatbot_delete_section'
+    );
+
+    // Mission "ORDER 8E-A2" - the country-conflict review/resolution
+    // proxy actions. CONFLICT_REVIEW_ACTION is a read-only GET;
+    // RESOLVE_CONFLICT_ACTION handles AUTO_DEDUPLICATE/CHOOSE_DOCUMENT
+    // (no file); RESOLVE_CONFLICT_REPLACE_ACTION handles
+    // REPLACE_WITH_DOCUMENT (a file, reusing the exact same upload
+    // decision flow as handle_upload).
+    private const CONFLICT_REVIEW_ACTION = (
+        'le_global_chatbot_conflict_review'
+    );
+
+    private const RESOLVE_CONFLICT_ACTION = (
+        'le_global_chatbot_resolve_conflict'
+    );
+
+    private const RESOLVE_CONFLICT_REPLACE_ACTION = (
+        'le_global_chatbot_resolve_conflict_replace'
     );
 
     private static ?string $page_hook = null;
@@ -120,6 +142,26 @@ final class LE_Global_Chatbot_Admin
         add_action(
             'admin_post_' . self::SECTION_ADD_ACTION,
             [self::class, 'handle_add_section']
+        );
+
+        add_action(
+            'admin_post_' . self::SECTION_DELETE_ACTION,
+            [self::class, 'handle_delete_section']
+        );
+
+        add_action(
+            'admin_post_' . self::CONFLICT_REVIEW_ACTION,
+            [self::class, 'handle_conflict_review']
+        );
+
+        add_action(
+            'admin_post_' . self::RESOLVE_CONFLICT_ACTION,
+            [self::class, 'handle_resolve_conflict']
+        );
+
+        add_action(
+            'admin_post_' . self::RESOLVE_CONFLICT_REPLACE_ACTION,
+            [self::class, 'handle_resolve_conflict_replace']
         );
     }
 
@@ -208,9 +250,15 @@ final class LE_Global_Chatbot_Admin
             $documents
         );
 
-        $needs_attention_count = self::count_needs_attention(
-            $documents,
-            $conflicted_country_codes
+        // Mission "ORDER 8E-A2", section 28 - the backend's own
+        // deduplicated, country-level stat is the source of truth;
+        // count($conflicted_country_codes) (never
+        // count_needs_attention's raw per-document count) is only ever
+        // a fallback for a stats response that could not be loaded.
+        $countries_requiring_action_count = (
+            $stats !== null
+            ? (int) $stats['countries_requiring_action']
+            : count($conflicted_country_codes)
         );
 
         ?>
@@ -253,7 +301,7 @@ final class LE_Global_Chatbot_Admin
             self::render_overview_panel(
                 $total_documents,
                 $total_countries,
-                $needs_attention_count
+                $countries_requiring_action_count
             );
             ?>
         </div>
@@ -310,6 +358,32 @@ final class LE_Global_Chatbot_Admin
                 ?>"
                 data-delete-action="<?php
                     echo esc_attr(self::DELETE_ACTION);
+                ?>"
+                data-conflict-review-action="<?php
+                    echo esc_attr(self::CONFLICT_REVIEW_ACTION);
+                ?>"
+                data-conflict-review-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(self::CONFLICT_REVIEW_ACTION)
+                    );
+                ?>"
+                data-resolve-conflict-action="<?php
+                    echo esc_attr(self::RESOLVE_CONFLICT_ACTION);
+                ?>"
+                data-resolve-conflict-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(self::RESOLVE_CONFLICT_ACTION)
+                    );
+                ?>"
+                data-resolve-conflict-replace-action="<?php
+                    echo esc_attr(self::RESOLVE_CONFLICT_REPLACE_ACTION);
+                ?>"
+                data-resolve-conflict-replace-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::RESOLVE_CONFLICT_REPLACE_ACTION
+                        )
+                    );
                 ?>"
             >
                 <input
@@ -439,6 +513,7 @@ final class LE_Global_Chatbot_Admin
             <div
                 id="le-global-chatbot-edit"
                 class="le-global-chatbot-admin__edit"
+                hidden
                 data-admin-post-url="<?php
                     echo esc_url(
                         admin_url('admin-post.php')
@@ -474,6 +549,16 @@ final class LE_Global_Chatbot_Admin
                         )
                     );
                 ?>"
+                data-section-delete-action="<?php
+                    echo esc_attr(self::SECTION_DELETE_ACTION);
+                ?>"
+                data-section-delete-nonce="<?php
+                    echo esc_attr(
+                        wp_create_nonce(
+                            self::SECTION_DELETE_ACTION
+                        )
+                    );
+                ?>"
                 data-section-add-action="<?php
                     echo esc_attr(self::SECTION_ADD_ACTION);
                 ?>"
@@ -485,6 +570,59 @@ final class LE_Global_Chatbot_Admin
                     );
                 ?>"
             >
+                <?php if ($conflicted_country_codes) : ?>
+                    <div class="le-global-chatbot-admin__duplicate-warning">
+                        <?php
+                        $conflict_count = count($conflicted_country_codes);
+
+                        echo esc_html(
+                            $conflict_count === 1
+                                ? '1 country requires action before '
+                                    . 'its content can be edited.'
+                                : sprintf(
+                                    '%d countries require action '
+                                        . 'before their content can be '
+                                        . 'edited.',
+                                    $conflict_count
+                                )
+                        );
+                        ?>
+
+                        <?php if ($conflict_count === 1) : ?>
+                            <?php
+                            $conflicted_document = self::find_document_by_country_code(
+                                $documents,
+                                $conflicted_country_codes[0]
+                            );
+                            ?>
+                            <button
+                                type="button"
+                                class="button"
+                                data-review-country-code="<?php
+                                    echo esc_attr(
+                                        $conflicted_country_codes[0]
+                                    );
+                                ?>"
+                                data-review-country-name="<?php
+                                    echo esc_attr(
+                                        $conflicted_document['country']
+                                        ?? 'This country'
+                                    );
+                                ?>"
+                            >
+                                Review
+                            </button>
+                        <?php else : ?>
+                            <a
+                                class="button"
+                                href="#le-global-chatbot-documents"
+                            >
+                                Review in Documents
+                            </a>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+
                 <div class="le-global-chatbot-admin__edit-field">
                     <label for="le-global-edit-country">
                         Country
@@ -547,6 +685,18 @@ final class LE_Global_Chatbot_Admin
                     </div>
 
                     <div class="le-global-chatbot-admin__edit-field">
+                        <label for="le-global-edit-title">
+                            Section title
+                        </label>
+
+                        <input
+                            type="text"
+                            id="le-global-edit-title"
+                            disabled
+                        >
+                    </div>
+
+                    <div class="le-global-chatbot-admin__edit-field">
                         <label for="le-global-edit-content">
                             Section content
                         </label>
@@ -562,6 +712,17 @@ final class LE_Global_Chatbot_Admin
                         id="le-global-edit-hint"
                         class="le-global-chatbot-admin__edit-hint"
                     ></p>
+
+                    <div class="le-global-chatbot-admin__edit-delete">
+                        <button
+                            type="button"
+                            id="le-global-edit-delete"
+                            class="button le-global-chatbot-admin__delete-button is-destructive"
+                            disabled
+                        >
+                            Delete section
+                        </button>
+                    </div>
                 </div>
 
                 <div
@@ -732,6 +893,13 @@ final class LE_Global_Chatbot_Admin
                 aria-live="polite"
             ></div>
 
+            <div
+                id="le-global-conflict-review"
+                class="le-global-chatbot-admin__conflict-review"
+                aria-live="polite"
+                hidden
+            ></div>
+
             <div id="le-global-chatbot-documents">
                 <?php
                 self::render_documents_table_body(
@@ -786,20 +954,151 @@ final class LE_Global_Chatbot_Admin
 
                 <tbody>
                     <?php
-                    foreach ($documents as $document) :
-                        if (!is_array($document)) {
-                            continue;
+                    foreach (
+                        self::group_documents_by_country_code($documents)
+                        as $group
+                    ) :
+                        $requires_action = false;
+
+                        foreach ($group as $grouped_document) {
+                            $code = isset($grouped_document['country_code'])
+                                ? (string) $grouped_document['country_code']
+                                : '';
+
+                            if (
+                                isset($grouped_document['requires_action'])
+                                ? (bool) $grouped_document['requires_action']
+                                : (
+                                    $code !== ''
+                                    && in_array(
+                                        $code,
+                                        $conflicted_country_codes,
+                                        true
+                                    )
+                                )
+                            ) {
+                                $requires_action = true;
+                                break;
+                            }
                         }
 
-                        self::render_document_row(
-                            $document,
-                            $conflicted_country_codes
-                        );
+                        if ($requires_action && count($group) > 1) :
+                            self::render_conflict_row($group);
+                        else :
+                            foreach ($group as $grouped_document) {
+                                self::render_document_row(
+                                    $grouped_document,
+                                    $conflicted_country_codes
+                                );
+                            }
+                        endif;
                     endforeach;
                     ?>
                 </tbody>
             </table>
         </div>
+        <?php
+    }
+
+    /**
+     * Mission "ORDER 8E-A2", section 21 - groups the catalog purely by
+     * country_code, preserving each country's own first-seen order -
+     * the one place both the initial server render and the later JS
+     * refresh must agree on which rows collapse into a single "Action
+     * required" row.
+     *
+     * @param array<int, array<string, mixed>> $documents
+     * @return array<int, array<int, array<string, mixed>>>
+     */
+    private static function group_documents_by_country_code(
+        array $documents
+    ): array {
+        $groups = [];
+        $index_by_code = [];
+
+        foreach ($documents as $document) {
+            if (!is_array($document)) {
+                continue;
+            }
+
+            $code = isset($document['country_code'])
+                ? (string) $document['country_code']
+                : '';
+
+            $key = $code === '' ? ' no-code-' . count($groups) : $code;
+
+            if (!isset($index_by_code[$key])) {
+                $index_by_code[$key] = count($groups);
+                $groups[] = [];
+            }
+
+            $groups[$index_by_code[$key]][] = $document;
+        }
+
+        return $groups;
+    }
+
+    /**
+     * One synthetic row for an entire conflicted country - never
+     * exposes document_id/document_type/chunk counts; "Review" is the
+     * only way forward (mirrors admin.js's conflictRowHtml exactly).
+     *
+     * @param array<int, array<string, mixed>> $documents_for_country
+     */
+    private static function render_conflict_row(
+        array $documents_for_country
+    ): void {
+        $first = $documents_for_country[0] ?? [];
+        $country = isset($first['country']) ? (string) $first['country'] : '';
+        $country_code = isset($first['country_code'])
+            ? (string) $first['country_code']
+            : '';
+        ?>
+        <tr
+            data-country="<?php echo esc_attr(strtolower($country)); ?>"
+            data-filename=""
+            data-status="needs_attention"
+        >
+            <td>
+                <strong><?php echo esc_html($country); ?></strong>
+
+                <?php if ($country_code !== '') : ?>
+                    <span class="le-global-chatbot-admin__country-code">
+                        <?php echo esc_html($country_code); ?>
+                    </span>
+                <?php endif; ?>
+            </td>
+
+            <td colspan="3">
+                <span
+                    class="le-global-chatbot-admin__status is-warning"
+                    title="More than one document record is linked to this country."
+                >
+                    <span aria-hidden="true">⚠</span> Action required
+                </span>
+                <span class="le-global-chatbot-admin__conflict-note">
+                    More than one document record is linked to this
+                    country.
+                </span>
+            </td>
+
+            <td>—</td>
+
+            <td>
+                <button
+                    type="button"
+                    class="button button-primary"
+                    data-review-country-code="<?php
+                        echo esc_attr($country_code);
+                    ?>"
+                    data-review-country-name="<?php
+                        echo esc_attr($country);
+                    ?>"
+                >
+                    Review
+                </button>
+            </td>
+        </tr>
         <?php
     }
 
@@ -1111,7 +1410,7 @@ final class LE_Global_Chatbot_Admin
     private static function render_overview_panel(
         int $total_documents,
         int $total_countries,
-        int $needs_attention_count
+        int $countries_requiring_action_count
     ): void {
         ?>
         <section class="le-global-chatbot-admin__panel">
@@ -1151,12 +1450,14 @@ final class LE_Global_Chatbot_Admin
                 </article>
 
                 <article class="le-global-chatbot-admin__summary-card">
-                    <span>Documents needing attention</span>
+                    <span>Countries requiring action</span>
 
                     <strong>
                         <?php
                         echo esc_html(
-                            number_format_i18n($needs_attention_count)
+                            number_format_i18n(
+                                $countries_requiring_action_count
+                            )
                         );
                         ?>
                     </strong>
@@ -1262,39 +1563,6 @@ final class LE_Global_Chatbot_Admin
         ];
     }
 
-    private static function count_needs_attention(
-        array $documents,
-        array $conflicted_country_codes
-    ): int {
-        $count = 0;
-
-        foreach ($documents as $document) {
-            if (!is_array($document)) {
-                continue;
-            }
-
-            $country_code = isset($document['country_code'])
-                ? (string) $document['country_code']
-                : '';
-
-            $has_conflict = (
-                $country_code !== ''
-                && in_array($country_code, $conflicted_country_codes, true)
-            );
-
-            $status = self::compute_display_status(
-                $document,
-                $has_conflict
-            );
-
-            if ($status['value'] !== 'ready') {
-                $count++;
-            }
-        }
-
-        return $count;
-    }
-
     /**
      * ORDER 8B, section 27 - a business-readable "14 Aug 2026, 14:32"
      * rendering of updated_at, never a raw ISO 8601 timestamp. Uses
@@ -1359,6 +1627,27 @@ final class LE_Global_Chatbot_Admin
             ) === '1'
         );
 
+        // Mission "ORDER 8E-A1"/"ORDER 8E-A2" - the two newer upload
+        // decision flags, forwarded exactly like replace_existing/
+        // confirm_warnings above: a fresh full resubmission of the
+        // same file, never a token/session.
+        $country_confirmed = (
+            isset($_POST['country_confirmed'])
+            && sanitize_text_field(
+                wp_unslash(
+                    (string) $_POST['country_confirmed']
+                )
+            ) === '1'
+        );
+
+        $selected_country_code = isset($_POST['selected_country_code'])
+            ? sanitize_text_field(
+                wp_unslash(
+                    (string) $_POST['selected_country_code']
+                )
+            )
+            : '';
+
         $fail = static function (
             string $message,
             int $status_code = 400,
@@ -1382,161 +1671,19 @@ final class LE_Global_Chatbot_Admin
 
         $file = $_FILES['document'] ?? null;
 
-        if (!is_array($file)) {
-            $fail(
-                'No DOCX document was received.'
-            );
-        }
-
-        $upload_error = isset(
-            $file['error']
-        )
-            ? (int) $file['error']
-            : UPLOAD_ERR_NO_FILE;
-
-        if ($upload_error !== UPLOAD_ERR_OK) {
-            $fail(
-                self::upload_error_message(
-                    $upload_error
-                )
-            );
-        }
-
-        $temporary_path = isset(
-            $file['tmp_name']
-        )
-            ? (string) $file['tmp_name']
-            : '';
-
-        $original_filename = isset(
-            $file['name']
-        )
-            ? (string) $file['name']
-            : '';
-
-        if (
-            $original_filename === ''
-            || strtolower(
-                pathinfo(
-                    $original_filename,
-                    PATHINFO_EXTENSION
-                )
-            ) !== 'docx'
-        ) {
-            $fail(
-                'Only DOCX documents are accepted.'
-            );
-        }
-
-        if (
-            $temporary_path === ''
-            || !is_uploaded_file(
-                $temporary_path
-            )
-        ) {
-            $fail(
-                'The uploaded file could not be validated.'
-            );
-        }
-
-        $file_content = file_get_contents(
-            $temporary_path
+        [$original_filename, $file_content] = (
+            self::validate_and_read_uploaded_docx($file, $fail)
         );
 
-        if ($file_content === false) {
-            $fail(
-                'The uploaded document could not be read.'
-            );
-        }
-
-        $boundary = (
-            'LEGlobalBoundary'
-            . str_replace(
-                '-',
-                '',
-                wp_generate_uuid4()
-            )
-        );
-
-        $line_break = "\r\n";
-
-        $header_filename = str_replace(
+        [$multipart_body, $boundary] = self::build_docx_multipart_body(
             [
-                '"',
-                "\r",
-                "\n",
+                'replace_existing' => $replace_existing ? 'true' : 'false',
+                'confirm_warnings' => $confirm_warnings ? 'true' : 'false',
+                'country_confirmed' => $country_confirmed ? 'true' : 'false',
+                'selected_country_code' => $selected_country_code,
             ],
-            '',
-            $original_filename
-        );
-
-        $multipart_body = (
-            '--'
-            . $boundary
-            . $line_break
-        );
-
-        $multipart_body .= (
-            'Content-Disposition: form-data; '
-            . 'name="replace_existing"'
-            . $line_break
-            . $line_break
-            . (
-                $replace_existing
-                ? 'true'
-                : 'false'
-            )
-            . $line_break
-        );
-
-        $multipart_body .= (
-            '--'
-            . $boundary
-            . $line_break
-        );
-
-        $multipart_body .= (
-            'Content-Disposition: form-data; '
-            . 'name="confirm_warnings"'
-            . $line_break
-            . $line_break
-            . (
-                $confirm_warnings
-                ? 'true'
-                : 'false'
-            )
-            . $line_break
-        );
-
-        $multipart_body .= (
-            '--'
-            . $boundary
-            . $line_break
-        );
-
-        $multipart_body .= (
-            'Content-Disposition: form-data; '
-            . 'name="file"; filename="'
-            . $header_filename
-            . '"'
-            . $line_break
-        );
-
-        $multipart_body .= (
-            'Content-Type: '
-            . 'application/vnd.openxmlformats-officedocument.'
-            . 'wordprocessingml.document'
-            . $line_break
-            . $line_break
-        );
-
-        $multipart_body .= (
+            $original_filename,
             $file_content
-            . $line_break
-            . '--'
-            . $boundary
-            . '--'
-            . $line_break
         );
 
         $result = self::request_backend(
@@ -1575,7 +1722,7 @@ final class LE_Global_Chatbot_Admin
             $fail(
                 self::extract_message(
                     $result['body'],
-                    'The document could not be indexed.'
+                    'The document could not be added.'
                 ),
                 (int) $result['status_code'],
                 $detail
@@ -1608,13 +1755,10 @@ final class LE_Global_Chatbot_Admin
             (
                 $result_status === 'replaced'
                 ? '%s replaced the previous country document '
-                    . 'successfully with %s chunks.'
-                : '%s was indexed successfully with %s chunks.'
+                    . 'successfully.'
+                : '%s was added successfully.'
             ),
-            $indexed_filename,
-            number_format_i18n(
-                $indexed_chunks
-            )
+            $indexed_filename
         );
 
         if ($is_ajax) {
@@ -1632,6 +1776,332 @@ final class LE_Global_Chatbot_Admin
         self::redirect_with_notice(
             'success',
             $success_message
+        );
+    }
+
+    /**
+     * Validate one $_FILES['document']-shaped entry and return its
+     * [original_filename, file_content] - shared by every handler
+     * that proxies a DOCX upload to the backend. $fail is called (and
+     * never returns - every real caller's $fail always ends the
+     * request) for any technical problem.
+     *
+     * @param mixed $file
+     * @return array{0: string, 1: string}
+     */
+    private static function validate_and_read_uploaded_docx(
+        $file,
+        callable $fail
+    ): array {
+        if (!is_array($file)) {
+            $fail('No DOCX document was received.');
+        }
+
+        $upload_error = isset($file['error'])
+            ? (int) $file['error']
+            : UPLOAD_ERR_NO_FILE;
+
+        if ($upload_error !== UPLOAD_ERR_OK) {
+            $fail(self::upload_error_message($upload_error));
+        }
+
+        $temporary_path = isset($file['tmp_name'])
+            ? (string) $file['tmp_name']
+            : '';
+
+        $original_filename = isset($file['name'])
+            ? (string) $file['name']
+            : '';
+
+        if (
+            $original_filename === ''
+            || strtolower(
+                pathinfo($original_filename, PATHINFO_EXTENSION)
+            ) !== 'docx'
+        ) {
+            $fail('Only DOCX documents are accepted.');
+        }
+
+        if (
+            $temporary_path === ''
+            || !is_uploaded_file($temporary_path)
+        ) {
+            $fail('The uploaded file could not be validated.');
+        }
+
+        $file_content = file_get_contents($temporary_path);
+
+        if ($file_content === false) {
+            $fail('The uploaded document could not be read.');
+        }
+
+        return [$original_filename, $file_content];
+    }
+
+    /**
+     * Build a multipart/form-data body from simple string fields plus
+     * one "file" part - shared by every handler that proxies a DOCX
+     * upload to the backend (handle_upload,
+     * handle_resolve_conflict_replace), so the exact wire format is
+     * defined in exactly one place.
+     *
+     * @param array<string, string> $fields
+     * @return array{0: string, 1: string} [$body, $boundary]
+     */
+    private static function build_docx_multipart_body(
+        array $fields,
+        string $original_filename,
+        string $file_content
+    ): array {
+        $boundary = (
+            'LEGlobalBoundary'
+            . str_replace('-', '', wp_generate_uuid4())
+        );
+
+        $line_break = "\r\n";
+
+        $header_filename = str_replace(
+            ['"', "\r", "\n"],
+            '',
+            $original_filename
+        );
+
+        $body = '';
+
+        foreach ($fields as $name => $value) {
+            $body .= '--' . $boundary . $line_break;
+            $body .= (
+                'Content-Disposition: form-data; name="'
+                . $name
+                . '"'
+                . $line_break
+                . $line_break
+                . $value
+                . $line_break
+            );
+        }
+
+        $body .= '--' . $boundary . $line_break;
+        $body .= (
+            'Content-Disposition: form-data; name="file"; filename="'
+            . $header_filename
+            . '"'
+            . $line_break
+        );
+        $body .= (
+            'Content-Type: application/vnd.openxmlformats-officedocument.'
+            . 'wordprocessingml.document'
+            . $line_break
+            . $line_break
+        );
+        $body .= (
+            $file_content
+            . $line_break
+            . '--'
+            . $boundary
+            . '--'
+            . $line_break
+        );
+
+        return [$body, $boundary];
+    }
+
+    /**
+     * Mission "ORDER 8E-A2", sections 20-27 - a read-only, safe review
+     * of one country's active conflict, relayed verbatim (the
+     * backend's own response already excludes document_type/chunk
+     * counts/SHA - only filename/year/last-updated/file size per
+     * candidate, plus whether AUTO_DEDUPLICATE is available).
+     */
+    public static function handle_conflict_review(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONFLICT_REVIEW_ACTION,
+            'nonce'
+        );
+
+        $country_code = self::read_country_code_for_json();
+
+        $result = self::request_backend(
+            'GET',
+            self::DOCUMENTS_PATH
+            . '/countries/'
+            . rawurlencode($country_code)
+            . '/conflict-review',
+            null,
+            30
+        );
+
+        self::relay_json_result(
+            $result,
+            'The conflict review could not be loaded.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8E-A2", sections 22-26 - AUTO_DEDUPLICATE and
+     * CHOOSE_DOCUMENT both act directly on the existing indexed
+     * records, with no file to upload - a simple url-encoded POST,
+     * never multipart. REPLACE_WITH_DOCUMENT has its own dedicated
+     * handler below, since it needs a file.
+     */
+    public static function handle_resolve_conflict(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::RESOLVE_CONFLICT_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $country_code = self::read_country_code_for_json();
+
+        $resolution_mode = isset($_POST['resolution_mode'])
+            ? sanitize_text_field(
+                wp_unslash((string) $_POST['resolution_mode'])
+            )
+            : '';
+
+        $keep_document_id = isset($_POST['keep_document_id'])
+            ? sanitize_text_field(
+                wp_unslash((string) $_POST['keep_document_id'])
+            )
+            : '';
+
+        if ($resolution_mode === '') {
+            wp_send_json_error(
+                ['message' => 'The resolution mode is required.'],
+                422
+            );
+        }
+
+        $fields = ['resolution_mode' => $resolution_mode];
+
+        if ($keep_document_id !== '') {
+            $fields['keep_document_id'] = $keep_document_id;
+        }
+
+        $result = self::request_backend(
+            'POST',
+            self::DOCUMENTS_PATH
+            . '/countries/'
+            . rawurlencode($country_code)
+            . '/resolve-conflict',
+            null,
+            60,
+            self::build_url_encoded_body($fields),
+            [
+                'Content-Type' => (
+                    'application/x-www-form-urlencoded; charset=UTF-8'
+                ),
+            ]
+        );
+
+        self::relay_json_result(
+            $result,
+            'This issue could not be resolved.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8E-A2", section 27 - "we couldn't determine which
+     * document should be used" is never a dead end: the Admin supplies
+     * an authoritative DOCX, which goes through the exact same upload
+     * validation flow as an ordinary upload (technical validation,
+     * country confirmation, content warning if applicable) - this
+     * handler only pins resolution_mode=REPLACE_WITH_DOCUMENT and the
+     * target country_code server-side, reusing
+     * build_docx_multipart_body/validate_and_read_uploaded_docx rather
+     * than a second, parallel upload implementation.
+     */
+    public static function handle_resolve_conflict_replace(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::RESOLVE_CONFLICT_REPLACE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $country_code = self::read_country_code_for_json();
+
+        $country_confirmed = (
+            isset($_POST['country_confirmed'])
+            && sanitize_text_field(
+                wp_unslash((string) $_POST['country_confirmed'])
+            ) === '1'
+        );
+
+        $confirm_warnings = (
+            isset($_POST['confirm_warnings'])
+            && sanitize_text_field(
+                wp_unslash((string) $_POST['confirm_warnings'])
+            ) === '1'
+        );
+
+        $selected_country_code = isset($_POST['selected_country_code'])
+            ? sanitize_text_field(
+                wp_unslash((string) $_POST['selected_country_code'])
+            )
+            : '';
+
+        $fail = static function (
+            string $message,
+            int $status_code = 400,
+            array $detail = []
+        ): void {
+            wp_send_json_error(
+                [
+                    'message' => $message,
+                    'detail' => $detail,
+                ],
+                $status_code
+            );
+        };
+
+        $file = $_FILES['document'] ?? null;
+
+        [$original_filename, $file_content] = (
+            self::validate_and_read_uploaded_docx($file, $fail)
+        );
+
+        [$multipart_body, $boundary] = self::build_docx_multipart_body(
+            [
+                'resolution_mode' => 'REPLACE_WITH_DOCUMENT',
+                'country_confirmed' => $country_confirmed ? 'true' : 'false',
+                'confirm_warnings' => $confirm_warnings ? 'true' : 'false',
+                'selected_country_code' => $selected_country_code,
+            ],
+            $original_filename,
+            $file_content
+        );
+
+        $result = self::request_backend(
+            'POST',
+            self::DOCUMENTS_PATH
+            . '/countries/'
+            . rawurlencode($country_code)
+            . '/resolve-conflict',
+            null,
+            120,
+            $multipart_body,
+            [
+                'Content-Type' => (
+                    'multipart/form-data; boundary='
+                    . $boundary
+                ),
+            ]
+        );
+
+        self::relay_json_result(
+            $result,
+            'The document could not be processed.'
         );
     }
 
@@ -1678,7 +2148,7 @@ final class LE_Global_Chatbot_Admin
                 $is_ajax,
                 self::extract_message(
                     $result['body'],
-                    'The document could not be reindexed.'
+                    'The chatbot data could not be refreshed.'
                 ),
                 (int) $result['status_code']
             );
@@ -1701,11 +2171,8 @@ final class LE_Global_Chatbot_Admin
             : 0;
 
         $success_message = sprintf(
-            '%s was reindexed successfully with %s chunks.',
-            $filename,
-            number_format_i18n(
-                $indexed_chunks
-            )
+            '%s was refreshed successfully.',
+            $filename
         );
 
         if ($is_ajax) {
@@ -1964,6 +2431,26 @@ final class LE_Global_Chatbot_Admin
             $document_id . '.docx'
         );
 
+        // Mission "ORDER 8G-A", section 10 - the reported bug ("the
+        // file downloads correctly, but a red failure notice also
+        // appears") matches the classic browser-level symptom of a
+        // declared Content-Length no longer matching the bytes
+        // actually placed on the wire (an active output buffer
+        // appending bytes after this point, or a compression layer
+        // altering the byte count post-hoc) - the browser still
+        // reconstructs the complete file, but flags the transfer as
+        // failed. Never self-compute Content-Length for this
+        // response: discard any active output buffering first, ask
+        // Apache to skip compressing this one response, and let the
+        // web server determine and send the real length itself.
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+
+        if (function_exists('apache_setenv')) {
+            @apache_setenv('no-gzip', '1');
+        }
+
         nocache_headers();
 
         header(
@@ -1975,10 +2462,6 @@ final class LE_Global_Chatbot_Admin
             'Content-Disposition: attachment; filename="'
             . $filename
             . '"'
-        );
-
-        header(
-            'Content-Length: ' . strlen($body)
         );
 
         // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
@@ -2157,6 +2640,22 @@ final class LE_Global_Chatbot_Admin
             );
         }
 
+        // Mission "ORDER 8G-A" - one Save now supports content only,
+        // title only, or both: an omitted (or blank) title simply
+        // means no rename was requested, exactly the pre-existing
+        // content-only behavior. Title, like content, is unslashed
+        // only - never sanitize_text_field()'d - the backend itself
+        // is the sole authority on trimming/validating it.
+        $title = isset($_POST['title'])
+            ? wp_unslash((string) $_POST['title'])
+            : '';
+
+        $payload = ['content' => $content];
+
+        if (trim($title) !== '') {
+            $payload['title'] = $title;
+        }
+
         $result = self::request_backend(
             'PUT',
             self::DOCUMENTS_PATH
@@ -2164,13 +2663,51 @@ final class LE_Global_Chatbot_Admin
             . rawurlencode($document_id)
             . '/sections/'
             . rawurlencode($section_id),
-            ['content' => $content],
+            $payload,
             60
         );
 
         self::relay_json_result(
             $result,
             'The section could not be saved.'
+        );
+    }
+
+    /**
+     * Mission "ORDER 8G-A", section 7 - permanently remove one
+     * top-level legal section from the current DOCX. The backend
+     * blocks deleting the document's last remaining usable section
+     * (surfaced to the browser as the section_is_last_remaining
+     * business error, mapped to a friendly message in admin.js).
+     */
+    public static function handle_delete_section(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::SECTION_DELETE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $section_id = self::read_section_id_for_json();
+
+        $result = self::request_backend(
+            'DELETE',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/sections/'
+            . rawurlencode($section_id),
+            null,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The section could not be deleted.'
         );
     }
 
@@ -2355,6 +2892,38 @@ final class LE_Global_Chatbot_Admin
     }
 
     /**
+     * Mission "ORDER 8E-A2" - the country-conflict endpoints are keyed
+     * by country_code rather than document_id; this is only a basic
+     * shape check (two letters), the backend itself is the final
+     * authority on which codes are actually recognized/allowed.
+     */
+    private static function read_country_code_for_json(): string
+    {
+        $country_code = isset($_REQUEST['country_code'])
+            ? sanitize_text_field(
+                wp_unslash((string) $_REQUEST['country_code'])
+            )
+            : '';
+
+        if (!preg_match('/^[A-Za-z]{2}$/', $country_code)) {
+            wp_send_json_error(
+                ['message' => 'The country code is invalid.'],
+                422
+            );
+        }
+
+        return strtoupper($country_code);
+    }
+
+    /**
+     * @param array<string, string> $fields
+     */
+    private static function build_url_encoded_body(array $fields): string
+    {
+        return http_build_query($fields, '', '&', PHP_QUERY_RFC3986);
+    }
+
+    /**
      * @return array{0: array<int, array<string, mixed>>, 1: ?string}
      */
     private static function fetch_document_catalog(): array
@@ -2441,7 +3010,7 @@ final class LE_Global_Chatbot_Admin
     }
 
     /**
-     * @return ?array{total_documents: int, total_countries: int, status_counts: array<string, int>}
+     * @return ?array{total_documents: int, total_countries: int, status_counts: array<string, int>, countries_requiring_action: int}
      */
     private static function fetch_document_stats(): ?array
     {
@@ -2469,6 +3038,14 @@ final class LE_Global_Chatbot_Admin
                 $result['body']['total_countries']
             )
                 ? (int) $result['body']['total_countries']
+                : 0,
+            // Mission "ORDER 8E-A2", section 28 - the backend's own
+            // deduplicated, country-level count: one conflict never
+            // counts once per extra raw record.
+            'countries_requiring_action' => isset(
+                $result['body']['countries_requiring_action']
+            )
+                ? (int) $result['body']['countries_requiring_action']
                 : 0,
             'status_counts' => isset(
                 $result['body']['status_counts']
@@ -2500,14 +3077,11 @@ final class LE_Global_Chatbot_Admin
         return sprintf(
             (
                 $source_cleanup_deferred
-                ? '%s was deleted successfully. %s indexed '
-                    . 'chunks were removed. Source-file cleanup '
-                    . 'is deferred.'
-                : '%s was deleted successfully. %s indexed '
-                    . 'chunks were removed.'
+                ? '%s was deleted successfully. Cleanup of some '
+                    . 'related files is still in progress.'
+                : '%s was deleted successfully.'
             ),
-            $filename,
-            number_format_i18n($deleted_chunks)
+            $filename
         );
     }
 
@@ -2864,6 +3438,32 @@ final class LE_Global_Chatbot_Admin
      * countries never swap places between renders just because the
      * catalog happened to list them in a different order.
      *
+     * Mission "ORDER 8E-A2", section 30 - a conflicted country must
+     * never silently disappear from Add/Edit with no explanation; this
+     * finds any one document for that country purely to display its
+     * human-readable name next to the explanatory message and Review
+     * button.
+     *
+     * @param array<int, array<string, mixed>> $documents
+     */
+    private static function find_document_by_country_code(
+        array $documents,
+        string $country_code
+    ): ?array {
+        foreach ($documents as $document) {
+            if (
+                is_array($document)
+                && isset($document['country_code'])
+                && (string) $document['country_code'] === $country_code
+            ) {
+                return $document;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * @param array<int, array<string, mixed>> $documents
      * @param array<int, string> $conflicted_country_codes
      * @return array<int, array{document_id: string, country: string, country_code: string}>

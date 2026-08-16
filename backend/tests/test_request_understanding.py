@@ -277,6 +277,63 @@ class RequestUnderstandingActionModelTests(unittest.TestCase):
                 )
             )
 
+    def test_document_legal_topics_default_to_empty(self) -> None:
+        action = RequestUnderstandingAction(**_legal_action())
+
+        self.assertEqual(action.document_legal_topics, [])
+
+    def test_document_legal_topics_are_deduplicated(self) -> None:
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=[],
+                document_legal_topics=[
+                    "V060 Temporary Validation Section",
+                    "V060 Temporary Validation Section",
+                ],
+            )
+        )
+
+        self.assertEqual(
+            action.document_legal_topics,
+            ["V060 Temporary Validation Section"],
+        )
+
+    def test_comparison_action_with_document_legal_topics_is_rejected(
+        self,
+    ) -> None:
+        """
+        Mission "ORDER 8F-A", section 9 (comparison safety) - a
+        document_legal_topics value is inherently one specific
+        country's own live section; a comparison spans two or more
+        countries by definition and must never carry one.
+        """
+
+        with self.assertRaises(ValidationError):
+            RequestUnderstandingAction(
+                **_comparison_action(
+                    document_legal_topics=[
+                        "V060 Temporary Validation Section"
+                    ],
+                )
+            )
+
+    def test_legal_information_action_with_document_legal_topics_is_ok(
+        self,
+    ) -> None:
+        action = RequestUnderstandingAction(
+            **_legal_action(
+                legal_topics=[],
+                document_legal_topics=[
+                    "V060 Temporary Validation Section"
+                ],
+            )
+        )
+
+        self.assertEqual(
+            action.document_legal_topics,
+            ["V060 Temporary Validation Section"],
+        )
+
 
 class ResolvedSubjectPrecisionTests(unittest.TestCase):
     """
@@ -551,6 +608,52 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                 **_resolved_result(
                     actions=[
                         _legal_action(legal_topics=[], topic_text=None)
+                    ]
+                )
+            )
+
+    def test_resolved_legal_information_action_with_only_document_legal_topics_is_accepted(
+        self,
+    ) -> None:
+        """
+        Mission "ORDER 8F-A" - document_legal_topics is a third,
+        independent way a legal_information action can satisfy the
+        completeness rule, distinct from legal_topics/topic_text.
+        """
+
+        result = RequestUnderstandingResult(
+            **_resolved_result(
+                actions=[
+                    _legal_action(
+                        legal_topics=[],
+                        topic_text=None,
+                        document_legal_topics=[
+                            "V060 Temporary Validation Section"
+                        ],
+                    )
+                ]
+            )
+        )
+
+        action = result.actions_of_type("legal_information")[0]
+
+        self.assertEqual(
+            action.document_legal_topics,
+            ["V060 Temporary Validation Section"],
+        )
+
+    def test_resolved_contact_action_with_document_legal_topics_is_rejected(
+        self,
+    ) -> None:
+        with self.assertRaises(ValidationError):
+            RequestUnderstandingResult(
+                **_resolved_result(
+                    actions=[
+                        _contact_action(
+                            document_legal_topics=[
+                                "V060 Temporary Validation Section"
+                            ]
+                        )
                     ]
                 )
             )

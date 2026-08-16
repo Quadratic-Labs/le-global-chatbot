@@ -751,6 +751,37 @@ def list_indexed_documents(
             "OpenSearch returned invalid document buckets."
         )
 
+    # A per-country active-document count, computed once up front so
+    # every row below can report requires_action/resolution_available
+    # from its own country's count alone - a later UI must never have
+    # to infer a conflict by counting how many raw rows share a
+    # country_code itself (mission "ORDER 8E-A1", section 29).
+    # Deliberately tolerant of a bucket the main loop below will itself
+    # reject: this pass only ever adds a count, never raises.
+    country_document_counts: dict[str, int] = {}
+
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+
+        bucket_country_code = _extract_metadata_source(
+            bucket
+        ).get("country_code")
+
+        if (
+            isinstance(bucket_country_code, str)
+            and bucket_country_code.strip()
+        ):
+            normalized_bucket_code = (
+                bucket_country_code.strip().upper()
+            )
+            country_document_counts[normalized_bucket_code] = (
+                country_document_counts.get(
+                    normalized_bucket_code, 0
+                )
+                + 1
+            )
+
     documents: list[
         AdminDocumentSummary
     ] = []
@@ -831,6 +862,13 @@ def list_indexed_documents(
                 reference_year
             )
 
+        document_requires_action = (
+            country_document_counts.get(
+                country_code.strip().upper(), 0
+            )
+            > 1
+        )
+
         documents.append(
             AdminDocumentSummary(
                 document_id=_required_string(
@@ -867,6 +905,13 @@ def list_indexed_documents(
                 source_bytes=source_bytes,
                 updated_at=updated_at,
                 status=document_status,
+                requires_action=document_requires_action,
+                action_reason=(
+                    "country_conflict"
+                    if document_requires_action
+                    else None
+                ),
+                resolution_available=document_requires_action,
             )
         )
 
@@ -921,4 +966,11 @@ def get_admin_document_stats(
             }
         ),
         status_counts=status_counts,
+        countries_requiring_action=len(
+            {
+                document.country_code
+                for document in catalog.documents
+                if document.requires_action
+            }
+        ),
     )

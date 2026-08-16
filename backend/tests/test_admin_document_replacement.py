@@ -10,18 +10,28 @@ from pathlib import Path
 from tests.admin_invariants import real_source_entries
 from unittest.mock import patch
 
+from docx import Document as DocxDocument
+
 from app.models.document import DocumentChunk
 from app.services.admin_document_replacement import (
     AdminDocumentAlreadyCurrentError,
+    AdminDocumentCountryConfirmationRequiredError,
+    AdminDocumentCountryConflictReviewRequiredError,
     AdminDocumentCountryNotAllowedError,
+    AdminDocumentCountrySelectionInvalidError,
+    AdminDocumentCountrySelectionRequiredError,
     AdminDocumentReplacementRequiredError,
     AdminDocumentWarningConfirmationRequiredError,
     ExistingCountryDocument,
     safe_upload_and_index_document,
 )
 from app.services.admin_documents import DocumentCountryUndeterminedError
+from app.services.docx_country_marker import read_country_marker
 from app.services.document_chunk_builder import (
+    AmbiguousDocumentCountryError,
     UndeterminableDocumentCountryError,
+    build_document_chunks_from_docx,
+    metadata_from_content,
 )
 from app.services.document_indexer import (
     DocumentIndexingError,
@@ -35,6 +45,35 @@ from app.services.document_section_state import (
     section_id_for_legal_topic,
     write_section_edit_state_atomic,
 )
+
+
+def _real_docx_bytes(paragraphs: list[str]) -> bytes:
+    """A minimal real DOCX (valid zip/OOXML), for tests that exercise
+    the actual marker-writing/parsing pipeline rather than a fake
+    chunk_builder."""
+
+    document = DocxDocument()
+
+    for text in paragraphs:
+        document.add_paragraph(text)
+
+    buffer = BytesIO()
+    document.save(buffer)
+
+    return buffer.getvalue()
+
+
+def _fake_indexer(*, chunks, client=None):
+    del client
+
+    return DocumentIndexingResult(
+        index_alias="legal-documents-v1",
+        document_id=chunks[0].document_id,
+        source_filename=chunks[0].source_filename,
+        requested_chunks=len(chunks),
+        indexed_chunks=len(chunks),
+        stale_chunks_deleted=0,
+    )
 
 
 AU_OLD_ID = "doc_" + "a" * 64
@@ -113,6 +152,7 @@ class SafeCountryReplacementTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -137,9 +177,18 @@ class SafeCountryReplacementTests(unittest.TestCase):
                 (source_directory / "AU.docx").exists()
             )
 
-    def test_confirmed_replacement_collapses_files_and_ids(
+    def test_replace_existing_never_bypasses_a_country_conflict(
         self,
     ) -> None:
+        # Mission "ORDER 8E-A1", section 18: more than one active
+        # document for a country is a genuine conflict the ordinary
+        # upload/replace decision must never blindly resolve, even
+        # with replace_existing=True - only the dedicated conflict-
+        # resolution API may do that (see
+        # admin_document_conflict_resolution.py). Superseded from this
+        # test's earlier "confirmed replace collapses to one" name -
+        # that collapsing behavior now belongs exclusively to
+        # AUTO_DEDUPLICATE/CHOOSE_DOCUMENT/REPLACE_WITH_DOCUMENT.
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root) / "source"
             processed_directory = Path(root) / "processed"
@@ -176,51 +225,45 @@ class SafeCountryReplacementTests(unittest.TestCase):
                 self.assertEqual(country_code, "AU")
                 return existing
 
-            def indexer(*, chunks, client=None):
-                del client
-                return DocumentIndexingResult(
-                    index_alias="legal-documents-v1",
-                    document_id=chunks[0].document_id,
-                    source_filename=chunks[0].source_filename,
-                    requested_chunks=len(chunks),
-                    indexed_chunks=len(chunks),
-                    stale_chunks_deleted=118,
+            def indexer_must_not_be_called(**kwargs):
+                del kwargs
+                raise AssertionError("indexer must not run")
+
+            with self.assertRaises(
+                AdminDocumentCountryConflictReviewRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"new-australia"),
+                    source_directory=source_directory,
+                    confirm_warnings=True,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    replace_existing=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=lookup,
+                    country_document_indexer=(
+                        indexer_must_not_be_called
+                    ),
                 )
 
-            response = safe_upload_and_index_document(
-                filename="Australia 2026.docx",
-                file_stream=BytesIO(b"new-australia"),
-                source_directory=source_directory,
-                confirm_warnings=True,
-                processed_directory=processed_directory,
-                maximum_bytes=1000,
-                replace_existing=True,
-                chunk_builder=lambda path: [
-                    _build_au_chunk(path.name)
-                ],
-                country_document_lookup=lookup,
-                country_document_indexer=indexer,
-            )
-
-            self.assertEqual(response.status, "replaced")
-            self.assertEqual(response.country_code, "AU")
+            self.assertEqual(context.exception.country_code, "AU")
             self.assertEqual(
-                response.replaced_document_ids,
                 sorted(
-                    [
-                        AU_OLD_ID,
-                        "doc_" + "c" * 64,
-                    ]
+                    candidate.document_id
+                    for candidate in context.exception.candidates
                 ),
+                sorted([AU_OLD_ID, "doc_" + "c" * 64]),
             )
-            self.assertFalse(legacy_path.exists())
+            # Zero mutation - both legacy sources untouched.
             self.assertEqual(
-                canonical_path.read_bytes(),
-                b"new-australia",
+                legacy_path.read_bytes(), b"legacy-australia"
             )
             self.assertEqual(
-                [path.name for path in real_source_entries(source_directory)],
-                ["AU.docx"],
+                canonical_path.read_bytes(), b"other-australia"
             )
 
     def test_failed_confirmed_replacement_restores_all_sources(
@@ -254,6 +297,7 @@ class SafeCountryReplacementTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     replace_existing=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
@@ -320,6 +364,7 @@ class SafeCountryReplacementTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -372,6 +417,7 @@ class SafeCountryReplacementTests(unittest.TestCase):
                 confirm_warnings=True,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 chunk_builder=counting_chunk_builder,
                 country_document_lookup=lambda code, client: [],
                 country_document_indexer=lambda *, chunks, client=None: (
@@ -438,6 +484,7 @@ class SafeCountryReplacementTests(unittest.TestCase):
                 confirm_warnings=True,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 chunk_builder=lambda path: [
                     _build_au_chunk(path.name)
                 ],
@@ -458,6 +505,7 @@ class SafeCountryReplacementTests(unittest.TestCase):
                 confirm_warnings=True,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 chunk_builder=lambda path: [
                     _build_au_chunk(path.name)
                 ],
@@ -553,6 +601,7 @@ class FilenameNeverDecidesIdentityTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -579,6 +628,7 @@ class FilenameNeverDecidesIdentityTests(unittest.TestCase):
                         confirm_warnings=True,
                         processed_directory=processed_directory,
                         maximum_bytes=1000,
+                        country_confirmed=True,
                         chunk_builder=lambda path: [
                             _build_au_chunk(path.name)
                         ],
@@ -610,15 +660,18 @@ class FilenameNeverDecidesIdentityTests(unittest.TestCase):
 
 class ConfirmedReplacementDuplicateCountTests(unittest.TestCase):
     """
-    Mission "HOTFIX 0.4.9", section 8 - confirmed replacement must
-    collapse to exactly one active document/source regardless of how
-    many duplicate legacy document_ids and source files the country
-    started with (tested here for 3, complementing the existing
-    2-duplicate coverage in test_confirmed_replacement_collapses_
-    files_and_ids above).
+    Mission "ORDER 8E-A1", section 18 - the ordinary upload/replace
+    decision must refuse to collapse a country conflict itself,
+    however many duplicate legacy document_ids and source files it
+    started with (tested here for 3) - it always defers to the
+    dedicated conflict-resolution API instead. Superseded from
+    "HOTFIX 0.4.9"'s original "confirmed replace collapses to one"
+    expectation.
     """
 
-    def test_confirmed_replace_with_three_duplicate_ids(self) -> None:
+    def test_confirmed_replace_with_three_duplicate_ids_requires_conflict_review(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root) / "source"
             processed_directory = Path(root) / "processed"
@@ -648,45 +701,46 @@ class ConfirmedReplacementDuplicateCountTests(unittest.TestCase):
                 self.assertEqual(country_code, "AU")
                 return existing
 
-            def indexer(*, chunks, client=None):
-                del client
-                return DocumentIndexingResult(
-                    index_alias="legal-documents-v1",
-                    document_id=chunks[0].document_id,
-                    source_filename=chunks[0].source_filename,
-                    requested_chunks=len(chunks),
-                    indexed_chunks=len(chunks),
-                    stale_chunks_deleted=118,
+            def indexer_must_not_be_called(**kwargs):
+                del kwargs
+                raise AssertionError("indexer must not run")
+
+            with self.assertRaises(
+                AdminDocumentCountryConflictReviewRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"new-australia"),
+                    source_directory=source_directory,
+                    confirm_warnings=True,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    replace_existing=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=lookup,
+                    country_document_indexer=(
+                        indexer_must_not_be_called
+                    ),
                 )
 
-            response = safe_upload_and_index_document(
-                filename="Australia 2026.docx",
-                file_stream=BytesIO(b"new-australia"),
-                source_directory=source_directory,
-                confirm_warnings=True,
-                processed_directory=processed_directory,
-                maximum_bytes=1000,
-                replace_existing=True,
-                chunk_builder=lambda path: [
-                    _build_au_chunk(path.name)
-                ],
-                country_document_lookup=lookup,
-                country_document_indexer=indexer,
-            )
-
-            self.assertEqual(response.status, "replaced")
             self.assertEqual(
-                response.replaced_document_ids,
+                sorted(
+                    candidate.document_id
+                    for candidate in context.exception.candidates
+                ),
                 sorted(
                     document.document_id for document in existing
                 ),
             )
             self.assertEqual(
-                [
+                sorted(
                     path.name
                     for path in real_source_entries(source_directory)
-                ],
-                ["AU.docx"],
+                ),
+                ["AU.docx", "Employment Law Overview Australia.docx"],
             )
 
     def test_confirmed_replace_with_source_missing(self) -> None:
@@ -728,6 +782,7 @@ class ConfirmedReplacementDuplicateCountTests(unittest.TestCase):
                 confirm_warnings=True,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 replace_existing=True,
                 chunk_builder=lambda path: [
                     _build_au_chunk(path.name)
@@ -749,15 +804,17 @@ class ConfirmedReplacementDuplicateCountTests(unittest.TestCase):
 
 class IdenticalFileAmbiguousCountryTests(unittest.TestCase):
     """
-    Mission "HOTFIX 0.4.9", section 13.B - a country left with
-    several document_ids (a pre-existing conflict/duplicate state)
-    must never be told "document_already_current", even if the newly
-    uploaded bytes happen to match one of the candidate files exactly:
-    the country's own state is inconsistent, and normalizing it
-    always requires an explicit confirmed replacement.
+    Mission "ORDER 8E-A1", section 18 - a country left with several
+    document_ids (a pre-existing conflict/duplicate state) must never
+    be told "document_already_current", even if the newly uploaded
+    bytes happen to match one of the candidate files exactly: the
+    country's own state is inconsistent, and normalizing it now always
+    requires the dedicated conflict-resolution review, never a plain
+    confirmed replacement (superseded from "HOTFIX 0.4.9"'s original
+    document_replacement_required expectation).
     """
 
-    def test_identical_bytes_but_ambiguous_country_still_requires_confirmation(
+    def test_identical_bytes_but_ambiguous_country_still_requires_conflict_review(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -791,7 +848,7 @@ class IdenticalFileAmbiguousCountryTests(unittest.TestCase):
             ]
 
             with self.assertRaises(
-                AdminDocumentReplacementRequiredError
+                AdminDocumentCountryConflictReviewRequiredError
             ):
                 safe_upload_and_index_document(
                     filename="Australia 2026.docx",
@@ -801,6 +858,7 @@ class IdenticalFileAmbiguousCountryTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -847,6 +905,7 @@ class SourceWriteFailureRollbackTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -890,6 +949,7 @@ class SourceWriteFailureRollbackTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     replace_existing=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
@@ -1046,6 +1106,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     confirm_warnings=False,
                     chunk_builder=lambda path: (
                         _build_chunks_with_topic_count(
@@ -1088,6 +1149,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                 source_directory=source_directory,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 confirm_warnings=True,
                 chunk_builder=lambda path: (
                     _build_chunks_with_topic_count(
@@ -1125,6 +1187,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     confirm_warnings=False,
                     chunk_builder=lambda path: (
                         _build_chunks_with_topic_count(
@@ -1198,6 +1261,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                 source_directory=source_directory,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 confirm_warnings=True,
                 chunk_builder=lambda path: (
                     _build_chunks_with_topic_count(
@@ -1237,6 +1301,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                 source_directory=source_directory,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 confirm_warnings=False,
                 chunk_builder=lambda path: (
                     _build_chunks_with_topic_count(
@@ -1273,6 +1338,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     replace_existing=False,
                     confirm_warnings=False,
                     chunk_builder=lambda path: [
@@ -1323,6 +1389,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     replace_existing=False,
                     confirm_warnings=True,
                     chunk_builder=lambda path: [
@@ -1368,6 +1435,7 @@ class WarningConfirmationRequiredTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     confirm_warnings=False,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
@@ -1419,6 +1487,7 @@ class AdminUploadAllowlistTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     confirm_warnings=True,
                     chunk_builder=lambda path: (
                         _build_chunks_with_topic_count(
@@ -1447,6 +1516,13 @@ class AdminUploadAllowlistTests(unittest.TestCase):
     def test_undetermined_country_is_a_different_error_than_not_allowed(
         self,
     ) -> None:
+        # Mission "ORDER 8E-A1", section 8: an undeterminable-but-
+        # processable DOCX is no longer a hard DocumentCountryUndeter
+        # minedError at all - it is a SELECT_COUNTRY decision. It must
+        # still stay clearly distinguishable from a country that WAS
+        # detected but is simply outside the allowlist (superseded
+        # from "ORDER 5C"'s original expectation of the old hard-fail
+        # contract).
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root) / "source"
             processed_directory = Path(root) / "processed"
@@ -1458,7 +1534,7 @@ class AdminUploadAllowlistTests(unittest.TestCase):
                 )
 
             with self.assertRaises(
-                DocumentCountryUndeterminedError
+                AdminDocumentCountrySelectionRequiredError
             ) as context:
                 safe_upload_and_index_document(
                     filename="Unknown.docx",
@@ -1466,6 +1542,7 @@ class AdminUploadAllowlistTests(unittest.TestCase):
                     source_directory=source_directory,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     confirm_warnings=True,
                     chunk_builder=undeterminable_builder,
                     country_document_lookup=_no_existing_documents,
@@ -1479,6 +1556,11 @@ class AdminUploadAllowlistTests(unittest.TestCase):
                 context.exception,
                 AdminDocumentCountryNotAllowedError,
             )
+            self.assertNotIsInstance(
+                context.exception,
+                DocumentCountryUndeterminedError,
+            )
+            self.assertTrue(context.exception.allowed_countries)
 
     def test_every_one_of_the_34_allowed_codes_passes_the_check(
         self,
@@ -1518,6 +1600,7 @@ class AdminUploadAllowlistTests(unittest.TestCase):
                         source_directory=source_directory,
                         processed_directory=processed_directory,
                         maximum_bytes=1000,
+                        country_confirmed=True,
                         confirm_warnings=True,
                         chunk_builder=lambda path, _code=code, _name=(
                             country_name
@@ -1597,6 +1680,7 @@ class SectionEditReplacementIntegrationTests(unittest.TestCase):
                 confirm_warnings=True,
                 processed_directory=processed_directory,
                 maximum_bytes=1000,
+                country_confirmed=True,
                 replace_existing=True,
                 chunk_builder=lambda path: [
                     _build_au_chunk(path.name)
@@ -1657,6 +1741,7 @@ class SectionEditReplacementIntegrationTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -1726,6 +1811,7 @@ class SectionEditReplacementIntegrationTests(unittest.TestCase):
                     confirm_warnings=True,
                     processed_directory=processed_directory,
                     maximum_bytes=1000,
+                    country_confirmed=True,
                     chunk_builder=lambda path: [
                         _build_au_chunk(path.name)
                     ],
@@ -1737,6 +1823,621 @@ class SectionEditReplacementIntegrationTests(unittest.TestCase):
 
             self.assertIsNotNone(
                 read_section_edit_state(source_directory, AU_OLD_ID)
+            )
+
+
+class CountryConfirmationGateTests(unittest.TestCase):
+    """
+    Mission "ORDER 8E-A1", sections 6/17 - a detected country (from
+    content or a marker) must never, by itself, cause any mutation:
+    country_confirmed=True is required first, checked before the
+    content-warning gate and before the existing-country/conflict
+    checks, one decision at a time.
+    """
+
+    def test_detected_country_requires_confirmation_first(
+        self,
+    ) -> None:
+        indexer_called = False
+
+        def indexer_must_not_be_called(**kwargs):
+            nonlocal indexer_called
+            del kwargs
+            indexer_called = True
+            raise AssertionError("indexer must not run")
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountryConfirmationRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia.docx",
+                    file_stream=BytesIO(b"australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=(
+                        lambda code, client: (_ for _ in ()).throw(
+                            AssertionError(
+                                "existing-country lookup must not run "
+                                "before country is confirmed"
+                            )
+                        )
+                    ),
+                    country_document_indexer=indexer_must_not_be_called,
+                )
+
+            self.assertEqual(context.exception.country_code, "AU")
+            self.assertEqual(context.exception.country, "Australia")
+            self.assertEqual(
+                context.exception.detection_source, "content"
+            )
+            self.assertFalse(indexer_called)
+
+            detail = context.exception.to_detail()
+            self.assertEqual(
+                detail["code"],
+                "document_country_confirmation_required",
+            )
+            self.assertEqual(detail["country_code"], "AU")
+            self.assertEqual(detail["detection_source"], "content")
+            # Mission "ORDER 8E-A2", section 6: a UI must be able to
+            # offer "choose a different country" straight from this
+            # same response, using the one authoritative server-side
+            # list - never a second, client-invented copy of it.
+            codes = {
+                option["code"]
+                for option in detail["allowed_countries"]
+            }
+            self.assertIn("FR", codes)
+            self.assertIn("AU", codes)
+
+            # Zero mutation, and Cancel (never retrying) leaves no
+            # trace - the staged file lived only in the request's own
+            # now-cleaned-up TemporaryDirectory.
+            self.assertEqual(
+                list(source_directory.iterdir())
+                if source_directory.exists()
+                else [],
+                [],
+            )
+            self.assertEqual(
+                list(processed_directory.iterdir())
+                if processed_directory.exists()
+                else [],
+                [],
+            )
+
+    def test_country_confirmed_true_proceeds(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            response = safe_upload_and_index_document(
+                filename="Australia.docx",
+                file_stream=BytesIO(b"australia-bytes"),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1000,
+                confirm_warnings=True,
+                country_confirmed=True,
+                chunk_builder=lambda path: [
+                    _build_au_chunk(path.name)
+                ],
+                country_document_lookup=lambda code, client: [],
+                country_document_indexer=_fake_indexer,
+            )
+
+            self.assertEqual(response.status, "uploaded")
+            self.assertEqual(response.country_code, "AU")
+
+    def test_confirmation_gate_precedes_the_content_warning_gate(
+        self,
+    ) -> None:
+        # An atypical, thin-coverage document for a fresh country must
+        # still ask for country confirmation FIRST, never the content
+        # warning, when neither decision has been made yet.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountryConfirmationRequiredError
+            ):
+                safe_upload_and_index_document(
+                    filename="Chile.docx",
+                    file_stream=BytesIO(b"chile-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    confirm_warnings=False,
+                    chunk_builder=lambda path: (
+                        _build_chunks_with_topic_count(
+                            "CL", "Chile", "doc_" + "c" * 64,
+                            path.name, 0,
+                        )
+                    ),
+                    country_document_lookup=_no_existing_documents,
+                    country_document_indexer=(
+                        lambda **kwargs: (_ for _ in ()).throw(
+                            AssertionError("indexer must not run")
+                        )
+                    ),
+                )
+
+    def test_confirmation_gate_precedes_conflict_review(self) -> None:
+        # A country already in a multi-document conflict state must
+        # still ask for country confirmation FIRST, before the
+        # existing-country lookup that would discover the conflict.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountryConfirmationRequiredError
+            ):
+                safe_upload_and_index_document(
+                    filename="Australia.docx",
+                    file_stream=BytesIO(b"australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    confirm_warnings=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=(
+                        lambda code, client: (_ for _ in ()).throw(
+                            AssertionError(
+                                "must never reach the existing-"
+                                "country lookup before confirmation"
+                            )
+                        )
+                    ),
+                )
+
+
+class CountrySelectionGateTests(unittest.TestCase):
+    """
+    Mission "ORDER 8E-A1", section 8/9 - an otherwise-processable DOCX
+    with no identifiable country is a SELECT_COUNTRY decision, never a
+    hard failure; a manually-selected country is validated server-side
+    against the admin allowlist before anything else happens.
+    """
+
+    def test_undetermined_country_returns_selection_required(
+        self,
+    ) -> None:
+        def undeterminable_builder(path):
+            del path
+            raise UndeterminableDocumentCountryError(
+                "no country could be resolved from content"
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountrySelectionRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Unknown.docx",
+                    file_stream=BytesIO(b"unknown-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=undeterminable_builder,
+                    country_document_lookup=_no_existing_documents,
+                )
+
+            detail = context.exception.to_detail()
+            self.assertEqual(
+                detail["code"], "document_country_selection_required"
+            )
+            codes = {
+                option["code"]
+                for option in detail["allowed_countries"]
+            }
+            self.assertIn("FR", codes)
+            self.assertIn("AU", codes)
+
+    def test_ambiguous_country_also_returns_selection_required(
+        self,
+    ) -> None:
+        def ambiguous_builder(path):
+            del path
+            raise AmbiguousDocumentCountryError(
+                "more than one country found in the cover"
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountrySelectionRequiredError
+            ):
+                safe_upload_and_index_document(
+                    filename="Ambiguous.docx",
+                    file_stream=BytesIO(b"ambiguous-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=True,
+                    chunk_builder=ambiguous_builder,
+                    country_document_lookup=_no_existing_documents,
+                )
+
+    def test_invalid_manual_selection_is_rejected_with_zero_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountrySelectionInvalidError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Unknown.docx",
+                    # Not even a real DOCX - proves the invalid-code
+                    # check runs before any archive is ever opened.
+                    file_stream=BytesIO(b"not-a-real-docx"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    confirm_warnings=True,
+                    selected_country_code="ZZ",
+                    chunk_builder=(
+                        lambda path: (_ for _ in ()).throw(
+                            AssertionError(
+                                "chunk_builder must not run for an "
+                                "invalid manual selection"
+                            )
+                        )
+                    ),
+                )
+
+            detail = context.exception.to_detail()
+            self.assertEqual(
+                detail["code"], "document_country_selection_invalid"
+            )
+            self.assertEqual(detail["country_code"], "ZZ")
+            self.assertEqual(
+                list(source_directory.iterdir())
+                if source_directory.exists()
+                else [],
+                [],
+            )
+
+    def test_unregistered_manual_selection_code_is_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentCountrySelectionInvalidError
+            ):
+                safe_upload_and_index_document(
+                    filename="Unknown.docx",
+                    file_stream=BytesIO(b"not-a-real-docx"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    confirm_warnings=True,
+                    selected_country_code="XX",
+                )
+
+
+class ManualCountryDocxRoundtripTests(unittest.TestCase):
+    """
+    Mission "ORDER 8E-A1", sections 10/12/13 - the full manual-country
+    invariant: a countryless DOCX, once the Admin selects a country,
+    must have that choice persisted INSIDE the DOCX itself (a DOCX-
+    native marker), surviving Download, a fresh independent parse, a
+    full Reindex, and a later re-upload - with no external state
+    anywhere.
+    """
+
+    def test_selecting_a_country_embeds_the_marker_and_uploads(
+        self,
+    ) -> None:
+        countryless_bytes = _real_docx_bytes(
+            [
+                "Some heading with no recognizable country.",
+                "01. Hiring Practices",
+                "Content about hiring rules and probation periods.",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            built_chunks = []
+
+            def capturing_chunk_builder(path):
+                chunks = build_document_chunks_from_docx(path)
+                built_chunks.extend(chunks)
+                return chunks
+
+            response = safe_upload_and_index_document(
+                filename="mystery.docx",
+                file_stream=BytesIO(countryless_bytes),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1_000_000,
+                confirm_warnings=True,
+                selected_country_code="fr",
+                chunk_builder=capturing_chunk_builder,
+                country_document_lookup=lambda code, client: [],
+                country_document_indexer=_fake_indexer,
+            )
+
+            self.assertEqual(response.status, "uploaded")
+            self.assertEqual(response.country_code, "FR")
+
+            stored_path = source_directory / "FR.docx"
+            self.assertTrue(stored_path.exists())
+
+            marker = read_country_marker(stored_path)
+            self.assertIsNotNone(marker)
+            self.assertEqual(marker.country_code, "FR")
+
+            # Mission "ORDER 8E-A2" real-browser finding: the marker-
+            # embedding candidate lives in its own subdirectory, never
+            # under a disambiguating filename prefix - chunk_builder
+            # reads source_filename straight from the candidate path's
+            # own name, which is then indexed and shown to the Admin
+            # verbatim, so it must stay exactly the original sanitized
+            # upload name, never leak an internal artifact like
+            # "country-marker.mystery.docx".
+            self.assertEqual(response.source_filename, "mystery.docx")
+            self.assertTrue(built_chunks)
+            self.assertTrue(
+                all(
+                    chunk.source_filename == "mystery.docx"
+                    for chunk in built_chunks
+                ),
+                [chunk.source_filename for chunk in built_chunks],
+            )
+
+    def test_full_manual_country_roundtrip_invariant(self) -> None:
+        # countryless -> select FR -> marker written -> Download ->
+        # fresh independent parse -> FR -> full Reindex -> still FR ->
+        # re-upload -> detects FR -> asks to confirm FR, no external
+        # state anywhere (mission section 12).
+        countryless_bytes = _real_docx_bytes(
+            [
+                "Some heading with no recognizable country.",
+                "01. Hiring Practices",
+                "Content about hiring rules and probation periods.",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            first = safe_upload_and_index_document(
+                filename="mystery.docx",
+                file_stream=BytesIO(countryless_bytes),
+                source_directory=source_directory,
+                processed_directory=processed_directory,
+                maximum_bytes=1_000_000,
+                confirm_warnings=True,
+                selected_country_code="fr",
+                chunk_builder=build_document_chunks_from_docx,
+                country_document_lookup=lambda code, client: [],
+                country_document_indexer=_fake_indexer,
+            )
+            self.assertEqual(first.status, "uploaded")
+
+            stored_path = source_directory / "FR.docx"
+
+            # "Download" = read the stored bytes back out.
+            downloaded_bytes = stored_path.read_bytes()
+
+            # A fresh, completely independent parse (no marker-writing
+            # involved at all) still resolves FR from the marker.
+            fresh_metadata = metadata_from_content(stored_path)
+            self.assertEqual(fresh_metadata.country_code, "FR")
+
+            # A full Reindex re-parses the very same stored file.
+            reindexed_chunks = build_document_chunks_from_docx(
+                stored_path
+            )
+            self.assertTrue(reindexed_chunks)
+            self.assertTrue(
+                all(
+                    chunk.country_code == "FR"
+                    for chunk in reindexed_chunks
+                )
+            )
+
+            # Re-upload the downloaded bytes with no manual selection
+            # this time - the marker alone must still detect FR and
+            # require confirmation, never external state.
+            existing = [
+                ExistingCountryDocument(
+                    document_id=first.document_id,
+                    source_filename="FR.docx",
+                    country="France",
+                    country_code="FR",
+                    reference_year=None,
+                )
+            ]
+
+            with self.assertRaises(
+                AdminDocumentCountryConfirmationRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="mystery.docx",
+                    file_stream=BytesIO(downloaded_bytes),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1_000_000,
+                    confirm_warnings=True,
+                    chunk_builder=build_document_chunks_from_docx,
+                    country_document_lookup=(
+                        lambda code, client: existing
+                    ),
+                )
+
+            self.assertEqual(context.exception.country_code, "FR")
+            self.assertEqual(
+                context.exception.detection_source, "marker"
+            )
+
+    def test_manual_selection_marker_embed_never_touches_disk_on_a_later_hard_failure(
+        self,
+    ) -> None:
+        # If a later stage after marker-embedding hard-fails (here:
+        # the country is fresh but the topic warning is declined), the
+        # embed happened only inside the request's own staging
+        # TemporaryDirectory - nothing was ever written to
+        # source_directory.
+        countryless_bytes = _real_docx_bytes(
+            ["Some heading with no recognizable country."]
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+
+            with self.assertRaises(
+                AdminDocumentWarningConfirmationRequiredError
+            ):
+                safe_upload_and_index_document(
+                    filename="mystery.docx",
+                    file_stream=BytesIO(countryless_bytes),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1_000_000,
+                    confirm_warnings=False,
+                    selected_country_code="fr",
+                    chunk_builder=build_document_chunks_from_docx,
+                    country_document_lookup=lambda code, client: [],
+                    country_document_indexer=(
+                        lambda **kwargs: (_ for _ in ()).throw(
+                            AssertionError("indexer must not run")
+                        )
+                    ),
+                )
+
+            self.assertEqual(
+                list(real_source_entries(source_directory)),
+                [],
+            )
+
+
+class CountryConflictReviewCandidateTests(unittest.TestCase):
+    """
+    Mission "ORDER 8E-A1", section 22 - the conflict review exposes
+    only safe, business-facing per-candidate fields (filename, year,
+    last-updated, file size); document_id is present only as an
+    internal identity, never required for the Admin to read.
+    """
+
+    def test_candidates_expose_only_safe_fields_with_real_file_stats(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            # Both use distinct, non-canonical legacy names - the
+            # canonical AU.docx candidate resolve_document_source_path
+            # always also tries would otherwise falsely collide with
+            # either one's own resolution (see
+            # document_source_resolver.py: the canonical name is a
+            # fallback candidate for every document of a country, not
+            # just its own current record).
+            first_path = source_directory / "Australia-2024.docx"
+            second_path = source_directory / "Australia-legacy-v2.docx"
+            first_path.write_bytes(b"first-australia-content")
+            second_path.write_bytes(b"second-australia-content-longer")
+
+            existing = [
+                ExistingCountryDocument(
+                    document_id=AU_OLD_ID,
+                    source_filename=first_path.name,
+                    country="Australia",
+                    country_code="AU",
+                    reference_year=2024,
+                ),
+                ExistingCountryDocument(
+                    document_id="doc_" + "c" * 64,
+                    source_filename=second_path.name,
+                    country="Australia",
+                    country_code="AU",
+                    reference_year=2026,
+                ),
+            ]
+
+            with self.assertRaises(
+                AdminDocumentCountryConflictReviewRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia-new.docx",
+                    file_stream=BytesIO(b"new-australia"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    confirm_warnings=True,
+                    country_confirmed=True,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=(
+                        lambda code, client: existing
+                    ),
+                )
+
+            detail = context.exception.to_detail()
+            self.assertEqual(
+                detail["code"],
+                "document_country_conflict_review_required",
+            )
+            candidates = {
+                candidate["source_filename"]: candidate
+                for candidate in detail["candidates"]
+            }
+            self.assertEqual(
+                set(candidates),
+                {"Australia-2024.docx", "Australia-legacy-v2.docx"},
+            )
+            self.assertEqual(
+                candidates["Australia-2024.docx"]["reference_year"],
+                2024,
+            )
+            self.assertEqual(
+                candidates["Australia-2024.docx"]["source_bytes"],
+                len(b"first-australia-content"),
+            )
+            self.assertIsNotNone(
+                candidates["Australia-2024.docx"]["updated_at"]
+            )
+            # document_id is present (needed for a hidden
+            # CHOOSE_DOCUMENT reference) but every candidate here still
+            # carries its own safe display fields alongside it.
+            self.assertIn(
+                "document_id",
+                candidates["Australia-legacy-v2.docx"],
             )
 
 

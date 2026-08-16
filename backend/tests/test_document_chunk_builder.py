@@ -23,6 +23,7 @@ from app.services.document_chunk_builder import (
     metadata_from_content,
     validate_docx_format,
 )
+from app.services.docx_country_marker import write_country_marker
 from app.services.docx_parser import ParsedSection
 
 
@@ -1111,6 +1112,162 @@ class RealDocumentStructureTests(unittest.TestCase):
             matching_chunks[0].section,
             "06. Social Media and Data Privacy in the USA",
         )
+
+
+class CountryMarkerPriorityTests(unittest.TestCase):
+    """
+    Mission "ORDER 8E-A1", section 11 - a valid DOCX-native country
+    marker always takes priority over content detection, but never
+    prevents content from being scanned for a reference_year, and
+    never disturbs detection for a document that has no marker at all
+    (every one of the 33 real production documents today).
+    """
+
+    def test_marker_resolves_a_document_with_no_detectable_country(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            countryless = _build_docx(
+                Path(directory),
+                ["Some heading with no recognizable country."],
+                body_paragraphs=["Body content."],
+            )
+
+            with self.assertRaises(UndeterminableDocumentCountryError):
+                metadata_from_content(countryless)
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                countryless,
+                marked,
+                country_code="fr",
+                country_name="France",
+            )
+
+            metadata = metadata_from_content(marked)
+
+            self.assertEqual(metadata.country_code, "FR")
+            self.assertEqual(metadata.country, "France")
+
+    def test_marker_wins_even_when_content_would_detect_differently(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Canada"],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                file_path,
+                marked,
+                country_code="de",
+                country_name="Germany",
+            )
+
+            metadata = metadata_from_content(marked)
+
+            self.assertEqual(metadata.country_code, "DE")
+
+    def test_marker_does_not_prevent_year_detection_from_content(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            # "Elbonia" is title-shaped but not a real registered
+            # country - content detection alone would fail here
+            # (UnknownCountryNameError, silently skipped), yet the
+            # year itself is still worth capturing once a marker has
+            # already settled the country from elsewhere.
+            countryless_with_year = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Elbonia 2027"],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                countryless_with_year,
+                marked,
+                country_code="jp",
+                country_name="Japan",
+            )
+
+            metadata = metadata_from_content(marked)
+
+            self.assertEqual(metadata.country_code, "JP")
+            self.assertEqual(metadata.reference_year, 2027)
+
+    def test_documents_without_a_marker_are_completely_unaffected(
+        self,
+    ) -> None:
+        # Every one of the 33 real production documents has no marker
+        # at all - detection for them must be byte-for-byte the same
+        # code path as before this mission.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Employment Law Overview Spain 2026"],
+            )
+
+            metadata = metadata_from_content(file_path)
+
+            self.assertEqual(metadata.country_code, "ES")
+            self.assertEqual(metadata.reference_year, 2026)
+
+    def test_explicit_country_code_mismatch_against_a_marker_is_rejected(
+        self,
+    ) -> None:
+        # Reuses the same CountryMetadataMismatchError contract a
+        # caller-supplied country_code already gets against content
+        # detection (see admin_document_sections.py's re-validation) -
+        # a marker is not a special case exempt from that check.
+        with TemporaryDirectory() as directory:
+            file_path = _build_docx(
+                Path(directory),
+                ["Some heading with no recognizable country."],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                file_path,
+                marked,
+                country_code="fr",
+                country_name="France",
+            )
+
+            with self.assertRaises(CountryMetadataMismatchError):
+                metadata_from_content(marked, country_code="DE")
+
+    def test_marker_survives_full_chunk_building_end_to_end(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            countryless = _build_docx(
+                Path(directory),
+                ["Some heading with no recognizable country."],
+                body_paragraphs=[
+                    "01. Hiring Practices",
+                    "Content about hiring.",
+                ],
+            )
+
+            marked = Path(directory) / "marked.docx"
+            write_country_marker(
+                countryless,
+                marked,
+                country_code="be",
+                country_name="Belgium",
+            )
+
+            chunks = build_document_chunks_from_docx(marked)
+
+            self.assertTrue(chunks)
+            self.assertTrue(
+                all(
+                    chunk.country_code == "BE"
+                    for chunk in chunks
+                )
+            )
 
 
 if __name__ == "__main__":

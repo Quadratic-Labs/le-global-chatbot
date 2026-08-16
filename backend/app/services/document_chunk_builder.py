@@ -26,6 +26,7 @@ from app.core.subsection_taxonomy import (
     get_subsection_topic_override,
 )
 from app.models.document import DocumentChunk
+from app.services.docx_country_marker import read_country_marker
 from app.services.docx_parser import (
     ParsedSection,
     build_contact_chunk_content,
@@ -434,6 +435,39 @@ def _match_title_line(
     return None
 
 
+def _detect_year_only_from_content(
+    file_path: Path,
+) -> int | None:
+    """
+    Best-effort reference_year from the document's own title/cover
+    content, independent of whether a country resolves there at all.
+
+    Used only when a DOCX-native country marker (see
+    docx_country_marker.py) already settled the country - the marker
+    takes priority for country (mission "ORDER 8E-A1", section 11),
+    but a title line's year is still worth capturing rather than
+    losing it just because country resolution is skipped.
+    """
+
+    lines = _leading_front_matter_blocks(file_path)
+
+    for index, line in enumerate(lines):
+        next_line = (
+            lines[index + 1] if index + 1 < len(lines) else None
+        )
+        candidate = _match_title_line(line, next_line)
+
+        if candidate is None:
+            continue
+
+        _, year = candidate
+
+        if year is not None:
+            return year
+
+    return None
+
+
 def _detect_country_and_year_from_content(
     file_path: Path,
     country_code: str | None = None,
@@ -442,6 +476,16 @@ def _detect_country_and_year_from_content(
     Resolve (country, country_code, reference_year) from the
     document's own title/cover content - never from its filename.
 
+    A valid DOCX-native country marker (see docx_country_marker.py)
+    always takes priority over content detection (mission "ORDER
+    8E-A1", section 11): an Admin's manually-selected country, once
+    persisted into the DOCX itself, must keep being recognized on
+    every future Download/Reindex/re-upload, even if the document's
+    own content still can't be resolved to a country on its own. The
+    marker only ever settles *which* country was detected - it is
+    never a bypass of the confirmation the upload flow always
+    requires (see admin_document_replacement.py).
+
     Only the leading front matter is scanned (see
     _leading_front_matter_blocks). Candidates are deduplicated by
     resolved country *code*, not raw text, so trivially different
@@ -449,6 +493,25 @@ def _detect_country_and_year_from_content(
     one distinct country code found there - a genuinely ambiguous
     cover - is refused rather than guessed at (section 7).
     """
+
+    marker = read_country_marker(file_path)
+
+    if marker is not None:
+        # Reuses resolve_country's own caller-supplied-code mismatch
+        # check (CountryMetadataMismatchError) rather than duplicating
+        # it - marker.country_name is already a canonical registry
+        # display name, so this always resolves back to
+        # marker.country_code when country_code is None.
+        country, resolved_code = resolve_country(
+            raw_country=marker.country_name,
+            country_code=country_code,
+        )
+
+        return (
+            country,
+            resolved_code,
+            _detect_year_only_from_content(file_path),
+        )
 
     lines = _leading_front_matter_blocks(file_path)
 

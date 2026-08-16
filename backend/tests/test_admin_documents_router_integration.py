@@ -336,6 +336,8 @@ class FreshUploadHttpContractTests(AdminRouterIntegrationTestCase):
             file=upload,
             replace_existing=False,
             confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
 
         self.assertEqual(response.status, "uploaded")
@@ -353,6 +355,8 @@ class FreshUploadHttpContractTests(AdminRouterIntegrationTestCase):
             file=_make_upload_file("Argentina.docx", _AR_BYTES),
             replace_existing=False,
             confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
         self.assertEqual(first.status, "uploaded")
 
@@ -371,6 +375,8 @@ class FreshUploadHttpContractTests(AdminRouterIntegrationTestCase):
             ),
             replace_existing=False,
             confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
 
         self.assertEqual(second.status, "uploaded")
@@ -401,6 +407,8 @@ class ExistingCountryHttpContractTests(AdminRouterIntegrationTestCase):
                 file=_make_upload_file("Argentina.docx", _AR_BYTES),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         error = context.exception
@@ -430,6 +438,8 @@ class ExistingCountryHttpContractTests(AdminRouterIntegrationTestCase):
                 ),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         error = context.exception
@@ -692,6 +702,8 @@ class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
                 ),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         self.assertEqual(context.exception.status_code, 422)
@@ -706,6 +718,8 @@ class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
                 file=_make_upload_file("Argentina.docx", b""),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         self.assertEqual(context.exception.status_code, 422)
@@ -726,6 +740,8 @@ class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
                     ),
                     replace_existing=False,
                     confirm_warnings=True,
+                    country_confirmed=True,
+                    selected_country_code=None,
                 )
         finally:
             os.environ.pop("DOCUMENT_UPLOAD_MAX_BYTES", None)
@@ -745,6 +761,8 @@ class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
                 ),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         self.assertEqual(context.exception.status_code, 422)
@@ -752,9 +770,14 @@ class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
             context.exception.detail["code"], "document_corrupt"
         )
 
-    def test_no_identifiable_country_returns_country_undetermined(
+    def test_no_identifiable_country_returns_selection_required(
         self,
     ) -> None:
+        # Mission "ORDER 8E-A1", section 8: an otherwise-processable
+        # DOCX with no identifiable country is no longer a hard
+        # 422 failure - it is a 409 SELECT_COUNTRY decision carrying
+        # the allowed country list (superseded from "ORDER 3"'s
+        # original document_country_undetermined/422 expectation).
         no_country_bytes = _build_real_docx_bytes(
             "Some random legal memo with no title structure."
         )
@@ -766,13 +789,17 @@ class TechnicalValidationHttpContractTests(AdminRouterIntegrationTestCase):
                 ),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
-        self.assertEqual(context.exception.status_code, 422)
+        self.assertEqual(context.exception.status_code, 409)
+        detail = context.exception.detail
         self.assertEqual(
-            context.exception.detail["code"],
-            "document_country_undetermined",
+            detail["code"],
+            "document_country_selection_required",
         )
+        self.assertTrue(detail["allowed_countries"])
 
 
 class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
@@ -903,6 +930,8 @@ class SharedInvariantHelperUsageTests(AdminRouterIntegrationTestCase):
             file=_make_upload_file("Argentina.docx", _AR_BYTES),
             replace_existing=False,
             confirm_warnings=True,
+            country_confirmed=True,
+            selected_country_code=None,
         )
 
         catalog = documents_router.get_admin_documents()
@@ -950,6 +979,8 @@ class SharedInvariantHelperUsageTests(AdminRouterIntegrationTestCase):
                 ),
                 replace_existing=False,
                 confirm_warnings=True,
+                country_confirmed=True,
+                selected_country_code=None,
             )
 
         after = [

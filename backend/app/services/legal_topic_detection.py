@@ -17,6 +17,7 @@ from app.services.legal_topic_taxonomy import (
 __all__ = [
     "CANONICAL_LEGAL_TOPICS",
     "TOPIC_RULES",
+    "detect_document_legal_topics",
 ]
 
 
@@ -97,6 +98,69 @@ def _normalize_topics(
         )
 
     return normalized_topics
+
+
+MIN_DOCUMENT_TOPIC_WORDS: Final[int] = 2
+
+
+def detect_document_legal_topics(
+    question: str,
+    document_topics: Sequence[str],
+) -> list[str]:
+    """
+    Deterministically detect LIVE document legal_topic titles (mission
+    "ORDER 8F-A") explicitly named in a question.
+
+    Distinct from detect_legal_topics: that function matches a fixed
+    set of canonical CONCEPT phrases against CANONICAL_LEGAL_TOPICS
+    (legal_topic_taxonomy.py) and never changes with the indexed
+    corpus. This one matches the actual, currently-indexed section
+    title text itself - including any Admin-created custom section -
+    supplied by the caller (see legal_catalog.get_document_legal_topics_
+    by_country), never invented or guessed here.
+
+    Deliberately conservative and exact: a document topic is detected
+    only when its full normalized title appears verbatim as a
+    substring of the normalized question - never a fuzzy/partial/
+    single-word match. This must survive being the ONLY signal
+    available when RequestUnderstanding's own LLM call fails entirely
+    (see routers/chat.py's _resolve_conservative_fallback), so it never
+    depends on the model succeeding.
+    """
+
+    normalized_question = _normalize_text(
+        question
+    )
+
+    if not normalized_question:
+        return []
+
+    detected_topics: list[str] = []
+    seen_topics: set[str] = set()
+
+    for topic in document_topics:
+        if topic in seen_topics:
+            continue
+
+        normalized_topic = _normalize_text(
+            topic
+        )
+
+        if not normalized_topic:
+            continue
+
+        # A single common word (e.g. a one-word canonical topic that
+        # also happens to be indexed as its own legal_topic) is never
+        # enough to deterministically claim an explicit title match -
+        # only a genuinely multi-word, specific section title is.
+        if len(normalized_topic.split()) < MIN_DOCUMENT_TOPIC_WORDS:
+            continue
+
+        if normalized_topic in normalized_question:
+            seen_topics.add(topic)
+            detected_topics.append(topic)
+
+    return detected_topics
 
 
 def detect_legal_topics(

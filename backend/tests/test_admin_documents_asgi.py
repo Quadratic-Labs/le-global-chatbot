@@ -506,6 +506,7 @@ class FreshUploadAsgiTests(AdminAsgiTestCase):
             extra_fields={
                 "replace_existing": "false",
                 "confirm_warnings": "true",
+                "country_confirmed": "true",
             },
         )
 
@@ -550,6 +551,7 @@ class ExistingCountryAsgiTests(AdminAsgiTestCase):
             extra_fields={
                 "replace_existing": "false",
                 "confirm_warnings": "true",
+                "country_confirmed": "true",
             },
         )
 

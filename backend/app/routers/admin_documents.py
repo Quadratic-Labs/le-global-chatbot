@@ -40,7 +40,11 @@ from app.services.admin_documents import (
 )
 from app.services.admin_document_replacement import (
     AdminDocumentAlreadyCurrentError,
+    AdminDocumentCountryConfirmationRequiredError,
+    AdminDocumentCountryConflictReviewRequiredError,
     AdminDocumentCountryNotAllowedError,
+    AdminDocumentCountrySelectionInvalidError,
+    AdminDocumentCountrySelectionRequiredError,
     AdminDocumentReplacementRequiredError,
     AdminDocumentWarningConfirmationRequiredError,
     safe_upload_and_index_document,
@@ -139,6 +143,8 @@ def upload_admin_document(
     file: UploadFile = File(...),
     replace_existing: bool = Form(False),
     confirm_warnings: bool = Form(False),
+    country_confirmed: bool = Form(False),
+    selected_country_code: str | None = Form(None),
 ) -> AdminDocumentUploadResponse:
     """Validate, persist, and index one DOCX document."""
 
@@ -159,7 +165,15 @@ def upload_admin_document(
             ),
             replace_existing=replace_existing,
             confirm_warnings=confirm_warnings,
+            country_confirmed=country_confirmed,
+            selected_country_code=selected_country_code,
         )
+
+    except AdminDocumentCountryConflictReviewRequiredError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
 
     except AdminDocumentWarningConfirmationRequiredError as error:
         raise HTTPException(
@@ -176,6 +190,32 @@ def upload_admin_document(
     except AdminDocumentAlreadyCurrentError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentCountryConfirmationRequiredError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentCountrySelectionRequiredError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentCountrySelectionInvalidError as error:
+        log_admin_business_error(
+            operation="upload",
+            error=error,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
             detail=error.to_detail(),
         ) from error
 

@@ -259,6 +259,7 @@ function installFakeDom({
     const fakeDropzone = new FakeElement();
     const fakeSearchInput = makeFakeGenericElement();
     const fakeStatusFilter = makeFakeGenericElement();
+    const fakeConflictReviewContainer = new FakeElement();
 
     const fakeForm = {
         // Deliberately NOT a URL string, exactly like a real browser:
@@ -277,6 +278,16 @@ function installFakeDom({
             refreshNonce: "test-refresh-nonce",
             reindexAction: "le_global_chatbot_reindex_document",
             deleteAction: "le_global_chatbot_delete_document",
+            conflictReviewAction: "le_global_chatbot_conflict_review",
+            conflictReviewNonce: "test-conflict-review-nonce",
+            resolveConflictAction: "le_global_chatbot_resolve_conflict",
+            resolveConflictNonce: "test-resolve-conflict-nonce",
+            resolveConflictReplaceAction: (
+                "le_global_chatbot_resolve_conflict_replace"
+            ),
+            resolveConflictReplaceNonce: (
+                "test-resolve-conflict-replace-nonce"
+            ),
         },
         getAttribute(name) {
             if (name === "action") {
@@ -320,6 +331,7 @@ function installFakeDom({
         "le-global-dropzone": fakeDropzone,
         "le-global-documents-search": fakeSearchInput,
         "le-global-documents-status-filter": fakeStatusFilter,
+        "le-global-conflict-review": fakeConflictReviewContainer,
     };
 
     global.document = {
@@ -357,6 +369,7 @@ function installFakeDom({
         fakeDropzone,
         fakeSearchInput,
         fakeStatusFilter,
+        fakeConflictReviewContainer,
     };
 }
 
@@ -405,12 +418,12 @@ test("errorMessage uses the structured data.message when present", () => {
 test("errorMessage falls back to the generic text only when no usable message exists", () => {
     assert.equal(
         errorMessage({ success: false, data: {} }),
-        "The document could not be indexed."
+        "The document could not be added."
     );
-    assert.equal(errorMessage(null), "The document could not be indexed.");
+    assert.equal(errorMessage(null), "The document could not be added.");
     assert.equal(
         errorMessage({ success: false, data: { message: "   " } }),
-        "The document could not be indexed."
+        "The document could not be added."
     );
 });
 
@@ -712,10 +725,14 @@ describe("detectConflictedCountryCodes", () => {
 
 describe("computeDisplayStatus", () => {
     test("a country conflict always wins, regardless of the document's own status", () => {
+        // Mission "ORDER 8E-A2", section 20 - superseded from "Needs
+        // attention" to the more actionable "Action required" wording,
+        // since a conflict always has a Review path (unlike a
+        // generically missing/unreadable source).
         const status = computeDisplayStatus({ status: "indexed" }, true);
 
         assert.equal(status.value, "needs_attention");
-        assert.equal(status.label, "Needs attention");
+        assert.equal(status.label, "Action required");
     });
 
     test("status 'indexed' with no conflict is Ready", () => {
@@ -940,6 +957,13 @@ describe("upload queue flow", () => {
             fetchCalls.push({
                 replaceExisting: options.body.get("replace_existing"),
                 confirmWarnings: options.body.get("confirm_warnings"),
+                countryConfirmed: options.body.get("country_confirmed"),
+                selectedCountryCode: options.body.get(
+                    "selected_country_code"
+                ),
+                action: options.body.get("action"),
+                nonce: options.body.get("_wpnonce"),
+                countryCode: options.body.get("country_code"),
             });
 
             const response = responses[Math.min(call, responses.length - 1)];
@@ -1271,7 +1295,7 @@ describe("upload queue flow", () => {
             assert.equal(snapshot()[0].status, "failed");
             assert.equal(
                 snapshot()[0].message,
-                "The document could not be indexed."
+                "The document could not be added."
             );
         }
     );
@@ -1820,6 +1844,723 @@ describe("upload queue flow", () => {
             assert.equal(snapshot()[0].status, "indexed");
         }
     );
+
+    // --- ORDER 8E-A2: country confirmation / selection / conflict-replace ---
+
+    test(
+        "409 country_confirmation_required -> awaiting_country_confirmation with country name+code, Cancel makes zero further requests",
+        async () => {
+            installFilesAndLoad([makeFakeFile("belgium.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "This document was detected as Belgium (BE). Confirm the country before it is processed further.",
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "BE",
+                                country_name: "Belgium",
+                                allowed_countries: [
+                                    { code: "BE", name: "Belgium" },
+                                    { code: "FR", name: "France" },
+                                ],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_confirmation"
+            );
+            assert.equal(snapshot()[0].detail.country_name, "Belgium");
+            assert.equal(snapshot()[0].detail.country_code, "BE");
+
+            moduleExports.__queueForTests.resolveDecision(0, "cancel");
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "cancelled");
+        }
+    );
+
+    test(
+        "confirm-country resubmits with country_confirmed=1 and reaches Ready",
+        async () => {
+            installFilesAndLoad([makeFakeFile("belgium.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "BE",
+                                country_name: "Belgium",
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "ok", status: "uploaded" },
+                    },
+                },
+            ]);
+
+            await submit();
+            moduleExports.__queueForTests.resolveDecision(0, "confirm-country");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(fetchCalls[0].countryConfirmed, null);
+            assert.equal(fetchCalls[1].countryConfirmed, "1");
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    test(
+        "'Choose a different country' switches to the selection panel with no request fired, and Back restores the confirmation panel",
+        async () => {
+            installFilesAndLoad([makeFakeFile("belgium.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "BE",
+                                country_name: "Belgium",
+                                allowed_countries: [
+                                    { code: "BE", name: "Belgium" },
+                                    { code: "FR", name: "France" },
+                                ],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            moduleExports.__queueForTests.resolveDecision(0, "change-country");
+
+            assert.equal(
+                fetchCalls.length,
+                1,
+                "switching to manual selection must never itself submit anything"
+            );
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_selection"
+            );
+            assert.deepEqual(
+                snapshot()[0].allowedCountries.map((c) => c.code),
+                ["BE", "FR"]
+            );
+
+            moduleExports.__queueForTests.resolveDecision(
+                0,
+                "back-to-confirmation"
+            );
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_confirmation"
+            );
+            assert.equal(snapshot()[0].detail.country_name, "Belgium");
+        }
+    );
+
+    test(
+        "409 document_country_selection_required (no country detected) shows friendly copy and a select decision, empty selection never submits",
+        async () => {
+            installFilesAndLoad([makeFakeFile("mystery.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: (
+                                "We couldn't identify the country automatically."
+                            ),
+                            detail: {
+                                code: "document_country_selection_required",
+                                allowed_countries: [
+                                    { code: "FR", name: "France" },
+                                    { code: "DE", name: "Germany" },
+                                ],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_selection"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(
+                0,
+                "select-country",
+                ""
+            );
+
+            assert.equal(
+                fetchCalls.length,
+                1,
+                "an empty selection must never be submitted to the backend"
+            );
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_selection"
+            );
+            assert.ok(snapshot()[0].selectionError);
+        }
+    );
+
+    test(
+        "selecting a country resubmits with selected_country_code and reaches Ready",
+        async () => {
+            installFilesAndLoad([makeFakeFile("mystery.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_selection_required",
+                                allowed_countries: [
+                                    { code: "FR", name: "France" },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "ok", status: "uploaded" },
+                    },
+                },
+            ]);
+
+            await submit();
+            moduleExports.__queueForTests.resolveDecision(
+                0,
+                "select-country",
+                "FR"
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(fetchCalls[1].selectedCountryCode, "FR");
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    test(
+        "422 document_country_selection_invalid on retry keeps the selection panel open with the real backend reason",
+        async () => {
+            installFilesAndLoad([makeFakeFile("mystery.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_selection_required",
+                                allowed_countries: [
+                                    { code: "ZZ", name: "Nowhere" },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: false,
+                    status: 422,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "Nowhere (ZZ) is not currently accepted for new document uploads.",
+                            detail: {
+                                code: "document_country_selection_invalid",
+                                allowed_countries: [
+                                    { code: "ZZ", name: "Nowhere" },
+                                ],
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+            moduleExports.__queueForTests.resolveDecision(
+                0,
+                "select-country",
+                "ZZ"
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_selection"
+            );
+            assert.equal(
+                snapshot()[0].selectionError,
+                "That country is not supported. Please choose another one."
+            );
+        }
+    );
+
+    test(
+        "a confirmed country is carried forward on every later resubmission, not only the round that first produced it (regression test - country confirmation was previously lost on the following decision)",
+        async () => {
+            installFilesAndLoad([makeFakeFile("belgium.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "BE",
+                                country_name: "Belgium",
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_warning_confirmation_required",
+                                replacement_required: false,
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "ok", status: "uploaded" },
+                    },
+                },
+            ]);
+
+            await submit();
+            moduleExports.__queueForTests.resolveDecision(0, "confirm-country");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_warning_confirmation"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(0, "continue");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 3);
+            assert.equal(
+                fetchCalls[2].countryConfirmed,
+                "1",
+                "the earlier country confirmation must still be present on this later resubmission"
+            );
+            assert.equal(fetchCalls[2].confirmWarnings, "1");
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    test(
+        "a hard technical failure never offers a Continue option, distinct from a content warning",
+        async () => {
+            const dom = installFilesAndLoad([makeFakeFile("corrupt.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 500,
+                    payload: undefined,
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(snapshot()[0].status, "failed");
+            assert.doesNotMatch(
+                dom.fakeQueueContainer.innerHTML,
+                /Continue anyway/
+            );
+            assert.doesNotMatch(
+                dom.fakeQueueContainer.innerHTML,
+                /data-decision="continue"/
+            );
+        }
+    );
+
+    test(
+        "independent per-file decisions: resolving one file's country confirmation never touches a sibling file's own request or status",
+        async () => {
+            installFilesAndLoad([
+                makeFakeFile("belgium.docx"),
+                makeFakeFile("chile.docx"),
+            ]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "BE",
+                                country_name: "Belgium",
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "ok", status: "uploaded" },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: { message: "ok", status: "uploaded" },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_confirmation"
+            );
+            assert.equal(snapshot()[1].status, "indexed");
+
+            moduleExports.__queueForTests.resolveDecision(0, "confirm-country");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(
+                fetchCalls.length,
+                3,
+                "only the resolved file may fire a new request"
+            );
+            assert.equal(snapshot()[0].status, "indexed");
+            assert.equal(
+                snapshot()[1].status,
+                "indexed",
+                "the sibling file's already-settled status must be untouched"
+            );
+        }
+    );
+
+    test(
+        "REPLACE_WITH_DOCUMENT: the very first attempt already targets the conflict-resolution proxy action, never the plain upload action (regression test for a race between enqueueFiles's synchronous pumpQueue and setting resolveConflictCountryCode)",
+        async () => {
+            installFilesAndLoad([]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "CZ",
+                                country_name: "Czech Republic",
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            moduleExports.__queueForTests.enqueueConflictReplacement(
+                "CZ",
+                makeFakeFile("czech-authoritative.docx")
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                fetchCalls[0].action,
+                "le_global_chatbot_resolve_conflict_replace",
+                "must never fall back to the plain upload action"
+            );
+            assert.equal(
+                fetchCalls[0].nonce,
+                "test-resolve-conflict-replace-nonce",
+                "must read the nonce fresh from the DOM, never a still-null cached config"
+            );
+            assert.equal(fetchCalls[0].countryCode, "CZ");
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_country_confirmation"
+            );
+        }
+    );
+
+    test(
+        "REPLACE_WITH_DOCUMENT: confirming the country resubmits to the same proxy action with country_confirmed=1 and reaches Ready",
+        async () => {
+            installFilesAndLoad([]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            detail: {
+                                code: "document_country_confirmation_required",
+                                country_code: "CZ",
+                                country_name: "Czech Republic",
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 200,
+                    payload: {
+                        success: true,
+                        data: { status: "replaced", country_code: "CZ" },
+                    },
+                },
+            ]);
+
+            moduleExports.__queueForTests.enqueueConflictReplacement(
+                "CZ",
+                makeFakeFile("czech-authoritative.docx")
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            moduleExports.__queueForTests.resolveDecision(0, "confirm-country");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(
+                fetchCalls[1].action,
+                "le_global_chatbot_resolve_conflict_replace"
+            );
+            assert.equal(fetchCalls[1].countryConfirmed, "1");
+            assert.equal(fetchCalls[1].countryCode, "CZ");
+            assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+});
+
+// --- ORDER 8E-A2: country-conflict review panel -----------------------
+//
+// openConflictReview/handleConflictAction/closeConflictReview always
+// read their action/nonce fresh from the DOM (getAdminFormConfig), so
+// Review can be resolved before any AJAX refresh has ever populated
+// the module-level adminFormConfig cache - see the regression tests
+// above for the upload-side version of that same bug.
+
+describe("conflict review panel", () => {
+    afterEach(() => {
+        delete global.document;
+        delete global.window;
+        delete global.FormData;
+        delete global.fetch;
+        delete require.cache[require.resolve(ADMIN_JS_PATH)];
+    });
+
+    function load() {
+        const dom = installFakeDom({});
+        global.window.confirm = () => true;
+        global.window.alert = () => {};
+
+        return { dom, moduleExports: loadFreshAdminModule() };
+    }
+
+    test("open() with a successful GET populates the review and moves to the list stage", async () => {
+        const { moduleExports } = load();
+
+        global.fetch = async (url) => {
+            assert.match(url, /action=le_global_chatbot_conflict_review/);
+            assert.match(url, /country_code=NO/);
+
+            return makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        resolution_mode: "AUTO_DEDUPLICATE",
+                        candidates: [],
+                    },
+                },
+            });
+        };
+
+        await moduleExports.__conflictReviewForTests.open("NO", "Norway");
+
+        const state = moduleExports.__conflictReviewForTests.getState();
+
+        assert.equal(state.stage, "list");
+        assert.equal(state.review.resolution_mode, "AUTO_DEDUPLICATE");
+    });
+
+    test("open() when the GET fails moves to the error stage with a business-friendly message, never a raw backend error", async () => {
+        const { moduleExports } = load();
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 503,
+            payload: undefined,
+        });
+
+        await moduleExports.__conflictReviewForTests.open("NO", "Norway");
+
+        const state = moduleExports.__conflictReviewForTests.getState();
+
+        assert.equal(state.stage, "error");
+        assert.ok(state.error);
+    });
+
+    test("close() clears the review state entirely", async () => {
+        const { moduleExports } = load();
+
+        global.fetch = async () => makeFakeResponse({
+            ok: true,
+            status: 200,
+            payload: { success: true, data: { candidates: [] } },
+        });
+
+        await moduleExports.__conflictReviewForTests.open("NO", "Norway");
+        moduleExports.__conflictReviewForTests.close();
+
+        assert.equal(moduleExports.__conflictReviewForTests.getState(), null);
+    });
+
+    test("'Fix duplicate' (AUTO_DEDUPLICATE) posts the resolution mode and moves to resolved on success", async () => {
+        const { moduleExports } = load();
+
+        global.fetch = async (url, options) => {
+            if (!options) {
+                return makeFakeResponse({
+                    ok: true,
+                    status: 200,
+                    payload: { success: true, data: { candidates: [] } },
+                });
+            }
+
+            assert.equal(
+                options.body.toString(),
+                "action=le_global_chatbot_resolve_conflict"
+                    + "&nonce=test-resolve-conflict-nonce"
+                    + "&country_code=NO"
+                    + "&resolution_mode=AUTO_DEDUPLICATE"
+            );
+
+            return makeFakeResponse({
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { status: "resolved" } },
+            });
+        };
+
+        await moduleExports.__conflictReviewForTests.open("NO", "Norway");
+        moduleExports.__conflictReviewForTests.handleAction(
+            "auto-deduplicate"
+        );
+
+        // handleConflictAction is deliberately fire-and-forget for this
+        // branch (it does not return submitConflictResolution's own
+        // promise), so the test waits for that in-flight mutation the
+        // same way a real Admin's click-then-wait would.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.equal(
+            moduleExports.__conflictReviewForTests.getState().stage,
+            "resolved"
+        );
+    });
+
+    test("'Upload the correct document' (REPLACE_WITH_DOCUMENT fallback) only switches the panel to the replace stage - never 'contact developer'", async () => {
+        const { moduleExports } = load();
+
+        global.fetch = async () => makeFakeResponse({
+            ok: true,
+            status: 200,
+            payload: { success: true, data: { candidates: [] } },
+        });
+
+        await moduleExports.__conflictReviewForTests.open("CZ", "Czech Republic");
+        moduleExports.__conflictReviewForTests.handleAction("show-replace");
+
+        assert.equal(
+            moduleExports.__conflictReviewForTests.getState().stage,
+            "replace"
+        );
+    });
 });
 
 // --- Documents table rendering (AJAX-refresh integration) -----------
@@ -1985,7 +2726,12 @@ describe("documents table rendering", () => {
         assert.equal(html.includes(">Reindex<"), false);
     });
 
-    test("a country conflict shows Needs attention on every affected row and disables Refresh chatbot data for them", async () => {
+    test("a country conflict collapses into one Action required row with a Review button, never per-record raw rows", async () => {
+        // Mission "ORDER 8E-A2", section 21 - superseded from "every
+        // affected row shows Needs attention" (two raw Italy rows) to
+        // exactly one grouped row per conflicted country, since the
+        // Admin has no use for seeing the same country twice with no
+        // way to tell the records apart.
         await mockRefresh(
             [
                 {
@@ -2025,9 +2771,9 @@ describe("documents table rendering", () => {
         const html = dom.fakeDocumentsContainer.innerHTML;
 
         assert.equal(
-            (html.match(/ Needs attention<\/span>/g) || []).length,
-            2,
-            "both conflicting Italy rows must show Needs attention"
+            (html.match(/ Action required<\/span>/g) || []).length,
+            1,
+            "Italy must collapse into exactly one Action required row"
         );
         assert.equal(
             (html.match(/ Ready<\/span>/g) || []).length,
@@ -2037,10 +2783,17 @@ describe("documents table rendering", () => {
         assert.equal(
             (html.match(/data-reindex-form/g) || []).length,
             1,
-            "only France's real Refresh form should render; Italy's two rows must be disabled instead"
+            "only France's real Refresh form should render; Italy has no per-record actions at all"
         );
         assert.equal(
-            html.includes("This country has conflicting document records."),
+            (html.match(/data-review-country-code="IT"/g) || []).length,
+            1,
+            "Italy's grouped row must offer exactly one Review action"
+        );
+        assert.equal(
+            html.includes(
+                "More than one document record is linked to this country."
+            ),
             true
         );
         // document_id may still exist technically (e.g. the hidden
@@ -2064,20 +2817,25 @@ describe("documents table rendering", () => {
         assert.equal(dom.fakeDocumentCount.textContent, "2 documents");
     });
 
-    test("Overview shows Documents/Countries/Documents needing attention only - no chunk or index metrics", async () => {
+    test("Overview shows Documents/Countries/Countries requiring action only - no chunk or index metrics", async () => {
+        // Mission "ORDER 8E-A2", section 28 - superseded from
+        // "Documents needing attention" (a raw-record count) to
+        // "Countries requiring action" (a deduplicated, country-level
+        // count) - one conflicted country never counts once per extra
+        // record.
         await mockRefresh(
             [
                 { document_id: "doc_1", country: "Italy", country_code: "IT", source_filename: "a.docx", status: "indexed", source_file_present: true },
                 { document_id: "doc_2", country: "Spain", country_code: "ES", source_filename: "b.docx", status: "indexed_source_missing", source_file_present: false },
             ],
-            { total_documents: 2, total_countries: 2 }
+            { total_documents: 2, total_countries: 2, countries_requiring_action: 1 }
         );
 
         const html = dom.fakeSummaryContainer.innerHTML;
 
         assert.match(html, /<span>Documents<\/span>/);
         assert.match(html, /<span>Countries<\/span>/);
-        assert.match(html, /<span>Documents needing attention<\/span>/);
+        assert.match(html, /<span>Countries requiring action<\/span>/);
         assert.equal(/chunk/i.test(html), false);
         assert.equal(/opensearch/i.test(html), false);
 
@@ -2283,8 +3041,10 @@ describe("add / edit a section", () => {
         const countrySelect = makeFakeSelect();
         const editOnlyFields = { hidden: false };
         const sectionSelect = makeFakeSelect();
+        const titleInput = makeFakeTextarea();
         const textarea = makeFakeTextarea();
         const editHintEl = { textContent: "" };
+        const deleteButton = makeFakeButton();
         const addOnlyFields = { hidden: true };
         const addTitleInput = makeFakeTextarea();
         const addPositionSelect = makeFakeSelect();
@@ -2296,6 +3056,7 @@ describe("add / edit a section", () => {
         const addSubmitButton = makeFakeButton();
 
         const editContainer = {
+            hidden: true,
             dataset: {
                 adminPostUrl: "https://example.test/wp-admin/admin-post.php",
                 sectionsListAction: "le_global_chatbot_list_sections",
@@ -2304,6 +3065,8 @@ describe("add / edit a section", () => {
                 sectionGetNonce: "section-get-nonce",
                 sectionUpdateAction: "le_global_chatbot_update_section",
                 sectionUpdateNonce: "section-update-nonce",
+                sectionDeleteAction: "le_global_chatbot_delete_section",
+                sectionDeleteNonce: "section-delete-nonce",
                 sectionAddAction: "le_global_chatbot_add_section",
                 sectionAddNonce: "section-add-nonce",
             },
@@ -2316,8 +3079,10 @@ describe("add / edit a section", () => {
             "le-global-edit-country": countrySelect,
             "le-global-edit-only-fields": editOnlyFields,
             "le-global-edit-section": sectionSelect,
+            "le-global-edit-title": titleInput,
             "le-global-edit-content": textarea,
             "le-global-edit-hint": editHintEl,
+            "le-global-edit-delete": deleteButton,
             "le-global-add-only-fields": addOnlyFields,
             "le-global-add-title": addTitleInput,
             "le-global-add-position": addPositionSelect,
@@ -2351,9 +3116,12 @@ describe("add / edit a section", () => {
             modeAddButton,
             countrySelect,
             editOnlyFields,
+            editContainer,
             sectionSelect,
+            titleInput,
             textarea,
             editHintEl,
+            deleteButton,
             addOnlyFields,
             addTitleInput,
             addPositionSelect,
@@ -2582,6 +3350,17 @@ describe("add / edit a section", () => {
                 status: 200,
                 payload: {
                     success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        sections: [{ section_id: "sec-1", legal_topic: "Hiring Practices" }],
+                    },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
                     data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Hiring Practices", content: "Draft text the admin just typed." },
                 },
             },
@@ -2589,16 +3368,17 @@ describe("add / edit a section", () => {
 
         await clickSave();
 
-        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls.length, 3);
         assert.equal(fetchCalls[0].options.method, "POST");
         assert.equal(fetchCalls[0].options.body.get("content"), "Draft text the admin just typed.");
         assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_aaa");
         assert.equal(fetchCalls[0].options.body.get("section_id"), "sec-1");
-        assert.match(fetchCalls[1].url, /action=le_global_chatbot_get_section/);
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_sections/);
+        assert.match(fetchCalls[2].url, /action=le_global_chatbot_get_section/);
         assert.equal(dom.textarea.value, "Draft text the admin just typed.");
         assert.equal(
             dom.messageEl.textContent,
-            "✓ Hiring Practices was updated successfully. The Italy document and chatbot content are now up to date."
+            "✓ \"Hiring Practices\" was updated successfully. The Italy document and chatbot content are now up to date."
         );
         assert.equal(dom.messageEl.className.includes("is-success"), true);
         assert.equal(/chunk/i.test(dom.messageEl.textContent), false);
@@ -3124,5 +3904,356 @@ describe("add / edit a section", () => {
         clickCancel();
 
         assert.equal(dom.addTitleInput.value, "Draft", "declining must never discard the draft");
+    });
+
+    // --- Collapsed-by-default panel (mission "ORDER 8G-A", section 9) -
+
+    test("the panel is collapsed by default and expands only once a mode button is clicked", () => {
+        assert.equal(dom.editContainer.hidden, true);
+
+        clickModeEdit();
+
+        assert.equal(dom.editContainer.hidden, false);
+    });
+
+    test("clicking + Add a new section also expands the panel", () => {
+        assert.equal(dom.editContainer.hidden, true);
+
+        clickModeAdd();
+
+        assert.equal(dom.editContainer.hidden, false);
+    });
+
+    test("expand() does not depend on setMode's own no-op guard - Edit is already the default mode, but the panel still starts collapsed", () => {
+        assert.equal(dom.editContainer.hidden, true);
+
+        clickModeEdit();
+
+        assert.equal(dom.editContainer.hidden, false);
+    });
+
+    test("Cancel collapses the panel back to its default state", () => {
+        clickModeEdit();
+        assert.equal(dom.editContainer.hidden, false);
+
+        clickCancel();
+
+        assert.equal(dom.editContainer.hidden, true);
+    });
+
+    // --- Section title / Rename (mission "ORDER 8G-A", sections 2-5) --
+
+    test("selecting a section loads its current title, and changing only the title enables Save", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Some content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.equal(dom.titleInput.value, "Working Time");
+        assert.equal(dom.titleInput.disabled, false);
+        assert.equal(dom.saveButton.disabled, true);
+
+        dom.titleInput.value = "Working Hours";
+        dom.titleInput._listeners.input();
+
+        assert.equal(dom.saveButton.disabled, false);
+    });
+
+    test("Save is disabled if the title is cleared to empty, even with edited content", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Some content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        dom.textarea.value = "Edited content.";
+        dom.textarea._listeners.input();
+        assert.equal(dom.saveButton.disabled, false);
+
+        dom.titleInput.value = "   ";
+        dom.titleInput._listeners.input();
+        assert.equal(dom.saveButton.disabled, true);
+    });
+
+    test("Rename: Save posts the changed title, and the response's own new section_id/title drive the re-selection", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.countrySelect.options = [{ value: "doc_aaa", textContent: "Australia (AU)" }];
+        dom.countrySelect.selectedIndex = 0;
+        dom.sectionSelect.value = "sec-hiring";
+        dom.titleInput.value = "Remote Work Equipment Requirements";
+        dom.textarea.value = "Some content.";
+        dom.saveButton.disabled = false;
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-remote-work",
+                        legal_topic: "Remote Work Equipment Requirements",
+                    },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        sections: [
+                            { section_id: "sec-remote-work", legal_topic: "Remote Work Equipment Requirements" },
+                        ],
+                    },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-remote-work",
+                        legal_topic: "Remote Work Equipment Requirements",
+                        content: "Some content.",
+                    },
+                },
+            },
+        ]);
+
+        await clickSave();
+
+        assert.equal(
+            fetchCalls[0].options.body.get("title"),
+            "Remote Work Equipment Requirements"
+        );
+        assert.equal(dom.sectionSelect.value, "sec-remote-work");
+        assert.equal(dom.titleInput.value, "Remote Work Equipment Requirements");
+        assert.match(
+            dom.messageEl.textContent,
+            /"Remote Work Equipment Requirements" was updated successfully/
+        );
+    });
+
+    test("a duplicate title from a rename attempt maps to the business-friendly message, not the raw code", async () => {
+        dom.countrySelect.value = "doc_aaa";
+        dom.sectionSelect.value = "sec-1";
+        dom.titleInput.value = "Hiring Practices";
+        dom.textarea.value = "Some content.";
+        dom.saveButton.disabled = false;
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 409,
+            payload: {
+                success: false,
+                data: { detail: { code: "section_already_exists" } },
+            },
+        });
+
+        await clickSave();
+
+        assert.equal(
+            dom.messageEl.textContent,
+            "This section already exists. Use \"Edit a section\" to update it."
+        );
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+    });
+
+    test("Cancel prompts for confirmation when only the title changed (content unchanged), and declining keeps the panel expanded", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "Same content.",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        dom.titleInput.value = "Working Hours";
+        dom.titleInput._listeners.input();
+
+        let confirmCalled = false;
+        global.window.confirm = () => {
+            confirmCalled = true;
+            return false;
+        };
+
+        clickCancel();
+
+        assert.equal(confirmCalled, true);
+        assert.equal(dom.titleInput.value, "Working Hours", "declining must never discard the edit");
+    });
+
+    // --- Delete section (mission "ORDER 8G-A", sections 6-8) ----------
+
+    test("Delete: declining the confirmation makes zero network calls", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "x",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        assert.equal(dom.deleteButton.disabled, false);
+        assert.equal(fetchCalls.length, 1);
+
+        global.window.confirm = () => false;
+
+        await dom.deleteButton._listeners.click();
+
+        assert.equal(fetchCalls.length, 1, "Delete must never call fetch when declined");
+    });
+
+    test("Delete: confirming shows the exact required wording, removes the section, and shows a success message", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "x",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        dom.countrySelect.options = [{ value: "doc_aaa", textContent: "Italy (IT)" }];
+        dom.countrySelect.selectedIndex = 0;
+        await changeSection("sec-1");
+
+        let confirmMessage = null;
+        global.window.confirm = (message) => {
+            confirmMessage = message;
+            return true;
+        };
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Working Time" },
+                },
+            },
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", sections: [] } },
+            },
+        ]);
+
+        await dom.deleteButton._listeners.click();
+
+        assert.match(confirmMessage, /Delete "Working Time"\?/);
+        assert.match(
+            confirmMessage,
+            /This section will be removed from the Italy document and will no longer be available to the chatbot\./
+        );
+        assert.equal(dom.sectionSelect.value, "");
+        assert.equal(dom.titleInput.value, "");
+        assert.equal(dom.deleteButton.disabled, true);
+        assert.match(dom.messageEl.textContent, /"Working Time" was deleted successfully/);
+    });
+
+    test("Delete: a section_is_last_remaining error maps to the friendly business message and re-enables Delete", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: {
+                        document_id: "doc_aaa",
+                        section_id: "sec-1",
+                        legal_topic: "Working Time",
+                        content: "x",
+                    },
+                },
+            },
+        ]);
+
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 409,
+            payload: {
+                success: false,
+                data: { detail: { code: "section_is_last_remaining" } },
+            },
+        });
+
+        await dom.deleteButton._listeners.click();
+
+        assert.equal(
+            dom.messageEl.textContent,
+            "This section cannot be deleted because it is the only remaining section in this document."
+        );
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+        assert.equal(dom.deleteButton.disabled, false, "must re-enable Delete after a failed attempt");
+        // The section must not have been discarded from the UI on a
+        // failed delete - the admin can still see/edit it.
+        assert.equal(dom.sectionSelect.value, "sec-1");
     });
 });

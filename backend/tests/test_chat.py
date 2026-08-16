@@ -57,6 +57,19 @@ from app.services.rag_answer import (
 )
 
 
+def _document_topic_provider(
+    country_codes: list[str],
+) -> dict[str, list[str]]:
+    """
+    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
+    document legal topics for any country, matching every test in this
+    file written before that mission (none of them concern the new
+    document_legal_topics concept).
+    """
+
+    return {}
+
+
 # country_registry.COUNTRIES answers "can this country be detected/
 # named at all" (mission "ORDER 5C" grew it to include several
 # countries - France, Germany among them - registered only so an
@@ -353,6 +366,7 @@ class ChatScopeTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -396,6 +410,7 @@ class ChatScopeTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -468,6 +483,7 @@ class ChatScopeTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=_FailingUnderstandingClient(),
@@ -524,6 +540,7 @@ class ChatScopeTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -555,6 +572,7 @@ class ChatScopeTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -589,6 +607,7 @@ class ChatScopeTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -649,6 +668,7 @@ class ChatScopeTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -716,6 +736,7 @@ class ChatScopeTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -811,6 +832,7 @@ class ChatScopeTests(unittest.TestCase):
                 max_sources=6,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -871,6 +893,7 @@ class ChatScopeTests(unittest.TestCase):
                     max_sources=1,
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 understanding_client=understanding_client,
             )
@@ -955,6 +978,7 @@ class ChatMetricsTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_search,
                 generation_client=client,
                 understanding_client=understanding_client,
@@ -1105,6 +1129,7 @@ class ChatMetricsTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_search,
                 generation_client=client,
                 understanding_client=understanding_client,
@@ -1223,6 +1248,7 @@ class ChatMetricsTests(unittest.TestCase):
                     max_sources=6,
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_search,
                 generation_client=client,
                 understanding_client=understanding_client,
@@ -1268,6 +1294,7 @@ class ChatMetricsTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 understanding_client=understanding_client,
             )
@@ -1350,6 +1377,7 @@ class ChatMetricsTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 understanding_client=understanding_client,
             )
@@ -1416,6 +1444,7 @@ class ChatMetricsTests(unittest.TestCase):
                         max_sources=1,
                     ),
                     catalog_provider=_catalog_provider,
+                    document_topic_provider=_document_topic_provider,
                     search_function=_unexpected_search,
                     understanding_client=understanding_client,
                 )
@@ -1462,6 +1491,7 @@ class ChatMetricsTests(unittest.TestCase):
                         ],
                     ),
                     catalog_provider=_catalog_provider,
+                    document_topic_provider=_document_topic_provider,
                     search_function=failing_search,
                     understanding_client=_FailingUnderstandingClient(),
                 )
@@ -1523,6 +1553,7 @@ class ChatMetricsTests(unittest.TestCase):
                         ],
                     ),
                     catalog_provider=_catalog_provider,
+                    document_topic_provider=_document_topic_provider,
                     search_function=fake_search,
                     generation_client=client,
                     understanding_client=_FailingUnderstandingClient(),
@@ -1582,6 +1613,7 @@ class ChatMetricsTests(unittest.TestCase):
                             country_codes=["ES"],
                         ),
                         catalog_provider=_catalog_provider,
+                        document_topic_provider=_document_topic_provider,
                         search_function=_unexpected_search,
                         generation_client=NoCallGenerationClient(),
                         understanding_client=understanding_client,
@@ -1655,6 +1687,7 @@ class ChatMetricsTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_search,
                 generation_client=client,
                 understanding_client=_FailingUnderstandingClient(),
@@ -1726,6 +1759,7 @@ class ChatMetricsTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_search,
                 generation_client=client,
                 understanding_client=_FailingUnderstandingClient(),
@@ -2186,6 +2220,7 @@ class HistoryContextTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -2283,6 +2318,7 @@ class HistoryContextTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=CountingClient(),
             understanding_client=understanding_client,
@@ -2349,6 +2385,7 @@ class HistoryContextTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_search,
                 generation_client=client,
                 understanding_client=_FailingUnderstandingClient(),
@@ -2489,6 +2526,7 @@ class HistoryContextTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=CountingClient(),
             understanding_client=understanding_client,
@@ -2621,6 +2659,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -2688,6 +2727,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -2765,6 +2805,7 @@ class ContactIntentTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -2858,6 +2899,7 @@ class ContactIntentTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -2897,6 +2939,7 @@ class ContactIntentTests(unittest.TestCase):
                 question="Can you give me a lawyer contact?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=understanding_client,
@@ -2943,6 +2986,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -3016,6 +3060,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -3073,6 +3118,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -3119,6 +3165,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -3479,6 +3526,7 @@ class ContactIntentTests(unittest.TestCase):
                     question=question
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -3548,6 +3596,7 @@ class ContactIntentTests(unittest.TestCase):
                     question=question
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     # Raises if generate() is ever invoked - reaching
@@ -3655,6 +3704,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_legal_search,
                 generation_client=CountingLegalClient(),
                 understanding_client=_FailingUnderstandingClient(),
@@ -3764,6 +3814,7 @@ class ContactIntentTests(unittest.TestCase):
                     )
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_legal_search,
                 generation_client=CountingLegalClient(),
                 understanding_client=understanding_client,
@@ -3827,6 +3878,7 @@ class ContactIntentTests(unittest.TestCase):
                     question="Who should I email in Peru?"
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     # Raises if generate() is ever invoked - reaching
@@ -3915,6 +3967,7 @@ class ContactIntentTests(unittest.TestCase):
                     ],
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=(
                     NoCallGenerationClient()
@@ -4059,6 +4112,7 @@ class ContactIntentTests(unittest.TestCase):
                     question=question
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=fake_legal_search,
                 generation_client=CountingLegalClient(),
                 understanding_client=_FailingUnderstandingClient(),
@@ -4139,6 +4193,7 @@ class ContactIntentTests(unittest.TestCase):
                     question=question
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 # A real, working legal search/generation path is
                 # supplied so that if the current topic detector
                 # recognizes a supported topic here (as it does today,
@@ -4473,6 +4528,7 @@ class SlovakiaContactFallbackTests(unittest.TestCase):
                 question="What is the notice period in Slovakia?"
             ),
             catalog_provider=catalog_without_slovakia,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -4706,6 +4762,7 @@ class JurisdictionNeutralClientStateCompatibilityTests(unittest.TestCase):
                 conversation_state=contaminated_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -4775,6 +4832,7 @@ class JurisdictionNeutralClientStateCompatibilityTests(unittest.TestCase):
                 conversation_state=degenerate_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=understanding_client,
@@ -4847,6 +4905,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=self._degenerate_spain_state(),
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=understanding_client,
@@ -4922,6 +4981,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 question="Tell me about working conditions in Peru."
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -4992,6 +5052,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=clean_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=_FailingUnderstandingClient(),
@@ -5026,6 +5087,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=self._degenerate_spain_state(),
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=_FailingUnderstandingClient(),
@@ -5077,6 +5139,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=multi_action_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=understanding_client,
@@ -5153,6 +5216,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=state_with_empty_legal_topics,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=_FailingUnderstandingClient(),
@@ -5256,6 +5320,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=state_with_empty_legal_topics,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -5340,6 +5405,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=broad_topic_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=_FailingUnderstandingClient(),
@@ -5444,6 +5510,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 ),
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search_turn1,
             generation_client=client1,
             understanding_client=turn1_understanding,
@@ -5493,6 +5560,7 @@ class TargetedEmptySubjectAndLocalFollowupTests(unittest.TestCase):
                 conversation_state=turn1_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search_turn2,
             generation_client=client2,
             understanding_client=_FailingUnderstandingClient(),
@@ -5550,6 +5618,7 @@ class AssistantHelpRouteTests(unittest.TestCase):
         return resolve_legal_chat_response(
             request=LegalChatRequest(question=question),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
@@ -5787,6 +5856,7 @@ class AssistantHelpRealQuestionBoundaryTests(unittest.TestCase):
                 )
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=FakeGenerationClient(
                 answer=(
@@ -5836,6 +5906,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 question="Explain overtime rules in Spain."
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=lambda request: LegalSearchResponse(
                 query=request.query,
                 total=1,
@@ -5865,6 +5936,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=turn1_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
@@ -5905,6 +5977,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=turn2.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search_turn3,
             generation_client=FakeGenerationClient(
                 answer=(
@@ -5940,6 +6013,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=contact_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
@@ -5981,6 +6055,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                     conversation_state=help_response.conversation_state,
                 ),
                 catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
                 search_function=_unexpected_search,
                 generation_client=NoCallGenerationClient(),
                 understanding_client=_FailingUnderstandingClient(),
@@ -6039,6 +6114,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 question="Compare overtime rules in Spain and Peru."
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search_turn1,
             generation_client=FakeGenerationClient(
                 answer=(
@@ -6060,6 +6136,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=turn1_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
@@ -6108,6 +6185,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=turn2.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search_turn3,
             generation_client=FakeGenerationClient(
                 answer=(
@@ -6147,6 +6225,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 question="Can you compare Spain and Peru?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
@@ -6175,6 +6254,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=guidance.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=follow_up_understanding,
@@ -6207,6 +6287,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 question="How can you help me about Canada?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
@@ -6278,6 +6359,7 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 conversation_state=turn1.conversation_state,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search_turn2,
             generation_client=FakeGenerationClient(
                 answer=(
@@ -6459,6 +6541,7 @@ class ThreeAxisCountryAvailabilityContractTests(unittest.TestCase):
                 question="What are the overtime rules in France?"
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             understanding_client=understanding_client,
         )
@@ -6526,6 +6609,7 @@ class ThreeAxisCountryAvailabilityContractTests(unittest.TestCase):
                 country_codes=["FR"],
             ),
             catalog_provider=catalog_with_france,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -6594,6 +6678,7 @@ class ThreeAxisCountryAvailabilityContractTests(unittest.TestCase):
                 country_codes=["TN"],
             ),
             catalog_provider=catalog_with_tunisia,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -6661,6 +6746,7 @@ class ThreeAxisCountryAvailabilityContractTests(unittest.TestCase):
                 ],
             ),
             catalog_provider=counting_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=fake_search,
             generation_client=client,
             understanding_client=understanding_client,
@@ -6763,6 +6849,7 @@ class EditRestoreConversationConsistencyTests(unittest.TestCase):
                 history=history,
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=self._current_state_search,
             generation_client=client,
             understanding_client=self._understanding_client(),
@@ -6793,6 +6880,7 @@ class EditRestoreConversationConsistencyTests(unittest.TestCase):
                 history=[],
             ),
             catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
             search_function=self._current_state_search,
             generation_client=client,
             understanding_client=self._understanding_client(),

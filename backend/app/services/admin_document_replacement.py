@@ -7,8 +7,10 @@ import os
 import shutil
 import tempfile
 import uuid
+import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
@@ -18,8 +20,16 @@ from opensearchpy.exceptions import (
 )
 
 from app.clients.opensearch import get_opensearch_client
-from app.core.admin_country_policy import is_admin_country_allowed
-from app.core.country_registry import CountryMetadataMismatchError
+from app.core.admin_country_policy import (
+    ADMIN_ALLOWED_COUNTRY_CODES,
+    is_admin_country_allowed,
+)
+from app.core.country_registry import (
+    CountryMetadataMismatchError,
+    UnknownCountryCodeError,
+    canonical_country_name,
+    normalize_country_code,
+)
 from app.models.admin_documents import AdminDocumentUploadResponse
 from app.models.document import DocumentChunk
 from app.services.admin_documents import (
@@ -35,6 +45,11 @@ from app.services.admin_documents import (
 from app.services.country_lock import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     country_lock,
+)
+from app.services.docx_country_marker import (
+    InvalidCountryMarkerValueError,
+    read_country_marker,
+    write_country_marker,
 )
 from app.services.document_chunk_builder import (
     DOCUMENT_FAMILY,
@@ -54,13 +69,34 @@ from app.services.document_section_state import (
     delete_section_edit_state,
 )
 from app.services.document_source_resolver import (
+    DocumentSourceConflictError,
     resolve_country_source_paths,
+    resolve_document_source_path,
 )
 from app.services.document_warnings import (
     TopicCoverageWarning,
     evaluate_topic_coverage,
 )
 from app.services.opensearch_index import LEGAL_DOCUMENTS_ALIAS
+
+
+def _sorted_admin_allowed_countries() -> list[dict[str, str]]:
+    """
+    Every country a NEW admin upload may target, for display in a
+    SELECT_COUNTRY/invalid-selection decision - sorted by name for a
+    stable, deterministic response.
+    """
+
+    return sorted(
+        (
+            {
+                "code": code,
+                "name": canonical_country_name(code),
+            }
+            for code in ADMIN_ALLOWED_COUNTRY_CODES
+        ),
+        key=lambda option: option["name"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +108,53 @@ class ExistingCountryDocument:
     country: str
     country_code: str
     reference_year: int | None
+
+
+class AdminDocumentUnexpectedCountryError(ValueError):
+    """
+    Raised when a caller declared which country it expects this
+    upload to resolve to (expected_country_code) and the document's
+    own detected country is a different one.
+
+    Used exclusively by the REPLACE_WITH_DOCUMENT conflict-resolution
+    path (mission "ORDER 8E-A1", section 35): the Admin is resolving a
+    specific country's conflict, and the browser's own claim about
+    which country that is must never be trusted blindly - the
+    uploaded DOCX's real, freshly-detected country is checked against
+    it here, before any mutation, so a mismatched file can never
+    silently resolve the wrong country's conflict (or worse, silently
+    perform an unrelated fresh upload/replace for whatever country it
+    actually turned out to be).
+    """
+
+    def __init__(
+        self,
+        *,
+        expected_country_code: str,
+        detected_country_code: str,
+        detected_country: str,
+    ) -> None:
+        self.expected_country_code = expected_country_code
+        self.detected_country_code = detected_country_code
+        self.detected_country = detected_country
+
+        super().__init__(
+            f"This upload was expected to resolve {expected_country_code}, "
+            f"but the document's own detected country is "
+            f"{detected_country} ({detected_country_code})."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 422 payload."""
+
+        return {
+            "code": "document_unexpected_country",
+            "message": str(self),
+            "operation": "upload",
+            "expected_country_code": self.expected_country_code,
+            "detected_country_code": self.detected_country_code,
+            "detected_country_name": self.detected_country,
+        }
 
 
 class AdminDocumentCountryNotAllowedError(ValueError):
@@ -237,6 +320,182 @@ class AdminDocumentWarningConfirmationRequiredError(ValueError):
         }
 
 
+class AdminDocumentCountryConfirmationRequiredError(ValueError):
+    """
+    Raised when a country was detected - from the DOCX's own content
+    or from a previously-persisted DOCX-native marker - but has not
+    yet been explicitly confirmed by the Admin.
+
+    Mission "ORDER 8E-A1", section 6: a detected country must never,
+    by itself, cause any mutation. Cancel (never re-submitting with
+    country_confirmed=true) leaves this upload with zero effect - the
+    staged file lives only inside the request's own TemporaryDirectory
+    and is discarded automatically.
+
+    Also carries the full admin-allowed country list (mission "ORDER
+    8E-A2", section 6): a UI must let the Admin correct a wrong
+    detection without IT support, which means offering a "choose a
+    different country" dropdown right from this same response, using
+    the one authoritative server-side list rather than a second,
+    client-invented copy of it.
+    """
+
+    def __init__(
+        self,
+        *,
+        country: str,
+        country_code: str,
+        detection_source: str,
+    ) -> None:
+        self.country = country
+        self.country_code = country_code
+        self.detection_source = detection_source
+
+        super().__init__(
+            f"This document was detected as {country} ({country_code}). "
+            "Confirm the country before it is processed further."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 409 payload."""
+
+        return {
+            "code": "document_country_confirmation_required",
+            "message": str(self),
+            "operation": "upload",
+            "country_code": self.country_code,
+            "country_name": self.country,
+            "detection_source": self.detection_source,
+            "allowed_countries": _sorted_admin_allowed_countries(),
+        }
+
+
+class AdminDocumentCountrySelectionRequiredError(ValueError):
+    """
+    Raised when a technically valid, processable DOCX has no country
+    that could be automatically identified from its own content or any
+    existing marker.
+
+    Mission "ORDER 8E-A1", section 8: this is never a hard failure any
+    more - the Admin may instead pick one explicitly from the allowed
+    upload list (selected_country_code), which is itself sufficient
+    confirmation - no separate country_confirmed round-trip is needed
+    for a country the Admin just explicitly chose.
+    """
+
+    def __init__(self) -> None:
+        self.allowed_countries = _sorted_admin_allowed_countries()
+
+        super().__init__(
+            "This document's country could not be automatically "
+            "identified. Select the correct country to continue."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 409 payload."""
+
+        return {
+            "code": "document_country_selection_required",
+            "message": str(self),
+            "operation": "upload",
+            "allowed_countries": self.allowed_countries,
+        }
+
+
+class AdminDocumentCountrySelectionInvalidError(ValueError):
+    """
+    Raised when an Admin-supplied selected_country_code is not on the
+    admin upload allowlist.
+
+    Deliberately distinct from AdminDocumentCountryNotAllowedError
+    (mission "ORDER 8E-A1", section 9): that one reports a country
+    genuinely *detected* from real content; this one reports a manual
+    selection value the server never even attempted to trust as
+    content - the request is rejected outright, with zero mutation.
+    """
+
+    def __init__(self, *, country_code: str) -> None:
+        self.country_code = country_code
+
+        super().__init__(
+            f"{country_code!r} is not a supported country for manual "
+            "selection."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 422 payload."""
+
+        return {
+            "code": "document_country_selection_invalid",
+            "message": str(self),
+            "operation": "upload",
+            "country_code": self.country_code,
+            "allowed_countries": _sorted_admin_allowed_countries(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CountryConflictCandidate:
+    """One safe, business-facing candidate in a country conflict review."""
+
+    document_id: str
+    source_filename: str
+    reference_year: int | None
+    updated_at: str | None
+    source_bytes: int | None
+
+
+class AdminDocumentCountryConflictReviewRequiredError(ValueError):
+    """
+    Raised when a country already has more than one active indexed
+    document - a broken state the ordinary upload/replace decision
+    must never try to blindly resolve.
+
+    Mission "ORDER 8E-A1", section 18: "never guess" - resolving a
+    genuine conflict requires the dedicated, generic conflict-
+    resolution API (see admin_document_conflict_resolution.py), never
+    this upload endpoint silently picking one document to keep.
+    """
+
+    def __init__(
+        self,
+        *,
+        country: str,
+        country_code: str,
+        candidates: Sequence[CountryConflictCandidate],
+    ) -> None:
+        self.country = country
+        self.country_code = country_code
+        self.candidates = tuple(candidates)
+
+        super().__init__(
+            f"{country} currently has {len(self.candidates)} active "
+            "documents. Review and resolve this conflict before "
+            "uploading."
+        )
+
+    def to_detail(self) -> dict[str, object]:
+        """Return a structured HTTP 409 payload."""
+
+        return {
+            "code": "document_country_conflict_review_required",
+            "message": str(self),
+            "operation": "upload",
+            "country": self.country,
+            "country_code": self.country_code,
+            "candidates": [
+                {
+                    "document_id": candidate.document_id,
+                    "source_filename": candidate.source_filename,
+                    "reference_year": candidate.reference_year,
+                    "updated_at": candidate.updated_at,
+                    "source_bytes": candidate.source_bytes,
+                }
+                for candidate in self.candidates
+            ],
+        }
+
+
 ChunkBuilder = Callable[[Path], list[DocumentChunk]]
 CountryDocumentLookup = Callable[
     [str, OpenSearch | None],
@@ -375,6 +634,62 @@ def _restore_backups(
             os.replace(backup_path, original_path)
 
 
+def _build_conflict_candidates(
+    existing_documents: Sequence[ExistingCountryDocument],
+    *,
+    source_directory: Path,
+    country_code: str,
+) -> list[CountryConflictCandidate]:
+    """
+    Build the safe, business-facing candidate list for a country
+    conflict review - filename/year/last-updated/file size only, never
+    a business-meaningful use of document_id (mission "ORDER 8E-A1",
+    section 22).
+
+    A per-document source-resolution conflict (two distinct metadata
+    fields pointing at two different real files for the very same
+    document_id - a different, narrower conflict than the country-
+    level one this function itself is building a review for) is
+    reported as a simply-absent source file rather than raised, so one
+    damaged candidate never prevents the Admin from reviewing the rest.
+    """
+
+    candidates: list[CountryConflictCandidate] = []
+
+    for document in existing_documents:
+        try:
+            resolved = resolve_document_source_path(
+                source_root=source_directory,
+                country_code=country_code,
+                source_filename=document.source_filename,
+            )
+            path = resolved.path
+
+        except DocumentSourceConflictError:
+            path = None
+
+        candidates.append(
+            CountryConflictCandidate(
+                document_id=document.document_id,
+                source_filename=document.source_filename,
+                reference_year=document.reference_year,
+                updated_at=(
+                    datetime.fromtimestamp(
+                        path.stat().st_mtime,
+                        tz=timezone.utc,
+                    ).isoformat()
+                    if path is not None
+                    else None
+                ),
+                source_bytes=(
+                    path.stat().st_size if path is not None else None
+                ),
+            )
+        )
+
+    return candidates
+
+
 def safe_upload_and_index_document(
     *,
     filename: str,
@@ -384,6 +699,10 @@ def safe_upload_and_index_document(
     maximum_bytes: int,
     replace_existing: bool = False,
     confirm_warnings: bool = False,
+    country_confirmed: bool = False,
+    selected_country_code: str | None = None,
+    resolve_country_conflict: bool = False,
+    expected_country_code: str | None = None,
     client: OpenSearch | None = None,
     chunk_builder: ChunkBuilder = build_document_chunks_from_docx,
     country_document_lookup: CountryDocumentLookup = (
@@ -419,6 +738,32 @@ def safe_upload_and_index_document(
     is always recomputed here, from the real uploaded bytes, never
     trusted from the caller (mission "ORDER 3", section 13).
 
+    Mission "ORDER 8E-A1": a detected country - whether from the DOCX's
+    own content or a previously-persisted marker - is never enough to
+    proceed on its own; country_confirmed=True is required first
+    (AdminDocumentCountryConfirmationRequiredError otherwise). When no
+    country can be detected at all, this is no longer a hard failure:
+    selected_country_code lets the Admin pick one explicitly from the
+    allowed upload list - itself sufficient confirmation, since picking
+    is confirming - and that choice is persisted into the DOCX itself
+    as a DOCX-native custom property (see docx_country_marker.py)
+    before anything else runs, so every later step (chunk parsing,
+    already-current comparison, the stored source file) is built from
+    that one normalized, marker-carrying candidate rather than the raw
+    upload bytes.
+
+    More than one active document for a country is a genuine conflict
+    (see AdminDocumentCountryConflictReviewRequiredError) that this
+    function refuses to guess through on an ordinary upload.
+    resolve_country_conflict=True is the one exception: the dedicated
+    REPLACE_WITH_DOCUMENT resolution mode (see
+    admin_document_conflict_resolution.py) reuses this exact function
+    - same technical validation, same country confirmation, same
+    content-suitability warning - to let the Admin supply an
+    authoritative DOCX that collapses every existing document for the
+    country down to this one, exactly like a confirmed single-document
+    replace already does. Never set by the ordinary upload endpoint.
+
     Every read/decide/mutate step from the country lookup onward runs
     under a per-country lock (country_lock) - never held during
     chunk_builder's own parsing, which does not touch shared state.
@@ -451,8 +796,86 @@ def safe_upload_and_index_document(
                 maximum_bytes=maximum_bytes,
             )
 
+            # A manual country selection is validated and persisted
+            # into the DOCX *before* chunk_builder ever runs (mission
+            # "ORDER 8E-A1", sections 9/10/13): every step downstream -
+            # parsing, the content-suitability warning, the
+            # already-current byte comparison, and the file that
+            # actually gets stored - must all see this one normalized
+            # candidate, never the raw, still-countryless upload bytes.
+            candidate_path = staged_path
+            manual_selection_used = False
+
+            if (
+                selected_country_code is not None
+                and selected_country_code.strip()
+            ):
+                raw_selected_code = (
+                    selected_country_code.strip().upper()
+                )
+
+                if not is_admin_country_allowed(raw_selected_code):
+                    raise AdminDocumentCountrySelectionInvalidError(
+                        country_code=raw_selected_code
+                    )
+
+                try:
+                    normalized_selected_code = normalize_country_code(
+                        raw_selected_code
+                    )
+
+                except UnknownCountryCodeError as error:
+                    raise AdminDocumentCountrySelectionInvalidError(
+                        country_code=raw_selected_code
+                    ) from error
+
+                # A dedicated subdirectory - never a filename prefix -
+                # so candidate_path.name is exactly safe_filename: the
+                # marker-embedded candidate must never leak an
+                # internal disambiguation artifact (e.g.
+                # "country-marker.<name>") into source_filename, which
+                # chunk_builder reads straight from file_path.name and
+                # which is then indexed, displayed, and returned to the
+                # Admin verbatim.
+                candidate_directory = (
+                    Path(temporary_directory) / "country-marker"
+                )
+                candidate_directory.mkdir(parents=True, exist_ok=True)
+                candidate_path = candidate_directory / safe_filename
+
+                try:
+                    write_country_marker(
+                        staged_path,
+                        candidate_path,
+                        country_code=normalized_selected_code,
+                        country_name=canonical_country_name(
+                            normalized_selected_code
+                        ),
+                    )
+
+                except InvalidCountryMarkerValueError as error:
+                    raise AdminDocumentCountrySelectionInvalidError(
+                        country_code=raw_selected_code
+                    ) from error
+
+                except (
+                    zipfile.BadZipFile,
+                    KeyError,
+                    OSError,
+                ) as error:
+                    # A manual country selection is validated before
+                    # chunk_builder's own validate_docx_format ever
+                    # runs - a corrupt/non-DOCX upload must still
+                    # surface as the ordinary DocumentCorruptError,
+                    # never an unhandled zip/archive exception.
+                    raise DocumentCorruptError(
+                        f"DOCX validation failed: {error}"
+                    ) from error
+
+                manual_selection_used = True
+
             try:
-                chunks = chunk_builder(staged_path)
+                chunks = chunk_builder(candidate_path)
 
             except InvalidDocxFormatError as error:
                 raise DocumentCorruptError(
@@ -462,8 +885,21 @@ def safe_upload_and_index_document(
             except (
                 UndeterminableDocumentCountryError,
                 AmbiguousDocumentCountryError,
-                CountryMetadataMismatchError,
             ) as error:
+                if manual_selection_used:
+                    # A validated, just-written marker always resolves
+                    # deterministically (see docx_country_marker.py) -
+                    # reaching here despite one would be a genuine
+                    # parser inconsistency, never a normal outcome, so
+                    # it is treated as a hard parse failure rather than
+                    # silently offering another decision.
+                    raise DocumentParseFailedError(
+                        f"DOCX validation failed: {error}"
+                    ) from error
+
+                raise AdminDocumentCountrySelectionRequiredError() from error
+
+            except CountryMetadataMismatchError as error:
                 raise DocumentCountryUndeterminedError(
                     f"DOCX validation failed: {error}"
                 ) from error
@@ -493,6 +929,38 @@ def safe_upload_and_index_document(
                 raise AdminDocumentCountryNotAllowedError(
                     country=first_chunk.country,
                     country_code=country_code,
+                )
+
+            if (
+                expected_country_code is not None
+                and country_code
+                != expected_country_code.strip().upper()
+            ):
+                raise AdminDocumentUnexpectedCountryError(
+                    expected_country_code=(
+                        expected_country_code.strip().upper()
+                    ),
+                    detected_country_code=country_code,
+                    detected_country=first_chunk.country,
+                )
+
+            # Mission "ORDER 8E-A1", section 6/17: country confirmation
+            # always comes before content-warning display, one decision
+            # at a time - a manual selection this same request already
+            # counts as confirmation (the Admin just explicitly chose
+            # it), so only an *automatically* detected country (marker
+            # or content, from an earlier request or this one) is ever
+            # asked to be confirmed again.
+            if not (country_confirmed or manual_selection_used):
+                raise AdminDocumentCountryConfirmationRequiredError(
+                    country=first_chunk.country,
+                    country_code=country_code,
+                    detection_source=(
+                        "marker"
+                        if read_country_marker(candidate_path)
+                        is not None
+                        else "content"
+                    ),
                 )
 
             topic_warning = evaluate_topic_coverage(chunks)
@@ -536,10 +1004,34 @@ def safe_upload_and_index_document(
                     for document in existing_documents
                 }
 
+                # Mission "ORDER 8E-A1", section 18: a genuine country
+                # conflict (more than one active document) is never
+                # something the ordinary upload/replace decision may
+                # guess its way through - it always requires the
+                # dedicated conflict-resolution API, checked first,
+                # before any warning or replacement decision below.
+                # resolve_country_conflict=True is that dedicated
+                # REPLACE_WITH_DOCUMENT resolution reusing this exact
+                # flow (mission section 26) - never set by the
+                # ordinary upload endpoint itself.
+                if (
+                    len(unique_document_ids) > 1
+                    and not resolve_country_conflict
+                ):
+                    raise AdminDocumentCountryConflictReviewRequiredError(
+                        country=first_chunk.country,
+                        country_code=country_code,
+                        candidates=_build_conflict_candidates(
+                            existing_documents,
+                            source_directory=source_directory,
+                            country_code=country_code,
+                        ),
+                    )
+
                 if (
                     len(unique_document_ids) == 1
                     and len(existing_paths) == 1
-                    and _sha256_file(staged_path)
+                    and _sha256_file(candidate_path)
                     == _sha256_file(existing_paths[0])
                 ):
                     raise AdminDocumentAlreadyCurrentError(
@@ -547,9 +1039,8 @@ def safe_upload_and_index_document(
                         country_code=country_code,
                     )
 
-                replacement_pending = (
-                    bool(existing_documents)
-                    and not replace_existing
+                replacement_pending = bool(existing_documents) and not (
+                    replace_existing or resolve_country_conflict
                 )
 
                 if (
@@ -585,7 +1076,7 @@ def safe_upload_and_index_document(
                 backups: list[tuple[Path, Path]] = []
                 new_final_installed = False
 
-                shutil.copyfile(staged_path, incoming_path)
+                shutil.copyfile(candidate_path, incoming_path)
 
                 try:
                     for existing_path in existing_paths:

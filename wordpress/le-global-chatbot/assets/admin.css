@@ -370,6 +370,27 @@
     gap: 0.75rem;
 }
 
+.le-global-chatbot-admin__edit-delete {
+    margin-top: 0.5rem;
+}
+
+.le-global-chatbot-admin__delete-button {
+    color: #d63638;
+    border-color: #d63638;
+}
+
+.le-global-chatbot-admin__delete-button:hover:not(:disabled),
+.le-global-chatbot-admin__delete-button:focus-visible {
+    color: #fff;
+    background: #d63638;
+    border-color: #d63638;
+}
+
+.le-global-chatbot-admin__delete-button:disabled {
+    color: #a7aaad;
+    border-color: #dcdcde;
+}
+
 /* --- Documents toolbar (search + status filter) --------------------- */
 
 .le-global-chatbot-admin__toolbar {
@@ -588,4 +609,170 @@
         width: 100%;
         min-width: 0;
     }
+}
+
+/* --- Upload decision panels (ORDER 8E-A2) --------------------------- */
+/*
+ * New awaiting_country_confirmation/awaiting_country_selection queue
+ * states reuse the existing .le-global-chatbot-admin__queue-message/
+ * .le-global-chatbot-admin__queue-decisions patterns unchanged; the
+ * rules below are only the genuinely new pieces - the country
+ * heading/value, the discreet "choose a different country" link, the
+ * inline country-select field, and an inline validation error.
+ */
+
+.le-global-chatbot-admin__queue-country-heading {
+    font-weight: 700;
+    color: #1d2327;
+}
+
+.le-global-chatbot-admin__queue-country-value {
+    font-size: 1rem;
+    color: #1d2327;
+}
+
+.le-global-chatbot-admin__queue-error {
+    color: #d63638;
+    font-weight: 600;
+}
+
+.le-global-chatbot-admin__queue-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    max-width: 320px;
+}
+
+.le-global-chatbot-admin__queue-field label {
+    font-weight: 600;
+    font-size: 0.86rem;
+}
+
+.le-global-chatbot-admin__queue-field select {
+    display: block;
+    width: 100%;
+}
+
+/*
+ * A discreet secondary action (never the same visual weight as
+ * Cancel/Confirm) - underlined text, not a button, but still a real
+ * <button> element so it stays keyboard/AT-reachable and gets a
+ * visible focus outline like every other interactive control here.
+ */
+.le-global-chatbot-admin__link-button {
+    align-self: flex-start;
+    padding: 0;
+    border: none;
+    background: none;
+    color: #2271b1;
+    font-size: 0.86rem;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.le-global-chatbot-admin__link-button:hover {
+    color: #135e96;
+}
+
+.le-global-chatbot-admin__link-button:focus-visible {
+    outline: 2px solid #2271b1;
+    outline-offset: 2px;
+}
+
+.le-global-chatbot-admin__queue-item[data-status="needs_conflict_resolution"] {
+    border-color: #f0e2a3;
+    background: #fff5d6;
+}
+
+/* --- Country-conflict review panel (ORDER 8E-A2) -------------------- */
+
+.le-global-chatbot-admin__conflict-note {
+    display: block;
+    margin-top: 0.35rem;
+    color: #646970;
+    font-size: 0.86rem;
+}
+
+.le-global-chatbot-admin__duplicate-warning .button {
+    margin-top: 0.5rem;
+}
+
+.le-global-chatbot-admin__conflict-review {
+    margin-bottom: 1rem;
+}
+
+.le-global-chatbot-admin__conflict-review[hidden] {
+    display: none;
+}
+
+.le-global-chatbot-admin__conflict-review-panel {
+    padding: 1rem 1.25rem;
+    border: 1px solid #dcdcde;
+    border-radius: 8px;
+    background: #f6f7f7;
+}
+
+.le-global-chatbot-admin__conflict-review-panel h3 {
+    margin-top: 0;
+}
+
+.le-global-chatbot-admin__conflict-review-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1rem;
+}
+
+.le-global-chatbot-admin__conflict-candidates {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin: 0 0 1rem;
+    padding: 0;
+    list-style: none;
+}
+
+.le-global-chatbot-admin__conflict-candidate {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.65rem 0.9rem;
+    border: 1px solid #dcdcde;
+    border-radius: 6px;
+    background: #fff;
+}
+
+.le-global-chatbot-admin__conflict-candidate-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.le-global-chatbot-admin__conflict-candidate-meta {
+    color: #646970;
+    font-size: 0.82rem;
+}
+
+/*
+ * The "Upload the correct document" file input follows the exact same
+ * visually-hidden-but-reachable technique as the main upload dropzone
+ * input (.le-global-chatbot-admin__file-input) - never display:none,
+ * so it stays reachable to assistive tech and the keyboard via its
+ * paired label's native for=/id= relationship.
+ */
+.le-global-chatbot-admin__visually-hidden-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.le-global-chatbot-admin__visually-hidden-input:focus-visible + * {
+    outline: 2px solid #2271b1;
 }

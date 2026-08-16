@@ -532,6 +532,170 @@ check(
     [false, 409, 'section_already_exists']
 );
 
+// --- update_section: title forwarding (Rename, mission "ORDER 8G-A") -
+
+reset_state(
+    ['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1'],
+    ['content' => 'Some content.', 'title' => 'Remote Work Equipment Requirements']
+);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
+    'document_id' => $VALID_DOCUMENT_ID,
+    'section_id' => 'sec-remote-work',
+    'legal_topic' => 'Remote Work Equipment Requirements',
+    'indexed_chunks' => 1,
+]);
+$halt = invoke_handler('handle_update_section');
+$sent_body = json_decode($GLOBALS['__test_backend_calls'][0]['body'] ?? '', true);
+check(
+    'a non-empty title is forwarded to the backend as-is',
+    $sent_body['title'] ?? null,
+    'Remote Work Equipment Requirements'
+);
+check(
+    'a rename response (new section_id/legal_topic) is relayed verbatim',
+    [$halt?->jsonSuccess, $halt?->jsonData['section_id'] ?? null, $halt?->jsonData['legal_topic'] ?? null],
+    [true, 'sec-remote-work', 'Remote Work Equipment Requirements']
+);
+
+reset_state(
+    ['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1'],
+    ['content' => 'Some content.']
+);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
+    'document_id' => $VALID_DOCUMENT_ID,
+    'section_id' => 'sec-1',
+    'legal_topic' => 'Overtime',
+    'indexed_chunks' => 1,
+]);
+invoke_handler('handle_update_section');
+$sent_body = json_decode($GLOBALS['__test_backend_calls'][0]['body'] ?? '', true);
+check(
+    'an omitted title is never forwarded to the backend at all (content-only edit, unchanged from before Rename existed)',
+    array_key_exists('title', $sent_body ?? ['title' => null]),
+    false
+);
+
+reset_state(
+    ['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1'],
+    ['content' => 'Some content.', 'title' => '   ']
+);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
+    'document_id' => $VALID_DOCUMENT_ID,
+    'section_id' => 'sec-1',
+    'legal_topic' => 'Overtime',
+    'indexed_chunks' => 1,
+]);
+invoke_handler('handle_update_section');
+$sent_body = json_decode($GLOBALS['__test_backend_calls'][0]['body'] ?? '', true);
+check(
+    'a whitespace-only title is treated the same as omitted - never forwarded',
+    array_key_exists('title', $sent_body ?? ['title' => null]),
+    false
+);
+
+reset_state(
+    ['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1'],
+    ['content' => 'Duplicate attempt.', 'title' => 'Hiring Practices']
+);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(409, [
+    'detail' => [
+        'code' => 'section_already_exists',
+        'message' => "A section already exists with this title: 'Hiring Practices'.",
+        'operation' => 'section_update',
+        'title' => 'Hiring Practices',
+    ],
+]);
+$halt = invoke_handler('handle_update_section');
+check(
+    'a duplicate-title rename error is propagated with its structured detail (operation=section_update)',
+    [
+        $halt?->jsonSuccess,
+        $halt?->statusCode,
+        $halt?->jsonData['detail']['code'] ?? null,
+        $halt?->jsonData['detail']['operation'] ?? null,
+    ],
+    [false, 409, 'section_already_exists', 'section_update']
+);
+
+// --- delete_section (mission "ORDER 8G-A", section 7) -----------------
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+$GLOBALS['__test_current_user_can'] = false;
+$halt = invoke_handler('handle_delete_section');
+check(
+    'unauthorized user gets a 403 and zero backend calls (delete_section)',
+    [$halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [403, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+$GLOBALS['__test_nonce_valid'] = false;
+$halt = invoke_handler('handle_delete_section');
+check(
+    'an invalid nonce halts before any backend call (delete_section)',
+    [$halt !== null, count($GLOBALS['__test_backend_calls'])],
+    [true, 0]
+);
+
+reset_state(['document_id' => 'not-a-real-id', 'section_id' => 'sec-1']);
+$halt = invoke_handler('handle_delete_section');
+check(
+    'an invalid document_id is rejected with 422 and zero backend calls (delete_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, count($GLOBALS['__test_backend_calls'])],
+    [false, 422, 0]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-1']);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
+    'document_id' => $VALID_DOCUMENT_ID,
+    'section_id' => 'sec-1',
+    'legal_topic' => 'Remote Working',
+]);
+$halt = invoke_handler('handle_delete_section');
+check(
+    'the delete is sent as a DELETE to the backend section path, exactly once',
+    [
+        $GLOBALS['__test_backend_calls'][0]['method'] ?? null,
+        str_ends_with(
+            $GLOBALS['__test_backend_calls'][0]['url'] ?? '',
+            '/documents/' . $VALID_DOCUMENT_ID . '/sections/sec-1'
+        ),
+        count($GLOBALS['__test_backend_calls']),
+    ],
+    ['DELETE', true, 1]
+);
+check(
+    'a successful delete is relayed via wp_send_json_success',
+    [$halt?->jsonSuccess, $halt?->jsonData['legal_topic'] ?? null],
+    [true, 'Remote Working']
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-only']);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(409, [
+    'detail' => [
+        'code' => 'section_is_last_remaining',
+        'message' => 'This section cannot be deleted because it is the only remaining section in this document.',
+        'operation' => 'section_delete',
+    ],
+]);
+$halt = invoke_handler('handle_delete_section');
+check(
+    'a section_is_last_remaining backend error is propagated with its structured detail',
+    [$halt?->jsonSuccess, $halt?->statusCode, $halt?->jsonData['detail']['code'] ?? null],
+    [false, 409, 'section_is_last_remaining']
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID, 'section_id' => 'sec-missing']);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(404, [
+    'detail' => ['code' => 'document_section_not_found', 'message' => 'No section "sec-missing" exists for this document.'],
+]);
+$halt = invoke_handler('handle_delete_section');
+check(
+    'a section-not-found backend error is propagated with its real message (delete_section)',
+    [$halt?->jsonSuccess, $halt?->statusCode, $halt?->jsonData['message'] ?? null],
+    [false, 404, 'No section "sec-missing" exists for this document.']
+);
+
 if ($failures > 0) {
     fwrite(STDERR, "\n{$failures} check(s) FAILED\n");
     exit(1);

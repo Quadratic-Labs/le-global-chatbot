@@ -22,6 +22,7 @@ from app.models.admin_document_lifecycle import (
 from app.models.admin_document_sections import (
     AdminDocumentSectionAddRequest,
     AdminDocumentSectionAddResponse,
+    AdminDocumentSectionDeleteResponse,
     AdminDocumentSectionListResponse,
     AdminDocumentSectionResponse,
     AdminDocumentSectionUpdateRequest,
@@ -45,10 +46,12 @@ from app.services.admin_document_lifecycle import (
 from app.services.admin_document_sections import (
     AdminDocumentSectionAlreadyExistsError,
     AdminDocumentSectionInvalidError,
+    AdminDocumentSectionLastRemainingError,
     AdminDocumentSectionNotFoundError,
     AdminDocumentSectionPositionError,
     AdminDocumentSectionUpdateFailedError,
     add_new_section,
+    delete_section,
     get_effective_section,
     list_effective_sections,
     update_effective_section,
@@ -642,9 +645,10 @@ def update_admin_document_section(
     section_id: str,
     payload: AdminDocumentSectionUpdateRequest,
 ) -> AdminDocumentSectionUpdateResponse:
-    """Save a new effective content for one existing section
-    (mission "ORDER 5C"). Never creates a new legal_topic - only an
-    already-existing section may be edited."""
+    """Save a new effective content for one existing section (mission
+    "ORDER 5C"), optionally renaming it in the same save (mission
+    "ORDER 8G-A") - an omitted or effectively-unchanged title is a
+    normal content-only edit, never a rename."""
 
     settings = get_settings()
 
@@ -653,6 +657,7 @@ def update_admin_document_section(
             document_id=document_id,
             section_id=section_id,
             new_content=payload.content,
+            new_title=payload.title,
             source_directory=settings.document_source_dir,
         )
 
@@ -715,6 +720,18 @@ def update_admin_document_section(
             status_code=(
                 status.HTTP_422_UNPROCESSABLE_ENTITY
             ),
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentSectionAlreadyExistsError as error:
+        log_admin_business_error(
+            operation="section_update",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
             detail=error.to_detail(),
         ) from error
 
@@ -969,6 +986,165 @@ def add_admin_document_section(
                 code="document_catalog_unavailable",
                 message=str(error),
                 operation="section_add",
+                document_id=document_id,
+            ),
+        ) from error
+
+
+@router.delete(
+    "/documents/{document_id}/sections/{section_id}",
+    response_model=AdminDocumentSectionDeleteResponse,
+)
+def delete_admin_document_section(
+    document_id: str,
+    section_id: str,
+) -> AdminDocumentSectionDeleteResponse:
+    """Permanently remove one top-level legal section from the current
+    DOCX (mission "ORDER 8G-A"). Blocks deleting the document's last
+    remaining usable section."""
+
+    settings = get_settings()
+
+    try:
+        return delete_section(
+            document_id=document_id,
+            section_id=section_id,
+            source_directory=settings.document_source_dir,
+        )
+
+    except InvalidAdminDocumentIdError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=admin_error_detail(
+                code="invalid_document_id",
+                message=str(error),
+                operation="section_delete",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentNotFoundError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=admin_error_detail(
+                code="document_not_found",
+                message=str(error),
+                operation="section_delete",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentSectionNotFoundError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentSectionLastRemainingError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentOperationInProgressError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=admin_error_detail(
+                code="document_operation_in_progress",
+                message=str(error),
+                operation="section_delete",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentCountryConflictError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+            country_code=error.country_code,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentSectionUpdateFailedError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=error.to_detail(),
+        ) from error
+
+    except AdminDocumentRollbackError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=admin_error_detail(
+                code="rollback_failed",
+                message=str(error),
+                operation="section_delete",
+                document_id=document_id,
+            ),
+        ) from error
+
+    except AdminDocumentLifecycleError as error:
+        log_admin_business_error(
+            operation="section_delete",
+            error=error,
+            document_id=document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=admin_error_detail(
+                code="document_catalog_unavailable",
+                message=str(error),
+                operation="section_delete",
                 document_id=document_id,
             ),
         ) from error
