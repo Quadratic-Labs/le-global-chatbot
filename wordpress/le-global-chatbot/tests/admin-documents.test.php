@@ -173,6 +173,11 @@ function esc_html(string $text): string
     return $text;
 }
 
+function esc_attr(string $text): string
+{
+    return $text;
+}
+
 function sanitize_key(string $value): string
 {
     return strtolower(preg_replace('/[^a-z0-9_\-]/', '', strtolower($value)) ?? '');
@@ -710,6 +715,82 @@ check(
         'application/vnd.openxmlformats-'
     ),
     true
+);
+
+// =====================================================================
+// render_notice (ORDER 8G-A.1 - the PRG notice must not persist across
+// a plain reload of the same URL once it has been shown once)
+// =====================================================================
+
+function invoke_render_notice(array $get): string
+{
+    $_GET = $get;
+
+    $reflection = new ReflectionClass('LE_Global_Chatbot_Admin');
+    $method = $reflection->getMethod('render_notice');
+    $method->setAccessible(true);
+
+    ob_start();
+    $method->invoke(null);
+
+    return ob_get_clean();
+}
+
+$output = invoke_render_notice([]);
+check(
+    'a clean page load (no notice query params) renders nothing',
+    $output,
+    ''
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'error',
+    'le_global_message' => 'The document identifier is invalid.',
+]);
+check(
+    'a genuinely present error notice still shows its message',
+    str_contains($output, 'The document identifier is invalid.'),
+    true
+);
+check(
+    'the shown notice self-clears its own URL query params via history.replaceState',
+    str_contains($output, 'history.replaceState') && str_contains($output, "'le_global_notice'") && str_contains($output, "'le_global_message'"),
+    true
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'success',
+    'le_global_message' => 'The section was saved.',
+]);
+check(
+    'a success notice also shows its message',
+    str_contains($output, 'The section was saved.'),
+    true
+);
+check(
+    'a success notice also self-clears its URL query params',
+    str_contains($output, 'history.replaceState'),
+    true
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'not-a-real-type',
+    'le_global_message' => 'Should never show.',
+]);
+check(
+    'an unrecognized notice type renders nothing (unchanged behavior)',
+    $output,
+    ''
+);
+
+$output = invoke_render_notice([
+    'le_global_notice' => 'error',
+    'le_global_message' => '',
+]);
+check(
+    'an empty message renders nothing (unchanged behavior)',
+    $output,
+    ''
 );
 
 if ($failures > 0) {

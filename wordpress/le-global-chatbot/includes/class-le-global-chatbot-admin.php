@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.7.0';
+    private const VERSION = '0.7.2';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -482,6 +482,17 @@ final class LE_Global_Chatbot_Admin
                         section.
                     </p>
                 </div>
+
+                <button
+                    type="button"
+                    id="le-global-edit-collapse"
+                    class="button le-global-chatbot-admin__collapse-button"
+                    aria-label="Collapse section form"
+                    title="Collapse section form"
+                    hidden
+                >
+                    <span aria-hidden="true">&#9650;</span>
+                </button>
             </div>
 
             <div
@@ -3619,6 +3630,17 @@ final class LE_Global_Chatbot_Admin
                 ?>
             </p>
         </div>
+        <script>
+            ( function () {
+                if ( ! window.history || ! window.history.replaceState ) {
+                    return;
+                }
+                var url = new URL( window.location.href );
+                url.searchParams.delete( 'le_global_notice' );
+                url.searchParams.delete( 'le_global_message' );
+                window.history.replaceState( null, '', url.toString() );
+            } )();
+        </script>
         <?php
     }
 

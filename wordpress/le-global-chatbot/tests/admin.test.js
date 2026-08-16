@@ -3054,6 +3054,10 @@ describe("add / edit a section", () => {
         const cancelButton = makeFakeButton();
         const saveButton = makeFakeButton();
         const addSubmitButton = makeFakeButton();
+        const collapseButton = makeFakeButton();
+        // Server-rendered `hidden` on the real button, mirroring
+        // #le-global-chatbot-edit's own default-collapsed state.
+        collapseButton.hidden = true;
 
         const editContainer = {
             hidden: true,
@@ -3092,6 +3096,7 @@ describe("add / edit a section", () => {
             "le-global-edit-cancel": cancelButton,
             "le-global-edit-save": saveButton,
             "le-global-add-submit": addSubmitButton,
+            "le-global-edit-collapse": collapseButton,
         };
 
         global.document = {
@@ -3131,6 +3136,7 @@ describe("add / edit a section", () => {
             cancelButton,
             saveButton,
             addSubmitButton,
+            collapseButton,
         };
     }
 
@@ -3192,6 +3198,10 @@ describe("add / edit a section", () => {
 
     function clickModeEdit() {
         return dom.modeEditButton._listeners.click();
+    }
+
+    function clickCollapse() {
+        return dom.collapseButton._listeners.click();
     }
 
     const TWO_SECTIONS_RESPONSE = {
@@ -3908,20 +3918,25 @@ describe("add / edit a section", () => {
 
     // --- Collapsed-by-default panel (mission "ORDER 8G-A", section 9) -
 
-    test("the panel is collapsed by default and expands only once a mode button is clicked", () => {
+    test("A: fresh page load - form hidden, both mode buttons and the collapse control usable/hidden as expected", () => {
         assert.equal(dom.editContainer.hidden, true);
+        assert.equal(dom.collapseButton.hidden, true);
+        assert.equal(dom.modeEditButton.hidden, false);
+        assert.equal(dom.modeAddButton.hidden, false);
+    });
 
+    test("B: clicking Edit a section shows the Edit form and reveals the dedicated collapse control", () => {
         clickModeEdit();
 
         assert.equal(dom.editContainer.hidden, false);
+        assert.equal(dom.collapseButton.hidden, false);
     });
 
-    test("clicking + Add a new section also expands the panel", () => {
-        assert.equal(dom.editContainer.hidden, true);
-
+    test("F: clicking + Add a new section shows the Add form and reveals the dedicated collapse control", () => {
         clickModeAdd();
 
         assert.equal(dom.editContainer.hidden, false);
+        assert.equal(dom.collapseButton.hidden, false);
     });
 
     test("expand() does not depend on setMode's own no-op guard - Edit is already the default mode, but the panel still starts collapsed", () => {
@@ -3932,13 +3947,127 @@ describe("add / edit a section", () => {
         assert.equal(dom.editContainer.hidden, false);
     });
 
-    test("Cancel collapses the panel back to its default state", () => {
+    // --- ORDER 8G-A.2: Collapse is presentation-only, Cancel resets only -
+
+    test("C/D: Collapse hides only the form (country/section/content preserved), and reopening Edit shows the same state", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Hiring Practices", content: "Original content." } },
+            },
+        ]);
+
         clickModeEdit();
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+        dom.textarea.value = "Edited but not yet saved.";
+        dom.textarea._listeners.input();
+
+        clickCollapse();
+
+        assert.equal(dom.editContainer.hidden, true, "the form itself must be hidden");
+        assert.equal(dom.collapseButton.hidden, true);
+        assert.equal(dom.countrySelect.value, "doc_aaa", "collapse must not reset the country");
+        assert.equal(dom.sectionSelect.value, "sec-1", "collapse must not reset the section");
+        assert.equal(dom.textarea.value, "Edited but not yet saved.", "collapse must not reset the content");
+
+        clickModeEdit();
+
+        assert.equal(dom.editContainer.hidden, false, "reopening Edit must show the form again");
+        assert.equal(dom.countrySelect.value, "doc_aaa");
+        assert.equal(dom.sectionSelect.value, "sec-1");
+        assert.equal(dom.textarea.value, "Edited but not yet saved.", "unsaved content must survive collapse/reopen");
+    });
+
+    test("G: entering Add content, collapsing, then reopening Add preserves the draft", () => {
+        clickModeAdd();
+        dom.addTitleInput.value = "Remote Working";
+        dom.addTitleInput._listeners.input();
+        dom.addContentTextarea.value = "Employees may work remotely.";
+        dom.addContentTextarea._listeners.input();
+
+        clickCollapse();
+
+        assert.equal(dom.editContainer.hidden, true);
+        assert.equal(dom.addTitleInput.value, "Remote Working", "collapse must not reset the Add title");
+        assert.equal(dom.addContentTextarea.value, "Employees may work remotely.", "collapse must not reset the Add content");
+
+        clickModeAdd();
+
         assert.equal(dom.editContainer.hidden, false);
+        assert.equal(dom.addTitleInput.value, "Remote Working");
+        assert.equal(dom.addContentTextarea.value, "Employees may work remotely.");
+    });
+
+    test("COLLAPSE_NO_DISCARD_WARNING: collapsing with dirty Add content never prompts, unlike a real mode switch", () => {
+        clickModeAdd();
+        dom.addTitleInput.value = "Draft";
+        dom.addTitleInput._listeners.input();
+
+        let confirmCalled = false;
+        global.window.confirm = () => {
+            confirmCalled = true;
+            return true;
+        };
+
+        clickCollapse();
+
+        assert.equal(confirmCalled, false, "Collapse is non-destructive and must never ask to discard");
+        assert.equal(dom.addTitleInput.value, "Draft", "the draft must still be there after collapsing");
+    });
+
+    test("E/H: Cancel resets the current form's fields but leaves the panel open (does not collapse)", async () => {
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { document_id: "doc_aaa", section_id: "sec-1", legal_topic: "Hiring Practices", content: "Original content." } },
+            },
+        ]);
+
+        clickModeEdit();
+        dom.countrySelect.value = "doc_aaa";
+        await changeSection("sec-1");
+        dom.textarea.value = "Edited but not yet saved.";
+        dom.textarea._listeners.input();
 
         clickCancel();
 
-        assert.equal(dom.editContainer.hidden, true);
+        assert.equal(dom.editContainer.hidden, false, "Cancel must NOT collapse the panel");
+        assert.equal(dom.collapseButton.hidden, false, "the collapse control stays visible - the panel is still open");
+        assert.equal(dom.countrySelect.value, "", "Cancel must reset the country selection");
+        assert.equal(dom.cancelButton.disabled, true, "nothing left to reset");
+    });
+
+    test("H: Cancel on a dirty Add form clears the fields but keeps the Add panel open", () => {
+        clickModeAdd();
+        dom.countrySelect.value = "doc_aaa";
+        dom.addTitleInput.value = "Test";
+        dom.addTitleInput._listeners.input();
+        dom.addContentTextarea.value = "Some content.";
+        dom.addContentTextarea._listeners.input();
+
+        clickCancel();
+
+        assert.equal(dom.editContainer.hidden, false, "Cancel must NOT collapse the Add panel");
+        assert.equal(dom.addOnlyFields.hidden, false, "Add mode itself must stay selected");
+        assert.equal(dom.addTitleInput.value, "", "Add title must be cleared");
+        assert.equal(dom.addContentTextarea.value, "", "Add content must be cleared");
+    });
+
+    test("J: switching to Edit mode with unsaved Add content asks for confirmation; declining keeps the draft and stays in Add mode", () => {
+        clickModeAdd();
+        dom.countrySelect.value = "doc_aaa";
+        dom.addTitleInput.value = "Unsaved draft";
+        dom.addTitleInput._listeners.input();
+
+        global.window.confirm = () => false;
+
+        clickModeEdit();
+
+        assert.equal(dom.addOnlyFields.hidden, false, "must stay in Add mode");
+        assert.equal(dom.addTitleInput.value, "Unsaved draft", "the draft must be preserved");
     });
 
     // --- Section title / Rename (mission "ORDER 8G-A", sections 2-5) --

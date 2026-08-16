@@ -28,6 +28,7 @@ from app.core.subsection_taxonomy import (
 from app.models.document import DocumentChunk
 from app.services.docx_country_marker import read_country_marker
 from app.services.docx_parser import (
+    ExtractedContact,
     ParsedSection,
     build_contact_chunk_content,
     extract_contacts_from_docx,
@@ -920,24 +921,23 @@ def build_document_chunks(
     return chunks
 
 
-def _build_contact_chunk(
-    file_path: Path,
+def build_contact_chunk_for_contacts(
+    contacts: Sequence[ExtractedContact],
     metadata: DocumentMetadata,
 ) -> DocumentChunk | None:
     """
-    Build one Contact-subsection chunk from a source DOCX, if it has
-    a validated contact card.
+    Build the one Contact-subsection DocumentChunk representing every
+    contact in `contacts`, or None when there is nothing to index.
 
-    Reuses the same document_id/chunk_id scheme as every other chunk
-    of this document, so it lives in the same OpenSearch mapping with
-    no new field. Returns None when no contact could be extracted,
-    rather than indexing an empty placeholder.
+    Public and reusable: the ONE shared formatter/builder behind every
+    Contact-chunk-producing path (initial DOCX parsing at upload time,
+    below; Admin Contact CRUD synchronization; and Reindex when a
+    structured contact state already exists - see admin_contacts.py) -
+    never a second, separately maintained implementation (mission
+    "ORDER 8G-B1", section 8). Reuses the same document_id/chunk_id
+    scheme as every other chunk of this document, so it lives in the
+    same OpenSearch mapping with no new field.
     """
-
-    contacts = extract_contacts_from_docx(
-        file_path,
-        country=metadata.country,
-    )
 
     if not contacts:
         return None
@@ -986,6 +986,29 @@ def _build_contact_chunk(
             content
         ),
         reference_year=metadata.reference_year,
+    )
+
+
+def _build_contact_chunk(
+    file_path: Path,
+    metadata: DocumentMetadata,
+) -> DocumentChunk | None:
+    """
+    Build one Contact-subsection chunk from a source DOCX, if it has
+    a validated contact card.
+
+    Returns None when no contact could be extracted, rather than
+    indexing an empty placeholder.
+    """
+
+    contacts = extract_contacts_from_docx(
+        file_path,
+        country=metadata.country,
+    )
+
+    return build_contact_chunk_for_contacts(
+        contacts,
+        metadata,
     )
 
 

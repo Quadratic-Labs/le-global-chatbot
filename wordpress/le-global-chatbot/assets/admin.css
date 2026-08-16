@@ -91,6 +91,14 @@
     margin-bottom: 1.25rem;
 }
 
+.le-global-chatbot-admin__collapse-button {
+    flex-shrink: 0;
+    align-self: flex-start;
+    padding: 0 0.6rem;
+    line-height: 1.9;
+    font-size: 0.8rem;
+}
+
 .le-global-chatbot-admin__panel-header h2 {
     margin: 0;
     display: flex;

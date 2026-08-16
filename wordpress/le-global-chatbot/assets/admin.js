@@ -1758,6 +1758,9 @@
         const addSubmitButton = document.getElementById(
             "le-global-add-submit"
         );
+        const collapseButton = document.getElementById(
+            "le-global-edit-collapse"
+        );
 
         if (
             !modeEditButton || !modeAddButton || !countrySelect
@@ -1766,6 +1769,7 @@
             || !addOnlyFields || !addTitleInput || !addPositionSelect
             || !duplicateWarningEl || !addContentTextarea || !messageEl
             || !cancelButton || !saveButton || !addSubmitButton
+            || !collapseButton
         ) {
             return;
         }
@@ -1989,12 +1993,23 @@
         // setMode()'s own no-op guard (mode === nextMode), since
         // clicking "Edit a section" while already in edit mode must
         // still reveal the panel the very first time.
+        //
+        // Mission "ORDER 8G-A.2" - collapse() is a pure presentation-
+        // state toggle: it never resets form fields/selections, so it
+        // is safe to call directly from the dedicated collapse button
+        // with no dirty check/confirm and no call to resetToEmpty().
+        // Reopening (clicking "Edit a section"/"+ Add a new section"
+        // again for the SAME mode) only calls expand() - since
+        // collapse() never touched any field value, everything the
+        // admin had selected/typed is exactly where they left it.
         function expand() {
             container.hidden = false;
+            collapseButton.hidden = false;
         }
 
         function collapse() {
             container.hidden = true;
+            collapseButton.hidden = true;
         }
 
         function buildQueryUrl(action, nonce, params) {
@@ -2734,13 +2749,16 @@
             updateAddSubmitAvailability();
         }
 
+        // Mission "ORDER 8G-A.2", section 6 - Cancel resets the current
+        // form back to its normal initial state but must NOT collapse
+        // the panel; collapsing is exclusively the dedicated ▲
+        // control's job now.
         function onCancel() {
             if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
                 return;
             }
 
             resetToEmpty();
-            collapse();
         }
 
         countrySelect.addEventListener("change", () => {
@@ -2785,6 +2803,9 @@
             setMode("add");
             expand();
         });
+        // Mission "ORDER 8G-A.2", section 4 - a pure presentation-state
+        // action: no dirty check, no reset, no backend request.
+        collapseButton.addEventListener("click", collapse);
 
         renderModeUI();
     }

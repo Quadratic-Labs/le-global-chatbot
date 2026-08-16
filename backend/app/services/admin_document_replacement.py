@@ -68,6 +68,9 @@ from app.services.document_indexer import (
 from app.services.document_section_state import (
     delete_section_edit_state,
 )
+from app.services.docx_parser import (
+    extract_contacts_from_docx,
+)
 from app.services.document_source_resolver import (
     DocumentSourceConflictError,
     resolve_country_source_paths,
@@ -1145,6 +1148,42 @@ def safe_upload_and_index_document(
                             "previous section-edit state could not "
                             "be fully cleared."
                         ) from error
+
+                # Mission "ORDER 8G-B1": "new DOCX always wins" for
+                # contacts too - a confirmed upload/replace entirely
+                # reseeds the structured contact state (and resets the
+                # admin-modified marker) from the SAME DOCX bytes just
+                # accepted, discarding whatever Admin Contact CRUD had
+                # previously recorded, with no merge. Deferred import
+                # (function-local, not module-level) to avoid a real
+                # circular import: admin_contacts imports from
+                # admin_document_lifecycle, which itself imports from
+                # this module. Reached only after the DOCX file and its
+                # legal/auto-contact OpenSearch chunks are already
+                # fully committed above - a failure here is reported
+                # narrowly, exactly like the section-edit-state cleanup
+                # immediately above it, rather than attempting to undo
+                # that already-successful commit.
+                from app.services.admin_contacts import (
+                    reseed_contact_state_from_parsed_contacts,
+                )
+
+                try:
+                    reseed_contact_state_from_parsed_contacts(
+                        document_id=indexing_result.document_id,
+                        country_code=country_code,
+                        source_directory=source_directory,
+                        contacts=extract_contacts_from_docx(
+                            candidate_path,
+                            country=first_chunk.country,
+                        ),
+                    )
+
+                except OSError as error:
+                    raise AdminDocumentStorageError(
+                        "The document was uploaded, but its contact "
+                        "state could not be seeded from the new DOCX."
+                    ) from error
 
             return AdminDocumentUploadResponse(
                 status=(
