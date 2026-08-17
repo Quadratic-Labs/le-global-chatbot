@@ -31,6 +31,13 @@ from fastapi import HTTPException, UploadFile
 from app.core.config import get_settings
 from app.routers import admin_document_lifecycle as lifecycle_router
 from app.routers import admin_documents as documents_router
+from app.services import admin_document_lifecycle as lifecycle_service
+from app.services.contact_state import (
+    ContactRecord,
+    ContactState,
+    write_contact_state_atomic,
+)
+from app.services.docx_parser import extract_contacts_from_docx
 from tests.admin_invariants import (
     assert_chunk_count_matches,
     assert_no_orphan_chunks,
@@ -878,6 +885,147 @@ class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
             context.exception.detail["code"], "source_conflict"
         )
 
+    def test_download_with_no_contact_state_returns_source_unmaterialized(
+        self,
+    ) -> None:
+        # No sidecar ever written for this document_id - matches every
+        # existing test/document above, and confirms the fallback path
+        # is unchanged (mission "ORDER 8G-B2.1").
+        document_id = "doc_" + "a" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        real_bytes = _build_real_docx_bytes("Argentina overview")
+        (self.source_dir / "AR.docx").write_bytes(real_bytes)
+
+        download = lifecycle_service.get_document_download(
+            document_id=document_id,
+            source_directory=self.source_dir,
+        )
+
+        self.assertFalse(download.contacts_materialized)
+        self.assertIsNone(download.cleanup_path)
+        self.assertEqual(
+            download.path.read_bytes(), real_bytes
+        )
+
+    def test_download_with_contact_state_returns_materialized_effective_docx(
+        self,
+    ) -> None:
+        document_id = "doc_" + "b" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        (self.source_dir / "AR.docx").write_bytes(
+            _build_real_docx_bytes("Argentina overview")
+        )
+
+        write_contact_state_atomic(
+            self.source_dir,
+            ContactState(
+                document_id=document_id,
+                country_code="AR",
+                contacts=(
+                    ContactRecord(
+                        contact_id="contact-1",
+                        member_firm="CURRENT FIRM",
+                        contact_person="Current Person",
+                        email="current@example.com",
+                        phone="+1 555 0100",
+                        address="1 Current Street",
+                        website="www.current.example",
+                    ),
+                ),
+            ),
+        )
+
+        download = lifecycle_service.get_document_download(
+            document_id=document_id,
+            source_directory=self.source_dir,
+        )
+
+        try:
+            self.assertTrue(download.contacts_materialized)
+            self.assertIsNotNone(download.cleanup_path)
+            self.assertTrue(download.cleanup_path.exists())
+
+            reparsed = extract_contacts_from_docx(download.path)
+            self.assertEqual(len(reparsed), 1)
+            self.assertEqual(
+                reparsed[0].member_firm, "CURRENT FIRM"
+            )
+            self.assertEqual(
+                reparsed[0].email, "current@example.com"
+            )
+
+            # source itself is never touched
+            self.assertNotEqual(
+                download.path, self.source_dir / "AR.docx"
+            )
+        finally:
+            if download.cleanup_path is not None:
+                download.cleanup_path.unlink(missing_ok=True)
+
+    def test_materialization_failure_leaves_no_orphan_temp_file(
+        self,
+    ) -> None:
+        document_id = "doc_" + "c" * 64
+        self.fake.add(
+            document_id=document_id,
+            country_code="AR",
+            source_filename="Argentina.docx",
+        )
+        (self.source_dir / "AR.docx").write_bytes(
+            _build_real_docx_bytes("Argentina overview")
+        )
+
+        write_contact_state_atomic(
+            self.source_dir,
+            ContactState(
+                document_id=document_id,
+                country_code="AR",
+                contacts=(
+                    ContactRecord(
+                        contact_id="contact-1",
+                        member_firm="CURRENT FIRM",
+                    ),
+                ),
+            ),
+        )
+
+        temp_dir_before = {
+            entry.name
+            for entry in Path(tempfile.gettempdir()).iterdir()
+            if entry.suffix == ".docx"
+        }
+
+        with patch(
+            "app.services.admin_document_lifecycle."
+            "materialize_effective_docx",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaises(RuntimeError):
+                lifecycle_service.get_document_download(
+                    document_id=document_id,
+                    source_directory=self.source_dir,
+                )
+
+        temp_dir_after = {
+            entry.name
+            for entry in Path(tempfile.gettempdir()).iterdir()
+            if entry.suffix == ".docx"
+        }
+
+        self.assertEqual(
+            temp_dir_before,
+            temp_dir_after,
+            "a failed materialization must never leave a temp file behind",
+        )
+
 
 class StatsHttpContractTests(AdminRouterIntegrationTestCase):
     """Mission "ORDER 3", section 26 - GET .../documents/stats."""
@@ -1023,4 +1171,56 @@ class RestoreEndpointRemovedTests(unittest.TestCase):
 
         self.assertFalse(
             hasattr(sections_service, "restore_effective_section")
+        )
+
+
+class IdenticalButAdminModifiedHttpContractTests(
+    AdminRouterIntegrationTestCase
+):
+    """
+    Mission "ORDER 8G-B2", section 14 - the router's own new exception
+    -> HTTP mapping for AdminDocumentIdenticalButAdminModifiedError.
+    Deliberately does not extend FakeOpenSearch's own query shapes for
+    this (its delete_by_query double is hard-coded to the country-wide
+    cleanup shape, not the Contact-chunk-scoped one) - the service-level
+    behavior this maps is already exhaustively covered in
+    test_admin_document_replacement.py; this proves only the NEW
+    router-level mapping itself.
+    """
+
+    def test_maps_to_409_with_structured_detail(self) -> None:
+        from app.services.admin_document_replacement import (
+            AdminDocumentIdenticalButAdminModifiedError,
+        )
+
+        def _raise(**kwargs):
+            del kwargs
+            raise AdminDocumentIdenticalButAdminModifiedError(
+                country="Argentina",
+                country_code="AR",
+                document_id="doc_" + "a" * 64,
+            )
+
+        with patch(
+            "app.routers.admin_documents.safe_upload_and_index_document",
+            side_effect=_raise,
+        ):
+            with self.assertRaises(HTTPException) as context:
+                documents_router.upload_admin_document(
+                    file=_make_upload_file("Argentina.docx", _AR_BYTES),
+                    replace_existing=False,
+                    confirm_warnings=True,
+                    country_confirmed=True,
+                    selected_country_code=None,
+                )
+
+        error = context.exception
+        self.assertEqual(error.status_code, 409)
+        self.assertEqual(
+            error.detail["code"],
+            "document_identical_but_admin_modified",
+        )
+        self.assertTrue(error.detail["admin_modified"])
+        self.assertEqual(
+            error.detail["document_id"], "doc_" + "a" * 64
         )

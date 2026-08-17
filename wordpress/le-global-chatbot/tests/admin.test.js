@@ -626,6 +626,33 @@ describe("classifyUploadResponse", () => {
         assert.equal(outcome.kind, "already_current");
     });
 
+    // Mission "ORDER 8G-B2", section 14 - byte-identical bytes, but
+    // this country's document has Admin (contact/section) changes
+    // since it was last accepted; this is deliberately never folded
+    // into "already_current" above - it needs its own confirmable
+    // decision, not a silent no-op.
+    test("document_identical_but_admin_modified routes to its own identical_but_admin_modified kind, distinct from already_current", () => {
+        const outcome = classifyUploadResponse(409, {
+            success: false,
+            data: {
+                message: "The uploaded DOCX is identical to the current Germany source, but this document has changes made in the Admin.",
+                detail: {
+                    code: "document_identical_but_admin_modified",
+                    country: "Germany",
+                    country_code: "DE",
+                    document_id: "doc_de",
+                    admin_modified: true,
+                },
+            },
+        });
+
+        assert.equal(outcome.kind, "identical_but_admin_modified");
+        assert.equal(outcome.detail.country, "Germany");
+        assert.equal(outcome.detail.country_code, "DE");
+        assert.equal(outcome.detail.document_id, "doc_de");
+        assert.equal(outcome.detail.admin_modified, true);
+    });
+
     test("document_replacement_required routes to replacement_required", () => {
         const outcome = classifyUploadResponse(409, {
             success: false,
@@ -964,6 +991,9 @@ describe("upload queue flow", () => {
                 action: options.body.get("action"),
                 nonce: options.body.get("_wpnonce"),
                 countryCode: options.body.get("country_code"),
+                confirmContactReseed: options.body.get(
+                    "confirm_contact_reseed"
+                ),
             });
 
             const response = responses[Math.min(call, responses.length - 1)];
@@ -2411,6 +2441,139 @@ describe("upload queue flow", () => {
             assert.equal(fetchCalls[1].countryConfirmed, "1");
             assert.equal(fetchCalls[1].countryCode, "CZ");
             assert.equal(snapshot()[0].status, "indexed");
+        }
+    );
+
+    // --- ORDER 8G-B2: identical-bytes-but-Admin-modified confirmation --
+    //
+    // Distinct from "document_already_current" above - the DOCX bytes
+    // are unchanged, but this country's contacts/sections were edited
+    // in the Admin since that source was last accepted, so the upload
+    // must still offer an explicit reseed-or-cancel decision rather
+    // than silently ending as "already up to date".
+
+    test(
+        "409 identical_but_admin_modified then reseed-contacts sends confirm_contact_reseed=1 and applies the resulting contact_count",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Germany.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "The uploaded DOCX is identical to the current Germany source, but this document has changes made in the Admin.",
+                            detail: {
+                                code: "document_identical_but_admin_modified",
+                                country: "Germany",
+                                country_code: "DE",
+                                document_id: "doc_de",
+                                admin_modified: true,
+                            },
+                        },
+                    },
+                },
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: {
+                            message: "Germany.docx's contacts were reseeded from the current document; Admin changes to them were discarded.",
+                            status: "contacts_reseeded",
+                            contact_count: 3,
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_contact_reseed_confirmation"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(0, "reseed-contacts");
+
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(fetchCalls[0].confirmContactReseed, null);
+            assert.equal(fetchCalls[1].confirmContactReseed, "1");
+            assert.equal(snapshot()[0].status, "indexed");
+            assert.equal(snapshot()[0].contactCount, 3);
+        }
+    );
+
+    test(
+        "409 identical_but_admin_modified then Cancel makes exactly one fetch total, zero mutation",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Germany.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: false,
+                    status: 409,
+                    payload: {
+                        success: false,
+                        data: {
+                            message: "The uploaded DOCX is identical to the current Germany source, but this document has changes made in the Admin.",
+                            detail: {
+                                code: "document_identical_but_admin_modified",
+                                country: "Germany",
+                                country_code: "DE",
+                                document_id: "doc_de",
+                                admin_modified: true,
+                            },
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(
+                snapshot()[0].status,
+                "awaiting_contact_reseed_confirmation"
+            );
+
+            moduleExports.__queueForTests.resolveDecision(0, "cancel");
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "cancelled");
+        }
+    );
+
+    test(
+        "a successful upload whose resulting contact_count is exactly 0 carries that zero count in the snapshot (non-blocking informational banner, never dropped as falsy)",
+        async () => {
+            installFilesAndLoad([makeFakeFile("Malta.docx")]);
+
+            queueFetchResponses([
+                {
+                    ok: true,
+                    status: 201,
+                    payload: {
+                        success: true,
+                        data: {
+                            message: "Malta.docx was added successfully.",
+                            status: "indexed",
+                            contact_count: 0,
+                        },
+                    },
+                },
+            ]);
+
+            await submit();
+
+            assert.equal(fetchCalls.length, 1);
+            assert.equal(snapshot()[0].status, "indexed");
+            assert.equal(snapshot()[0].contactCount, 0);
         }
     );
 });
@@ -4384,5 +4547,1021 @@ describe("add / edit a section", () => {
         // The section must not have been discarded from the UI on a
         // failed delete - the admin can still see/edit it.
         assert.equal(dom.sectionSelect.value, "sec-1");
+    });
+});
+
+// --- Contacts panel (mission "ORDER 8G-B2") --------------------------
+//
+// A dedicated, self-contained fake DOM/fetch for wireContactsPanel() -
+// mirrors "add / edit a section" above (segmented View/Add control,
+// its own dedicated Collapse control, Cancel-resets-only-never-
+// collapses, the same UNSAVED_CHANGES_PROMPT dirty-guard on mode
+// switches) plus one extra, purely client-side sub-state View mode
+// alone has: "list" vs "edit-one" (editing exactly one contact).
+//
+// admin.js dispatches every write (Add/Update/Delete) through the
+// ordinary admin-post.php POST convention, exactly like every other
+// action in this file - "PUT"/"DELETE" only describe the WordPress
+// proxy's own *internal* request to the backend (see
+// class-le-global-chatbot-admin.php's handle_update_contact/
+// handle_delete_contact), never the browser-side fetch method, which
+// is always POST here.
+
+describe("contacts panel", () => {
+    // The shared makeFakeGenericElement()/makeFakeButton() etc. (top
+    // of file) do not implement appendChild/track children -
+    // wireContactsPanel() builds each contact card via repeated
+    // createElement()+appendChild() calls, so document.createElement
+    // needs its own small node here that supports exactly that.
+    function makeFakeCardNode() {
+        const node = {
+            value: "",
+            textContent: "",
+            className: "",
+            type: "",
+            _children: [],
+            _listeners: {},
+            appendChild(child) {
+                node._children.push(child);
+                return child;
+            },
+            addEventListener(eventName, handler) {
+                node._listeners[eventName] = handler;
+            },
+        };
+
+        return node;
+    }
+
+    // For the two byId, pre-existing containers (#le-global-contact-
+    // list, #le-global-contact-zero-warning) the real code appends
+    // into and clears via `.textContent = ""` (never innerHTML) -
+    // mirrors makeFakeSelect()'s own textContent-clears-children
+    // convention above.
+    function makeFakeAppendableContainer() {
+        const container = {
+            hidden: false,
+            _children: [],
+            appendChild(child) {
+                container._children.push(child);
+                return child;
+            },
+        };
+
+        Object.defineProperty(container, "textContent", {
+            get() {
+                return "";
+            },
+            set() {
+                container._children = [];
+            },
+        });
+
+        return container;
+    }
+
+    // Recursively gathers every textContent under a rendered card -
+    // used only for the one "contact_id/document_id never leaks into
+    // user-facing text" check below, never for asserting on the
+    // card's full rendered markup (that is the E2E suite's job).
+    function collectTextContent(node) {
+        let text = node.textContent || "";
+
+        (node._children || []).forEach((child) => {
+            text += " " + collectTextContent(child);
+        });
+
+        return text;
+    }
+
+    function installContactsFakeDom() {
+        const modeViewButton = makeFakeButton();
+        const modeAddButton = makeFakeButton();
+        const countrySelect = makeFakeSelect();
+        const viewOnlyFields = { hidden: false };
+        const zeroWarningEl = makeFakeAppendableContainer();
+        zeroWarningEl.hidden = true;
+        const listEl = makeFakeAppendableContainer();
+        const addAnotherButton = makeFakeButton();
+        addAnotherButton.hidden = true;
+        const editFieldsEl = { hidden: true };
+        const editIdInput = makeFakeGenericElement();
+        const editMemberFirmInput = makeFakeGenericElement();
+        const editContactPersonInput = makeFakeGenericElement();
+        const editEmailInput = makeFakeGenericElement();
+        const editPhoneInput = makeFakeGenericElement();
+        const editAddressInput = makeFakeGenericElement();
+        const editWebsiteInput = makeFakeGenericElement();
+
+        [
+            editMemberFirmInput,
+            editContactPersonInput,
+            editEmailInput,
+            editPhoneInput,
+            editAddressInput,
+            editWebsiteInput,
+        ].forEach((input) => {
+            input.disabled = true;
+        });
+
+        const backToListButton = makeFakeButton();
+        const addBackToListButton = makeFakeButton();
+        const addOnlyFields = { hidden: true };
+        const addMemberFirmInput = makeFakeGenericElement();
+        const addContactPersonInput = makeFakeGenericElement();
+        const addEmailInput = makeFakeGenericElement();
+        const addPhoneInput = makeFakeGenericElement();
+        const addAddressInput = makeFakeGenericElement();
+        const addWebsiteInput = makeFakeGenericElement();
+
+        [
+            addMemberFirmInput,
+            addContactPersonInput,
+            addEmailInput,
+            addPhoneInput,
+            addAddressInput,
+            addWebsiteInput,
+        ].forEach((input) => {
+            input.disabled = true;
+        });
+
+        const messageEl = makeFakeMessageElement();
+        const cancelButton = makeFakeButton();
+        cancelButton.disabled = true;
+        const saveButton = makeFakeButton();
+        saveButton.disabled = true;
+        const addSubmitButton = makeFakeButton();
+        addSubmitButton.disabled = true;
+        const collapseButton = makeFakeButton();
+        collapseButton.hidden = true;
+
+        const container = {
+            hidden: true,
+            dataset: {
+                adminPostUrl: "https://example.test/wp-admin/admin-post.php",
+                contactsListAction: "le_global_chatbot_list_contacts",
+                contactsListNonce: "contacts-list-nonce",
+                contactAddAction: "le_global_chatbot_add_contact",
+                contactAddNonce: "contact-add-nonce",
+                contactUpdateAction: "le_global_chatbot_update_contact",
+                contactUpdateNonce: "contact-update-nonce",
+                contactDeleteAction: "le_global_chatbot_delete_contact",
+                contactDeleteNonce: "contact-delete-nonce",
+            },
+        };
+
+        const byId = {
+            "le-global-chatbot-contacts": container,
+            "le-global-contact-mode-view": modeViewButton,
+            "le-global-contact-mode-add": modeAddButton,
+            "le-global-contact-country": countrySelect,
+            "le-global-contact-view-only-fields": viewOnlyFields,
+            "le-global-contact-zero-warning": zeroWarningEl,
+            "le-global-contact-list": listEl,
+            "le-global-contact-add-another": addAnotherButton,
+            "le-global-contact-edit-fields": editFieldsEl,
+            "le-global-contact-edit-id": editIdInput,
+            "le-global-contact-edit-member-firm": editMemberFirmInput,
+            "le-global-contact-edit-contact-person": editContactPersonInput,
+            "le-global-contact-edit-email": editEmailInput,
+            "le-global-contact-edit-phone": editPhoneInput,
+            "le-global-contact-edit-address": editAddressInput,
+            "le-global-contact-edit-website": editWebsiteInput,
+            "le-global-contact-back-to-list": backToListButton,
+            "le-global-contact-add-back-to-list": addBackToListButton,
+            "le-global-contact-add-only-fields": addOnlyFields,
+            "le-global-contact-add-member-firm": addMemberFirmInput,
+            "le-global-contact-add-contact-person": addContactPersonInput,
+            "le-global-contact-add-email": addEmailInput,
+            "le-global-contact-add-phone": addPhoneInput,
+            "le-global-contact-add-address": addAddressInput,
+            "le-global-contact-add-website": addWebsiteInput,
+            "le-global-chatbot-contact-message": messageEl,
+            "le-global-contact-cancel": cancelButton,
+            "le-global-contact-save": saveButton,
+            "le-global-contact-add-submit": addSubmitButton,
+            "le-global-contact-collapse": collapseButton,
+        };
+
+        global.document = {
+            querySelectorAll: () => [],
+            querySelector: () => null,
+            getElementById: (id) => byId[id] || null,
+            createElement: () => makeFakeCardNode(),
+            addEventListener() {},
+            removeEventListener() {},
+        };
+
+        global.window = {
+            confirm: () => true,
+            alert: () => {},
+            location: { reload: () => {} },
+        };
+
+        global.FormData = FakeFormData;
+
+        return {
+            container,
+            modeViewButton,
+            modeAddButton,
+            countrySelect,
+            viewOnlyFields,
+            zeroWarningEl,
+            listEl,
+            addAnotherButton,
+            editFieldsEl,
+            editIdInput,
+            editMemberFirmInput,
+            editContactPersonInput,
+            editEmailInput,
+            editPhoneInput,
+            editAddressInput,
+            editWebsiteInput,
+            backToListButton,
+            addBackToListButton,
+            addOnlyFields,
+            addMemberFirmInput,
+            addContactPersonInput,
+            addEmailInput,
+            addPhoneInput,
+            addAddressInput,
+            addWebsiteInput,
+            messageEl,
+            cancelButton,
+            saveButton,
+            addSubmitButton,
+            collapseButton,
+        };
+    }
+
+    let dom;
+    let fetchCalls;
+    let confirmCalls;
+    let confirmReturnValue;
+
+    beforeEach(() => {
+        dom = installContactsFakeDom();
+        fetchCalls = [];
+        confirmCalls = [];
+        confirmReturnValue = true;
+
+        global.window.confirm = (message) => {
+            confirmCalls.push(message);
+            return confirmReturnValue;
+        };
+
+        loadFreshAdminModule();
+    });
+
+    afterEach(() => {
+        delete global.document;
+        delete global.window;
+        delete global.FormData;
+        delete global.fetch;
+        delete require.cache[require.resolve(ADMIN_JS_PATH)];
+    });
+
+    function queueFetchResponses(responses) {
+        let call = 0;
+
+        global.fetch = async (url, options) => {
+            fetchCalls.push({ url, options });
+
+            const response = responses[Math.min(call, responses.length - 1)];
+            call += 1;
+
+            return makeFakeResponse(response);
+        };
+    }
+
+    function selectCountry(value) {
+        dom.countrySelect.value = value;
+        return dom.countrySelect._listeners.change();
+    }
+
+    function setField(input, value) {
+        input.value = value;
+        input._listeners.input();
+    }
+
+    function clickModeView() {
+        return dom.modeViewButton._listeners.click();
+    }
+
+    function clickModeAdd() {
+        return dom.modeAddButton._listeners.click();
+    }
+
+    function clickCollapse() {
+        return dom.collapseButton._listeners.click();
+    }
+
+    function clickCancel() {
+        return dom.cancelButton._listeners.click();
+    }
+
+    function clickSave() {
+        return dom.saveButton._listeners.click();
+    }
+
+    function clickAddSubmit() {
+        return dom.addSubmitButton._listeners.click();
+    }
+
+    // Reaches one level into a rendered card's own children to fire
+    // its Edit/Delete button - unavoidable since there is no test-only
+    // hook onto beginEditContact/confirmDeleteContact, but deliberately
+    // never used to assert on the card's rendered field text (that
+    // stays the E2E/canary suite's job - see the file's own header).
+    function clickCardAction(index, actionIndex) {
+        const card = dom.listEl._children[index];
+        const actions = card._children[card._children.length - 1];
+
+        return actions._children[actionIndex]._listeners.click();
+    }
+
+    function clickEditOnCard(index) {
+        return clickCardAction(index, 0);
+    }
+
+    function clickDeleteOnCard(index) {
+        return clickCardAction(index, 1);
+    }
+
+    const CONTACT_1 = {
+        contact_id: "contact-1",
+        member_firm: "Acme Legal SARL",
+        contact_person: "Jane Doe",
+        email: "jane@example.test",
+        phone: "+33 1 23 45 67 89",
+        address: "1 Rue de Paris, 75001 Paris",
+        website: "https://acme-legal.example",
+    };
+
+    const CONTACT_2 = {
+        contact_id: "contact-2",
+        member_firm: "Beta Law LLP",
+        contact_person: "John Roe",
+        email: "john@example.test",
+        phone: "+1 555 0100",
+        address: "2 Main St, Springfield",
+        website: "https://beta-law.example",
+    };
+
+    const LEGACY_CONTACT = {
+        contact_id: "legacy-1",
+        member_firm: "Legacy Firm",
+        contact_person: "Old Contact",
+        email: "",
+        phone: "",
+        address: "",
+        website: "",
+    };
+
+    const ZERO_CONTACTS_RESPONSE = {
+        ok: true,
+        status: 200,
+        payload: { success: true, data: { contacts: [] } },
+    };
+
+    const ONE_CONTACT_RESPONSE = {
+        ok: true,
+        status: 200,
+        payload: { success: true, data: { contacts: [CONTACT_1] } },
+    };
+
+    const TWO_CONTACTS_RESPONSE = {
+        ok: true,
+        status: 200,
+        payload: { success: true, data: { contacts: [CONTACT_1, CONTACT_2] } },
+    };
+
+    const LEGACY_CONTACT_RESPONSE = {
+        ok: true,
+        status: 200,
+        payload: { success: true, data: { contacts: [LEGACY_CONTACT] } },
+    };
+
+    function fillAddFields(values) {
+        setField(dom.addMemberFirmInput, values.member_firm);
+        setField(dom.addContactPersonInput, values.contact_person);
+        setField(dom.addEmailInput, values.email);
+        setField(dom.addPhoneInput, values.phone);
+        setField(dom.addAddressInput, values.address);
+        setField(dom.addWebsiteInput, values.website);
+    }
+
+    // --- Panel: default state, mode switches, collapse, cancel --------
+
+    test("default state: panel collapsed, View mode active, Add-only fields hidden", () => {
+        assert.equal(dom.container.hidden, true);
+        assert.equal(dom.collapseButton.hidden, true);
+        assert.equal(dom.viewOnlyFields.hidden, false);
+        assert.equal(dom.addOnlyFields.hidden, true);
+    });
+
+    test("clicking 'View contacts' expands the panel and shows the view-only fields", () => {
+        clickModeView();
+
+        assert.equal(dom.container.hidden, false);
+        assert.equal(dom.viewOnlyFields.hidden, false);
+        assert.equal(dom.addOnlyFields.hidden, true);
+    });
+
+    test("the zero-contact warning stays hidden until a country is actually selected", () => {
+        clickModeView();
+
+        assert.equal(
+            dom.zeroWarningEl.hidden,
+            true,
+            "an empty warning box must never appear before any country has been chosen"
+        );
+    });
+
+    test("clicking '+ Add a contact' expands the panel and shows the add-only fields", () => {
+        clickModeAdd();
+
+        assert.equal(dom.container.hidden, false);
+        assert.equal(dom.addOnlyFields.hidden, false);
+        assert.equal(dom.viewOnlyFields.hidden, true);
+        assert.equal(dom.saveButton.hidden, true);
+        assert.equal(dom.addSubmitButton.hidden, false);
+    });
+
+    test("Collapse hides the panel while preserving in-memory field values", () => {
+        clickModeAdd();
+        setField(dom.addMemberFirmInput, "Draft firm name");
+
+        clickCollapse();
+
+        assert.equal(dom.container.hidden, true);
+        assert.equal(dom.collapseButton.hidden, true);
+        assert.equal(
+            dom.addMemberFirmInput.value,
+            "Draft firm name",
+            "collapse must never clear in-progress Add field values"
+        );
+
+        // "Re-expand" the same way a real collapse/expand round trip
+        // would - collapse() never touches field state, so clearing
+        // the container's own hidden flag back to false is enough to
+        // show the value is still there (no re-fetch/re-render needed
+        // since Add mode's fields are always live DOM nodes).
+        dom.container.hidden = false;
+
+        assert.equal(dom.addMemberFirmInput.value, "Draft firm name");
+    });
+
+    test("Cancel resets the current mode's fields without collapsing", () => {
+        clickModeAdd();
+        setField(dom.addMemberFirmInput, "Draft firm name");
+
+        clickCancel();
+
+        assert.equal(dom.container.hidden, false, "Cancel must not collapse the panel");
+        assert.equal(dom.addOnlyFields.hidden, false, "Add mode itself must stay selected");
+        assert.equal(dom.addMemberFirmInput.value, "", "Add fields must be cleared");
+    });
+
+    test("switching mode with unsaved Add content prompts for confirmation; declining keeps the content and the current mode", () => {
+        clickModeAdd();
+        setField(dom.addMemberFirmInput, "Draft firm name");
+
+        confirmReturnValue = false;
+
+        clickModeView();
+
+        assert.equal(confirmCalls.length, 1);
+        assert.equal(dom.addOnlyFields.hidden, false, "must stay in Add mode");
+        assert.equal(dom.addMemberFirmInput.value, "Draft firm name", "content must be preserved");
+    });
+
+    // --- View: fetching/rendering contacts -----------------------------
+
+    test("selecting a country with zero contacts shows the warning and auto-switches to Add mode, expanding the panel", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        dom.countrySelect.options = [
+            { value: "doc_zz", textContent: "Zzedonia (ZZ)" },
+        ];
+        dom.countrySelect.selectedIndex = 0;
+
+        await selectCountry("doc_zz");
+
+        assert.equal(fetchCalls.length, 1);
+        assert.match(fetchCalls[0].url, /action=le_global_chatbot_list_contacts/);
+        assert.match(fetchCalls[0].url, /nonce=contacts-list-nonce/);
+        assert.match(fetchCalls[0].url, /document_id=doc_zz/);
+
+        assert.equal(dom.zeroWarningEl.hidden, false);
+        assert.equal(dom.zeroWarningEl._children.length, 1);
+        assert.equal(
+            dom.zeroWarningEl._children[0].textContent,
+            "⚠ No L&E Global contact is currently configured for Zzedonia."
+        );
+
+        // Auto-switched to Add mode, no second click needed.
+        assert.equal(dom.container.hidden, false);
+        assert.equal(dom.addOnlyFields.hidden, false);
+        assert.equal(dom.viewOnlyFields.hidden, true);
+    });
+
+    test("one contact renders without throwing", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        assert.equal(fetchCalls.length, 1);
+        assert.equal(dom.zeroWarningEl.hidden, true);
+        assert.equal(dom.listEl.hidden, false);
+        assert.equal(dom.listEl._children.length, 1);
+        assert.equal(
+            dom.addOnlyFields.hidden,
+            true,
+            "must stay in View mode - never auto-switch when contacts already exist"
+        );
+    });
+
+    test("multiple contacts for one country all get fetched and rendered without throwing", async () => {
+        queueFetchResponses([TWO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        assert.equal(fetchCalls.length, 1);
+        assert.equal(dom.zeroWarningEl.hidden, true);
+        assert.equal(dom.listEl._children.length, 2);
+    });
+
+    test("rendered contact cards never surface the internal contact_id or document_id in any user-facing text", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        const cardText = dom.listEl._children
+            .map((card) => collectTextContent(card))
+            .join(" ");
+
+        assert.equal(cardText.includes("contact-1"), false);
+        assert.equal(cardText.includes("doc_fr"), false);
+        assert.equal(dom.messageEl.textContent.includes("contact-1"), false);
+        assert.equal(dom.messageEl.textContent.includes("doc_fr"), false);
+    });
+
+    // --- Add: required fields, submit, duplicates, errors --------------
+
+    test("Add submit stays disabled until a country is selected and all six fields are filled", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        assert.equal(dom.addSubmitButton.disabled, true);
+
+        await selectCountry("doc_fr");
+        clickModeAdd();
+
+        assert.equal(dom.addSubmitButton.disabled, true, "still empty");
+
+        setField(dom.addMemberFirmInput, "Acme Legal SARL");
+        setField(dom.addContactPersonInput, "Jane Doe");
+        setField(dom.addEmailInput, "jane@example.test");
+        setField(dom.addPhoneInput, "+33 1 23 45 67 89");
+        setField(dom.addAddressInput, "1 Rue de Paris");
+
+        assert.equal(dom.addSubmitButton.disabled, true, "website is still blank");
+
+        setField(dom.addWebsiteInput, "https://example.test");
+
+        assert.equal(dom.addSubmitButton.disabled, false);
+    });
+
+    test("a successful Add fires the correct POST with all six fields and reloads the contact list", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        // Zero contacts already auto-switched to Add mode.
+        assert.equal(dom.addOnlyFields.hidden, false);
+
+        fillAddFields(CONTACT_1);
+
+        assert.equal(dom.addSubmitButton.disabled, false);
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-1" } } },
+            ONE_CONTACT_RESPONSE,
+        ]);
+
+        await clickAddSubmit();
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].options.method, "POST");
+        assert.equal(fetchCalls[0].options.body.get("action"), "le_global_chatbot_add_contact");
+        assert.equal(fetchCalls[0].options.body.get("nonce"), "contact-add-nonce");
+        assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_fr");
+        assert.equal(fetchCalls[0].options.body.get("member_firm"), "Acme Legal SARL");
+        assert.equal(fetchCalls[0].options.body.get("contact_person"), "Jane Doe");
+        assert.equal(fetchCalls[0].options.body.get("email"), "jane@example.test");
+        assert.equal(fetchCalls[0].options.body.get("phone"), "+33 1 23 45 67 89");
+        assert.equal(fetchCalls[0].options.body.get("address"), "1 Rue de Paris, 75001 Paris");
+        assert.equal(fetchCalls[0].options.body.get("website"), "https://acme-legal.example");
+
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_contacts/);
+        assert.equal(dom.addMemberFirmInput.value, "", "Add fields must be cleared after a successful submit");
+        assert.match(dom.messageEl.textContent, /added successfully/);
+        assert.equal(dom.messageEl.className.includes("is-success"), true);
+    });
+
+    test("adding a second contact when one already exists is allowed - never treated as a replace/edit", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickModeAdd();
+
+        fillAddFields(CONTACT_2);
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-2" } } },
+            TWO_CONTACTS_RESPONSE,
+        ]);
+
+        await clickAddSubmit();
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].options.body.get("action"), "le_global_chatbot_add_contact");
+        assert.equal(
+            fetchCalls[0].options.body.has("contact_id"),
+            false,
+            "Add must never send a contact_id - that would make it an edit"
+        );
+        assert.equal(dom.listEl._children.length, 2, "the list reloads to show both contacts");
+    });
+
+    test("an identical duplicate contact is explicitly permitted - no client-side duplicate rejection", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickModeAdd();
+
+        // Exactly the same field values as the already-existing contact-1.
+        fillAddFields(CONTACT_1);
+
+        assert.equal(
+            dom.addSubmitButton.disabled,
+            false,
+            "an exact duplicate of an existing contact must never be blocked client-side"
+        );
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-1-dup" } } },
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { contacts: [CONTACT_1, { ...CONTACT_1, contact_id: "contact-1-dup" }] } },
+            },
+        ]);
+
+        await clickAddSubmit();
+
+        assert.equal(fetchCalls.length, 2, "the duplicate submits normally, exactly like any other Add");
+        assert.equal(fetchCalls[0].options.body.get("member_firm"), CONTACT_1.member_firm);
+    });
+
+    test("a backend API error on Add is surfaced in the message area and does not clear the entered fields", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        // Zero contacts already auto-switched to Add mode.
+
+        fillAddFields(CONTACT_1);
+
+        global.fetch = async () => makeFakeResponse({
+            ok: false,
+            status: 500,
+            payload: { success: false, data: { message: "The contact could not be added." } },
+        });
+
+        await clickAddSubmit();
+
+        assert.match(dom.messageEl.textContent, /could not be added/);
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+        assert.equal(
+            dom.addMemberFirmInput.value,
+            "Acme Legal SARL",
+            "a failed Add must never silently discard what the admin typed"
+        );
+        assert.equal(dom.addWebsiteInput.value, "https://acme-legal.example");
+    });
+
+    // --- Edit: pre-population, dirty-check, save, legacy blanks, cancel -
+
+    test("selecting Edit on a contact pre-populates all six edit fields with its current values", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        clickEditOnCard(0);
+
+        assert.equal(dom.editFieldsEl.hidden, false);
+        assert.equal(dom.listEl.hidden, true);
+        assert.equal(dom.editIdInput.value, "contact-1");
+        assert.equal(dom.editMemberFirmInput.value, "Acme Legal SARL");
+        assert.equal(dom.editContactPersonInput.value, "Jane Doe");
+        assert.equal(dom.editEmailInput.value, "jane@example.test");
+        assert.equal(dom.editPhoneInput.value, "+33 1 23 45 67 89");
+        assert.equal(dom.editAddressInput.value, "1 Rue de Paris, 75001 Paris");
+        assert.equal(dom.editWebsiteInput.value, "https://acme-legal.example");
+        assert.equal(dom.editMemberFirmInput.disabled, false, "fields must become editable");
+    });
+
+    test("Save stays disabled until all six fields are filled and at least one differs from the loaded baseline", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        assert.equal(dom.saveButton.disabled, true, "unchanged baseline - nothing to save yet");
+
+        setField(dom.editMemberFirmInput, "");
+        assert.equal(dom.saveButton.disabled, true, "a blank field must keep Save disabled even though it is now 'dirty'");
+
+        setField(dom.editMemberFirmInput, "Acme Legal SARL (renamed)");
+        assert.equal(dom.saveButton.disabled, false, "all six filled and one differs from the baseline");
+
+        setField(dom.editMemberFirmInput, "Acme Legal SARL");
+        assert.equal(dom.saveButton.disabled, true, "back to the baseline - nothing dirty");
+    });
+
+    test("a successful Save posts the update with the exact contact_id and reloads the list", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        setField(dom.editPhoneInput, "+33 9 99 99 99 99");
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            {
+                ok: true,
+                status: 200,
+                payload: {
+                    success: true,
+                    data: { contacts: [{ ...CONTACT_1, phone: "+33 9 99 99 99 99" }] },
+                },
+            },
+        ]);
+
+        await clickSave();
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].options.method, "POST");
+        assert.equal(fetchCalls[0].options.body.get("action"), "le_global_chatbot_update_contact");
+        assert.equal(fetchCalls[0].options.body.get("nonce"), "contact-update-nonce");
+        assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_fr");
+        assert.equal(fetchCalls[0].options.body.get("contact_id"), "contact-1");
+        assert.equal(fetchCalls[0].options.body.get("phone"), "+33 9 99 99 99 99");
+
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_contacts/);
+        assert.match(dom.messageEl.textContent, /updated successfully/);
+        assert.equal(dom.messageEl.className.includes("is-success"), true);
+    });
+
+    test("a legacy contact with blank fields is viewable/editable without throwing; Save stays disabled while any field is blank", async () => {
+        queueFetchResponses([LEGACY_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_legacy");
+
+        assert.doesNotThrow(() => clickEditOnCard(0));
+
+        assert.equal(dom.editMemberFirmInput.value, "Legacy Firm");
+        assert.equal(dom.editContactPersonInput.value, "Old Contact");
+        assert.equal(dom.editEmailInput.value, "");
+        assert.equal(dom.editPhoneInput.value, "");
+        assert.equal(dom.editAddressInput.value, "");
+        assert.equal(dom.editWebsiteInput.value, "");
+        assert.equal(
+            dom.saveButton.disabled,
+            true,
+            "blank fields must keep Save disabled even though nothing has changed yet"
+        );
+
+        setField(dom.editEmailInput, "old@example.test");
+        assert.equal(dom.saveButton.disabled, true, "phone/address/website are still blank");
+
+        setField(dom.editPhoneInput, "1");
+        setField(dom.editAddressInput, "a");
+        setField(dom.editWebsiteInput, "https://legacy.example");
+
+        assert.equal(dom.saveButton.disabled, false, "all six are now filled and dirty relative to baseline");
+    });
+
+    test("Cancel while editing restores the fields to the loaded baseline, not to empty, and stays in edit-one mode", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        clickModeView();
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        setField(dom.editMemberFirmInput, "Something else entirely");
+
+        clickCancel();
+
+        assert.equal(
+            dom.editMemberFirmInput.value,
+            "Acme Legal SARL",
+            "Cancel must restore the loaded baseline, never blank it"
+        );
+        assert.equal(dom.editFieldsEl.hidden, false, "must stay in edit-one mode");
+        assert.equal(dom.container.hidden, false, "Cancel must not collapse the panel");
+    });
+
+    // --- Delete: confirm gating -----------------------------------------
+
+    test("clicking Delete shows a confirm dialog and makes zero fetch calls until confirmed", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        fetchCalls.length = 0;
+
+        let fetchCountAtConfirmTime = null;
+
+        global.window.confirm = (message) => {
+            confirmCalls.push(message);
+            fetchCountAtConfirmTime = fetchCalls.length;
+            return true;
+        };
+
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            ZERO_CONTACTS_RESPONSE,
+        ]);
+
+        clickDeleteOnCard(0);
+
+        assert.equal(confirmCalls.length, 1);
+        assert.equal(fetchCountAtConfirmTime, 0, "no fetch may happen before the confirm dialog resolves");
+
+        // The confirmed deletion itself fires and completes in the
+        // background (fire-and-forget, like every other decision in
+        // this panel) - let it settle before the test ends so it
+        // never leaks an in-flight request into the next test.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    test("declining the Delete confirmation leaves state untouched with zero fetch calls", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        fetchCalls.length = 0;
+        confirmReturnValue = false;
+
+        clickDeleteOnCard(0);
+
+        assert.equal(confirmCalls.length, 1);
+        assert.equal(fetchCalls.length, 0);
+        assert.equal(dom.listEl._children.length, 1, "the contact must still be listed");
+    });
+
+    test("confirming Delete fires exactly one delete request for the exact contact_id and reloads the list", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+
+        fetchCalls.length = 0;
+        confirmReturnValue = true;
+
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            ZERO_CONTACTS_RESPONSE,
+        ]);
+
+        clickDeleteOnCard(0);
+
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.equal(fetchCalls.length, 2);
+        assert.equal(fetchCalls[0].options.method, "POST");
+        assert.equal(fetchCalls[0].options.body.get("action"), "le_global_chatbot_delete_contact");
+        assert.equal(fetchCalls[0].options.body.get("nonce"), "contact-delete-nonce");
+        assert.equal(fetchCalls[0].options.body.get("document_id"), "doc_fr");
+        assert.equal(fetchCalls[0].options.body.get("contact_id"), "contact-1");
+
+        assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_contacts/);
+        assert.equal(dom.listEl._children.length, 0);
+        assert.match(dom.messageEl.textContent, /deleted successfully/);
+    });
+
+    // --- "← Back to contacts" (mission "ORDER 8G-B2.1") -----------------
+
+    describe("back to contacts navigation", () => {
+        test("the control exists in Add mode", () => {
+            clickModeAdd();
+
+            assert.equal(dom.addBackToListButton.hidden, false);
+        });
+
+        test("the control exists in Edit mode", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickEditOnCard(0);
+
+            assert.equal(dom.editFieldsEl.hidden, false);
+            assert.equal(dom.backToListButton.hidden, false);
+        });
+
+        test("clean Back from Add mode returns to the list, country preserved, panel not collapsed", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickModeAdd();
+
+            dom.addBackToListButton._listeners.click();
+
+            assert.equal(dom.addOnlyFields.hidden, true, "must leave Add mode");
+            assert.equal(dom.viewOnlyFields.hidden, false, "must return to View mode");
+            assert.equal(dom.editFieldsEl.hidden, true, "must show the list, not an edit form");
+            assert.equal(dom.countrySelect.value, "doc_fr", "country selection must be preserved");
+            assert.equal(dom.container.hidden, false, "must not collapse the panel");
+        });
+
+        test("clean Back from Edit mode returns to the list, country preserved, panel not collapsed", async () => {
+            clickModeView();
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickEditOnCard(0);
+
+            dom.backToListButton._listeners.click();
+
+            assert.equal(dom.editFieldsEl.hidden, true, "must leave the edit form");
+            assert.equal(dom.listEl.hidden, false, "must show the list");
+            assert.equal(dom.countrySelect.value, "doc_fr", "country selection must be preserved");
+            assert.equal(dom.container.hidden, false, "must not collapse the panel");
+        });
+
+        test("dirty Back from Add mode prompts for confirmation; declining keeps the content and stays in Add mode", async () => {
+            clickModeAdd();
+            setField(dom.addMemberFirmInput, "Draft firm name");
+            confirmReturnValue = false;
+
+            dom.addBackToListButton._listeners.click();
+
+            assert.equal(confirmCalls.length, 1);
+            assert.equal(dom.addOnlyFields.hidden, false, "must remain in Add mode");
+            assert.equal(
+                dom.addMemberFirmInput.value,
+                "Draft firm name",
+                "declining discard must never clear the field"
+            );
+        });
+
+        test("dirty Back from Add mode, confirming, discards the draft and returns to the list", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickModeAdd();
+            setField(dom.addMemberFirmInput, "Draft firm name");
+            confirmReturnValue = true;
+
+            dom.addBackToListButton._listeners.click();
+
+            assert.equal(confirmCalls.length, 1);
+            assert.equal(dom.viewOnlyFields.hidden, false);
+            assert.equal(dom.addMemberFirmInput.value, "");
+        });
+
+        test("dirty Back from Edit mode prompts for confirmation; declining keeps the edited value and stays in the form", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickEditOnCard(0);
+            setField(dom.editMemberFirmInput, "Changed firm name");
+            confirmReturnValue = false;
+
+            dom.backToListButton._listeners.click();
+
+            assert.equal(confirmCalls.length, 1);
+            assert.equal(dom.editFieldsEl.hidden, false, "must remain in the edit form");
+            assert.equal(dom.editMemberFirmInput.value, "Changed firm name");
+        });
+
+        test("Back is distinct from Cancel and from Collapse", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickModeAdd();
+            setField(dom.addMemberFirmInput, "Draft firm name");
+
+            // Cancel: resets fields, stays in Add mode (unchanged
+            // semantics - not touched by this mission).
+            dom.cancelButton._listeners.click();
+            assert.equal(dom.addOnlyFields.hidden, false);
+            assert.equal(dom.addMemberFirmInput.value, "");
+
+            // Collapse: hides the panel, preserves field state
+            // (unchanged semantics - not touched by this mission).
+            setField(dom.addMemberFirmInput, "Another draft");
+            clickCollapse();
+            assert.equal(dom.container.hidden, true);
+            assert.equal(dom.addMemberFirmInput.value, "Another draft");
+        });
     });
 });

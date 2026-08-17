@@ -682,6 +682,90 @@ def delete_contact(
     )
 
 
+def _reseed_contacts_from_current_docx_locked(
+    *,
+    validated_document_id: str,
+    source_directory: Path,
+    opensearch_client: OpenSearch,
+) -> AdminContactListResponse:
+    """
+    The real reseed-from-current-DOCX logic - always called with the
+    country's lock already held by the caller.
+
+    Split out from reseed_contacts_from_current_docx (mission "ORDER
+    8G-B2") so safe_upload_and_index_document's own "identical bytes,
+    Admin has changes, confirmed reseed" branch - which is already
+    running inside its OWN country_lock at that point - can invoke
+    this directly instead of the public, lock-ACQUIRING wrapper below:
+    country_lock uses a plain flock() per freshly-opened file
+    descriptor, which is not reentrant even within the same process/
+    thread, so calling the public wrapper from inside an
+    already-held lock for the same country would deadlock (observed
+    directly while building this integration).
+    """
+
+    country_code, document_metadata = _load_country_code_and_metadata(
+        document_id=validated_document_id,
+        client=opensearch_client,
+        operation="contact_reseed",
+    )
+
+    source_filename = _required_string(
+        document_metadata,
+        "source_filename",
+    )
+    country = _required_string(
+        document_metadata,
+        "country",
+    )
+
+    try:
+        resolved_source = resolve_document_source_path(
+            source_root=source_directory,
+            country_code=country_code,
+            source_filename=source_filename,
+        )
+
+    except DocumentSourceConflictError as error:
+        raise AdminDocumentLifecycleError(
+            "The source DOCX could not be unambiguously resolved."
+        ) from error
+
+    if resolved_source.path is None:
+        raise AdminDocumentLifecycleError(
+            "The source DOCX file is missing."
+        )
+
+    parsed_contacts = extract_contacts_from_docx(
+        resolved_source.path,
+        country=country,
+    )
+
+    new_contacts = tuple(
+        _extracted_contact_to_record(contact)
+        for contact in parsed_contacts
+    )
+
+    _apply_contact_state_change(
+        document_id=validated_document_id,
+        country_code=country_code,
+        source_directory=source_directory,
+        new_contacts=new_contacts,
+        document_metadata=document_metadata,
+        client=opensearch_client,
+        reset_marker=True,
+    )
+
+    return AdminContactListResponse(
+        document_id=validated_document_id,
+        country_code=country_code,
+        contacts=[
+            _contact_summary(record)
+            for record in new_contacts
+        ],
+    )
+
+
 def reseed_contacts_from_current_docx(
     *,
     document_id: str,
@@ -702,6 +786,13 @@ def reseed_contacts_from_current_docx(
     what is already active. Nothing about the DOCX file itself changes
     here (there is nothing to change) - only the structured contact
     state, the derived Contact chunk, and the admin-modified marker.
+
+    Acquires the country lock itself - the correct entry point for any
+    STANDALONE caller (e.g. a future dedicated endpoint). A caller that
+    already holds the lock for this country (safe_upload_and_index_
+    document's own identical-bytes branch) must call
+    _reseed_contacts_from_current_docx_locked directly instead, never
+    this function, to avoid a self-deadlock.
     """
 
     validated_document_id = _validate_document_id(document_id)
@@ -717,66 +808,11 @@ def reseed_contacts_from_current_docx(
         _required_string(preliminary_metadata, "country_code"),
         timeout_seconds=lock_timeout_seconds,
     ):
-        country_code, document_metadata = _load_country_code_and_metadata(
-            document_id=validated_document_id,
-            client=opensearch_client,
-            operation="contact_reseed",
-        )
-
-        source_filename = _required_string(
-            document_metadata,
-            "source_filename",
-        )
-        country = _required_string(
-            document_metadata,
-            "country",
-        )
-
-        try:
-            resolved_source = resolve_document_source_path(
-                source_root=source_directory,
-                country_code=country_code,
-                source_filename=source_filename,
-            )
-
-        except DocumentSourceConflictError as error:
-            raise AdminDocumentLifecycleError(
-                "The source DOCX could not be unambiguously resolved."
-            ) from error
-
-        if resolved_source.path is None:
-            raise AdminDocumentLifecycleError(
-                "The source DOCX file is missing."
-            )
-
-        parsed_contacts = extract_contacts_from_docx(
-            resolved_source.path,
-            country=country,
-        )
-
-        new_contacts = tuple(
-            _extracted_contact_to_record(contact)
-            for contact in parsed_contacts
-        )
-
-        _apply_contact_state_change(
-            document_id=validated_document_id,
-            country_code=country_code,
+        return _reseed_contacts_from_current_docx_locked(
+            validated_document_id=validated_document_id,
             source_directory=source_directory,
-            new_contacts=new_contacts,
-            document_metadata=document_metadata,
-            client=opensearch_client,
-            reset_marker=True,
+            opensearch_client=opensearch_client,
         )
-
-    return AdminContactListResponse(
-        document_id=validated_document_id,
-        country_code=country_code,
-        contacts=[
-            _contact_summary(record)
-            for record in new_contacts
-        ],
-    )
 
 
 def reseed_contact_state_from_parsed_contacts(

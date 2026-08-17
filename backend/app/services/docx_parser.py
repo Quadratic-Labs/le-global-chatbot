@@ -6,10 +6,11 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import IO, Final, TypeAlias
 
 from docx import Document
 from docx.document import Document as DocxDocument
+from docx.opc.exceptions import PackageNotFoundError
 from docx.oxml.ns import qn
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
@@ -1713,7 +1714,22 @@ def extract_contacts_from_docx(
     file_path: Path,
     country: str | None = None,
 ) -> list[ExtractedContact]:
-    """Extract every validated contact card from one source DOCX."""
+    """
+    Extract every validated contact card from one source DOCX.
+
+    Checks for the deterministic, Admin-managed block (mission "ORDER
+    8G-B2.1") first - present only on a DOCX this system itself
+    materialized for Download - and falls back to the ordinary
+    text-box-based legacy parser for every real, organically-uploaded
+    document, where that marker is never present.
+    """
+
+    deterministic_contacts = extract_deterministic_contact_blocks(
+        file_path
+    )
+
+    if deterministic_contacts is not None:
+        return deterministic_contacts
 
     return parse_contact_blocks(
         extract_text_box_blocks(
@@ -1773,3 +1789,127 @@ def build_contact_chunk_content(
     return "\n\n".join(
         entries
     )
+
+
+# --- Deterministic Contact block (mission "ORDER 8G-B2.1") -----------
+#
+# A Download of the effective (current) DOCX materializes structured
+# Contact state as one plain, ordinary paragraph-based block instead of
+# reconstructing a new floating text box from scratch - far more
+# reliable to write and to re-parse than trying to clone the
+# heterogeneous legacy text-box/VML-fallback shapes real source
+# documents use. This marker is deliberately distinctive so it can
+# never coincidentally match real, organically-authored legal document
+# text; extract_contacts_from_docx() checks for it first (see below)
+# and, if present, uses ONLY this block - a materialized download's own
+# legacy text boxes are already blanked by the same operation that adds
+# this block (app.services.document_contact_materializer), so there is
+# never a real conflict between the two representations.
+
+DETERMINISTIC_CONTACT_BLOCK_MARKER: Final[str] = (
+    "L&E GLOBAL - CURRENT CONTACT INFORMATION (ADMIN-MANAGED)"
+)
+
+DETERMINISTIC_NO_CONTACTS_LINE: Final[str] = (
+    "(No contacts currently configured.)"
+)
+
+_DETERMINISTIC_FIELD_LABELS: Final[
+    tuple[tuple[str, str], ...]
+] = (
+    ("Member firm: ", "member_firm"),
+    ("Contact person: ", "contact_person"),
+    ("Email: ", "email"),
+    ("Phone: ", "phone"),
+    ("Address: ", "address"),
+    ("Website: ", "website"),
+)
+
+
+def _parse_deterministic_contact_entry(
+    lines: Sequence[str],
+) -> ExtractedContact:
+    """Parse one blank-line-delimited group of "Label: value" lines
+    (the exact inverse of build_contact_chunk_content's own per-contact
+    formatting) into one ExtractedContact."""
+
+    fields: dict[str, str] = {}
+
+    for line in lines:
+        for label, field_name in _DETERMINISTIC_FIELD_LABELS:
+            if line.startswith(label):
+                fields[field_name] = line[len(label):].strip()
+                break
+
+    return ExtractedContact(**fields)
+
+
+def extract_deterministic_contact_blocks(
+    source: Path | IO[bytes],
+) -> list[ExtractedContact] | None:
+    """
+    Recognize the deterministic, Admin-managed Contact block a
+    materialized Download DOCX carries.
+
+    Returns None (never an empty list) when the marker paragraph is
+    absent, so callers can fall back to the ordinary text-box-based
+    legacy parser - an empty list is reserved for "the marker is
+    present and explicitly states zero contacts".
+    """
+
+    try:
+        document = Document(source)
+
+    except (
+        KeyError,
+        OSError,
+        zipfile.BadZipFile,
+        PackageNotFoundError,
+    ):
+        return None
+
+    paragraph_texts = [
+        paragraph.text
+        for paragraph in document.paragraphs
+    ]
+
+    try:
+        marker_index = paragraph_texts.index(
+            DETERMINISTIC_CONTACT_BLOCK_MARKER
+        )
+
+    except ValueError:
+        return None
+
+    remaining = paragraph_texts[marker_index + 1:]
+
+    if (
+        remaining
+        and remaining[0].strip() == DETERMINISTIC_NO_CONTACTS_LINE
+    ):
+        return []
+
+    contacts: list[ExtractedContact] = []
+    current_lines: list[str] = []
+
+    def flush_current_entry() -> None:
+        if current_lines:
+            contacts.append(
+                _parse_deterministic_contact_entry(
+                    current_lines
+                )
+            )
+
+    for text in remaining:
+        stripped = text.strip()
+
+        if stripped == "":
+            flush_current_entry()
+            current_lines = []
+            continue
+
+        current_lines.append(stripped)
+
+    flush_current_entry()
+
+    return contacts

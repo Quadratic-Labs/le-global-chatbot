@@ -205,6 +205,23 @@
                 };
             }
 
+            // Mission "ORDER 8G-B2", section 14 - the uploaded bytes
+            // are already byte-identical to what is active, but this
+            // country's document has Admin changes (a section or
+            // contact mutation) since that source was last accepted.
+            // The ordinary "already up to date" short-circuit must
+            // never silently end the workflow here - this is a
+            // distinct, separately confirmable outcome.
+            if (
+                detail.code === "document_identical_but_admin_modified"
+            ) {
+                return {
+                    kind: "identical_but_admin_modified",
+                    detail,
+                    message: businessMessage(payload, fallback),
+                };
+            }
+
             if (detail.code === "document_warning_confirmation_required") {
                 return {
                     kind: detail.replacement_required
@@ -2812,6 +2829,954 @@
 
     wireEditSection();
 
+    // --- Contacts panel (mission "ORDER 8G-B2") -----------------------
+    //
+    // Reuses the exact same collapsed-by-default segmented View/Add
+    // pattern wireEditSection() above already establishes - dedicated
+    // ▲ collapse control (pure presentation, no backend request, state
+    // preserved), Cancel resets only (never collapses), mode-switch
+    // dirty-change protection via the same UNSAVED_CHANGES_PROMPT.
+    //
+    // View mode has one further, purely client-side sub-state
+    // (list vs a single contact's edit form) that Section editing has
+    // no equivalent of - toggled by viewSubState, completely
+    // independent of the top-level mode/collapse machinery.
+    function wireContactsPanel() {
+        const container = document.getElementById(
+            "le-global-chatbot-contacts"
+        );
+
+        if (!container) {
+            return;
+        }
+
+        const modeViewButton = document.getElementById(
+            "le-global-contact-mode-view"
+        );
+        const modeAddButton = document.getElementById(
+            "le-global-contact-mode-add"
+        );
+        const countrySelect = document.getElementById(
+            "le-global-contact-country"
+        );
+        const viewOnlyFields = document.getElementById(
+            "le-global-contact-view-only-fields"
+        );
+        const zeroWarningEl = document.getElementById(
+            "le-global-contact-zero-warning"
+        );
+        const listEl = document.getElementById(
+            "le-global-contact-list"
+        );
+        const addAnotherButton = document.getElementById(
+            "le-global-contact-add-another"
+        );
+        const editFieldsEl = document.getElementById(
+            "le-global-contact-edit-fields"
+        );
+        const editIdInput = document.getElementById(
+            "le-global-contact-edit-id"
+        );
+        const editMemberFirmInput = document.getElementById(
+            "le-global-contact-edit-member-firm"
+        );
+        const editContactPersonInput = document.getElementById(
+            "le-global-contact-edit-contact-person"
+        );
+        const editEmailInput = document.getElementById(
+            "le-global-contact-edit-email"
+        );
+        const editPhoneInput = document.getElementById(
+            "le-global-contact-edit-phone"
+        );
+        const editAddressInput = document.getElementById(
+            "le-global-contact-edit-address"
+        );
+        const editWebsiteInput = document.getElementById(
+            "le-global-contact-edit-website"
+        );
+        const backToListButton = document.getElementById(
+            "le-global-contact-back-to-list"
+        );
+        const addBackToListButton = document.getElementById(
+            "le-global-contact-add-back-to-list"
+        );
+        const addOnlyFields = document.getElementById(
+            "le-global-contact-add-only-fields"
+        );
+        const addMemberFirmInput = document.getElementById(
+            "le-global-contact-add-member-firm"
+        );
+        const addContactPersonInput = document.getElementById(
+            "le-global-contact-add-contact-person"
+        );
+        const addEmailInput = document.getElementById(
+            "le-global-contact-add-email"
+        );
+        const addPhoneInput = document.getElementById(
+            "le-global-contact-add-phone"
+        );
+        const addAddressInput = document.getElementById(
+            "le-global-contact-add-address"
+        );
+        const addWebsiteInput = document.getElementById(
+            "le-global-contact-add-website"
+        );
+        const messageEl = document.getElementById(
+            "le-global-chatbot-contact-message"
+        );
+        const cancelButton = document.getElementById(
+            "le-global-contact-cancel"
+        );
+        const saveButton = document.getElementById(
+            "le-global-contact-save"
+        );
+        const addSubmitButton = document.getElementById(
+            "le-global-contact-add-submit"
+        );
+        const collapseButton = document.getElementById(
+            "le-global-contact-collapse"
+        );
+
+        if (
+            !modeViewButton || !modeAddButton || !countrySelect
+            || !viewOnlyFields || !zeroWarningEl || !listEl
+            || !addAnotherButton || !editFieldsEl || !editIdInput
+            || !editMemberFirmInput || !editContactPersonInput
+            || !editEmailInput || !editPhoneInput || !editAddressInput
+            || !editWebsiteInput || !backToListButton
+            || !addBackToListButton
+            || !addOnlyFields || !addMemberFirmInput
+            || !addContactPersonInput || !addEmailInput
+            || !addPhoneInput || !addAddressInput || !addWebsiteInput
+            || !messageEl || !cancelButton || !saveButton
+            || !addSubmitButton || !collapseButton
+        ) {
+            return;
+        }
+
+        const config = container.dataset;
+
+        let mode = "view";
+        let viewSubState = "list";
+        let saving = false;
+        let adding = false;
+        let deleting = false;
+        let previousCountryValue = "";
+        let currentContacts = [];
+        let editBaseline = null;
+        let contactGeneration = 0;
+
+        const editFields = [
+            ["member_firm", editMemberFirmInput],
+            ["contact_person", editContactPersonInput],
+            ["email", editEmailInput],
+            ["phone", editPhoneInput],
+            ["address", editAddressInput],
+            ["website", editWebsiteInput],
+        ];
+
+        const addFields = [
+            ["member_firm", addMemberFirmInput],
+            ["contact_person", addContactPersonInput],
+            ["email", addEmailInput],
+            ["phone", addPhoneInput],
+            ["address", addAddressInput],
+            ["website", addWebsiteInput],
+        ];
+
+        function setMessage(text, kind) {
+            messageEl.textContent = text || "";
+            messageEl.className = (
+                "le-global-chatbot-admin__edit-message"
+                + (kind ? ` ${kind}` : "")
+            );
+        }
+
+        function selectedCountryName() {
+            const option = countrySelect.options[countrySelect.selectedIndex];
+
+            if (!option) {
+                return "this country";
+            }
+
+            return option.textContent.replace(/\s*\([^)]*\)\s*$/, "").trim();
+        }
+
+        function buildQueryUrl(action, nonce, params) {
+            let url = (
+                config.adminPostUrl
+                + "?action=" + encodeURIComponent(action)
+                + "&nonce=" + encodeURIComponent(nonce)
+            );
+
+            Object.keys(params || {}).forEach((key) => {
+                url += (
+                    "&" + encodeURIComponent(key)
+                    + "=" + encodeURIComponent(params[key])
+                );
+            });
+
+            return url;
+        }
+
+        async function fetchJson(url, options) {
+            const response = await fetch(url, {
+                credentials: "same-origin",
+                ...options,
+            });
+
+            let payload = null;
+
+            try {
+                payload = await response.json();
+            } catch {
+                payload = null;
+            }
+
+            return { response, payload };
+        }
+
+        function isSuccessful(result) {
+            return Boolean(
+                result
+                && result.response.ok
+                && result.payload
+                && result.payload.success === true
+            );
+        }
+
+        function isAddFieldsFilled(fields, inputs) {
+            return inputs.every(([, input]) => input.value.trim() !== "");
+        }
+
+        function isEditDirty() {
+            if (viewSubState !== "edit-one" || editBaseline === null) {
+                return false;
+            }
+
+            return editFields.some(
+                ([key, input]) => input.value !== editBaseline[key]
+            );
+        }
+
+        function isAddDirty() {
+            return addFields.some(
+                ([, input]) => input.value.trim() !== ""
+            );
+        }
+
+        function isDirty() {
+            if (mode === "add") {
+                return isAddDirty();
+            }
+
+            return isEditDirty();
+        }
+
+        function updateSaveAvailability() {
+            const ready = (
+                !saving
+                && viewSubState === "edit-one"
+                && editBaseline !== null
+                && isAddFieldsFilled(null, editFields)
+                && isEditDirty()
+            );
+
+            saveButton.disabled = !ready;
+        }
+
+        function updateAddSubmitAvailability() {
+            const ready = (
+                !adding
+                && countrySelect.value !== ""
+                && isAddFieldsFilled(null, addFields)
+            );
+
+            addSubmitButton.disabled = !ready;
+        }
+
+        function updateCancelAvailability() {
+            cancelButton.disabled = !isDirty();
+        }
+
+        [...editFields, ...addFields].forEach(([, input]) => {
+            input.addEventListener("input", () => {
+                updateSaveAvailability();
+                updateAddSubmitAvailability();
+                updateCancelAvailability();
+            });
+        });
+
+        function renderModeUI() {
+            const isView = mode === "view";
+
+            modeViewButton.classList.toggle("is-active", isView);
+            modeAddButton.classList.toggle("is-active", !isView);
+            modeViewButton.setAttribute("aria-selected", String(isView));
+            modeAddButton.setAttribute("aria-selected", String(!isView));
+
+            viewOnlyFields.hidden = !isView;
+            addOnlyFields.hidden = isView;
+            saveButton.hidden = !isView;
+            addSubmitButton.hidden = isView;
+
+            updateCancelAvailability();
+        }
+
+        function renderViewSubStateUI() {
+            const isEditingOne = viewSubState === "edit-one";
+
+            // Guard on a real country selection too, not just an empty
+            // contacts array - otherwise this warning (styled with a
+            // visible border/background) would show up empty the
+            // moment View mode opens, before any country was ever
+            // chosen and before currentContacts has been populated by
+            // a real fetch.
+            zeroWarningEl.hidden = (
+                isEditingOne
+                || currentContacts.length > 0
+                || countrySelect.value === ""
+            );
+            listEl.hidden = isEditingOne;
+            addAnotherButton.hidden = (
+                isEditingOne || currentContacts.length === 0
+            );
+            editFieldsEl.hidden = !isEditingOne;
+
+            updateCancelAvailability();
+        }
+
+        function setMode(nextMode) {
+            if (saving || adding || deleting) {
+                return;
+            }
+
+            if (mode === nextMode) {
+                return;
+            }
+
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
+            mode = nextMode;
+            setMessage("", null);
+            renderModeUI();
+        }
+
+        // Mirrors wireEditSection()'s own expand()/collapse() exactly
+        // (mission "ORDER 8G-A", section 9 / "ORDER 8G-A.2", section
+        // 4) - a pure presentation-state toggle, safe to call directly
+        // from the dedicated collapse button with no dirty check.
+        function expand() {
+            container.hidden = false;
+            collapseButton.hidden = false;
+        }
+
+        function collapse() {
+            container.hidden = true;
+            collapseButton.hidden = true;
+        }
+
+        function clearContactList() {
+            listEl.textContent = "";
+        }
+
+        // Never innerHTML for anything derived from real contact data
+        // (mission "ORDER 5D"'s own discipline, reused here) - every
+        // node is built with createElement/textContent.
+        function buildContactCard(contact) {
+            const card = document.createElement("div");
+            card.className = "le-global-chatbot-admin__contact-card";
+
+            const fieldLabels = [
+                ["Member firm", contact.member_firm],
+                ["Contact person", contact.contact_person],
+                ["Email", contact.email],
+                ["Phone", contact.phone],
+                ["Address", contact.address],
+                ["Website", contact.website],
+            ];
+
+            fieldLabels.forEach(([label, value]) => {
+                const row = document.createElement("p");
+                row.className = "le-global-chatbot-admin__contact-field";
+
+                const labelEl = document.createElement("strong");
+                labelEl.textContent = `${label}: `;
+                row.appendChild(labelEl);
+
+                const valueEl = document.createElement("span");
+                valueEl.textContent = value || "—";
+                row.appendChild(valueEl);
+
+                card.appendChild(row);
+            });
+
+            const actions = document.createElement("div");
+            actions.className = (
+                "le-global-chatbot-admin__contact-card-actions"
+            );
+
+            const editButton = document.createElement("button");
+            editButton.type = "button";
+            editButton.className = "button";
+            editButton.textContent = "Edit contact";
+            editButton.addEventListener(
+                "click",
+                () => beginEditContact(contact)
+            );
+            actions.appendChild(editButton);
+
+            const deleteButton = document.createElement("button");
+            deleteButton.type = "button";
+            deleteButton.className = (
+                "button le-global-chatbot-admin__delete-button"
+                + " is-destructive"
+            );
+            deleteButton.textContent = "Delete contact";
+            deleteButton.addEventListener(
+                "click",
+                () => confirmDeleteContact(contact)
+            );
+            actions.appendChild(deleteButton);
+
+            card.appendChild(actions);
+
+            return card;
+        }
+
+        function renderContactList() {
+            clearContactList();
+
+            currentContacts.forEach((contact) => {
+                listEl.appendChild(buildContactCard(contact));
+            });
+
+            const countryName = selectedCountryName();
+
+            zeroWarningEl.textContent = "";
+
+            if (currentContacts.length === 0) {
+                const warning = document.createElement("p");
+                warning.textContent = (
+                    `⚠ No L&E Global contact is currently configured `
+                    + `for ${countryName}.`
+                );
+                zeroWarningEl.appendChild(warning);
+            }
+
+            renderViewSubStateUI();
+
+            // Mission "ORDER 8G-B2", section 5 - a zero-contact country
+            // reveals the Add form directly, no second click on
+            // "+ Add a contact" required.
+            if (currentContacts.length === 0 && mode !== "add") {
+                setMode("add");
+                expand();
+            }
+        }
+
+        function resetEditOnlyFields() {
+            editIdInput.value = "";
+            editFields.forEach(([, input]) => {
+                input.value = "";
+                input.disabled = true;
+            });
+            editBaseline = null;
+        }
+
+        function resetAddOnlyFields() {
+            addFields.forEach(([, input]) => {
+                input.value = "";
+            });
+        }
+
+        function resetToEmpty() {
+            contactGeneration += 1;
+
+            countrySelect.disabled = false;
+            countrySelect.value = "";
+            previousCountryValue = "";
+            currentContacts = [];
+
+            clearContactList();
+            zeroWarningEl.hidden = true;
+            zeroWarningEl.textContent = "";
+            addAnotherButton.hidden = true;
+
+            viewSubState = "list";
+            resetEditOnlyFields();
+
+            addFields.forEach(([, input]) => {
+                input.value = "";
+                input.disabled = true;
+            });
+
+            setMessage("", null);
+            saveButton.disabled = true;
+            addSubmitButton.disabled = true;
+            updateCancelAvailability();
+        }
+
+        function beginEditContact(contact) {
+            if (
+                viewSubState === "edit-one"
+                && isEditDirty()
+                && !window.confirm(UNSAVED_CHANGES_PROMPT)
+            ) {
+                return;
+            }
+
+            editIdInput.value = contact.contact_id;
+
+            editBaseline = {
+                member_firm: contact.member_firm || "",
+                contact_person: contact.contact_person || "",
+                email: contact.email || "",
+                phone: contact.phone || "",
+                address: contact.address || "",
+                website: contact.website || "",
+            };
+
+            editFields.forEach(([key, input]) => {
+                input.value = editBaseline[key];
+                input.disabled = false;
+            });
+
+            viewSubState = "edit-one";
+            setMessage("", null);
+            renderViewSubStateUI();
+            updateSaveAvailability();
+        }
+
+        function backToList() {
+            if (isEditDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
+            viewSubState = "list";
+            resetEditOnlyFields();
+            setMessage("", null);
+            renderViewSubStateUI();
+        }
+
+        // "← Back to contacts" from Add mode (mission "ORDER 8G-B2.1",
+        // sections 8-9) - navigation, not Cancel/Collapse/Reset. Mirrors
+        // backToList()'s own shape rather than delegating to setMode(),
+        // since viewSubState may already be "edit-one" if Add mode was
+        // entered by clicking the "+ Add a contact" tab directly while
+        // mid-edit (that tab switch itself never resets viewSubState,
+        // matching its own established behavior) - explicitly forcing
+        // "list" here guarantees this button always lands on the
+        // current country's contact list, never a stale edit-one form.
+        function backToListFromAdd() {
+            if (isAddDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
+            resetAddOnlyFields();
+            viewSubState = "list";
+            mode = "view";
+            setMessage("", null);
+            renderModeUI();
+            renderViewSubStateUI();
+        }
+
+        async function loadContacts(documentId) {
+            contactGeneration += 1;
+            const generation = contactGeneration;
+
+            currentContacts = [];
+            clearContactList();
+            viewSubState = "list";
+            resetEditOnlyFields();
+            setMessage("Loading contacts…", null);
+
+            const url = buildQueryUrl(
+                config.contactsListAction,
+                config.contactsListNonce,
+                { document_id: documentId }
+            );
+
+            let result;
+
+            try {
+                result = await fetchJson(url, { method: "GET" });
+            } catch {
+                result = null;
+            }
+
+            if (generation !== contactGeneration) {
+                return;
+            }
+
+            if (!isSuccessful(result)) {
+                setMessage(
+                    businessMessage(
+                        result ? result.payload : null,
+                        "The contacts could not be loaded."
+                    ),
+                    "is-error"
+                );
+                return;
+            }
+
+            currentContacts = (
+                result.payload.data
+                && Array.isArray(result.payload.data.contacts)
+            )
+                ? result.payload.data.contacts
+                : [];
+
+            setMessage("", null);
+            renderContactList();
+        }
+
+        async function onCountryChange() {
+            const documentId = countrySelect.value;
+
+            if (documentId === "") {
+                resetToEmpty();
+                return;
+            }
+
+            countrySelect.disabled = false;
+            addFields.forEach(([, input]) => {
+                input.disabled = false;
+            });
+            updateAddSubmitAvailability();
+            cancelButton.disabled = true;
+
+            await loadContacts(documentId);
+        }
+
+        function confirmDeleteContact(contact) {
+            const label = contact.contact_person || "this contact";
+            const countryName = selectedCountryName();
+
+            const confirmed = window.confirm(
+                `Delete "${label}"?\n\nThis contact will be removed `
+                + `from ${countryName} and will no longer be `
+                + "available to the chatbot."
+            );
+
+            if (!confirmed) {
+                return;
+            }
+
+            deleteContact(contact);
+        }
+
+        async function deleteContact(contact) {
+            if (saving || adding || deleting) {
+                return;
+            }
+
+            const documentId = countrySelect.value;
+
+            if (documentId === "") {
+                return;
+            }
+
+            deleting = true;
+            setMessage("Deleting…", null);
+
+            const generation = contactGeneration;
+
+            const formData = new FormData();
+            formData.set("action", config.contactDeleteAction);
+            formData.set("nonce", config.contactDeleteNonce);
+            formData.set("document_id", documentId);
+            formData.set("contact_id", contact.contact_id);
+
+            let result;
+
+            try {
+                result = await fetchJson(config.adminPostUrl, {
+                    method: "POST",
+                    body: formData,
+                });
+            } catch {
+                result = null;
+            }
+
+            deleting = false;
+
+            if (generation !== contactGeneration) {
+                return;
+            }
+
+            if (!isSuccessful(result)) {
+                setMessage(
+                    businessMessage(
+                        result ? result.payload : null,
+                        "We couldn't delete this contact. Nothing has "
+                        + "been confirmed as completed. Please try "
+                        + "again or contact support."
+                    ),
+                    "is-error"
+                );
+                return;
+            }
+
+            if (
+                viewSubState === "edit-one"
+                && editIdInput.value === contact.contact_id
+            ) {
+                viewSubState = "list";
+                resetEditOnlyFields();
+            }
+
+            await loadContacts(documentId);
+
+            setMessage(
+                `✓ "${contact.contact_person || "Contact"}" was `
+                + "deleted successfully. The chatbot content is now "
+                + "up to date.",
+                "is-success"
+            );
+        }
+
+        async function onSave() {
+            if (
+                saving || adding || deleting || saveButton.disabled
+            ) {
+                return;
+            }
+
+            const documentId = countrySelect.value;
+            const contactId = editIdInput.value;
+
+            if (documentId === "" || contactId === "") {
+                return;
+            }
+
+            saving = true;
+            saveButton.disabled = true;
+            saveButton.textContent = "Saving…";
+            cancelButton.disabled = true;
+            countrySelect.disabled = true;
+            setMessage("Saving…", null);
+
+            const generation = contactGeneration;
+
+            const formData = new FormData();
+            formData.set("action", config.contactUpdateAction);
+            formData.set("nonce", config.contactUpdateNonce);
+            formData.set("document_id", documentId);
+            formData.set("contact_id", contactId);
+
+            editFields.forEach(([key, input]) => {
+                formData.set(key, input.value.trim());
+            });
+
+            let result;
+
+            try {
+                result = await fetchJson(config.adminPostUrl, {
+                    method: "POST",
+                    body: formData,
+                });
+            } catch {
+                result = null;
+            }
+
+            saving = false;
+            saveButton.textContent = "Save changes";
+
+            if (generation !== contactGeneration) {
+                return;
+            }
+
+            countrySelect.disabled = false;
+
+            if (!isSuccessful(result)) {
+                cancelButton.disabled = false;
+                setMessage(
+                    businessMessage(
+                        result ? result.payload : null,
+                        "We couldn't save your changes. Nothing has "
+                        + "been confirmed as completed. Please try "
+                        + "again or contact support."
+                    ),
+                    "is-error"
+                );
+                updateSaveAvailability();
+                return;
+            }
+
+            await loadContacts(documentId);
+
+            const savedContact = currentContacts.find(
+                (contact) => contact.contact_id === contactId
+            );
+
+            if (savedContact) {
+                beginEditContact(savedContact);
+            }
+
+            setMessage(
+                "✓ The contact was updated successfully. The "
+                + "chatbot content is now up to date.",
+                "is-success"
+            );
+        }
+
+        async function onAddSubmit() {
+            if (
+                saving || adding || deleting
+                || addSubmitButton.disabled
+            ) {
+                return;
+            }
+
+            const documentId = countrySelect.value;
+
+            if (documentId === "") {
+                return;
+            }
+
+            const countryName = selectedCountryName();
+
+            adding = true;
+            addSubmitButton.disabled = true;
+            addSubmitButton.textContent = "Adding contact…";
+            cancelButton.disabled = true;
+            countrySelect.disabled = true;
+            setMessage("Adding contact…", null);
+
+            const generation = contactGeneration;
+
+            const formData = new FormData();
+            formData.set("action", config.contactAddAction);
+            formData.set("nonce", config.contactAddNonce);
+            formData.set("document_id", documentId);
+
+            addFields.forEach(([key, input]) => {
+                formData.set(key, input.value.trim());
+            });
+
+            let result;
+
+            try {
+                result = await fetchJson(config.adminPostUrl, {
+                    method: "POST",
+                    body: formData,
+                });
+            } catch {
+                result = null;
+            }
+
+            adding = false;
+            addSubmitButton.textContent = "Add contact";
+
+            if (generation !== contactGeneration) {
+                return;
+            }
+
+            countrySelect.disabled = false;
+
+            if (!isSuccessful(result)) {
+                cancelButton.disabled = false;
+                setMessage(
+                    businessMessage(
+                        result ? result.payload : null,
+                        "We couldn't add the contact. Nothing has "
+                        + "been confirmed as completed. Please try "
+                        + "again or contact support."
+                    ),
+                    "is-error"
+                );
+                updateAddSubmitAvailability();
+                return;
+            }
+
+            resetAddOnlyFields();
+            updateAddSubmitAvailability();
+
+            await loadContacts(documentId);
+
+            setMessage(
+                `✓ The contact was added successfully for `
+                + `${countryName}. The chatbot content is now up to `
+                + "date.",
+                "is-success"
+            );
+        }
+
+        // Mission "ORDER 8G-B2", section 8 - Cancel resets only the
+        // CURRENT mode's own field values (never the country/contact
+        // selection, never collapses); this is the one deliberate
+        // difference from wireEditSection()'s own Cancel (which also
+        // clears country) - the mission's own wording for Contacts is
+        // explicit: "restore persisted contact values, remain in
+        // current contact mode/panel".
+        function onCancel() {
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
+            if (mode === "add") {
+                resetAddOnlyFields();
+                updateAddSubmitAvailability();
+            } else if (viewSubState === "edit-one" && editBaseline) {
+                editFields.forEach(([key, input]) => {
+                    input.value = editBaseline[key];
+                });
+                updateSaveAvailability();
+            }
+
+            setMessage("", null);
+            updateCancelAvailability();
+        }
+
+        countrySelect.addEventListener("change", () => {
+            if (isDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                countrySelect.value = previousCountryValue;
+                return undefined;
+            }
+
+            previousCountryValue = countrySelect.value;
+            return onCountryChange();
+        });
+
+        saveButton.addEventListener("click", onSave);
+        addSubmitButton.addEventListener("click", onAddSubmit);
+        cancelButton.addEventListener("click", onCancel);
+        backToListButton.addEventListener("click", backToList);
+        addBackToListButton.addEventListener(
+            "click",
+            backToListFromAdd
+        );
+
+        addAnotherButton.addEventListener("click", () => {
+            viewSubState = "list";
+            resetEditOnlyFields();
+            setMode("add");
+            expand();
+        });
+
+        modeViewButton.addEventListener("click", () => {
+            setMode("view");
+            expand();
+        });
+        modeAddButton.addEventListener("click", () => {
+            setMode("add");
+            expand();
+        });
+
+        // Mission "ORDER 8G-A.2", section 4 - a pure presentation-state
+        // action: no dirty check, no reset, no backend request.
+        collapseButton.addEventListener("click", collapse);
+
+        renderModeUI();
+        renderViewSubStateUI();
+    }
+
+    wireContactsPanel();
+
     wireDocumentsToolbar();
     wireDeleteForms();
     wireReindexForms();
@@ -2846,6 +3811,7 @@
         confirmWarnings,
         countryConfirmed,
         selectedCountryCode,
+        confirmContactReseed,
     }) {
         const formData = new FormData();
 
@@ -2882,6 +3848,13 @@
 
         if (selectedCountryCode) {
             formData.set("selected_country_code", selectedCountryCode);
+        }
+
+        // Mission "ORDER 8G-B2", section 14 - confirming the Admin
+        // wants to discard this country's Admin contact changes and
+        // reseed them from the (possibly byte-identical) DOCX.
+        if (confirmContactReseed) {
+            formData.set("confirm_contact_reseed", "1");
         }
 
         return formData;
@@ -3026,6 +3999,7 @@
         awaiting_combined_confirmation: "Waiting for confirmation",
         awaiting_country_confirmation: "Waiting for confirmation",
         awaiting_country_selection: "Waiting for confirmation",
+        awaiting_contact_reseed_confirmation: "Waiting for confirmation",
         needs_conflict_resolution: "Action required",
         cancelled: "Cancelled",
         failed: "Failed",
@@ -3051,6 +4025,7 @@
             || status === "awaiting_country_confirmation"
             || status === "awaiting_country_selection"
             || status === "needs_conflict_resolution"
+            || status === "awaiting_contact_reseed_confirmation"
         ) {
             return { icon: "⚠", cls: "is-warning" };
         }
@@ -3088,6 +4063,7 @@
                         : ""
                 )
                 + `<span class="le-global-chatbot-admin__queue-message">New document: ${filename}</span>`
+                + adminModifiedWarningHtml(item.detail)
                 + decisionButtonsHtml(item.id, "Cancel", "cancel", "Replace document", "replace")
             );
         } else if (item.status === "awaiting_warning_confirmation") {
@@ -3103,7 +4079,30 @@
             extra = (
                 warningMessagesHtml(item.detail)
                 + `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(country)} already has a document.</span>`
+                + adminModifiedWarningHtml(item.detail)
                 + decisionButtonsHtml(item.id, "Cancel", "cancel", "Continue and replace", "continue-and-replace")
+            );
+        } else if (
+            item.status === "awaiting_contact_reseed_confirmation"
+        ) {
+            const country = (
+                (item.detail && item.detail.country) || "This country"
+            );
+
+            extra = (
+                `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(country)} has changes made in the Admin.</span>`
+                + '<span class="le-global-chatbot-admin__queue-message">'
+                + "This document is identical to the one already "
+                + "active, but confirming will discard those Admin "
+                + "changes and regenerate contacts from it."
+                + "</span>"
+                + decisionButtonsHtml(
+                    item.id,
+                    "Cancel",
+                    "cancel",
+                    "Discard changes and reseed",
+                    "reseed-contacts"
+                )
             );
         } else if (item.status === "awaiting_country_confirmation") {
             extra = countryConfirmationHtml(item);
@@ -3125,6 +4124,22 @@
                 + `data-review-country-code="${escapeHtml(countryCode)}" `
                 + `data-review-country-name="${escapeHtml(countryName)}">`
                 + "Review</button>"
+                + "</span>"
+            );
+        } else if (
+            (item.status === "indexed" || item.status === "replaced")
+            && item.contactCount === 0
+        ) {
+            // Mission "ORDER 8G-B2", section 18 - informational and
+            // actionable, never a red processing error: the document
+            // itself is still exactly as successful as the status
+            // above already says.
+            extra = (
+                '<span class="le-global-chatbot-admin__queue-message '
+                + 'le-global-chatbot-admin__queue-warning">'
+                + "⚠ Contact missing for this document. It does not "
+                + "currently contain an L&amp;E Global contact — use "
+                + "the Contacts panel to add one."
                 + "</span>"
             );
         }
@@ -3164,6 +4179,29 @@
                 `<span class="le-global-chatbot-admin__queue-message">${escapeHtml(warning.message)}</span>`
             ))
             .join("");
+    }
+
+    // Mission "ORDER 8G-B2", section 12/13 - composed into the SAME
+    // existing replacement-confirmation dialog (never a second,
+    // separate modal) whenever this country's document has Admin
+    // changes (a section or contact mutation) recorded since its last
+    // accepted upload. Never mentions the marker/state/index by name -
+    // purely business wording, matching the mission's own conceptual
+    // text.
+    function adminModifiedWarningHtml(detail) {
+        if (!detail || !detail.admin_modified) {
+            return "";
+        }
+
+        return (
+            '<span class="le-global-chatbot-admin__queue-message '
+            + 'le-global-chatbot-admin__queue-warning">'
+            + "This country has changes made in the Admin. Uploading "
+            + "this document will replace the current document and "
+            + "discard those changes, including section and contact "
+            + "information."
+            + "</span>"
+        );
     }
 
     function decisionButtonsHtml(itemId, cancelLabel, cancelValue, continueLabel, continueValue) {
@@ -3332,6 +4370,12 @@
             decision === "continue" || decision === "continue-and-replace"
         );
 
+        // Mission "ORDER 8G-B2", section 14 - "Confirm" on the
+        // identical-bytes-but-Admin-modified dialog resubmits with
+        // this one additional flag; the DOCX bytes themselves never
+        // change, only the structured contact state is reseeded.
+        const confirmContactReseed = decision === "reseed-contacts";
+
         if (decision === "select-country" && !(selectedValue || "")) {
             // Nothing selected yet - stay on the same panel rather
             // than submitting an empty choice the server would only
@@ -3367,6 +4411,7 @@
             confirmWarnings,
             countryConfirmed: Boolean(item.countryConfirmed),
             selectedCountryCode: item.selectedCountryCode || "",
+            confirmContactReseed,
         };
 
         // A single, deliberate admin decision (Replace/Continue/
@@ -3403,6 +4448,7 @@
             confirmWarnings: false,
             countryConfirmed: false,
             selectedCountryCode: "",
+            confirmContactReseed: false,
         };
 
         let result;
@@ -3437,6 +4483,12 @@
 
         if (outcome.kind === "already_current") {
             item.status = "already_current";
+            renderQueue();
+            return;
+        }
+
+        if (outcome.kind === "identical_but_admin_modified") {
+            item.status = "awaiting_contact_reseed_confirmation";
             renderQueue();
             return;
         }
@@ -3499,6 +4551,20 @@
             renderQueue();
             return;
         }
+
+        // Mission "ORDER 8G-B2", section 18 - a successful upload/
+        // replace/reseed whose resulting structured contact count is
+        // exactly 0 gets a non-blocking, actionable warning alongside
+        // its normal success status - the document itself still
+        // finishes exactly as before (Ready), this is purely
+        // informational.
+        item.contactCount = (
+            result.payload
+            && result.payload.data
+            && typeof result.payload.data.contact_count === "number"
+        )
+            ? result.payload.data.contact_count
+            : null;
 
         item.status = (
             item.forcedOptions && item.forcedOptions.replaceExisting
