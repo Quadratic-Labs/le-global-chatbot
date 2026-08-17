@@ -6,7 +6,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import IO, Final, TypeAlias
 
 from docx import Document
 from docx.document import Document as DocxDocument
@@ -1713,7 +1713,22 @@ def extract_contacts_from_docx(
     file_path: Path,
     country: str | None = None,
 ) -> list[ExtractedContact]:
-    """Extract every validated contact card from one source DOCX."""
+    """
+    Extract every validated contact card from one source DOCX.
+
+    Checks for the deterministic, Admin-managed block (mission "ORDER
+    8G-B2.1") first - present only on a DOCX this system itself
+    materialized for Download - and falls back to the ordinary
+    text-box-based legacy parser for every real, organically-uploaded
+    document, where that marker is never present.
+    """
+
+    deterministic_contacts = extract_deterministic_contact_blocks(
+        file_path
+    )
+
+    if deterministic_contacts is not None:
+        return deterministic_contacts
 
     return parse_contact_blocks(
         extract_text_box_blocks(
@@ -1773,3 +1788,225 @@ def build_contact_chunk_content(
     return "\n\n".join(
         entries
     )
+
+
+# --- Deterministic Contact block (mission "ORDER 8G-B2.1" family) ----
+#
+# A Download of the effective (current) DOCX materializes structured
+# Contact state INSIDE the document's own real Contact text box - the
+# same visual card a human already looks at (mission "ORDER 8G-B2.1R2"
+# - two earlier attempts placed the content correctly for
+# extract_contacts_from_docx() but not for a human eye: v0.8.1 appended
+# it at the document's end, v0.8.2 moved it to plain paragraphs near
+# the title but outside the actual visual card). No visible technical
+# marker is written anywhere in the document; instead, one hidden
+# (w:vanish) marker paragraph is the first line inside the box - never
+# rendered by Word, but still literally present in <w:t> text for this
+# function's own regex-based extraction to find. Deliberately
+# distinctive so it can never coincidentally match real, organically
+# authored legal document text.
+
+CONTACT_BOX_HIDDEN_MARKER: Final[str] = (
+    "LE-GLOBAL-CONTACT-BLOCK-V3"
+)
+
+# Closes a hidden-marker block inserted directly among ordinary body
+# paragraphs (a document with no pre-existing Contact text box at all
+# - see app.services.document_contact_materializer's in-flow-paragraph
+# fallback). A floating text box's own bounds already delimit its
+# content unambiguously, so this end marker is only ever needed - and
+# only ever looked for - when the block lives among plain body
+# paragraphs, where consecutive <w:p> elements alone can't tell the
+# inserted block apart from the document's own surrounding content.
+# Hidden the same way as the start marker: present in <w:t> text for
+# parsing, never rendered by Word.
+CONTACT_BOX_HIDDEN_END_MARKER: Final[str] = (
+    "LE-GLOBAL-CONTACT-BLOCK-END-V3"
+)
+
+DETERMINISTIC_NO_CONTACTS_LINE: Final[str] = (
+    "No L&E Global contact is currently configured."
+)
+
+_DETERMINISTIC_FIELD_LABELS: Final[
+    tuple[tuple[str, str], ...]
+] = (
+    ("Member firm: ", "member_firm"),
+    ("Contact person: ", "contact_person"),
+    ("Email: ", "email"),
+    ("Phone: ", "phone"),
+    ("Address: ", "address"),
+    ("Website: ", "website"),
+)
+
+
+def _parse_deterministic_contact_entry(
+    lines: Sequence[str],
+) -> ExtractedContact:
+    """Parse one blank-line-delimited group of "Label: value" lines
+    (the exact inverse of build_contact_chunk_content's own per-contact
+    formatting) into one ExtractedContact."""
+
+    fields: dict[str, str] = {}
+
+    for line in lines:
+        for label, field_name in _DETERMINISTIC_FIELD_LABELS:
+            if line.startswith(label):
+                fields[field_name] = line[len(label):].strip()
+                break
+
+    return ExtractedContact(**fields)
+
+
+def _parse_contact_lines_after_marker(
+    remaining: Sequence[str],
+) -> list[ExtractedContact]:
+    """Turn the blank-line-delimited lines following a hidden marker
+    into contacts - shared by both places the marker can appear (a
+    floating text box's own content, or plain in-flow body paragraphs
+    for a document with no pre-existing Contact box)."""
+
+    if remaining and remaining[0].strip() == DETERMINISTIC_NO_CONTACTS_LINE:
+        return []
+
+    contacts: list[ExtractedContact] = []
+    current_lines: list[str] = []
+
+    def flush_current_entry() -> None:
+        if current_lines:
+            contacts.append(
+                _parse_deterministic_contact_entry(current_lines)
+            )
+
+    for text in remaining:
+        stripped = text.strip()
+
+        if stripped == "":
+            flush_current_entry()
+            current_lines = []
+            continue
+
+        current_lines.append(stripped)
+
+    flush_current_entry()
+
+    return contacts
+
+
+def extract_deterministic_contact_blocks(
+    source: Path | IO[bytes],
+) -> list[ExtractedContact] | None:
+    """
+    Recognize the hidden-marker Contact block a materialized Download
+    DOCX carries - either one <w:txbxContent> block (the document's own
+    real Contact text box, reused and resized in place by
+    app.services.document_contact_materializer) or, for a document with
+    no pre-existing Contact box at all, a run of plain in-flow body
+    paragraphs bounded by a hidden start and end marker - whose first
+    line is the hidden marker.
+
+    Returns None (never an empty list) when no such block is found, so
+    callers fall back to the ordinary text-box-based legacy parser - an
+    empty list is reserved for "the marker is present and explicitly
+    states zero contacts". Reads document.xml directly (the same way
+    extract_text_box_blocks() does) rather than via python-docx's
+    paragraph API, since a floating shape's own content never shows up
+    in python-docx's paragraph API at all.
+    """
+
+    try:
+        with zipfile.ZipFile(source) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+    except (
+        KeyError,
+        OSError,
+        zipfile.BadZipFile,
+    ):
+        return None
+
+    for match in _TEXT_BOX_CONTENT_PATTERN.finditer(document_xml):
+        lines = _text_box_lines_preserving_blanks(match.group(1))
+
+        if not lines or lines[0].strip() != CONTACT_BOX_HIDDEN_MARKER:
+            continue
+
+        return _parse_contact_lines_after_marker(lines[1:])
+
+    # No floating Contact box carries the marker - look for it among
+    # plain body paragraphs instead (the in-flow fallback used for a
+    # document with no pre-existing Contact box, e.g. an originally
+    # zero-contact source). Unlike a text box's own bounds, consecutive
+    # <w:p> elements alone can't tell an inserted block apart from the
+    # document's own surrounding paragraphs, so this path is bounded by
+    # an explicit hidden end marker instead.
+    paragraph_lines = [
+        _single_paragraph_line(match.group(0))
+        for match in _TEXT_BOX_PARAGRAPH_PATTERN.finditer(document_xml)
+    ]
+
+    for index, line in enumerate(paragraph_lines):
+        if line.strip() != CONTACT_BOX_HIDDEN_MARKER:
+            continue
+
+        block_lines: list[str] = []
+
+        for later_line in paragraph_lines[index + 1:]:
+            if later_line.strip() == CONTACT_BOX_HIDDEN_END_MARKER:
+                return _parse_contact_lines_after_marker(block_lines)
+
+            block_lines.append(later_line)
+
+        # End marker never found - malformed, fall through to the
+        # legacy parser rather than guessing where the block ends.
+        break
+
+    return None
+
+
+def _single_paragraph_line(paragraph_xml: str) -> str:
+    """Extract the one line of text one already-isolated <w:p>...</w:p>
+    fragment represents - the same per-paragraph token-to-text logic
+    _text_box_lines_preserving_blanks applies to each paragraph it
+    finds, factored out so a single paragraph (e.g. one already matched
+    by _TEXT_BOX_PARAGRAPH_PATTERN elsewhere) can be converted without
+    re-running paragraph-boundary detection on it."""
+
+    tokens = [
+        match.group(1)
+        if match.group(1) is not None
+        else ", "
+        for match in _TEXT_BOX_TOKEN_PATTERN.finditer(
+            paragraph_xml
+        )
+    ]
+
+    return _clean_text_box_line(
+        _normalize_text(
+            unescape(
+                "".join(tokens)
+            )
+        )
+    )
+
+
+def _text_box_lines_preserving_blanks(
+    raw_block_xml: str,
+) -> list[str]:
+    """Like extract_text_box_blocks()'s own per-paragraph line
+    extraction, but keeps one "" entry per blank paragraph instead of
+    dropping it - the hidden-marker Contact block relies on a blank
+    paragraph as the delimiter between one contact's fields and the
+    next."""
+
+    return [
+        _single_paragraph_line(paragraph_xml)
+        for paragraph_xml in _TEXT_BOX_PARAGRAPH_PATTERN.findall(
+            raw_block_xml
+        )
+    ]

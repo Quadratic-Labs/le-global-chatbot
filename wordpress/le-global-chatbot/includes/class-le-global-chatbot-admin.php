@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.8.0';
+    private const VERSION = '0.8.1';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -1042,15 +1042,15 @@ final class LE_Global_Chatbot_Admin
                 </div>
 
                 <div
+                    id="le-global-contact-zero-warning"
+                    class="le-global-chatbot-admin__duplicate-warning"
+                    hidden
+                ></div>
+
+                <div
                     id="le-global-contact-view-only-fields"
                     class="le-global-chatbot-admin__mode-fields"
                 >
-                    <div
-                        id="le-global-contact-zero-warning"
-                        class="le-global-chatbot-admin__duplicate-warning"
-                        hidden
-                    ></div>
-
                     <div
                         id="le-global-contact-list"
                         aria-live="polite"
@@ -1146,7 +1146,7 @@ final class LE_Global_Chatbot_Admin
                             id="le-global-contact-back-to-list"
                             class="button-link le-global-chatbot-admin__back-link"
                         >
-                            &larr; Back to list
+                            &larr; Back to contacts
                         </button>
                     </div>
                 </div>
@@ -1221,6 +1221,14 @@ final class LE_Global_Chatbot_Admin
                             disabled
                         >
                     </div>
+
+                    <button
+                        type="button"
+                        id="le-global-contact-add-back-to-list"
+                        class="button-link le-global-chatbot-admin__back-link"
+                    >
+                        &larr; Back to contacts
+                    </button>
                 </div>
 
                 <div

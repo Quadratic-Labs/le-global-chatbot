@@ -4665,6 +4665,7 @@ describe("contacts panel", () => {
         });
 
         const backToListButton = makeFakeButton();
+        const addBackToListButton = makeFakeButton();
         const addOnlyFields = { hidden: true };
         const addMemberFirmInput = makeFakeGenericElement();
         const addContactPersonInput = makeFakeGenericElement();
@@ -4727,6 +4728,7 @@ describe("contacts panel", () => {
             "le-global-contact-edit-address": editAddressInput,
             "le-global-contact-edit-website": editWebsiteInput,
             "le-global-contact-back-to-list": backToListButton,
+            "le-global-contact-add-back-to-list": addBackToListButton,
             "le-global-contact-add-only-fields": addOnlyFields,
             "le-global-contact-add-member-firm": addMemberFirmInput,
             "le-global-contact-add-contact-person": addContactPersonInput,
@@ -4776,6 +4778,7 @@ describe("contacts panel", () => {
             editAddressInput,
             editWebsiteInput,
             backToListButton,
+            addBackToListButton,
             addOnlyFields,
             addMemberFirmInput,
             addContactPersonInput,
@@ -5449,5 +5452,116 @@ describe("contacts panel", () => {
         assert.match(fetchCalls[1].url, /action=le_global_chatbot_list_contacts/);
         assert.equal(dom.listEl._children.length, 0);
         assert.match(dom.messageEl.textContent, /deleted successfully/);
+    });
+
+    // --- "← Back to contacts" (mission "ORDER 8G-B2.1") -----------------
+
+    describe("back to contacts navigation", () => {
+        test("the control exists in Add mode", () => {
+            clickModeAdd();
+
+            assert.equal(dom.addBackToListButton.hidden, false);
+        });
+
+        test("the control exists in Edit mode", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickEditOnCard(0);
+
+            assert.equal(dom.editFieldsEl.hidden, false);
+            assert.equal(dom.backToListButton.hidden, false);
+        });
+
+        test("clean Back from Add mode returns to the list, country preserved, panel not collapsed", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickModeAdd();
+
+            dom.addBackToListButton._listeners.click();
+
+            assert.equal(dom.addOnlyFields.hidden, true, "must leave Add mode");
+            assert.equal(dom.viewOnlyFields.hidden, false, "must return to View mode");
+            assert.equal(dom.editFieldsEl.hidden, true, "must show the list, not an edit form");
+            assert.equal(dom.countrySelect.value, "doc_fr", "country selection must be preserved");
+            assert.equal(dom.container.hidden, false, "must not collapse the panel");
+        });
+
+        test("clean Back from Edit mode returns to the list, country preserved, panel not collapsed", async () => {
+            clickModeView();
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickEditOnCard(0);
+
+            dom.backToListButton._listeners.click();
+
+            assert.equal(dom.editFieldsEl.hidden, true, "must leave the edit form");
+            assert.equal(dom.listEl.hidden, false, "must show the list");
+            assert.equal(dom.countrySelect.value, "doc_fr", "country selection must be preserved");
+            assert.equal(dom.container.hidden, false, "must not collapse the panel");
+        });
+
+        test("dirty Back from Add mode prompts for confirmation; declining keeps the content and stays in Add mode", async () => {
+            clickModeAdd();
+            setField(dom.addMemberFirmInput, "Draft firm name");
+            confirmReturnValue = false;
+
+            dom.addBackToListButton._listeners.click();
+
+            assert.equal(confirmCalls.length, 1);
+            assert.equal(dom.addOnlyFields.hidden, false, "must remain in Add mode");
+            assert.equal(
+                dom.addMemberFirmInput.value,
+                "Draft firm name",
+                "declining discard must never clear the field"
+            );
+        });
+
+        test("dirty Back from Add mode, confirming, discards the draft and returns to the list", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickModeAdd();
+            setField(dom.addMemberFirmInput, "Draft firm name");
+            confirmReturnValue = true;
+
+            dom.addBackToListButton._listeners.click();
+
+            assert.equal(confirmCalls.length, 1);
+            assert.equal(dom.viewOnlyFields.hidden, false);
+            assert.equal(dom.addMemberFirmInput.value, "");
+        });
+
+        test("dirty Back from Edit mode prompts for confirmation; declining keeps the edited value and stays in the form", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickEditOnCard(0);
+            setField(dom.editMemberFirmInput, "Changed firm name");
+            confirmReturnValue = false;
+
+            dom.backToListButton._listeners.click();
+
+            assert.equal(confirmCalls.length, 1);
+            assert.equal(dom.editFieldsEl.hidden, false, "must remain in the edit form");
+            assert.equal(dom.editMemberFirmInput.value, "Changed firm name");
+        });
+
+        test("Back is distinct from Cancel and from Collapse", async () => {
+            queueFetchResponses([ONE_CONTACT_RESPONSE]);
+            await selectCountry("doc_fr");
+            clickModeAdd();
+            setField(dom.addMemberFirmInput, "Draft firm name");
+
+            // Cancel: resets fields, stays in Add mode (unchanged
+            // semantics - not touched by this mission).
+            dom.cancelButton._listeners.click();
+            assert.equal(dom.addOnlyFields.hidden, false);
+            assert.equal(dom.addMemberFirmInput.value, "");
+
+            // Collapse: hides the panel, preserves field state
+            // (unchanged semantics - not touched by this mission).
+            setField(dom.addMemberFirmInput, "Another draft");
+            clickCollapse();
+            assert.equal(dom.container.hidden, true);
+            assert.equal(dom.addMemberFirmInput.value, "Another draft");
+        });
     });
 });

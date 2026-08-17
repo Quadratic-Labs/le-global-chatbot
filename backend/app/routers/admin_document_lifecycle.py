@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -9,6 +11,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from app.core.admin_error_reporting import (
     admin_error_detail,
@@ -381,13 +384,19 @@ def download_admin_document(
     document_id: str,
 ) -> FileResponse:
     """
-    Stream the real source DOCX backing one document_id.
+    Stream the effective (current) DOCX backing one document_id.
 
     The client supplies only document_id - never a path - and the
     exact same source resolver reindex/delete already trust decides
     which real file that is (mission "ORDER 3", section 25): no
     client-controlled path ever reaches the filesystem, so path
     traversal is structurally not possible here.
+
+    When the document has structured Contact state, the streamed file
+    is a temporary "effective" copy materializing that CURRENT state
+    into the document's existing legal content (mission "ORDER
+    8G-B2.1") - the persisted source itself is never modified, and the
+    temporary file is deleted once the response has been fully sent.
     """
 
     settings = get_settings()
@@ -400,10 +409,20 @@ def download_admin_document(
             ),
         )
 
+        cleanup_path = download.cleanup_path
+
         return FileResponse(
             path=download.path,
             media_type=DOCX_MEDIA_TYPE,
             filename=download.download_filename,
+            background=(
+                BackgroundTask(
+                    os.unlink,
+                    cleanup_path,
+                )
+                if cleanup_path is not None
+                else None
+            ),
         )
 
     except InvalidAdminDocumentIdError as error:

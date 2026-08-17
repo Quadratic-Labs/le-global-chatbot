@@ -2582,6 +2582,56 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
                 context.exception.to_detail()["admin_modified"]
             )
 
+    def test_dirty_document_with_topic_warning_flags_admin_modified_too(
+        self,
+    ) -> None:
+        # Found via the real-Chromium canary (mission "ORDER 8G-B2",
+        # section 26): when a re-upload triggers BOTH a topic-coverage
+        # warning AND a pending replacement (the "combined" path,
+        # AdminDocumentWarningConfirmationRequiredError with
+        # replacement_required=True), admin_modified must still be
+        # carried in its detail - not just on the plain
+        # AdminDocumentReplacementRequiredError path above. Without
+        # this, admin.js's adminModifiedWarningHtml() silently has
+        # nothing to render for this path, and confirming the combined
+        # decision would discard Admin changes with no warning shown.
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root) / "source"
+            processed_directory = Path(root) / "processed"
+            source_directory.mkdir(parents=True)
+
+            (
+                source_directory
+                / "Employment Law Overview Australia.docx"
+            ).write_bytes(b"legacy-australia")
+
+            from app.services.admin_modification_marker import (
+                mark_admin_modified,
+            )
+
+            mark_admin_modified(source_directory, AU_OLD_ID)
+
+            with self.assertRaises(
+                AdminDocumentWarningConfirmationRequiredError
+            ) as context:
+                safe_upload_and_index_document(
+                    filename="Australia 2026.docx",
+                    file_stream=BytesIO(b"new-australia-bytes"),
+                    source_directory=source_directory,
+                    processed_directory=processed_directory,
+                    maximum_bytes=1000,
+                    country_confirmed=True,
+                    confirm_warnings=False,
+                    chunk_builder=lambda path: [
+                        _build_au_chunk(path.name)
+                    ],
+                    country_document_lookup=_existing_documents,
+                )
+
+            error = context.exception
+            self.assertTrue(error.replacement_required)
+            self.assertTrue(error.to_detail()["admin_modified"])
+
     def test_identical_bytes_clean_still_raises_already_current(
         self,
     ) -> None:

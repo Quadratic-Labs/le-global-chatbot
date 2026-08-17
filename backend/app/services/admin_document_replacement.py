@@ -345,12 +345,14 @@ class AdminDocumentWarningConfirmationRequiredError(ValueError):
         warnings: Sequence[TopicCoverageWarning],
         replacement_required: bool,
         existing_document_ids: Sequence[str],
+        admin_modified: bool = False,
     ) -> None:
         self.country = country
         self.country_code = country_code
         self.warnings = tuple(warnings)
         self.replacement_required = replacement_required
         self.existing_document_ids = tuple(existing_document_ids)
+        self.admin_modified = admin_modified
 
         super().__init__(
             "The document is technically valid but its content "
@@ -359,7 +361,19 @@ class AdminDocumentWarningConfirmationRequiredError(ValueError):
         )
 
     def to_detail(self) -> dict[str, object]:
-        """Return a structured HTTP 409 payload."""
+        """
+        Return a structured HTTP 409 payload.
+
+        admin_modified (mission "ORDER 8G-B2", section 12) - carried
+        here too, not just on AdminDocumentReplacementRequiredError:
+        this "combined" warning+replacement path is reachable even
+        when a country is admin-modified (a topic-coverage warning and
+        a pending replacement can both apply to the same upload), and
+        without this field admin.js's adminModifiedWarningHtml() has
+        nothing to render here, silently dropping the "this will
+        discard your Admin changes" notice on confirm (found via the
+        real-Chromium canary, mission "ORDER 8G-B2" section 26).
+        """
 
         return {
             "code": "document_warning_confirmation_required",
@@ -369,6 +383,7 @@ class AdminDocumentWarningConfirmationRequiredError(ValueError):
             "country_name": self.country,
             "replacement_required": self.replacement_required,
             "existing_document_ids": list(self.existing_document_ids),
+            "admin_modified": self.admin_modified,
             "warnings": [
                 {
                     "code": warning.code,
@@ -1189,6 +1204,13 @@ def safe_upload_and_index_document(
                         replacement_required=replacement_pending,
                         existing_document_ids=sorted(
                             unique_document_ids
+                        ),
+                        admin_modified=any(
+                            is_admin_modified_since_upload(
+                                source_directory,
+                                document.document_id,
+                            )
+                            for document in existing_documents
                         ),
                     )
 

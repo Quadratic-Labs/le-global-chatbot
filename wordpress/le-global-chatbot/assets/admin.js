@@ -2898,6 +2898,9 @@
         const backToListButton = document.getElementById(
             "le-global-contact-back-to-list"
         );
+        const addBackToListButton = document.getElementById(
+            "le-global-contact-add-back-to-list"
+        );
         const addOnlyFields = document.getElementById(
             "le-global-contact-add-only-fields"
         );
@@ -2942,6 +2945,7 @@
             || !editMemberFirmInput || !editContactPersonInput
             || !editEmailInput || !editPhoneInput || !editAddressInput
             || !editWebsiteInput || !backToListButton
+            || !addBackToListButton
             || !addOnlyFields || !addMemberFirmInput
             || !addContactPersonInput || !addEmailInput
             || !addPhoneInput || !addAddressInput || !addWebsiteInput
@@ -3358,6 +3362,28 @@
             renderViewSubStateUI();
         }
 
+        // "← Back to contacts" from Add mode (mission "ORDER 8G-B2.1",
+        // sections 8-9) - navigation, not Cancel/Collapse/Reset. Mirrors
+        // backToList()'s own shape rather than delegating to setMode(),
+        // since viewSubState may already be "edit-one" if Add mode was
+        // entered by clicking the "+ Add a contact" tab directly while
+        // mid-edit (that tab switch itself never resets viewSubState,
+        // matching its own established behavior) - explicitly forcing
+        // "list" here guarantees this button always lands on the
+        // current country's contact list, never a stale edit-one form.
+        function backToListFromAdd() {
+            if (isAddDirty() && !window.confirm(UNSAVED_CHANGES_PROMPT)) {
+                return;
+            }
+
+            resetAddOnlyFields();
+            viewSubState = "list";
+            mode = "view";
+            setMessage("", null);
+            renderModeUI();
+            renderViewSubStateUI();
+        }
+
         async function loadContacts(documentId) {
             contactGeneration += 1;
             const generation = contactGeneration;
@@ -3720,6 +3746,10 @@
         addSubmitButton.addEventListener("click", onAddSubmit);
         cancelButton.addEventListener("click", onCancel);
         backToListButton.addEventListener("click", backToList);
+        addBackToListButton.addEventListener(
+            "click",
+            backToListFromAdd
+        );
 
         addAnotherButton.addEventListener("click", () => {
             viewSubState = "list";
