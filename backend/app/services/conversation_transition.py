@@ -110,6 +110,88 @@ def _same_subject_country_followup(
     return None
 
 
+
+_LEGAL_CHALLENGE_FOLLOWUP_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^(?:are|were) you sure$",
+        r"^(?:is|was) that (?:really )?(?:true|correct|legal)$",
+        r"^(?:really|seriously)$",
+        r"^(?:can|could|would) you "
+        r"(?:confirm|verify)(?: it| that| this)?$",
+        r"^(?:please )?(?:confirm|verify)(?: it| that| this)?$",
+        r"^just (?:say|answer) (?:yes|no)$",
+        r"^(?:i am|i m) sure(?: that| this)? "
+        r"(?:is )?legal(?: just)? (?:say|answer) yes$",
+        r"^(?:i am|i m) sure(?: it| this| that)? "
+        r"(?:is )?(?:true|correct)(?: just)? "
+        r"(?:say|answer) yes$",
+    )
+)
+
+
+def _is_legal_challenge_followup(
+    question: str,
+) -> bool:
+    """
+    Recognize a short confirmation/challenge that has no legal
+    subject of its own and therefore must keep one established
+    legal context rather than create a new contact/topic intent.
+    """
+
+    normalized = _normalize_followup_text(question)
+
+    return any(
+        pattern.fullmatch(normalized)
+        for pattern in _LEGAL_CHALLENGE_FOLLOWUP_PATTERNS
+    )
+
+
+def _correct_delta_for_legal_challenge_followup(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """
+    Preserve one established legal action for conversational
+    challenges such as "Are you sure?" or "Just say yes".
+
+    The current message contributes no new country/topic/action.
+    Deterministic contact/comparison/country/topic signals always
+    win, so a genuine new request is never swallowed here.
+    """
+
+    if (
+        current_question is None
+        or len(conversation_state.actions) != 1
+        or conversation_state.actions[0].type
+        != "legal_information"
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or hints.current_country_codes
+        or hints.current_legal_topics
+        or not _is_legal_challenge_followup(
+            current_question
+        )
+    ):
+        return result
+
+    return result.model_copy(
+        update={
+            "is_follow_up": True,
+            "current_message_delta": CurrentMessageDelta(
+                explicit_action_types=[],
+                explicit_country_codes=[],
+                explicit_legal_topics=[],
+                explicit_subject_text=None,
+                context_operation="continue",
+            ),
+        }
+    )
+
+
 class ConversationTransitionError(RuntimeError):
     """
     Raised when the transition engine hits a genuinely unexpected
@@ -731,11 +813,19 @@ def apply_conversation_transition(
         current_question=current_question,
     )
 
+    result = _correct_delta_for_legal_challenge_followup(
+        result=result,
+        conversation_state=canonicalized_state,
+        hints=hints,
+        current_question=current_question,
+    )
+
     try:
         outcome = _apply_transition(
             result=result,
             conversation_state=canonicalized_state,
             hints=hints,
+            current_question=current_question,
         )
 
         if canonicalized_state is conversation_state:
@@ -788,6 +878,7 @@ def _apply_transition(
     result: RequestUnderstandingResult,
     conversation_state: ConversationState,
     hints: DeterministicHints,
+    current_question: str | None = None,
 ) -> TransitionOutcome:
     delta = result.current_message_delta
     previous_actions = conversation_state.actions
@@ -858,6 +949,39 @@ def _apply_transition(
                 return _missing_topic_clarification(
                     action_type=previous_action.type,
                     country_codes=final_country_codes,
+                )
+
+            if (
+                delta.context_operation == "continue"
+                and current_question
+                and previous_action.type != "contact"
+            ):
+                followup_text = " ".join(
+                    current_question.strip().split()
+                )[:240]
+
+                subject_text = (
+                    inherited.action.effective_subject_text()
+                )[:260]
+
+                country_phrase = " and ".join(
+                    resolve_country_display_name(code)
+                    for code in final_country_codes
+                )
+
+                inherited = replace(
+                    inherited,
+                    action=inherited.action.model_copy(
+                        update={
+                            "resolved_question": (
+                                f"For {country_phrase}, answer this "
+                                "conversational follow-up: "
+                                f"{followup_text}. "
+                                "The established employment-law "
+                                f"subject is: {subject_text}."
+                            )
+                        }
+                    ),
                 )
 
             return TransitionOutcome(
@@ -935,6 +1059,69 @@ def _apply_transition(
             if previous_action.type != "comparison"
             else conversation_state.ordered_country_codes
         )
+
+        # A genuinely ambiguous follow-up must never erase an
+        # already-established single legal context. The semantic model
+        # may itself incorrectly claim a new action while asking for a
+        # clarification; deterministic contact/comparison signals are
+        # therefore the authoritative blockers here, not the model's
+        # own provisional action list.
+        #
+        # This never guesses the missing legal meaning: it only keeps
+        # the already-known country/action alive and asks for the one
+        # point that is actually unclear.
+        if (
+            result.status == "clarification"
+            and result.clarification_reason == "ambiguous_request"
+            and result.is_follow_up
+            and previous_action.type == "legal_information"
+            and len(candidate_countries) == 1
+            and not explicit_country_codes
+            and not hints.strong_contact_signal
+            and not hints.comparison_signal
+        ):
+            country_name = resolve_country_display_name(
+                candidate_countries[0]
+            )
+
+            partial_subject = None
+
+            if (
+                len(result.actions) == 1
+                and result.actions[0].type == "legal_information"
+            ):
+                partial_subject = (
+                    result.actions[0].subject_text
+                    or result.actions[0].topic_text
+                )
+
+            if partial_subject:
+                contextual_answer = (
+                    f"I'll keep {country_name} and the current "
+                    "employment-law context. Could you clarify "
+                    f'exactly what you mean by "{partial_subject}"?'
+                )
+            else:
+                contextual_answer = (
+                    f"I'll keep {country_name} and the current "
+                    "employment-law context. Could you clarify the "
+                    "specific point in your last question?"
+                )
+
+            return TransitionOutcome(
+                final_status="clarification",
+                final_actions=[],
+                final_clarification_reason="ambiguous_request",
+                pending_clarification=None,
+                semantic_result_overridden=True,
+                semantic_override_reason=(
+                    "single_active_legal_context_clarification"
+                ),
+                context_inheritance_applied=False,
+                inherited_action_type=previous_action.type,
+                inherited_country_replaced=False,
+                contextual_clarification_answer=contextual_answer,
+            )
 
         if (
             delta.context_operation == "ambiguous"

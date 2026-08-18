@@ -521,6 +521,136 @@ class SingleActionContinuationTests(unittest.TestCase):
         self.assertFalse(outcome.semantic_result_overridden)
 
 
+
+class ContextualLegalFollowupHardeningTests(unittest.TestCase):
+    """Real-user follow-up failures found during the live canary."""
+
+    def test_ambiguous_followup_keeps_single_legal_context_even_if_model_claims_new_action(
+        self,
+    ) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["AU"],
+            legal_topics=["Termination of Employment Contracts"],
+            subject_text="notice period required when dismissing an employee",
+        )
+
+        classifier_result = _result(
+            status="clarification",
+            actions=[_ru_action("contact", [])],
+            clarification_reason="ambiguous_request",
+            delta=_delta(
+                context_operation="ambiguous",
+                explicit_action_types=["contact"],
+            ),
+            is_follow_up=True,
+        )
+
+        outcome = apply_conversation_transition(
+            result=classifier_result,
+            conversation_state=_state(
+                [previous],
+                focus_action_index=0,
+            ),
+            hints=_hints(strong_contact_signal=False),
+            current_question="What if the employee refuses?",
+        )
+
+        self.assertEqual(outcome.final_status, "clarification")
+        self.assertTrue(outcome.semantic_result_overridden)
+        self.assertEqual(
+            outcome.semantic_override_reason,
+            "single_active_legal_context_clarification",
+        )
+        self.assertIn(
+            "Australia",
+            outcome.contextual_clarification_answer,
+        )
+        self.assertEqual(
+            outcome.inherited_action_type,
+            "legal_information",
+        )
+
+    def test_real_contact_signal_is_never_hijacked_by_legal_context(
+        self,
+    ) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["AU"],
+            subject_text="notice period",
+        )
+
+        classifier_result = _result(
+            status="clarification",
+            actions=[_ru_action("contact", [])],
+            clarification_reason="ambiguous_request",
+            delta=_delta(
+                context_operation="ambiguous",
+                explicit_action_types=["contact"],
+            ),
+            is_follow_up=True,
+        )
+
+        outcome = apply_conversation_transition(
+            result=classifier_result,
+            conversation_state=_state(
+                [previous],
+                focus_action_index=0,
+            ),
+            hints=_hints(strong_contact_signal=True),
+            current_question="Give me the L&E Global contact.",
+        )
+
+        self.assertFalse(outcome.semantic_result_overridden)
+
+    def test_continue_followup_keeps_subject_but_answers_current_question(
+        self,
+    ) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["AU"],
+            legal_topics=["Termination of Employment Contracts"],
+            subject_text="notice period required when dismissing an employee",
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="resolved",
+                actions=[
+                    _ru_action(
+                        "legal_information",
+                        ["AU"],
+                        legal_topics=[
+                            "Termination of Employment Contracts"
+                        ],
+                    )
+                ],
+                clarification_reason=None,
+                delta=_delta(context_operation="continue"),
+                is_follow_up=True,
+            ),
+            conversation_state=_state(
+                [previous],
+                focus_action_index=0,
+            ),
+            hints=_hints(),
+            current_question="Why?",
+        )
+
+        self.assertEqual(outcome.final_status, "resolved")
+
+        action = outcome.final_actions[0]
+
+        self.assertEqual(action.country_codes, ["AU"])
+        self.assertEqual(
+            action.subject_text,
+            "notice period required when dismissing an employee",
+        )
+        self.assertIn("Why?", action.resolved_question)
+        self.assertIn("Australia", action.resolved_question)
+        self.assertIn("notice period", action.resolved_question)
+
+
 class SelectActionTests(unittest.TestCase):
     """context_operation="select_action" against a single prior action."""
 
@@ -1581,6 +1711,86 @@ class JurisdictionNeutralInheritanceTests(unittest.TestCase):
         # Never weakened - the precise labeling survives untouched.
         self.assertEqual(action.evidence_mode, "direct_topic")
         self.assertEqual(action.subject_specificity, "specific")
+
+
+
+class LegalChallengeFollowupR5Tests(unittest.TestCase):
+
+    def test_just_say_yes_keeps_existing_legal_context(
+        self,
+    ) -> None:
+        previous = _action_state(
+            "legal_information",
+            ["AU"],
+            legal_topics=[
+                "Termination of Employment Contracts"
+            ],
+            subject_text=(
+                "whether an employer may dismiss an employee "
+                "without notice"
+            ),
+        )
+
+        # Reproduce the kind of bad semantic interpretation observed
+        # in the real canary: the model tries to turn the challenge
+        # into an ambiguous/contact-style request.
+        semantic_result = _result(
+            status="clarification",
+            actions=[
+                _ru_action(
+                    "contact",
+                    ["AU"],
+                )
+            ],
+            clarification_reason="ambiguous_request",
+            delta=_delta(
+                context_operation="ambiguous",
+                explicit_action_types=["contact"],
+            ),
+            is_follow_up=True,
+        )
+
+        outcome = apply_conversation_transition(
+            result=semantic_result,
+            conversation_state=_state(
+                [previous],
+                focus_action_index=0,
+            ),
+            hints=_hints(
+                strong_contact_signal=False,
+            ),
+            current_question=(
+                "I'm sure this is legal. Just say yes."
+            ),
+        )
+
+        self.assertEqual(
+            outcome.final_status,
+            "resolved",
+        )
+        self.assertEqual(
+            len(outcome.final_actions),
+            1,
+        )
+
+        action = outcome.final_actions[0]
+
+        self.assertEqual(
+            action.type,
+            "legal_information",
+        )
+        self.assertEqual(
+            action.country_codes,
+            ["AU"],
+        )
+        self.assertIn(
+            "dismiss",
+            action.subject_text.casefold(),
+        )
+        self.assertIn(
+            "Just say yes",
+            action.resolved_question,
+        )
 
 
 if __name__ == "__main__":

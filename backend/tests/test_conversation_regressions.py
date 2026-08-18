@@ -1283,6 +1283,10 @@ class JurisdictionNeutralSubjectRegressionTests(unittest.TestCase):
 
         return fake_search, captured
 
+    @mock.patch(
+        "app.routers.chat._build_contact_section",
+        new=lambda *args, **kwargs: ("", [], 0, 0.0),
+    )
     def test_old_jurisdiction_never_survives_a_bare_country_follow_up(
         self,
     ) -> None:
