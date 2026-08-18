@@ -1688,6 +1688,7 @@ HARD_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
         "uncited_material_claim",
         "citation_country_mismatch",
         "invalid_grounding_structure",
+        "challenge_certainty_flip",
     }
 )
 
@@ -3465,6 +3466,235 @@ def _build_context(
     )
 
 
+
+_CHALLENGE_MESSAGE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"^\s*(?:"
+    r"are\s+you\s+sure"
+    r"|really"
+    r"|can\s+you\s+confirm"
+    r"|are\s+you\s+certain"
+    r"|is\s+that\s+(?:correct|right)"
+    r"|confirm\s+it"
+    r"|just\s+say\s+yes"
+    r"|trust\s+me"
+    r"(?:\s*[,.;!]?\s*just\s+say\s+yes)?"
+    r"|i(?:['’]m|\s+am)\s+sure"
+    r"(?:\s*[.!]?\s*just\s+say\s+yes)?"
+    r")\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+_PRIOR_UNCERTAINTY_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:cannot\s+reliably|can't\s+reliably"
+    r"|cannot\s+confirm|can't\s+confirm"
+    r"|cannot\s+determine|can't\s+determine"
+    r"|not\s+established"
+    r"|insufficient\s+(?:evidence|information)"
+    r"|not\s+enough\s+(?:evidence|information))\b",
+    re.IGNORECASE,
+)
+
+_DEFINITIVE_CHALLENGE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?im)^\s*(?:[-*•]\s*)?(?:yes|no)\b"
+)
+
+_EXPLICIT_CORRECTION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:correction|i\s+need\s+to\s+correct"
+    r"|my\s+previous\s+answer\s+was\s+incorrect"
+    r"|i\s+should\s+correct)\b",
+    re.IGNORECASE,
+)
+
+
+def _last_assistant_answer(
+    request: LegalChatRequest,
+) -> str | None:
+    for message in reversed(request.history):
+        if (
+            message.role == "assistant"
+            and message.content.strip()
+        ):
+            return message.content.strip()
+
+    return None
+
+
+def _build_challenge_context_block(
+    *,
+    request: LegalChatRequest,
+    current_user_question: str,
+) -> str | None:
+    if not _CHALLENGE_MESSAGE_PATTERN.fullmatch(
+        current_user_question.strip()
+    ):
+        return None
+
+    previous_answer = _last_assistant_answer(request)
+
+    if previous_answer is None:
+        return None
+
+    return "\n".join(
+        [
+            (
+                "PREVIOUS ASSISTANT ANSWER — CONVERSATIONAL "
+                "CONTEXT ONLY, NOT A LEGAL SOURCE"
+            ),
+            previous_answer[:3000],
+            "",
+            "CHALLENGE STABILITY",
+            (
+                "The user's challenge adds no new legal evidence. "
+                "Preserve the previous answer's conclusion and degree of certainty unless "
+                "the validated source extracts require a correction. "
+                "If changing the prior conclusion, explicitly say "
+                "that this is a correction and support the corrected "
+                "conclusion from the validated sources. Never cite "
+                "the previous assistant answer."
+            ),
+        ]
+    )
+
+
+def _explicit_challenge_stance(
+    answer: str,
+) -> str | None:
+    """
+    Detect an explicit Yes/No conclusion in a legal answer.
+
+    Handles both:
+      Australia
+      - Yes — ...
+
+    and:
+      Australia - No — ...
+    """
+
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        line = re.sub(
+            r"^[-*•]\s*",
+            "",
+            line,
+        )
+
+        direct = re.match(
+            r"(?i)^(yes|no)\b",
+            line,
+        )
+
+        if direct is not None:
+            return direct.group(1).casefold()
+
+        country_prefixed = re.match(
+            r"(?i)^"
+            r"[A-Za-zÀ-ÖØ-öø-ÿ]"
+            r"[A-Za-zÀ-ÖØ-öø-ÿ .&'’()-]{1,60}"
+            r"\s*[-:]\s*"
+            r"(yes|no)\b",
+            line,
+        )
+
+        if country_prefixed is not None:
+            return (
+                country_prefixed.group(1).casefold()
+            )
+
+    return None
+
+
+def _validate_challenge_certainty_stability(
+    *,
+    current_user_question: str,
+    previous_assistant_answer: str | None,
+    answer: str,
+) -> list[QualityError]:
+    """
+    A pure challenge or pressure message adds no new legal facts.
+
+    It may ask the assistant to verify its answer, but it must never
+    silently turn:
+        uncertain -> Yes/No
+        Yes -> No
+        No -> Yes
+
+    A real source-driven correction remains possible only when the
+    answer explicitly identifies itself as a correction.
+    """
+
+    if not _CHALLENGE_MESSAGE_PATTERN.fullmatch(
+        current_user_question.strip()
+    ):
+        return []
+
+    if not previous_assistant_answer:
+        return []
+
+    if _EXPLICIT_CORRECTION_PATTERN.search(
+        answer
+    ):
+        return []
+
+    previous_stance = _explicit_challenge_stance(
+        previous_assistant_answer
+    )
+
+    new_stance = _explicit_challenge_stance(
+        answer
+    )
+
+    if (
+        _PRIOR_UNCERTAINTY_PATTERN.search(
+            previous_assistant_answer
+        )
+        and new_stance is not None
+    ):
+        return [
+            QualityError(
+                error_type=(
+                    "challenge_certainty_flip"
+                ),
+                message=(
+                    "The user supplied no new legal facts or "
+                    "evidence. The previous answer was explicitly "
+                    "uncertain. Preserve that uncertainty unless "
+                    "the validated sources require an explicit "
+                    "correction."
+                ),
+            )
+        ]
+
+    if (
+        previous_stance is not None
+        and new_stance is not None
+        and previous_stance != new_stance
+    ):
+        return [
+            QualityError(
+                error_type=(
+                    "challenge_certainty_flip"
+                ),
+                message=(
+                    "The user supplied no new legal facts or "
+                    "evidence. Do not silently change the previous "
+                    f"{previous_stance.upper()} conclusion to "
+                    f"{new_stance.upper()}. Preserve the prior "
+                    "conclusion or explicitly explain a "
+                    "source-supported correction."
+                ),
+            )
+        ]
+
+    return []
+
+
 def _build_model_input(
     request: LegalChatRequest,
     hits: list[LegalSearchHit],
@@ -3497,9 +3727,21 @@ def _build_model_input(
             ]
         )
 
+    challenge_context = _build_challenge_context_block(
+        request=request,
+        current_user_question=(
+            literal_question or resolved_question
+        ),
+    )
+
     return "\n\n".join(
         [
             question_block,
+            *(
+                [challenge_context]
+                if challenge_context is not None
+                else []
+            ),
             ANSWER_QUALITY_INSTRUCTIONS,
             "VALIDATED L&E GLOBAL SOURCES",
             _build_context(
@@ -4284,6 +4526,18 @@ def answer_legal_question(
             context=context_text,
             hits=selected_hits,
         )
+        hard_errors = list(
+            hard_errors
+        ) + _validate_challenge_certainty_stability(
+            current_user_question=(
+                current_user_question or request.question
+            ),
+            previous_assistant_answer=(
+                _last_assistant_answer(request)
+            ),
+            answer=answer,
+        )
+
 
         for spec_index, spec in enumerate(specs):
             if not (

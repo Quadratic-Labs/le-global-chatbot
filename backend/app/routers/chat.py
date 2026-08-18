@@ -63,6 +63,9 @@ from app.services.legal_catalog import (
     get_document_legal_topics_by_country,
     get_legal_catalog,
 )
+from app.services.jurisdiction_resolution import (
+    resolve_city_country_codes,
+)
 from app.services.legal_search import (
     LegalSearchError,
     search_contact_chunks,
@@ -438,22 +441,35 @@ def _format_country_list(
     )
 
 
+
 def _unavailable_countries_answer(
     unavailable_codes: list[str],
 ) -> str:
-    """Build the fallback answer naming the unavailable countries."""
+    """Explain that a recognized country is outside this chatbot corpus."""
 
     display_names = [
-        resolve_country_display_name(
-            country_code
-        )
+        resolve_country_display_name(country_code)
         for country_code in unavailable_codes
     ]
 
-    return UNAVAILABLE_COUNTRIES_ANSWER_TEMPLATE.format(
-        countries=_format_country_list(
-            display_names
+    if len(display_names) == 1:
+        country = display_names[0]
+
+        return (
+            f"{country} is not currently covered by the validated "
+            "L&E Global documents available in this chatbot. "
+            "I therefore cannot provide employment-law information "
+            f"or a validated L&E Global contact for {country}."
         )
+
+    countries = _format_country_list(display_names)
+
+    return (
+        "The following countries are not currently covered by the "
+        "validated L&E Global documents available in this chatbot: "
+        f"{countries}. I therefore cannot provide employment-law "
+        "information or validated L&E Global contacts for those "
+        "countries."
     )
 
 
@@ -580,6 +596,234 @@ def _has_comparison_signal(
     )
 
 
+
+def _has_location_scoped_contact_request(question: str) -> bool:
+    """Recognize a direct request for contact data tied to a location."""
+
+    normalized = _normalize_contact_question(question)
+
+    acquisition = re.search(
+        r"\b(?:can|could|may)\s+i\s+(?:have|get)\b"
+        r"|\b(?:give|send|show)\s+me\b"
+        r"|\bprovide\s+me\s+with\b"
+        r"|\bi\s+(?:need|want)\b",
+        normalized,
+    )
+
+    contact_data = re.search(
+        r"\bcontact\s+(?:details|information|info)\b",
+        normalized,
+    )
+
+    return bool(acquisition and contact_data)
+
+
+
+def _normalize_city_label(value: str) -> str:
+    """Normalize a city/capital label for deterministic comparison."""
+
+    import unicodedata
+
+    decomposed = unicodedata.normalize(
+        "NFKD",
+        value.strip().casefold(),
+    )
+
+    return "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+
+
+def _resolve_unique_capital_country_code(
+    city_name: str,
+    candidate_codes: frozenset[str],
+) -> str | None:
+    """
+    Prefer a country only when this ambiguous city is the national
+    capital of exactly one candidate country.
+
+    Examples:
+      Rome -> Italy among IT/TG/US.
+      Milan -> no preference.
+      Barcelona -> no preference.
+    """
+
+    if len(candidate_codes) < 2:
+        return None
+
+    try:
+        import geonamescache
+
+        countries = (
+            geonamescache.GeonamesCache()
+            .get_countries()
+        )
+    except Exception:
+        return None
+
+    wanted = _normalize_city_label(city_name)
+
+    matches: list[str] = []
+
+    for country_code in sorted(candidate_codes):
+        country = countries.get(country_code)
+
+        if not country:
+            continue
+
+        capital = str(
+            country.get("capital") or ""
+        ).strip()
+
+        if (
+            capital
+            and _normalize_city_label(capital)
+            == wanted
+        ):
+            matches.append(country_code)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+def _resolve_current_country_scope(
+    request: LegalChatRequest,
+    catalog_provider: CountryCatalogProvider,
+) -> CountryAvailability:
+    """
+    Resolve explicit countries first.
+
+    For a direct contact request, a city may supply the country:
+    - one geographic candidate -> use it;
+    - several candidates -> prefer the only candidate covered by the
+      current L&E corpus;
+    - if several covered candidates remain -> prefer a unique national
+      capital match;
+    - otherwise keep the request ambiguous rather than guessing.
+    """
+
+    scope = resolve_country_availability(
+        request=request,
+        catalog_provider=catalog_provider,
+    )
+
+    if (
+        scope.available_codes
+        or scope.unavailable_codes
+        or request.country_codes
+    ):
+        return scope
+
+    contact_request = (
+        _detect_contact_intent(request.question)
+        or _has_direct_who_to_reach_form(request.question)
+        or _has_location_scoped_contact_request(
+            request.question
+        )
+    )
+
+    if not contact_request:
+        return scope
+
+    city_codes, matched_location = (
+        resolve_city_country_codes(
+            request.question
+        )
+    )
+
+    location_text = matched_location or ""
+
+    # Contact phrases often contain the locality in a final
+    # "for/in/at/near <city>" fragment.
+    if len(city_codes) != 1:
+        location_match = re.search(
+            r"\b(?:for|in|at|near)\s+"
+            r"([A-Za-zÀ-ÖØ-öø-ÿ'’ .-]{2,80}?)"
+            r"\s*[?.!]*$",
+            request.question,
+            re.IGNORECASE,
+        )
+
+        if location_match is not None:
+            location_fragment = (
+                location_match.group(1).strip()
+            )
+
+            (
+                fragment_codes,
+                fragment_location,
+            ) = resolve_city_country_codes(
+                location_fragment
+            )
+
+            if fragment_codes:
+                city_codes = fragment_codes
+                location_text = (
+                    fragment_location
+                    or location_fragment
+                )
+
+    if not city_codes:
+        return scope
+
+    # Straightforward city.
+    if len(city_codes) == 1:
+        selected_codes = city_codes
+
+    else:
+        # Ask the existing country-availability layer which of the
+        # geographic candidates are actually covered by the current
+        # validated corpus.
+        candidate_scope = resolve_country_availability(
+            request=request.model_copy(
+                update={
+                    "country_codes": sorted(city_codes)
+                }
+            ),
+            catalog_provider=catalog_provider,
+        )
+
+        supported_candidates = frozenset(
+            candidate_scope.available_codes
+        )
+
+        if len(supported_candidates) == 1:
+            selected_codes = supported_candidates
+
+        elif len(supported_candidates) >= 2:
+            capital_code = (
+                _resolve_unique_capital_country_code(
+                    location_text,
+                    supported_candidates,
+                )
+            )
+
+            if capital_code is None:
+                return scope
+
+            selected_codes = frozenset(
+                {capital_code}
+            )
+
+        else:
+            # No candidate is currently covered. Do not guess among
+            # several unsupported countries.
+            return scope
+
+    return resolve_country_availability(
+        request=request.model_copy(
+            update={
+                "country_codes": sorted(selected_codes)
+            }
+        ),
+        catalog_provider=catalog_provider,
+    )
+
+
 def _build_deterministic_hints(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider,
@@ -594,7 +838,7 @@ def _build_deterministic_hints(
     itself fails (see _resolve_conservative_fallback).
     """
 
-    current_country_scope = resolve_country_availability(
+    current_country_scope = _resolve_current_country_scope(
         request=request,
         catalog_provider=catalog_provider,
     )
@@ -660,6 +904,9 @@ def _build_deterministic_hints(
         strong_contact_signal=(
             _detect_contact_intent(request.question)
             or _has_direct_who_to_reach_form(request.question)
+            or _has_location_scoped_contact_request(
+                request.question
+            )
         ),
         comparison_signal=_has_comparison_signal(request.question),
         history_country_codes=history_country_codes,
@@ -853,7 +1100,12 @@ def _build_contact_section(
         render(country_code)
 
     for country_code in unavailable_country_codes:
-        render(country_code)
+        if country_code.upper() in CONTACT_COUNTRY_FALLBACK_CODES:
+            render(country_code)
+        else:
+            answer_sections.append(
+                _unavailable_countries_answer([country_code])
+            )
 
     return (
         "\n\n".join(answer_sections),
@@ -1355,6 +1607,7 @@ def _resolve_conservative_fallback(
                 known_excluded_country_codes=(
                     current_country_scope.unavailable_codes or None
                 ),
+                current_user_question=request.question,
             )
 
             if current_country_scope.unavailable_codes:
@@ -1465,6 +1718,7 @@ def _resolve_conservative_fallback(
             known_excluded_country_codes=(
                 current_country_scope.unavailable_codes or None
             ),
+            current_user_question=request.question,
         )
 
         if current_country_scope.unavailable_codes:
@@ -2366,6 +2620,52 @@ def resolve_legal_chat_response(
         # still reaches retrieval/generation, so precise wording such
         # as employee-vs-contractor remains available to the answer
         # model.
+        # A clear contact request with one deterministically
+        # resolved country must not be sent back to a generic
+        # missing-country clarification from semantic understanding.
+        if (
+            result.status == "clarification"
+            and previous_conversation_state is None
+            and hints.strong_contact_signal
+            and (
+            len(current_country_scope.available_codes)
+            + len(current_country_scope.unavailable_codes)
+            == 1
+        )
+            and not hints.comparison_signal
+        ):
+            metrics.request_understanding_confidence = (
+                result.confidence
+            )
+            metrics.request_understanding_method = (
+                "semantic_contact_clarification_recovered"
+            )
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "deterministic_single_contact_scope"
+            )
+
+            response = _resolve_conservative_fallback(
+                request=request,
+                hints=hints,
+                current_country_scope=current_country_scope,
+                current_legal_scope=current_legal_scope,
+                metrics=metrics,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                max_context_characters=max_context_characters,
+                max_source_characters=max_source_characters,
+            )
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+            metrics.log()
+
+            return response
+
         if (
             result.status == "clarification"
             and previous_conversation_state is None

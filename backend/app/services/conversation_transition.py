@@ -44,6 +44,9 @@ from app.services.legal_subject_scope import (
     CanonicalSearchConcept,
     canonicalize_legal_subject,
 )
+from app.services.jurisdiction_resolution import (
+    resolve_city_country_codes,
+)
 from app.services.request_understanding import (
     CurrentMessageDelta,
     DeterministicHints,
@@ -521,11 +524,27 @@ def _passthrough(
     """No conversation_state, or nothing this engine needs to do -
     trust the classifier's own result exactly as given."""
 
+    pending_clarification = None
+
+    if (
+        result.status == "clarification"
+        and result.clarification_reason == "missing_country"
+        and len(result.actions) == 1
+        and result.actions[0].type == "contact"
+    ):
+        pending_clarification = ConversationPendingClarification(
+            reason="missing_country",
+            candidate_action_types=["contact"],
+            candidate_country_codes=[],
+        )
+        contact_missing_country_pending = True
+        del contact_missing_country_pending
+
     return TransitionOutcome(
         final_status=result.status,
         final_actions=list(result.actions),
         final_clarification_reason=result.clarification_reason,
-        pending_clarification=None,
+        pending_clarification=pending_clarification,
         semantic_result_overridden=False,
         semantic_override_reason=None,
         context_inheritance_applied=False,
@@ -1130,6 +1149,72 @@ def _correct_delta_for_pressure_challenge_followup(
     )
 
 
+
+def _resolve_contact_missing_country_pending(
+    *,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> TransitionOutcome | None:
+    """
+    Consume a country/city reply to an earlier contact missing-country
+    clarification. A city is accepted only when it maps to one country.
+    """
+
+    pending = conversation_state.pending_clarification
+
+    if (
+        pending is None
+        or pending.reason != "missing_country"
+        or len(pending.candidate_action_types) != 1
+        or pending.candidate_action_types[0] != "contact"
+    ):
+        return None
+
+    if hints.current_legal_topics or hints.comparison_signal:
+        return None
+
+    candidate_codes = list(
+        dict.fromkeys(
+            [
+                *hints.current_country_codes,
+                *hints.current_unavailable_country_codes,
+            ]
+        )
+    )
+
+    if (
+        not candidate_codes
+        and current_question is not None
+    ):
+        city_codes, _ = resolve_city_country_codes(current_question)
+
+        if len(city_codes) == 1:
+            candidate_codes = sorted(city_codes)
+
+    if len(candidate_codes) != 1:
+        return None
+
+    return TransitionOutcome(
+        final_status="resolved",
+        final_actions=[
+            RequestUnderstandingAction(
+                type="contact",
+                country_codes=candidate_codes,
+            )
+        ],
+        final_clarification_reason=None,
+        pending_clarification=None,
+        semantic_result_overridden=True,
+        semantic_override_reason=(
+            "contact_missing_country_resolved"
+        ),
+        context_inheritance_applied=False,
+        inherited_action_type="contact",
+        inherited_country_replaced=True,
+    )
+
+
 def apply_conversation_transition(
     *,
     result: RequestUnderstandingResult,
@@ -1165,6 +1250,17 @@ def apply_conversation_transition(
     canonicalized_state = _canonicalize_conversation_state(
         conversation_state
     )
+
+    contact_pending_outcome = (
+        _resolve_contact_missing_country_pending(
+            conversation_state=canonicalized_state,
+            hints=hints,
+            current_question=current_question,
+        )
+    )
+
+    if contact_pending_outcome is not None:
+        return contact_pending_outcome
 
     result = _correct_delta_for_country_only_followup(
         result=result,
