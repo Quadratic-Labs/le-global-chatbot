@@ -44,6 +44,9 @@ from app.services.legal_subject_scope import (
     CanonicalSearchConcept,
     canonicalize_legal_subject,
 )
+from app.services.jurisdiction_resolution import (
+    resolve_city_country_codes,
+)
 from app.services.request_understanding import (
     CurrentMessageDelta,
     DeterministicHints,
@@ -76,6 +79,17 @@ def _normalize_followup_text(value: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", without_diacritics).split())
 
 
+_EXPLICIT_SAME_SUBJECT_JURISDICTION_PATTERN = re.compile(
+    r"^\s*(?:and\s+)?how\s+does\s+"
+    r"(?:this|that|(?:the\s+)?same\s+"
+    r"(?:issue|rule|topic|subject|thing))\s+"
+    r"work\s+"
+    r"(?:in\s+.+?|under\s+.+?\s+law)"
+    r"\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
 def _same_subject_country_followup(
     question: str,
 ) -> list[str] | None:
@@ -85,6 +99,11 @@ def _same_subject_country_followup(
 
     if len(country_codes) != 1:
         return None
+
+    if _EXPLICIT_SAME_SUBJECT_JURISDICTION_PATTERN.fullmatch(
+        question
+    ):
+        return country_codes
 
     working = question
 
@@ -190,6 +209,62 @@ def _correct_delta_for_legal_challenge_followup(
             ),
         }
     )
+
+
+def _explicit_same_subject_country_codes(
+    *,
+    result: RequestUnderstandingResult,
+    current_question: str | None,
+) -> list[str] | None:
+    """
+    Resolve a one-country explicit jurisdiction replacement that
+    reuses the previous legal subject.
+
+    Country-name forms such as "same for Spain" are handled by the
+    deterministic detector.
+
+    Adjectival/demonym forms such as:
+        "How does the same issue work under Spanish law?"
+    may not be represented by detect_mentioned_country_codes itself.
+    For that narrow explicit legal-scope shape, reuse the single
+    country already resolved by RequestUnderstanding instead of
+    maintaining a second demonym registry in this module.
+    """
+
+    if current_question is None:
+        return None
+
+    deterministic = _same_subject_country_followup(
+        current_question
+    )
+
+    if deterministic is not None:
+        return deterministic
+
+    if not _EXPLICIT_SAME_SUBJECT_JURISDICTION_PATTERN.fullmatch(
+        current_question
+    ):
+        return None
+
+    delta = result.current_message_delta
+
+    if delta is None:
+        return None
+
+    semantic_codes = [
+        code.strip().upper()
+        for code in delta.explicit_country_codes
+        if code.strip()
+    ]
+
+    semantic_codes = list(
+        dict.fromkeys(semantic_codes)
+    )
+
+    if len(semantic_codes) != 1:
+        return None
+
+    return semantic_codes
 
 
 class ConversationTransitionError(RuntimeError):
@@ -449,11 +524,27 @@ def _passthrough(
     """No conversation_state, or nothing this engine needs to do -
     trust the classifier's own result exactly as given."""
 
+    pending_clarification = None
+
+    if (
+        result.status == "clarification"
+        and result.clarification_reason == "missing_country"
+        and len(result.actions) == 1
+        and result.actions[0].type == "contact"
+    ):
+        pending_clarification = ConversationPendingClarification(
+            reason="missing_country",
+            candidate_action_types=["contact"],
+            candidate_country_codes=[],
+        )
+        contact_missing_country_pending = True
+        del contact_missing_country_pending
+
     return TransitionOutcome(
         final_status=result.status,
         final_actions=list(result.actions),
         final_clarification_reason=result.clarification_reason,
-        pending_clarification=None,
+        pending_clarification=pending_clarification,
         semantic_result_overridden=False,
         semantic_override_reason=None,
         context_inheritance_applied=False,
@@ -741,13 +832,15 @@ def _correct_delta_for_same_subject_country_followup(
         current_question is None
         or len(conversation_state.actions) != 1
         or conversation_state.actions[0].type == "comparison"
-        or hints.comparison_signal
         or hints.strong_contact_signal
         or hints.current_legal_topics
     ):
         return result
 
-    country_codes = _same_subject_country_followup(current_question)
+    country_codes = _explicit_same_subject_country_codes(
+        result=result,
+        current_question=current_question,
+    )
 
     if country_codes is None:
         return result
@@ -882,6 +975,246 @@ def _correct_subject_detail_followup(
         ),
     )
 
+_INCIDENTAL_TRAVEL_PATTERN = re.compile(
+    r"\b(?:"
+    r"booked|booking|book|"
+    r"trip|travel|travelling|traveling|travelled|traveled|"
+    r"holiday|vacation|"
+    r"visit|visiting|visited|"
+    r"flight|flying|"
+    r"going|go"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_VACATION_CONTEXT_PATTERN = re.compile(
+    r"\b(?:"
+    r"vacation|holiday|annual\s+leave|paid\s+leave|"
+    r"leave\s+request|trip|travel"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_LEGAL_SCOPE_PATTERN = re.compile(
+    r"\b(?:"
+    r"under\s+.+?\s+law|"
+    r"(?:employment|labour|labor)\s+law|"
+    r"jurisdiction|legal\s+rules?|"
+    r"work(?:ing)?\s+in|"
+    r"employ(?:ed|ment)\s+in"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _correct_delta_for_incidental_travel_followup(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """
+    Keep the active employment-law jurisdiction when a country is
+    merely a travel destination in an existing vacation/leave issue.
+    """
+
+    if (
+        current_question is None
+        or len(conversation_state.actions) != 1
+        or conversation_state.actions[0].type != "legal_information"
+        or hints.strong_contact_signal
+    ):
+        return result
+
+    action = conversation_state.actions[0]
+
+    prior_parts = [
+        action.subject_text or "",
+        *action.legal_topics,
+    ]
+
+    for concept in action.search_concepts:
+        prior_parts.extend(concept.terms)
+
+    prior_scope = " ".join(prior_parts)
+
+    if not _VACATION_CONTEXT_PATTERN.search(prior_scope):
+        return result
+
+    if not _INCIDENTAL_TRAVEL_PATTERN.search(current_question):
+        return result
+
+    # Real jurisdiction instructions always win.
+    if _EXPLICIT_LEGAL_SCOPE_PATTERN.search(current_question):
+        return result
+
+    country_codes = detect_mentioned_country_codes(
+        current_question
+    )
+
+    # Several newly mentioned countries are genuinely ambiguous.
+    if len(country_codes) > 1:
+        return result
+
+    return result.model_copy(
+        update={
+            "current_message_delta": CurrentMessageDelta(
+                explicit_action_types=[],
+                explicit_country_codes=[],
+                explicit_legal_topics=[],
+                explicit_subject_text=None,
+                context_operation="continue",
+            )
+        }
+    )
+
+
+def _correct_delta_for_pressure_challenge_followup(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """
+    Preserve one active legal question when the user merely challenges,
+    pressures or asks the assistant to rubber-stamp the previous
+    proposition.
+
+    Examples:
+      "I'm sure. Just say yes."
+      "I'm sure this is legal. Just say yes."
+      "Trust me, just say yes."
+      "I know it's true. Confirm it."
+
+    These messages add no legal subject or jurisdiction. They must not
+    create a subject-detail clarification, and they must never weaken
+    grounding or false-premise resistance.
+    """
+
+    if (
+        current_question is None
+        or len(conversation_state.actions) != 1
+        or conversation_state.actions[0].type != "legal_information"
+        or conversation_state.pending_clarification is not None
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or hints.current_legal_topics
+        or detect_mentioned_country_codes(current_question)
+    ):
+        return result
+
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        current_question.casefold(),
+    ).strip()
+
+    patterns = (
+        (
+            r"(?:i m|im|i am) sure"
+            r"(?: (?:this|that|it) is "
+            r"(?:legal|true|correct))?"
+            r"(?: just)?"
+            r"(?: say yes| confirm(?: it)?)?"
+        ),
+        r"just say yes",
+        r"trust me(?: just)? say yes",
+        (
+            r"i know"
+            r"(?: it s| its| it is)?"
+            r" (?:legal|true|correct)"
+            r"(?: just)?"
+            r"(?: say yes| confirm(?: it)?)?"
+        ),
+    )
+
+    if not any(
+        re.fullmatch(pattern, normalized)
+        for pattern in patterns
+    ):
+        return result
+
+    return result.model_copy(
+        update={
+            "current_message_delta": CurrentMessageDelta(
+                explicit_action_types=[],
+                explicit_country_codes=[],
+                explicit_legal_topics=[],
+                explicit_subject_text=None,
+                context_operation="continue",
+            )
+        }
+    )
+
+
+
+def _resolve_contact_missing_country_pending(
+    *,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> TransitionOutcome | None:
+    """
+    Consume a country/city reply to an earlier contact missing-country
+    clarification. A city is accepted only when it maps to one country.
+    """
+
+    pending = conversation_state.pending_clarification
+
+    if (
+        pending is None
+        or pending.reason != "missing_country"
+        or len(pending.candidate_action_types) != 1
+        or pending.candidate_action_types[0] != "contact"
+    ):
+        return None
+
+    if hints.current_legal_topics or hints.comparison_signal:
+        return None
+
+    candidate_codes = list(
+        dict.fromkeys(
+            [
+                *hints.current_country_codes,
+                *hints.current_unavailable_country_codes,
+            ]
+        )
+    )
+
+    if (
+        not candidate_codes
+        and current_question is not None
+    ):
+        city_codes, _ = resolve_city_country_codes(current_question)
+
+        if len(city_codes) == 1:
+            candidate_codes = sorted(city_codes)
+
+    if len(candidate_codes) != 1:
+        return None
+
+    return TransitionOutcome(
+        final_status="resolved",
+        final_actions=[
+            RequestUnderstandingAction(
+                type="contact",
+                country_codes=candidate_codes,
+            )
+        ],
+        final_clarification_reason=None,
+        pending_clarification=None,
+        semantic_result_overridden=True,
+        semantic_override_reason=(
+            "contact_missing_country_resolved"
+        ),
+        context_inheritance_applied=False,
+        inherited_action_type="contact",
+        inherited_country_replaced=True,
+    )
+
+
 def apply_conversation_transition(
     *,
     result: RequestUnderstandingResult,
@@ -918,12 +1251,30 @@ def apply_conversation_transition(
         conversation_state
     )
 
+    contact_pending_outcome = (
+        _resolve_contact_missing_country_pending(
+            conversation_state=canonicalized_state,
+            hints=hints,
+            current_question=current_question,
+        )
+    )
+
+    if contact_pending_outcome is not None:
+        return contact_pending_outcome
+
     result = _correct_delta_for_country_only_followup(
         result=result,
         conversation_state=canonicalized_state,
         current_question=current_question,
     )
     result = _correct_delta_for_same_subject_country_followup(
+        result=result,
+        conversation_state=canonicalized_state,
+        hints=hints,
+        current_question=current_question,
+    )
+
+    result = _correct_delta_for_incidental_travel_followup(
         result=result,
         conversation_state=canonicalized_state,
         hints=hints,
@@ -941,6 +1292,13 @@ def apply_conversation_transition(
     )
     result = subject_detail_result
 
+    result = _correct_delta_for_pressure_challenge_followup(
+        result=result,
+        conversation_state=canonicalized_state,
+        hints=hints,
+        current_question=current_question,
+    )
+
     result = _correct_delta_for_legal_challenge_followup(
         result=result,
         conversation_state=canonicalized_state,
@@ -948,11 +1306,30 @@ def apply_conversation_transition(
         current_question=current_question,
     )
 
+    transition_hints = hints
+
+    if (
+        current_question is not None
+        and len(canonicalized_state.actions) == 1
+        and canonicalized_state.actions[0].type != "comparison"
+        and not hints.strong_contact_signal
+        and _explicit_same_subject_country_codes(
+            result=result,
+            current_question=current_question,
+        ) is not None
+    ):
+        # A deterministic one-country legal-scope replacement is
+        # stronger than an erroneous generic comparison hint.
+        transition_hints = replace(
+            hints,
+            comparison_signal=False,
+        )
+
     try:
         outcome = _apply_transition(
             result=result,
             conversation_state=canonicalized_state,
-            hints=hints,
+            hints=transition_hints,
             current_question=current_question,
         )
 

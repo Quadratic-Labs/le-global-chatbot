@@ -63,6 +63,9 @@ from app.services.legal_catalog import (
     get_document_legal_topics_by_country,
     get_legal_catalog,
 )
+from app.services.jurisdiction_resolution import (
+    resolve_city_country_codes,
+)
 from app.services.legal_search import (
     LegalSearchError,
     search_contact_chunks,
@@ -580,6 +583,91 @@ def _has_comparison_signal(
     )
 
 
+
+def _has_location_scoped_contact_request(question: str) -> bool:
+    """Recognize a direct request for contact data tied to a location."""
+
+    normalized = _normalize_contact_question(question)
+
+    acquisition = re.search(
+        r"\b(?:can|could|may)\s+i\s+(?:have|get)\b"
+        r"|\b(?:give|send|show)\s+me\b"
+        r"|\bprovide\s+me\s+with\b"
+        r"|\bi\s+(?:need|want)\b",
+        normalized,
+    )
+
+    contact_data = re.search(
+        r"\bcontact\s+(?:details|information|info)\b",
+        normalized,
+    )
+
+    return bool(acquisition and contact_data)
+
+
+def _resolve_current_country_scope(
+    request: LegalChatRequest,
+    catalog_provider: CountryCatalogProvider,
+) -> CountryAvailability:
+    """
+    Resolve normal country names first. For a direct contact request
+    only, a city that maps to exactly one country may supply the
+    country. Ambiguous cities are never guessed.
+    """
+
+    scope = resolve_country_availability(
+        request=request,
+        catalog_provider=catalog_provider,
+    )
+
+    if (
+        scope.available_codes
+        or scope.unavailable_codes
+        or request.country_codes
+    ):
+        return scope
+
+    contact_request = (
+        _detect_contact_intent(request.question)
+        or _has_direct_who_to_reach_form(request.question)
+        or _has_location_scoped_contact_request(request.question)
+    )
+
+    if not contact_request:
+        return scope
+
+    city_codes, _ = resolve_city_country_codes(request.question)
+
+    # Some contact formulations put the locality in a trailing
+    # "for/in <city>" phrase. Resolve that location fragment as a
+    # deterministic fallback, but never guess an ambiguous city.
+    if len(city_codes) != 1:
+        location_match = re.search(
+            r"\b(?:for|in|at|near)\s+"
+            r"([A-Za-zÀ-ÖØ-öø-ÿ'’ .-]{2,80}?)"
+            r"\s*[?.!]*$",
+            request.question,
+            re.IGNORECASE,
+        )
+
+        if location_match is not None:
+            city_codes, _ = resolve_city_country_codes(
+                location_match.group(1).strip()
+            )
+
+    if len(city_codes) != 1:
+        return scope
+
+    return resolve_country_availability(
+        request=request.model_copy(
+            update={
+                "country_codes": sorted(city_codes),
+            }
+        ),
+        catalog_provider=catalog_provider,
+    )
+
+
 def _build_deterministic_hints(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider,
@@ -594,7 +682,7 @@ def _build_deterministic_hints(
     itself fails (see _resolve_conservative_fallback).
     """
 
-    current_country_scope = resolve_country_availability(
+    current_country_scope = _resolve_current_country_scope(
         request=request,
         catalog_provider=catalog_provider,
     )
@@ -660,6 +748,9 @@ def _build_deterministic_hints(
         strong_contact_signal=(
             _detect_contact_intent(request.question)
             or _has_direct_who_to_reach_form(request.question)
+            or _has_location_scoped_contact_request(
+                request.question
+            )
         ),
         comparison_signal=_has_comparison_signal(request.question),
         history_country_codes=history_country_codes,
@@ -1355,6 +1446,7 @@ def _resolve_conservative_fallback(
                 known_excluded_country_codes=(
                     current_country_scope.unavailable_codes or None
                 ),
+                current_user_question=request.question,
             )
 
             if current_country_scope.unavailable_codes:
@@ -1465,6 +1557,7 @@ def _resolve_conservative_fallback(
             known_excluded_country_codes=(
                 current_country_scope.unavailable_codes or None
             ),
+            current_user_question=request.question,
         )
 
         if current_country_scope.unavailable_codes:
@@ -2366,6 +2459,49 @@ def resolve_legal_chat_response(
         # still reaches retrieval/generation, so precise wording such
         # as employee-vs-contractor remains available to the answer
         # model.
+        # A clear contact request with one deterministically
+        # resolved country must not be sent back to a generic
+        # missing-country clarification from semantic understanding.
+        if (
+            result.status == "clarification"
+            and previous_conversation_state is None
+            and hints.strong_contact_signal
+            and len(current_country_scope.available_codes) == 1
+            and not current_country_scope.unavailable_codes
+            and not hints.comparison_signal
+        ):
+            metrics.request_understanding_confidence = (
+                result.confidence
+            )
+            metrics.request_understanding_method = (
+                "semantic_contact_clarification_recovered"
+            )
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "deterministic_single_contact_scope"
+            )
+
+            response = _resolve_conservative_fallback(
+                request=request,
+                hints=hints,
+                current_country_scope=current_country_scope,
+                current_legal_scope=current_legal_scope,
+                metrics=metrics,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                max_context_characters=max_context_characters,
+                max_source_characters=max_source_characters,
+            )
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+            metrics.log()
+
+            return response
+
         if (
             result.status == "clarification"
             and previous_conversation_state is None

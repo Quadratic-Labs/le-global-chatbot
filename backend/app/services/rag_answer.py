@@ -135,22 +135,66 @@ MISSING_COUNTRY_ANSWER: Final[str] = (
 )
 
 INSUFFICIENT_EVIDENCE_ANSWER_TEMPLATE: Final[str] = (
-    "I do not have enough validated L&E Global information to "
-    "answer {subject} for {country} reliably."
+    "I cannot reliably determine {subject} for {country}."
 )
 
 PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE: Final[str] = (
-    "For {country}, the supplied sources only partially address "
-    "{subject}. That country's section must still contain only "
-    "hyphen-prefixed bullet points, exactly like every other section -"
-    " never a plain-text sentence before or between them. Make the "
-    "FIRST bullet in that section exactly this sentence, unmodified: "
-    "\"- The available L&E Global information only partially "
-    "addresses {subject} in {country}.\" Every other bullet in that "
-    "section must present only what the sources actually support - "
-    "never state or imply the sources answer the specific question "
-    "in full."
+    "For {country}, the evidence only partially addresses {subject}. "
+    "This text is an INTERNAL generation instruction and must never "
+    "be repeated or described to the user. "
+    "The first bullet must answer the exact question at the strongest "
+    "level of certainty actually supported. If the requested legal "
+    "proposition cannot be established, use natural wording such as "
+    "'I cannot reliably confirm whether ...' and cite the relevant "
+    "source. Do not mention documents, sources, extracts, retrieval, "
+    "'available information', or 'L&E Global information' in that "
+    "limitation. "
+    "After such a limitation, include at most ONE additional bullet, "
+    "and only when it directly helps answer the SAME narrow legal "
+    "question. If no directly relevant supporting rule exists, stop "
+    "after the limitation bullet. Never fill the section with nearby "
+    "legal rules merely because they were retrieved."
 )
+
+
+ANSWER_QUALITY_INSTRUCTIONS: Final[str] = """
+ANSWER QUALITY REQUIREMENTS
+
+- Start with the practical answer to the exact question.
+- Write clear professional English for a non-lawyer.
+- Preserve every legally material condition, qualification and
+  exception.
+- Never make a legal proposition stronger than the supplied evidence.
+- A source stating that a subject is regulated does NOT establish that
+  an employer may refuse, approve, prohibit, require or waive the act
+  the user asked about.
+- Never infer a permission, prohibition, entitlement, deadline,
+  exception or consequence unless a cited extract actually establishes
+  it.
+- If the exact proposition is not established, say so once and provide
+  only the closest directly relevant supported rules.
+- Keep narrow questions narrow. Do not pad an annual-vacation question
+  with marriage, bereavement, relocation or unrelated special leave.
+- For "Are you sure?", "Really?", "Why?", "Can you confirm?" and
+  similar follow-ups, answer the EXACT proposition currently being
+  challenged.
+- If the correct rule is conditional, prefer a qualified opening such
+  as "No - not generally", "Yes - but only if", or "It depends on".
+- Avoid repetitive documentary phrases and filler.
+- Every material legal proposition must remain cited.
+
+- Never write the phrase "available L&E Global information" in the
+  final answer. A limitation should describe the legal uncertainty,
+  not the retrieval system.
+- Once a bullet says the exact requested proposition cannot be
+  reliably confirmed, do not follow it with adjacent domestic rules
+  unless those rules directly help answer that exact proposition.
+- For a question about which country's law applies, do not substitute
+  immigration, work-authorisation, residence-permit, payroll,
+  registration or social-security rules for choice-of-law analysis
+  unless the user specifically asks for those matters.
+""".strip()
+
 
 _GENERIC_SUBJECT_FALLBACK: Final[str] = "this question"
 
@@ -1644,6 +1688,7 @@ HARD_QUALITY_ERROR_TYPES: Final[frozenset[str]] = frozenset(
         "uncited_material_claim",
         "citation_country_mismatch",
         "invalid_grounding_structure",
+        "challenge_certainty_flip",
     }
 )
 
@@ -2724,6 +2769,368 @@ def _validate_no_false_absence_claims(
     return []
 
 
+_LIMITATION_BULLET_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:"
+    r"cannot\s+reliably\s+(?:confirm|determine)|"
+    r"cannot\s+definitively\s+(?:confirm|determine)|"
+    r"cannot\s+provide\s+a\s+definitive\s+answer|"
+    r"a\s+definitive\s+answer\s+cannot\s+be\s+provided"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+_PARTIAL_RELEVANCE_STOP_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "this",
+        "that",
+        "these",
+        "those",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "to",
+        "of",
+        "for",
+        "by",
+        "in",
+        "on",
+        "at",
+        "and",
+        "or",
+        "with",
+        "from",
+        "as",
+        "under",
+        "applicable",
+        "rule",
+        "rules",
+        "law",
+        "laws",
+        "legal",
+        "govern",
+        "governed",
+        "governs",
+        "regulate",
+        "regulated",
+        "regulates",
+    }
+)
+
+
+def _normalize_partial_relevance_token(
+    token: str,
+) -> str:
+    """
+    Tiny lexical normalization for a relevance guard only.
+
+    This is deliberately not a legal stemmer. It merely lets obvious
+    grammatical variants such as "request" / "requests" count as the
+    same concept without changing retrieval or grounding semantics.
+    """
+
+    normalized = token.casefold()
+
+    if (
+        len(normalized) > 4
+        and normalized.endswith("ies")
+    ):
+        normalized = normalized[:-3] + "y"
+    elif (
+        len(normalized) > 4
+        and normalized.endswith("s")
+        and not normalized.endswith("ss")
+    ):
+        normalized = normalized[:-1]
+
+    return normalized
+
+
+def _partial_relevance_tokens(
+    text: str,
+) -> set[str]:
+    tokens = {
+        _normalize_partial_relevance_token(token)
+        for token in re.findall(
+            r"[a-z0-9]+",
+            text.casefold(),
+        )
+    }
+
+    return {
+        token
+        for token in tokens
+        if (
+            token
+            and token not in _PARTIAL_RELEVANCE_STOP_WORDS
+        )
+    }
+
+
+def _search_concept_terms(
+    concept: SearchConceptLike,
+) -> list[str]:
+    terms = getattr(
+        concept,
+        "terms",
+        None,
+    )
+
+    if terms is None and isinstance(concept, dict):
+        terms = concept.get("terms")
+
+    if not isinstance(terms, (list, tuple)):
+        return []
+
+    return [
+        str(term).strip()
+        for term in terms
+        if str(term).strip()
+    ]
+
+
+def _bullet_matches_search_concepts(
+    *,
+    bullet: str,
+    search_concepts: Sequence[SearchConceptLike],
+    evidence_mode: str,
+) -> bool:
+    """
+    Lightweight LOCAL relevance check for one supporting bullet.
+
+    `answer_mentions_concepts()` remains the stronger whole-answer
+    subject-drift validator. This helper answers a narrower question:
+    after a limitation, is this individual extra bullet still directly
+    about the user's subject, or is it unrelated padding?
+    """
+
+    bullet_tokens = _partial_relevance_tokens(
+        bullet
+    )
+
+    if not bullet_tokens:
+        return False
+
+    matched_groups: list[bool] = []
+
+    for concept in search_concepts:
+        alternatives = _search_concept_terms(
+            concept
+        )
+
+        alternative_matches = []
+
+        for term in alternatives:
+            term_tokens = _partial_relevance_tokens(
+                term
+            )
+
+            if not term_tokens:
+                continue
+
+            overlap = (
+                bullet_tokens
+                & term_tokens
+            )
+
+            # Multi-word legal concept:
+            # two meaningful shared words is strong enough for this
+            # local "relevant supporting bullet" check.
+            if len(term_tokens) >= 2:
+                alternative_matches.append(
+                    len(overlap) >= 2
+                )
+            else:
+                # A specific single-word concept such as "overtime"
+                # must occur explicitly.
+                only = next(iter(term_tokens))
+
+                alternative_matches.append(
+                    len(only) >= 5
+                    and only in bullet_tokens
+                )
+
+        matched_groups.append(
+            any(alternative_matches)
+        )
+
+    if not matched_groups:
+        return False
+
+    if evidence_mode == "relation_required":
+        # e.g. dismissal + sick leave:
+        # merely discussing dismissal alone is background padding.
+        return all(matched_groups)
+
+    return any(matched_groups)
+
+
+_CHOICE_OF_LAW_CONCEPT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?:"
+    r"choice\s+of\s+law|"
+    r"applicable\s+(?:employment\s+)?law|"
+    r"governing\s+(?:employment\s+)?law|"
+    r"which\s+country(?:'s)?\s+(?:employment\s+)?law|"
+    r"(?:employment\s+)?law\s+(?:applies|governs)|"
+    r"law\s+governing\s+(?:the\s+)?employment"
+    r")",
+    re.IGNORECASE,
+)
+
+_CHOICE_OF_LAW_RELATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?:"
+    r"choice\s+of\s+law|"
+    r"applicable\s+(?:employment\s+)?law|"
+    r"governing\s+(?:employment\s+)?law|"
+    r"(?:employment\s+)?law\s+(?:applies|governs)|"
+    r"governed\s+by\s+(?:.+?\s+)?law|"
+    r"foreign\s+employment\s+law|"
+    r"mandatory\s+(?:employment\s+)?law|"
+    r"posted\s+workers?\s+act"
+    r")",
+    re.IGNORECASE,
+)
+
+_CHOICE_OF_LAW_PADDING_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?:"
+    r"social\s+security|"
+    r"residence\s+permit|"
+    r"work\s+authori[sz]ation|"
+    r"immigration|"
+    r"\bvisa\b|"
+    r"\bpayroll\b|"
+    r"\btax(?:ation)?\b|"
+    r"registration\s+with\s+(?:the\s+)?"
+    r"(?:social\s+security|tax)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_choice_of_law_subject(
+    search_concepts: Sequence[SearchConceptLike],
+) -> bool:
+    text = " ".join(
+        term
+        for concept in search_concepts
+        for term in _search_concept_terms(concept)
+    )
+
+    return bool(
+        _CHOICE_OF_LAW_CONCEPT_PATTERN.search(text)
+    )
+
+
+def _validate_partial_answer_relevance(
+    *,
+    answer: str,
+    search_concepts: Sequence[SearchConceptLike],
+    evidence_mode: str,
+    country_codes: Sequence[str],
+) -> list[QualityError]:
+    """
+    Once a country section explicitly says the narrow proposition
+    cannot be confirmed, reject padding with unrelated legal rules.
+
+    Normal answers are untouched. This guard only considers bullets
+    AFTER an explicit limitation.
+    """
+
+    if not search_concepts:
+        return []
+
+    requested_codes = set(
+        _normalize_country_codes(country_codes)
+    )
+
+    choice_of_law_subject = _is_choice_of_law_subject(
+        search_concepts
+    )
+
+    for section in _parse_country_sections(answer):
+        if (
+            section.kind != "country"
+            or not section.bullets
+        ):
+            continue
+
+        section_code = _resolve_section_country_code(
+            section_title=section.title,
+            requested_country_codes=country_codes,
+        )
+
+        if section_code not in requested_codes:
+            continue
+
+        first_bullet = section.bullets[0]
+
+        if not _LIMITATION_BULLET_PATTERN.search(
+            first_bullet
+        ):
+            continue
+
+        for bullet in section.bullets[1:]:
+            if choice_of_law_subject:
+                # Immigration, residence, payroll, tax and social
+                # security are distinct legal questions. They must not
+                # be used as filler after admitting that the applicable
+                # employment law itself cannot be established.
+                if _CHOICE_OF_LAW_PADDING_PATTERN.search(
+                    bullet
+                ):
+                    return [
+                        QualityError(
+                            error_type="subject_drift",
+                            message=(
+                                "The user asks which employment law "
+                                "governs a cross-border relationship. "
+                                "Do not substitute immigration, "
+                                "residence, social-security, payroll "
+                                "or tax rules for choice-of-law "
+                                "analysis."
+                            ),
+                        )
+                    ]
+
+                # A supporting bullet that actually discusses which
+                # law governs/applies is directly relevant even when
+                # its wording differs from the generated search terms.
+                if _CHOICE_OF_LAW_RELATION_PATTERN.search(
+                    bullet
+                ):
+                    continue
+
+            if _bullet_matches_search_concepts(
+                bullet=bullet,
+                search_concepts=search_concepts,
+                evidence_mode=evidence_mode,
+            ):
+                continue
+
+            return [
+                QualityError(
+                    error_type="subject_drift",
+                    message=(
+                        "After stating that the exact requested "
+                        "proposition cannot be reliably confirmed, "
+                        "the answer adds material outside that same "
+                        "narrow subject. Remove adjacent or background "
+                        "legal material instead of padding the answer."
+                    ),
+                )
+            ]
+
+    return []
+
+
+
 def _validate_no_subject_drift(
     answer: str,
     search_concepts: Sequence[SearchConceptLike],
@@ -3059,6 +3466,235 @@ def _build_context(
     )
 
 
+
+_CHALLENGE_MESSAGE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"^\s*(?:"
+    r"are\s+you\s+sure"
+    r"|really"
+    r"|can\s+you\s+confirm"
+    r"|are\s+you\s+certain"
+    r"|is\s+that\s+(?:correct|right)"
+    r"|confirm\s+it"
+    r"|just\s+say\s+yes"
+    r"|trust\s+me"
+    r"(?:\s*[,.;!]?\s*just\s+say\s+yes)?"
+    r"|i(?:['’]m|\s+am)\s+sure"
+    r"(?:\s*[.!]?\s*just\s+say\s+yes)?"
+    r")\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+_PRIOR_UNCERTAINTY_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:cannot\s+reliably|can't\s+reliably"
+    r"|cannot\s+confirm|can't\s+confirm"
+    r"|cannot\s+determine|can't\s+determine"
+    r"|not\s+established"
+    r"|insufficient\s+(?:evidence|information)"
+    r"|not\s+enough\s+(?:evidence|information))\b",
+    re.IGNORECASE,
+)
+
+_DEFINITIVE_CHALLENGE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?im)^\s*(?:[-*•]\s*)?(?:yes|no)\b"
+)
+
+_EXPLICIT_CORRECTION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:correction|i\s+need\s+to\s+correct"
+    r"|my\s+previous\s+answer\s+was\s+incorrect"
+    r"|i\s+should\s+correct)\b",
+    re.IGNORECASE,
+)
+
+
+def _last_assistant_answer(
+    request: LegalChatRequest,
+) -> str | None:
+    for message in reversed(request.history):
+        if (
+            message.role == "assistant"
+            and message.content.strip()
+        ):
+            return message.content.strip()
+
+    return None
+
+
+def _build_challenge_context_block(
+    *,
+    request: LegalChatRequest,
+    current_user_question: str,
+) -> str | None:
+    if not _CHALLENGE_MESSAGE_PATTERN.fullmatch(
+        current_user_question.strip()
+    ):
+        return None
+
+    previous_answer = _last_assistant_answer(request)
+
+    if previous_answer is None:
+        return None
+
+    return "\n".join(
+        [
+            (
+                "PREVIOUS ASSISTANT ANSWER — CONVERSATIONAL "
+                "CONTEXT ONLY, NOT A LEGAL SOURCE"
+            ),
+            previous_answer[:3000],
+            "",
+            "CHALLENGE STABILITY",
+            (
+                "The user's challenge adds no new legal evidence. "
+                "Preserve the previous answer's conclusion and degree of certainty unless "
+                "the validated source extracts require a correction. "
+                "If changing the prior conclusion, explicitly say "
+                "that this is a correction and support the corrected "
+                "conclusion from the validated sources. Never cite "
+                "the previous assistant answer."
+            ),
+        ]
+    )
+
+
+def _explicit_challenge_stance(
+    answer: str,
+) -> str | None:
+    """
+    Detect an explicit Yes/No conclusion in a legal answer.
+
+    Handles both:
+      Australia
+      - Yes — ...
+
+    and:
+      Australia - No — ...
+    """
+
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        line = re.sub(
+            r"^[-*•]\s*",
+            "",
+            line,
+        )
+
+        direct = re.match(
+            r"(?i)^(yes|no)\b",
+            line,
+        )
+
+        if direct is not None:
+            return direct.group(1).casefold()
+
+        country_prefixed = re.match(
+            r"(?i)^"
+            r"[A-Za-zÀ-ÖØ-öø-ÿ]"
+            r"[A-Za-zÀ-ÖØ-öø-ÿ .&'’()-]{1,60}"
+            r"\s*[-:]\s*"
+            r"(yes|no)\b",
+            line,
+        )
+
+        if country_prefixed is not None:
+            return (
+                country_prefixed.group(1).casefold()
+            )
+
+    return None
+
+
+def _validate_challenge_certainty_stability(
+    *,
+    current_user_question: str,
+    previous_assistant_answer: str | None,
+    answer: str,
+) -> list[QualityError]:
+    """
+    A pure challenge or pressure message adds no new legal facts.
+
+    It may ask the assistant to verify its answer, but it must never
+    silently turn:
+        uncertain -> Yes/No
+        Yes -> No
+        No -> Yes
+
+    A real source-driven correction remains possible only when the
+    answer explicitly identifies itself as a correction.
+    """
+
+    if not _CHALLENGE_MESSAGE_PATTERN.fullmatch(
+        current_user_question.strip()
+    ):
+        return []
+
+    if not previous_assistant_answer:
+        return []
+
+    if _EXPLICIT_CORRECTION_PATTERN.search(
+        answer
+    ):
+        return []
+
+    previous_stance = _explicit_challenge_stance(
+        previous_assistant_answer
+    )
+
+    new_stance = _explicit_challenge_stance(
+        answer
+    )
+
+    if (
+        _PRIOR_UNCERTAINTY_PATTERN.search(
+            previous_assistant_answer
+        )
+        and new_stance is not None
+    ):
+        return [
+            QualityError(
+                error_type=(
+                    "challenge_certainty_flip"
+                ),
+                message=(
+                    "The user supplied no new legal facts or "
+                    "evidence. The previous answer was explicitly "
+                    "uncertain. Preserve that uncertainty unless "
+                    "the validated sources require an explicit "
+                    "correction."
+                ),
+            )
+        ]
+
+    if (
+        previous_stance is not None
+        and new_stance is not None
+        and previous_stance != new_stance
+    ):
+        return [
+            QualityError(
+                error_type=(
+                    "challenge_certainty_flip"
+                ),
+                message=(
+                    "The user supplied no new legal facts or "
+                    "evidence. Do not silently change the previous "
+                    f"{previous_stance.upper()} conclusion to "
+                    f"{new_stance.upper()}. Preserve the prior "
+                    "conclusion or explicitly explain a "
+                    "source-supported correction."
+                ),
+            )
+        ]
+
+    return []
+
+
 def _build_model_input(
     request: LegalChatRequest,
     hits: list[LegalSearchHit],
@@ -3091,9 +3727,22 @@ def _build_model_input(
             ]
         )
 
+    challenge_context = _build_challenge_context_block(
+        request=request,
+        current_user_question=(
+            literal_question or resolved_question
+        ),
+    )
+
     return "\n\n".join(
         [
             question_block,
+            *(
+                [challenge_context]
+                if challenge_context is not None
+                else []
+            ),
+            ANSWER_QUALITY_INSTRUCTIONS,
             "VALIDATED L&E GLOBAL SOURCES",
             _build_context(
                 hits
@@ -3877,6 +4526,18 @@ def answer_legal_question(
             context=context_text,
             hits=selected_hits,
         )
+        hard_errors = list(
+            hard_errors
+        ) + _validate_challenge_certainty_stability(
+            current_user_question=(
+                current_user_question or request.question
+            ),
+            previous_assistant_answer=(
+                _last_assistant_answer(request)
+            ),
+            answer=answer,
+        )
+
 
         for spec_index, spec in enumerate(specs):
             if not (
@@ -3907,6 +4568,16 @@ def answer_legal_question(
                 answer=answer,
                 search_concepts=spec.search_concepts,
                 evidence_mode=spec.evidence_mode,
+            )
+
+            soft_errors = (
+                list(soft_errors)
+                + _validate_partial_answer_relevance(
+                    answer=answer,
+                    search_concepts=spec.search_concepts,
+                    evidence_mode=spec.evidence_mode,
+                    country_codes=spec.country_codes,
+                )
             )
 
         return hard_errors, soft_errors
