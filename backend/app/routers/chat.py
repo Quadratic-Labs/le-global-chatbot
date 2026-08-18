@@ -29,6 +29,7 @@ from app.models.chat import (
     LegalChatRequest,
     LegalChatResponse,
 )
+from app.models.conversation_state import ConversationPendingClarification
 from app.models.conversation_state import ConversationState
 from app.services.assistant_help import (
     build_assistant_help_answer,
@@ -1204,6 +1205,79 @@ def _try_local_broad_legal_overview_result(
     )
 
 
+
+def _try_local_clear_fresh_legal_result(
+    *,
+    question: str,
+    result: RequestUnderstandingResult,
+    conversation_state: object | None,
+    hints: DeterministicHints,
+    current_country_scope: CountryAvailability,
+    current_legal_scope: LegalScope,
+) -> RequestUnderstandingResult | None:
+    """
+    Recover only a fresh, objectively complete legal request that the
+    semantic understanding call incorrectly labelled ambiguous.
+
+    This is intentionally NOT a deterministic fast path: semantic
+    understanding has already run. It only prevents a spurious
+    legal-vs-contact clarification when the current message itself
+    already establishes one country and a supported legal topic.
+    """
+
+    if (
+        result.status != "clarification"
+        or result.clarification_reason != "ambiguous_request"
+        or conversation_state is not None
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or len(current_country_scope.available_codes) != 1
+        or bool(current_country_scope.unavailable_codes)
+        or not current_legal_scope.is_supported
+        or not current_legal_scope.legal_topics
+    ):
+        return None
+
+    subject = " ".join(question.split())
+
+    # RequestUnderstandingAction.subject_text is capped at 300 chars.
+    # A longer message is not safe to reconstruct deterministically:
+    # leave it under the semantic clarification path instead.
+    if not subject or len(subject) > 300:
+        return None
+
+    country_code = current_country_scope.available_codes[0]
+    legal_topics = list(current_legal_scope.legal_topics)
+
+    return RequestUnderstandingResult(
+        status="resolved",
+        actions=[
+            RequestUnderstandingAction(
+                type="legal_information",
+                country_codes=[country_code],
+                legal_topics=legal_topics,
+                document_legal_topics=[],
+                topic_text=None,
+                resolved_question=subject,
+                subject_text=subject,
+                search_concepts=[],
+                subject_specificity="specific",
+                evidence_mode="direct_topic",
+            )
+        ],
+        is_follow_up=False,
+        confidence=1.0,
+        clarification_reason=None,
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=["legal_information"],
+            explicit_country_codes=[country_code],
+            explicit_legal_topics=legal_topics,
+            explicit_subject_text=None,
+            context_operation="independent",
+        ),
+    )
+
+
 def _resolve_conservative_fallback(
     request: LegalChatRequest,
     hints: DeterministicHints,
@@ -1737,6 +1811,7 @@ def _execute_resolved_plan(
                 max_context_characters=max_context_characters,
                 max_source_characters=max_source_characters,
                 metrics=metrics,
+                current_user_question=request.question,
                 action_specs=action_specs or None,
                 known_excluded_country_codes=(
                     merged_unavailable_codes or None
@@ -2160,7 +2235,47 @@ def resolve_legal_chat_response(
             metrics.outcome = (
                 "clarification_elliptical_followup"
             )
-            metrics.conversation_state_emitted = True
+            # This fast-path returns before semantic understanding
+            # and conversation_transition. Preserve the established
+            # legal action AND explicitly record that the next user
+            # message is expected to provide the missing subject
+            # detail; otherwise routing would depend on history alone.
+            response_conversation_state = (
+                previous_conversation_state
+            )
+
+            if (
+                previous_conversation_state is not None
+                and len(previous_conversation_state.actions) == 1
+                and previous_conversation_state.actions[0].type
+                == "legal_information"
+                and previous_conversation_state.actions[0].country_codes
+            ):
+                active_action = (
+                    previous_conversation_state.actions[0]
+                )
+
+                response_conversation_state = (
+                    previous_conversation_state.model_copy(
+                        update={
+                            "pending_clarification": (
+                                ConversationPendingClarification(
+                                    reason="subject_detail",
+                                    candidate_action_types=[
+                                        "legal_information"
+                                    ],
+                                    candidate_country_codes=list(
+                                        active_action.country_codes
+                                    ),
+                                )
+                            )
+                        }
+                    )
+                )
+
+            metrics.conversation_state_emitted = (
+                response_conversation_state is not None
+            )
             metrics.total_ms = (
                 perf_counter() - total_started_at
             ) * 1000
@@ -2173,9 +2288,7 @@ def resolve_legal_chat_response(
                 model=None,
                 retrieval_total=0,
                 sources=[],
-                conversation_state=(
-                    previous_conversation_state
-                ),
+                conversation_state=response_conversation_state,
             )
 
         outcome = understand_request(
@@ -2319,6 +2432,20 @@ def resolve_legal_chat_response(
             metrics.semantic_override_reason = (
                 "broad_legal_overview"
             )
+
+        clear_fresh_legal_result = (
+            _try_local_clear_fresh_legal_result(
+                question=request.question,
+                result=result,
+                conversation_state=previous_conversation_state,
+                hints=hints,
+                current_country_scope=current_country_scope,
+                current_legal_scope=current_legal_scope,
+            )
+        )
+
+        if clear_fresh_legal_result is not None:
+            result = clear_fresh_legal_result
 
         metrics.request_understanding_confidence = result.confidence
         metrics.contextual_question_used = result.is_follow_up
@@ -2495,15 +2622,36 @@ def resolve_legal_chat_response(
                 )
 
             if transition_outcome.pending_clarification is not None:
-                response_conversation_state = (
-                    build_next_conversation_state(
-                        executed=[],
-                        pending_clarification=(
-                            transition_outcome.pending_clarification
-                        ),
-                    )
+                pending_clarification = (
+                    transition_outcome.pending_clarification
                 )
-                metrics.conversation_state_emitted = True
+
+                if (
+                    pending_clarification.reason
+                    == "subject_detail"
+                    and previous_conversation_state is not None
+                ):
+                    response_conversation_state = (
+                        previous_conversation_state.model_copy(
+                            update={
+                                "pending_clarification":
+                                    pending_clarification
+                            }
+                        )
+                    )
+                else:
+                    response_conversation_state = (
+                        build_next_conversation_state(
+                            executed=[],
+                            pending_clarification=(
+                                pending_clarification
+                            ),
+                        )
+                    )
+
+                metrics.conversation_state_emitted = (
+                    response_conversation_state is not None
+                )
 
             metrics.total_ms = (
                 perf_counter() - total_started_at

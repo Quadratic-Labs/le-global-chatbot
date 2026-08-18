@@ -234,6 +234,7 @@ class ConversationPendingClarification(BaseModel):
         "missing_country",
         "missing_topic",
         "ambiguous_reference",
+        "subject_detail",
     ]
 
     candidate_action_types: list[

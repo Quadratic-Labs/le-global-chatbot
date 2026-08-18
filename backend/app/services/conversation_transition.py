@@ -765,6 +765,123 @@ def _correct_delta_for_same_subject_country_followup(
     )
 
 
+
+def _correct_subject_detail_followup(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """Resume one server-requested subject clarification safely."""
+
+    pending = conversation_state.pending_clarification
+
+    if (
+        pending is None
+        or pending.reason != "subject_detail"
+        or current_question is None
+        or result.status != "clarification"
+        or len(conversation_state.actions) != 1
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+    ):
+        return result
+
+    previous = conversation_state.actions[0]
+
+    if previous.type != "legal_information":
+        return result
+
+    if (
+        pending.candidate_action_types
+        != ["legal_information"]
+        or set(pending.candidate_country_codes)
+        != set(previous.country_codes)
+    ):
+        return result
+
+    delta = result.current_message_delta
+
+    # Never steal an explicit jurisdiction/action switch.
+    if delta.explicit_country_codes:
+        return result
+
+    if (
+        delta.explicit_action_types
+        and set(delta.explicit_action_types)
+        != {"legal_information"}
+    ):
+        return result
+
+    subject = (
+        delta.explicit_subject_text
+        or current_question.strip()
+    )
+
+    words = re.findall(
+        r"[a-z0-9]+",
+        subject.casefold(),
+    )
+
+    # Still vague -> continue clarifying instead of guessing.
+    if len(words) < 4:
+        return result
+
+    subject = subject[:300]
+
+    search_concepts = (
+        [
+            ConversationSearchConcept(
+                terms=list(concept.terms)
+            )
+            for concept in previous.search_concepts
+        ]
+        if previous.search_concepts
+        else [
+            ConversationSearchConcept(
+                terms=[subject]
+            )
+        ]
+    )
+
+    action = RequestUnderstandingAction(
+        type="legal_information",
+        country_codes=list(previous.country_codes),
+        legal_topics=list(previous.legal_topics),
+        topic_text=(
+            None
+            if previous.legal_topics
+            else subject[:200]
+        ),
+        resolved_question=_build_resolved_question(
+            action_type="legal_information",
+            country_codes=list(previous.country_codes),
+            subject_text=subject,
+        ),
+        subject_text=subject,
+        search_concepts=search_concepts,
+        subject_specificity="specific",
+        evidence_mode=previous.evidence_mode,
+    )
+
+    return RequestUnderstandingResult(
+        status="resolved",
+        actions=[action],
+        is_follow_up=True,
+        confidence=result.confidence,
+        clarification_reason=None,
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=[
+                "legal_information"
+            ],
+            explicit_country_codes=[],
+            explicit_legal_topics=list(previous.legal_topics),
+            explicit_subject_text=subject,
+            context_operation="change_subject",
+        ),
+    )
+
 def apply_conversation_transition(
     *,
     result: RequestUnderstandingResult,
@@ -813,6 +930,17 @@ def apply_conversation_transition(
         current_question=current_question,
     )
 
+    subject_detail_result = _correct_subject_detail_followup(
+        result=result,
+        conversation_state=canonicalized_state,
+        hints=hints,
+        current_question=current_question,
+    )
+    subject_detail_overridden = (
+        subject_detail_result is not result
+    )
+    result = subject_detail_result
+
     result = _correct_delta_for_legal_challenge_followup(
         result=result,
         conversation_state=canonicalized_state,
@@ -827,6 +955,47 @@ def apply_conversation_transition(
             hints=hints,
             current_question=current_question,
         )
+
+        # Structural guarantee: every contextual legal clarification
+        # must explicitly describe what the next user message is
+        # expected to resolve. History remains useful context, but
+        # conversation routing must never depend on history alone.
+        if (
+            outcome.final_status == "clarification"
+            and outcome.contextual_clarification_answer is not None
+            and outcome.pending_clarification is None
+            and len(canonicalized_state.actions) == 1
+            and canonicalized_state.actions[0].type
+            == "legal_information"
+        ):
+            active_action = canonicalized_state.actions[0]
+
+            outcome = replace(
+                outcome,
+                pending_clarification=(
+                    ConversationPendingClarification(
+                        reason="subject_detail",
+                        candidate_action_types=[
+                            "legal_information"
+                        ],
+                        candidate_country_codes=list(
+                            active_action.country_codes
+                        ),
+                    )
+                ),
+            )
+
+        if subject_detail_overridden:
+            outcome = replace(
+                outcome,
+                semantic_result_overridden=True,
+                semantic_override_reason=(
+                    "subject_detail_clarification_resolved"
+                ),
+                context_inheritance_applied=True,
+                inherited_action_type="legal_information",
+                inherited_country_replaced=False,
+            )
 
         if canonicalized_state is conversation_state:
             return outcome
@@ -1112,7 +1281,17 @@ def _apply_transition(
                 final_status="clarification",
                 final_actions=[],
                 final_clarification_reason="ambiguous_request",
-                pending_clarification=None,
+                pending_clarification=(
+                    ConversationPendingClarification(
+                        reason="subject_detail",
+                        candidate_action_types=[
+                            "legal_information"
+                        ],
+                        candidate_country_codes=list(
+                            candidate_countries
+                        ),
+                    )
+                ),
                 semantic_result_overridden=True,
                 semantic_override_reason=(
                     "single_active_legal_context_clarification"

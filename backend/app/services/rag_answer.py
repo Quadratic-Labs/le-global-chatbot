@@ -376,7 +376,13 @@ Rules:
 41. For confirmation or challenge follow-ups such as "Are you sure?",
     "Really?", "Why?" or "Can you confirm?", answer that conversational
     follow-up directly in the first bullet. Do not simply repeat the
-    previous answer.
+    previous answer. If the proposition being checked is conditional,
+    qualified, or depends on exceptions, never begin with an
+    unqualified "Yes". Lead with the qualified conclusion supported by
+    the sources, for example "No - not generally", "Yes - but only if",
+    or "It depends on", and preserve every material condition. For a
+    "Why?" follow-up, explain the reason rather than merely restating
+    the conclusion.
 42. Use a heading named "Comparison" only when the user is actually
     comparing two or more countries. Contrasting statuses, contract
     types, worker classifications, scenarios or alternatives within a
@@ -2768,28 +2774,69 @@ def _validate_explicit_alternatives(
 ) -> list[QualityError]:
     """
     Ensure an explicit employee/contractor classification question
-    does not silently answer only the employee branch.
+    actually addresses both alternatives.
+
+    Merely mentioning both labels is insufficient. Each classification
+    must be treated as a real branch of the answer.
     """
 
     if not _EMPLOYEE_CONTRACTOR_QUESTION_PATTERN.search(question):
         return []
 
-    normalized_answer = answer.casefold()
+    def has_branch(role_pattern: str) -> bool:
+        branch_pattern = re.compile(
+            rf"""
+            (?:
+                \b(?:if|when|where|for|as)\b
+                [^.\n]{{0,100}}
+                \b{role_pattern}\b
+            )
+            |
+            (?:
+                \b{role_pattern}\b
+                \s*:
+            )
+            |
+            (?:
+                \b(?:by\s+contrast|conversely)\b
+                [^.\n]{{0,100}}
+                \b{role_pattern}\b
+            )
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        )
+        return bool(branch_pattern.search(answer))
 
-    if (
-        "employee" in normalized_answer
-        and "contractor" in normalized_answer
-    ):
+    employee_branch = has_branch(r"employee")
+    contractor_branch = has_branch(
+        r"(?:independent\s+)?contractor"
+    )
+
+    if employee_branch and contractor_branch:
         return []
+
+    missing = []
+
+    if not employee_branch:
+        missing.append("employee")
+
+    if not contractor_branch:
+        missing.append("independent-contractor")
 
     return [
         QualityError(
             error_type="subject_drift",
             message=(
                 "The user explicitly contrasts employee and "
-                "independent-contractor status. Address both branches. "
-                "If one branch is not established by the available "
-                "information, say so clearly rather than omitting it."
+                "independent-contractor status. The answer is missing "
+                "a distinct "
+                + " and ".join(missing)
+                + " branch. Address each classification explicitly, "
+                "for example with 'If the person is an employee...' "
+                "and 'If the person is an independent contractor...'. "
+                "If the applicable rule for one branch is not "
+                "established by the available information, state that "
+                "clearly instead of merely mentioning the label."
             ),
         )
     ]
@@ -3015,22 +3062,49 @@ def _build_context(
 def _build_model_input(
     request: LegalChatRequest,
     hits: list[LegalSearchHit],
+    current_user_question: str | None = None,
 ) -> str:
     """Build the complete grounded generation input."""
 
+    resolved_question = request.question.strip()
+    literal_question = (
+        current_user_question.strip()
+        if current_user_question
+        else ""
+    )
+
+    if literal_question and literal_question != resolved_question:
+        question_block = "\n".join(
+            [
+                "CURRENT USER MESSAGE",
+                literal_question,
+                "",
+                "RESOLVED LEGAL QUESTION",
+                resolved_question,
+            ]
+        )
+    else:
+        question_block = "\n".join(
+            [
+                "USER QUESTION",
+                resolved_question,
+            ]
+        )
+
     return "\n\n".join(
         [
-            "USER QUESTION",
-            request.question.strip(),
+            question_block,
             "VALIDATED L&E GLOBAL SOURCES",
             _build_context(
                 hits
             ),
             (
-                "Write the answer using only the source "
-                "extracts above. Cite every material legal "
-                "statement using source numbers such as "
-                "[1], [2], or [1, 2]."
+                "The CURRENT USER MESSAGE, when present, expresses "
+                "the user's conversational intent. The RESOLVED LEGAL "
+                "QUESTION expresses the legal scope. Neither is a "
+                "legal source. Write the answer using only the source "
+                "extracts above. Cite every material legal statement "
+                "using source numbers such as [1], [2], or [1, 2]."
             ),
         ]
     )
@@ -3122,62 +3196,111 @@ def sanitize_user_facing_legal_answer(
     answer: str,
 ) -> str:
     """
-    Remove internal evidence-mechanism wording only at the
-    user-facing boundary, without another model call.
+    Remove internal evidence-container wording at the HTTP boundary
+    without rewriting ordinary legal uses of words such as "sources".
+
+    In particular, "the main sources are federal statutes" is normal
+    legal prose and must remain untouched. Only qualified internal
+    references or source-scoped evidence-limitation statements are
+    normalized.
     """
 
-    # Remove container phrases such as "in these extracts" when the
-    # surrounding sentence already states the actual user-facing rule.
+    sanitized = answer
+
+    # "provided L&E Global information" is user-facing but unnecessarily
+    # exposes the mechanics of how the answer was assembled.
     sanitized = re.sub(
-        r"\s+in\s+(?:the|these|provided|supplied|available)\s+"
-        r"(?:validated\s+)?(?:L&E\s+Global\s+)?"
-        r"(?:extracts?|documents?|sources?)\b",
-        "",
-        answer,
+        r"\b(?:the\s+)?(?:provided|supplied|retrieved|cited)\s+"
+        r"L&E\s+Global\s+information\b",
+        "the available L&E Global information",
+        sanitized,
         flags=re.IGNORECASE,
     )
 
-    sanitized = _USER_FACING_INTERNAL_REFERENCE_PATTERN.sub(
+    # Explicitly qualified internal containers are never ordinary
+    # substantive legal prose.
+    sanitized = re.sub(
+        r"\b(?:the\s+|these\s+)?"
+        r"(?:provided|supplied|retrieved|cited|available)\s+"
+        r"(?:(?:validated|L&E\s+Global)\s+)*"
+        r"(?:extracts?|documents?|materials?|sources?)\b",
         "the available L&E Global information",
         sanitized,
+        flags=re.IGNORECASE,
     )
 
-    # Avoid awkward wording such as:
-    # "not available in the available information".
+    # "these extracts/documents/..." is likewise an internal reference.
     sanitized = re.sub(
-        r"\b(?:is|are)\s+not available in "
-        r"the available L&E Global information\b",
-        (
-            "cannot be reliably confirmed from "
-            "the available L&E Global information"
+        r"\bthese\s+"
+        r"(?:extracts?|documents?|materials?|sources?)\b",
+        "the available L&E Global information",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Bare "the sources/documents/..." is rewritten ONLY when it is
+    # explicitly being used to describe an evidence limitation.
+    # This deliberately does NOT match ordinary wording such as
+    # "the main sources are federal statutes".
+    sanitized = re.sub(
+        r"\bthe\s+"
+        r"(?:sources?|extracts?|documents?|materials?)\s+"
+        r"(?:do|does)\s+not\s+"
+        r"(establish|support|contain|provide|show|indicate|address|"
+        r"specify|confirm)\b",
+        lambda m: (
+            "the available L&E Global information does not "
+            + m.group(1)
         ),
         sanitized,
         flags=re.IGNORECASE,
     )
 
-    # Fix plural -> singular grammar introduced by replacing
-    # extracts/documents/sources with "information".
-    replacements = {
-        "do": "does",
-        "are": "is",
-        "address": "addresses",
-        "establish": "establishes",
-        "support": "supports",
-        "contain": "contains",
-        "provide": "provides",
-        "show": "shows",
-        "indicate": "indicates",
-    }
+    sanitized = re.sub(
+        r"\bthe\s+"
+        r"(?:sources?|extracts?|documents?|materials?)\s+"
+        r"(?:are|is)\s+(?:insufficient|incomplete|limited)\b",
+        "the available L&E Global information is limited",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
 
-    for old, new in replacements.items():
+    # Normalize common limitation constructions without touching legal
+    # uses of "context", "source", etc. elsewhere.
+    sanitized = re.sub(
+        r"\b(?:not available|not provided)\s+in\s+"
+        r"(?:the\s+)?"
+        r"(?:provided|supplied|retrieved|cited|available)?\s*"
+        r"(?:extracts?|documents?|materials?|sources?)\b",
+        "cannot be reliably confirmed from "
+        "the available L&E Global information",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Singular grammar after normalization.
+    grammar_replacements = (
+        (r"\binformation\s+do\s+not\b", "information does not"),
+        (r"\binformation\s+are\b", "information is"),
+        (r"\binformation\s+address\b", "information addresses"),
+        (r"\binformation\s+establish\b", "information establishes"),
+        (r"\binformation\s+support\b", "information supports"),
+        (r"\binformation\s+contain\b", "information contains"),
+        (r"\binformation\s+provide\b", "information provides"),
+        (r"\binformation\s+show\b", "information shows"),
+        (r"\binformation\s+indicate\b", "information indicates"),
+    )
+
+    for pattern, replacement_text in grammar_replacements:
         sanitized = re.sub(
-            rf"\bthe available L&E Global information\s+{old}\b",
-            f"the available L&E Global information {new}",
+            pattern,
+            replacement_text,
             sanitized,
             flags=re.IGNORECASE,
         )
 
     return sanitized
+
 
 
 def _find_citation_numbers(
@@ -3308,6 +3431,7 @@ def answer_legal_question(
     evidence_mode: str | None = None,
     action_specs: list[LegalActionEvidenceSpec] | None = None,
     known_excluded_country_codes: list[str] | None = None,
+    current_user_question: str | None = None,
 ) -> LegalChatResponse:
     """
     Retrieve legal chunks and generate one grounded answer.
@@ -3689,6 +3813,7 @@ def answer_legal_question(
     model_input = _build_model_input(
         request=request,
         hits=selected_hits,
+        current_user_question=current_user_question,
     )
 
     def _generate_with_instructions(
@@ -3726,8 +3851,27 @@ def answer_legal_question(
         list[QualityError],
         list[QualityError],
     ]:
+        resolved_validation_question = request.question.strip()
+        literal_validation_question = (
+            current_user_question.strip()
+            if current_user_question
+            else ""
+        )
+
+        validation_question = (
+            literal_validation_question
+            + "\n"
+            + resolved_validation_question
+            if (
+                literal_validation_question
+                and literal_validation_question
+                != resolved_validation_question
+            )
+            else resolved_validation_question
+        )
+
         hard_errors, soft_errors = _validate_answer_quality(
-            question=request.question,
+            question=validation_question,
             answer=answer,
             country_codes=request.country_codes,
             context=context_text,
