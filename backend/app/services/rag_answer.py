@@ -125,10 +125,8 @@ explanation.
 """.strip()
 
 NO_INFORMATION_ANSWER: Final[str] = (
-    "The available validated L&E Global documents do not "
-    "contain enough information to answer this question. "
-    "Please contact the relevant L&E Global member firm "
-    "for country-specific legal advice."
+    "I do not have enough validated L&E Global information "
+    "to answer this question reliably."
 )
 
 MISSING_COUNTRY_ANSWER: Final[str] = (
@@ -137,8 +135,8 @@ MISSING_COUNTRY_ANSWER: Final[str] = (
 )
 
 INSUFFICIENT_EVIDENCE_ANSWER_TEMPLATE: Final[str] = (
-    "The available validated L&E Global documents do not contain "
-    "enough information to answer {subject} for {country}."
+    "I do not have enough validated L&E Global information to "
+    "answer {subject} for {country} reliably."
 )
 
 PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE: Final[str] = (
@@ -147,8 +145,8 @@ PARTIAL_EVIDENCE_INSTRUCTION_TEMPLATE: Final[str] = (
     "hyphen-prefixed bullet points, exactly like every other section -"
     " never a plain-text sentence before or between them. Make the "
     "FIRST bullet in that section exactly this sentence, unmodified: "
-    "\"- The available validated L&E Global documents only partially "
-    "address {subject} in {country}.\" Every other bullet in that "
+    "\"- The available L&E Global information only partially "
+    "addresses {subject} in {country}.\" Every other bullet in that "
     "section must present only what the sources actually support - "
     "never state or imply the sources answer the specific question "
     "in full."
@@ -213,6 +211,25 @@ EXCLUDED_COUNTRY_HEADING_INSTRUCTION_TEMPLATE: Final[str] = (
     "comparison between them - never any other country name."
 )
 
+BROAD_OVERVIEW_INSTRUCTIONS: Final[str] = """
+For a broad single-country employment-law overview:
+- Start with exactly the country name as the only heading.
+- After the heading, output exactly 4 or 5 hyphen-prefixed bullets
+  and nothing else.
+- Give an executive overview, not a source-by-source summary.
+- Cover distinct major employment-law themes.
+- Keep each bullet concise and focused on one major theme.
+- Prefer foundational rules over narrow exceptions, long statutory
+  lists, transitional details, or niche examples.
+- Merge closely related evidence instead of enumerating every detail.
+- Every bullet must contain its supporting citation.
+- Do not claim the overview is exhaustive.
+- Never invent a theme that the supplied sources do not support.
+- Do not add a conclusion, closing sentence, follow-up offer, or any
+  standalone prose before or after the bullets.
+"""
+
+
 SYSTEM_INSTRUCTIONS: Final[str] = """
 You are the L&E Global employment law assistant.
 
@@ -241,7 +258,11 @@ Rules:
 11. Answer only the legal issue explicitly requested by the user.
 12. Do not include adjacent legal topics merely because they appear
     in the same source extract.
-13. For a single country, provide no more than six concise bullets.
+13. For a focused single-country question, normally provide no more
+    than four concise bullets. For a genuinely broad overview, provide
+    no more than five. Use additional bullets only when a statutory
+    scale, mandatory list of conditions, or legally material exception
+    cannot be represented accurately within those limits.
 14. For comparisons, provide no more than four concise bullets per
     country and one short comparison section.
 15. Do not repeat a rule in the country section and again using
@@ -317,6 +338,55 @@ Rules:
 31. In a comparison, give every country a comparable level of
     detail: when concrete figures are available for a country, state
     them instead of describing that country only in general terms.
+32. The first bullet of each country section must answer the user's
+    actual question as directly as the evidence allows. Lead with the
+    conclusion or practical rule, not background information.
+33. For a focused single-country question, normally use two to four
+    concise bullets. Use more only when necessary to preserve a
+    statutory scale, important conditions, exceptions, or other
+    information needed for an accurate answer.
+34. Prioritize information by usefulness to the user's question.
+    Do not turn every retrieved passage into a bullet. Omit secondary,
+    adjacent or lower-priority details merely present in the sources.
+35. For a very broad request such as an overview of a country's whole
+    employment-law framework, give a coherent high-level overview from
+    the strongest relevant evidence. Do not fill the answer with
+    isolated niche subjects simply because they were retrieved.
+36. For a conversational follow-up, answer the new or refined point.
+    Do not repeat the previous answer unless that information is
+    necessary to understand the follow-up.
+37. Use clear professional English that a non-lawyer can understand.
+    Prefer short sentences and plain wording while preserving the
+    exact legal meaning. Explain unavoidable legal terminology
+    briefly rather than copying dense documentary phrasing.
+38. Do not add generic filler, a generic conclusion, or a repeated
+    disclaimer merely to make the answer longer.
+39. If the user's question contains a materially false, overbroad or
+    misleading premise, correct that premise explicitly in the FIRST
+    bullet before explaining exceptions. Never answer "Yes" to a broad
+    proposition merely because a narrow exception exists. For example,
+    if something is permitted only in serious-misconduct cases, say
+    "No - not generally" before explaining that exception.
+40. When the user explicitly contrasts alternatives or asks whether an
+    outcome depends on a classification (for example employee versus
+    independent contractor, fixed-term versus indefinite, or employee
+    versus self-employed status), do not answer only one branch as if
+    it resolved the whole question. Address each supported branch and
+    clearly qualify any branch the evidence does not establish.
+41. For confirmation or challenge follow-ups such as "Are you sure?",
+    "Really?", "Why?" or "Can you confirm?", answer that conversational
+    follow-up directly in the first bullet. Do not simply repeat the
+    previous answer.
+42. Use a heading named "Comparison" only when the user is actually
+    comparing two or more countries. Contrasting statuses, contract
+    types, worker classifications, scenarios or alternatives within a
+    single country must remain inside that country's section and must
+    not create a separate Comparison section.
+43. Never use the words "extracts", "documents", "sources",
+    "materials", "retrieval", or "context" to explain an evidence limitation to the
+    user. When one requested branch cannot be established, use plain
+    user-facing wording such as "I cannot reliably confirm the rule for
+    that branch from the available L&E Global information."
 """.strip()
 
 
@@ -978,6 +1048,117 @@ def _rerank_hits(
     return [hits[position - 1] for position in order]
 
 
+
+_BROAD_OVERVIEW_TOPIC_PRIORITY: Final[tuple[str, ...]] = (
+    "Employment Contracts",
+    "Working Conditions",
+    "Termination of Employment Contracts",
+    "Anti-Discrimination Laws",
+    "Trade Unions and Employers Associations",
+    "Employee Benefits",
+    "Hiring Practices",
+    "Pay Equity Laws",
+    "Transfer of Undertakings",
+    "Restrictive Covenants",
+    "Social Media and Data Privacy",
+)
+
+
+def _select_broad_overview_hits(
+    hits: Sequence[LegalSearchHit],
+    limit: int,
+) -> list[LegalSearchHit]:
+    """
+    Select representative evidence for a whole-domain overview.
+
+    Preserve one general Overview extract when available, then cover
+    distinct foundational legal topics before allowing any topic to
+    consume a second source slot.
+    """
+
+    if limit <= 0:
+        return []
+
+    ranked_hits = _deduplicate_hits(hits)
+
+    selected: list[LegalSearchHit] = []
+    selected_ids: set[str] = set()
+    selected_topics: set[str] = set()
+
+    overview_hit = next(
+        (
+            hit
+            for hit in ranked_hits
+            if (
+                not (hit.legal_topic or "").strip()
+                and "overview" in hit.section.casefold()
+            )
+        ),
+        None,
+    )
+
+    if overview_hit is not None:
+        selected.append(overview_hit)
+        selected_ids.add(overview_hit.chunk_id)
+
+    for topic in _BROAD_OVERVIEW_TOPIC_PRIORITY:
+        if len(selected) >= limit:
+            break
+
+        hit = next(
+            (
+                candidate
+                for candidate in ranked_hits
+                if (
+                    candidate.chunk_id not in selected_ids
+                    and (candidate.legal_topic or "").strip()
+                    == topic
+                )
+            ),
+            None,
+        )
+
+        if hit is None:
+            continue
+
+        selected.append(hit)
+        selected_ids.add(hit.chunk_id)
+        selected_topics.add(topic)
+
+    # If a country's corpus does not expose enough priority topics,
+    # prefer another distinct topic before duplicating one.
+    if len(selected) < limit:
+        for hit in ranked_hits:
+            if len(selected) >= limit:
+                break
+
+            if hit.chunk_id in selected_ids:
+                continue
+
+            topic = (hit.legal_topic or "").strip()
+
+            if not topic or topic in selected_topics:
+                continue
+
+            selected.append(hit)
+            selected_ids.add(hit.chunk_id)
+            selected_topics.add(topic)
+
+    # Last-resort fill only.
+    if len(selected) < limit:
+        for hit in ranked_hits:
+            if len(selected) >= limit:
+                break
+
+            if hit.chunk_id in selected_ids:
+                continue
+
+            selected.append(hit)
+            selected_ids.add(hit.chunk_id)
+
+    return selected[:limit]
+
+
 def _retrieve_country_hits(
     request: LegalChatRequest,
     country_code: str,
@@ -988,6 +1169,7 @@ def _retrieve_country_hits(
     rerank_enabled: bool,
     rerank_pool_multiplier: int,
     metrics: LegalChatMetrics | None = None,
+    broad_overview: bool = False,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve and select up to output_limit hits for one country.
@@ -1057,10 +1239,19 @@ def _retrieve_country_hits(
                 country_codes=[
                     country_code,
                 ],
-                limit=_candidate_search_limit(
-                    fair_share_limit=output_limit,
-                    rerank_enabled=rerank_enabled,
-                    rerank_pool_multiplier=rerank_pool_multiplier,
+                limit=(
+                    min(
+                        max(output_limit * 6, 24),
+                        MAX_RERANK_POOL_SIZE,
+                    )
+                    if broad_overview
+                    else _candidate_search_limit(
+                        fair_share_limit=output_limit,
+                        rerank_enabled=rerank_enabled,
+                        rerank_pool_multiplier=(
+                            rerank_pool_multiplier
+                        ),
+                    )
                 ),
             )
         )
@@ -1072,7 +1263,14 @@ def _retrieve_country_hits(
 
         return (
             response.total,
-            hits[:output_limit],
+            (
+                _select_broad_overview_hits(
+                    hits=hits,
+                    limit=output_limit,
+                )
+                if broad_overview
+                else hits[:output_limit]
+            ),
         )
 
     if len(normalized_topics) <= 1:
@@ -1161,6 +1359,7 @@ def _retrieve_search_hits(
     rerank_pool_multiplier: int = 1,
     metrics: LegalChatMetrics | None = None,
     search_concepts: Sequence[SearchConceptLike] | None = None,
+    broad_overview: bool = False,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve legal chunks.
@@ -1180,7 +1379,11 @@ def _retrieve_search_hits(
                 country_codes
             )
         ),
-        search_concepts=search_concepts,
+        search_concepts=(
+            None
+            if broad_overview
+            else search_concepts
+        ),
     )
 
     if not country_codes:
@@ -1243,6 +1446,7 @@ def _retrieve_search_hits(
             rerank_enabled=rerank_enabled,
             rerank_pool_multiplier=rerank_pool_multiplier,
             metrics=metrics,
+            broad_overview=broad_overview,
         )
 
         return (
@@ -2550,6 +2754,47 @@ def _validate_no_subject_drift(
     ]
 
 
+
+_EMPLOYEE_CONTRACTOR_QUESTION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\bemployee\b.*\b(?:independent\s+)?contractor\b"
+    r"|\b(?:independent\s+)?contractor\b.*\bemployee\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _validate_explicit_alternatives(
+    question: str,
+    answer: str,
+) -> list[QualityError]:
+    """
+    Ensure an explicit employee/contractor classification question
+    does not silently answer only the employee branch.
+    """
+
+    if not _EMPLOYEE_CONTRACTOR_QUESTION_PATTERN.search(question):
+        return []
+
+    normalized_answer = answer.casefold()
+
+    if (
+        "employee" in normalized_answer
+        and "contractor" in normalized_answer
+    ):
+        return []
+
+    return [
+        QualityError(
+            error_type="subject_drift",
+            message=(
+                "The user explicitly contrasts employee and "
+                "independent-contractor status. Address both branches. "
+                "If one branch is not established by the available "
+                "information, say so clearly rather than omitting it."
+            ),
+        )
+    ]
+
+
 def _validate_answer_quality(
     question: str,
     answer: str,
@@ -2621,6 +2866,13 @@ def _validate_answer_quality(
                 hits=hits,
             )
         )
+
+    all_errors.extend(
+        _validate_explicit_alternatives(
+            question=question,
+            answer=answer,
+        )
+    )
 
     all_errors.extend(
         _validate_paid_leave_scope(
@@ -2855,6 +3107,79 @@ def _deduplicate_adjacent_citations(
     )
 
 
+
+_USER_FACING_INTERNAL_REFERENCE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:the|these|provided|supplied|available)?\s*"
+    r"(?:validated\s+)?(?:L&E\s+Global\s+)?"
+    r"(?:extracts?|documents?|sources?|materials?)\b",
+    re.IGNORECASE,
+)
+
+
+def sanitize_user_facing_legal_answer(
+    answer: str,
+) -> str:
+    """
+    Remove internal evidence-mechanism wording only at the
+    user-facing boundary, without another model call.
+    """
+
+    # Remove container phrases such as "in these extracts" when the
+    # surrounding sentence already states the actual user-facing rule.
+    sanitized = re.sub(
+        r"\s+in\s+(?:the|these|provided|supplied|available)\s+"
+        r"(?:validated\s+)?(?:L&E\s+Global\s+)?"
+        r"(?:extracts?|documents?|sources?)\b",
+        "",
+        answer,
+        flags=re.IGNORECASE,
+    )
+
+    sanitized = _USER_FACING_INTERNAL_REFERENCE_PATTERN.sub(
+        "the available L&E Global information",
+        sanitized,
+    )
+
+    # Avoid awkward wording such as:
+    # "not available in the available information".
+    sanitized = re.sub(
+        r"\b(?:is|are)\s+not available in "
+        r"the available L&E Global information\b",
+        (
+            "cannot be reliably confirmed from "
+            "the available L&E Global information"
+        ),
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Fix plural -> singular grammar introduced by replacing
+    # extracts/documents/sources with "information".
+    replacements = {
+        "do": "does",
+        "are": "is",
+        "address": "addresses",
+        "establish": "establishes",
+        "support": "supports",
+        "contain": "contains",
+        "provide": "provides",
+        "show": "shows",
+        "indicate": "indicates",
+    }
+
+    for old, new in replacements.items():
+        sanitized = re.sub(
+            rf"\bthe available L&E Global information\s+{old}\b",
+            f"the available L&E Global information {new}",
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+
+    return sanitized
+
+
 def _find_citation_numbers(
     answer: str,
 ) -> list[int]:
@@ -3067,6 +3392,13 @@ def answer_legal_question(
             sources=[],
         )
 
+    broad_overview_request = (
+        len(specs) == 1
+        and specs[0].evidence_mode == "broad_topic"
+        and not specs[0].legal_topics
+        and len(all_requested_codes) == 1
+    )
+
     retrieval_total = 0
     hits_by_spec: list[list[LegalSearchHit]] = []
 
@@ -3078,6 +3410,16 @@ def answer_legal_question(
                     spec.legal_topics or request.legal_topics
                 ),
             }
+        )
+
+        broad_overview = (
+            spec.evidence_mode == "broad_topic"
+            and not spec.legal_topics
+            and len(
+                _normalize_country_codes(
+                    spec.country_codes
+                )
+            ) == 1
         )
 
         try:
@@ -3092,6 +3434,7 @@ def answer_legal_question(
                 rerank_pool_multiplier=rerank_pool_multiplier,
                 metrics=metrics,
                 search_concepts=spec.search_concepts,
+                broad_overview=broad_overview,
             )
         except LegalSearchError as error:
             raise RagAnswerError(
@@ -3430,6 +3773,11 @@ def answer_legal_question(
 
     first_generated_text = _generate_with_instructions(
         SYSTEM_INSTRUCTIONS
+        + (
+            BROAD_OVERVIEW_INSTRUCTIONS
+            if broad_overview_request
+            else ""
+        )
         + partial_evidence_instruction
         + excluded_country_instruction
     )
@@ -3462,6 +3810,11 @@ def answer_legal_question(
 
         repaired_generated_text = _generate_with_instructions(
             SYSTEM_INSTRUCTIONS
+            + (
+                BROAD_OVERVIEW_INSTRUCTIONS
+                if broad_overview_request
+                else ""
+            )
             + partial_evidence_instruction
             + excluded_country_instruction
             + "\n\n"

@@ -831,6 +831,37 @@ action; the same is true for a one-country formulation such as "give me
 the same information for X" or "do the same for X". It is
 "select_action" or "ambiguous" when the prior state held more than one.
 
+Short conversational follow-ups must reuse known context instead of
+restarting the conversation:
+
+- When the structured state contains exactly one active legal action,
+  a short challenge, confirmation or explanation request such as
+  "why?", "are you sure?", "can you confirm?", "really?", or "I'm sure
+  this is legal, just say yes" that introduces no new country, action
+  or legal subject is a continuation. Use context_operation="continue"
+  and retain the existing country, action and subject.
+
+- When a follow-up introduces a new condition or refinement but omits
+  the country, for example "what if the employee refuses?", "what if
+  they do not sign?", or "and if the employee is on sick leave?", and
+  there is exactly one active legal action with a known country,
+  inherit that country into the resolved action. If the legal subject
+  genuinely changes or becomes more specific, use
+  context_operation="change_subject" and resolve the refined subject
+  using the current message together with the prior state.
+
+- Never ask the user to repeat a country that is already unambiguous in
+  the single active structured state unless the current message
+  explicitly changes or contradicts that country.
+
+- If a follow-up is genuinely ambiguous, preserve any unambiguous
+  country and action already known. Ask only for the missing meaning;
+  do not restart with a generic country/topic/contact question.
+
+- An ambiguous legal follow-up must never become a contact request
+  merely because it is short or underspecified. A contact action still
+  requires contact intent in the current message.
+
 For every legal_information or comparison action, also identify the
 precise sub-topic actually asked about, distinct from its broad
 legal_topics bucket:
@@ -856,7 +887,15 @@ legal_topics bucket:
   "overtime", "health and safety", or "salary" as if they were synonyms
   of remote work. A subject naming one relation between two concepts
   (e.g. "dismissal while on sick leave") needs two groups, one per
-  concept - never merge them into one.
+  concept - never merge them into one. The same applies when the user
+  explicitly asks whether an outcome depends on a legal classification
+  or alternative status, such as employee versus independent
+  contractor: classification/status is one concept group and the legal
+  consequence is another, so use relation_required. For worker-status
+  classification, prefer precise terms such as "independent contractor",
+  "contractor", "worker classification", "employment status" or
+  "employee status"; never use the generic word "employee" alone as
+  proof that contractor/classification evidence exists.
 - subject_specificity: "specific" when the subject names one precise
   rule or concept beyond its general topic area; "broad" when the
   question genuinely is the whole topic area itself (e.g. "explain
@@ -1469,6 +1508,11 @@ def understand_request(
         result = _parse_understanding_response(response.text)
 
         if result is None:
+            if attempt_number < MAX_UNDERSTANDING_ATTEMPTS:
+                retry_triggered = True
+                retry_reason = "invalid_response"
+                continue
+
             return RequestUnderstandingOutcome(
                 result=None,
                 elapsed_ms=(

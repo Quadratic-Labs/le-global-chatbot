@@ -76,6 +76,7 @@ from app.services.legal_topic_detection import (
     resolve_legal_scope,
 )
 from app.services.rag_answer import (
+    sanitize_user_facing_legal_answer,
     DEFAULT_MAX_CONTEXT_CHARACTERS,
     DEFAULT_MAX_SOURCE_CHARACTERS,
     InvalidLegalChatRequestError,
@@ -949,6 +950,102 @@ def _check_explicit_filter_conflict(
     return False
 
 
+_ELLIPTICAL_LEGAL_FOLLOWUP_ENDING = re.compile(
+    r"\b(?:"
+    r"refuse|refuses|refused|"
+    r"decline|declines|declined|"
+    r"reject|rejects|rejected|"
+    r"doesnt|doesn't|dont|don't|"
+    r"wont|won't|wouldnt|wouldn't"
+    r")\s*[?.!]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _try_local_elliptical_legal_clarification(
+    *,
+    question: str,
+    conversation_state: ConversationState | None,
+    hints: DeterministicHints,
+) -> str | None:
+    """
+    Resolve one structurally incomplete legal follow-up locally.
+
+    Example:
+        prior: Australia / notice period
+        now:   "What if the employee refuses?"
+
+    The verb has no object, so answering would require inventing what
+    is being refused. Keep the established legal context and ask only
+    for the missing complement. No OpenAI call is needed.
+
+    Deliberately narrow:
+    - exactly one existing legal-information action;
+    - exactly one already-known country;
+    - no newly named country/topic;
+    - no contact/comparison signal;
+    - only an unmistakably incomplete trailing verb/auxiliary.
+    """
+
+    if (
+        conversation_state is None
+        or len(conversation_state.actions) != 1
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or hints.current_country_codes
+        or hints.current_legal_topics
+    ):
+        return None
+
+    action = conversation_state.actions[0]
+
+    if (
+        action.type != "legal_information"
+        or len(action.country_codes) != 1
+    ):
+        return None
+
+    if not _ELLIPTICAL_LEGAL_FOLLOWUP_ENDING.search(
+        question.strip()
+    ):
+        return None
+
+    country = resolve_country_display_name(
+        action.country_codes[0]
+    )
+
+    normalized = question.casefold()
+
+    actor = None
+
+    for candidate in (
+        "employee",
+        "employer",
+        "worker",
+    ):
+        if re.search(
+            rf"\b{candidate}\b",
+            normalized,
+        ):
+            actor = candidate
+            break
+
+    if actor is not None:
+        missing_detail = (
+            f"What exactly is the {actor} refusing "
+            "to do or accept?"
+        )
+    else:
+        missing_detail = (
+            "What exactly is being refused or rejected?"
+        )
+
+    return (
+        f"I'll keep {country} and the current employment-law "
+        f"context. {missing_detail}"
+    )
+
+
 def _try_local_country_only_followup_result(
     *,
     question: str,
@@ -1020,6 +1117,89 @@ def _try_local_country_only_followup_result(
             explicit_legal_topics=[],
             explicit_subject_text=None,
             context_operation="replace_country",
+        ),
+    )
+
+
+
+_BROAD_LEGAL_OVERVIEW_DOMAIN_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:employment|labou?r)\s+law\b",
+    re.IGNORECASE,
+)
+
+_BROAD_LEGAL_OVERVIEW_CUE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+        r"\b(?:"
+        r"everything|overview|comprehensive|"
+        r"general\s+overview|"
+        r"tell\s+me\s+about|"
+        r"what\s+should\s+i\s+know\s+about|"
+        r"main\s+(?:areas?|topics?)|"
+        r"key\s+(?:areas?|topics?)"
+        r")\b",
+        re.IGNORECASE,
+)
+
+
+def _try_local_broad_legal_overview_result(
+    *,
+    question: str,
+    previous_conversation_state: ConversationState | None,
+    hints: DeterministicHints,
+    current_country_scope: CountryAvailability,
+) -> RequestUnderstandingResult | None:
+    """
+    Recover only a fresh, explicit whole-domain employment-law
+    overview when semantic understanding incorrectly asks whether the
+    user wants legal information or contact details.
+
+    This never fires for contact, comparison, multi-country or
+    conversational requests.
+    """
+
+    if (
+        previous_conversation_state is not None
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or current_country_scope.unavailable_codes
+        or len(current_country_scope.available_codes) != 1
+        or not _BROAD_LEGAL_OVERVIEW_DOMAIN_PATTERN.search(question)
+        or not _BROAD_LEGAL_OVERVIEW_CUE_PATTERN.search(question)
+    ):
+        return None
+
+    country_code = current_country_scope.available_codes[0]
+
+    subject_text = "broad overview of employment law"
+
+    return RequestUnderstandingResult(
+        status="resolved",
+        actions=[
+            RequestUnderstandingAction(
+                type="legal_information",
+                country_codes=[country_code],
+                legal_topics=[],
+                document_legal_topics=[],
+                topic_text="employment law overview",
+                subject_text=subject_text,
+                resolved_question=question.strip(),
+                search_concepts=[],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        ],
+        is_follow_up=False,
+        confidence=1.0,
+        clarification_reason=None,
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=["legal_information"],
+            explicit_country_codes=[country_code],
+            explicit_legal_topics=[],
+            explicit_subject_text=subject_text,
+            context_operation="independent",
         ),
     )
 
@@ -1569,6 +1749,52 @@ def _execute_resolved_plan(
             model_used = legal_response.model
             retrieval_total += legal_response.retrieval_total
 
+            # Product fallback: when validated legal evidence cannot
+            # answer the requested question, do not merely tell the
+            # user to contact someone. Resolve the actual current
+            # L&E Global contact deterministically when available.
+            #
+            # If the user already explicitly requested a contact,
+            # leave that action to the normal contact loop below so
+            # the same contact is never rendered twice.
+            if (
+                not legal_response.grounded
+                and not contact_actions
+                and merged_available_codes
+            ):
+                (
+                    fallback_contact_answer,
+                    fallback_contact_sources,
+                    fallback_contact_retrieval_total,
+                    fallback_contact_took_ms,
+                ) = _build_contact_section(
+                    country_codes=merged_available_codes,
+                    unavailable_country_codes=[],
+                    citation_offset=max(
+                        (source.citation for source in sources),
+                        default=0,
+                    ),
+                )
+
+                metrics.opensearch_ms += fallback_contact_took_ms
+                retrieval_total += (
+                    fallback_contact_retrieval_total
+                )
+
+                if fallback_contact_sources:
+                    answer_parts.append(
+                        "For case-specific guidance, you can use "
+                        "the L&E Global contact below:\n\n"
+                        + fallback_contact_answer
+                    )
+                    grounded = True
+                elif fallback_contact_answer:
+                    # Never promise a contact "below" when the
+                    # country currently has no validated contact.
+                    answer_parts.append(fallback_contact_answer)
+
+                sources.extend(fallback_contact_sources)
+
             if merged_unavailable_codes:
                 answer_parts.append(
                     "Note: "
@@ -1603,7 +1829,10 @@ def _execute_resolved_plan(
         ) = _build_contact_section(
             country_codes=action_scope.available_codes,
             unavailable_country_codes=action_scope.unavailable_codes,
-            citation_offset=len(sources),
+            citation_offset=max(
+                (source.citation for source in sources),
+                default=0,
+            ),
         )
 
         metrics.opensearch_ms += took_ms
@@ -1909,6 +2138,46 @@ def resolve_legal_chat_response(
                     ].type
                 )
 
+        local_elliptical_clarification = (
+            _try_local_elliptical_legal_clarification(
+                question=request.question,
+                conversation_state=previous_conversation_state,
+                hints=hints,
+            )
+        )
+
+        if local_elliptical_clarification is not None:
+            metrics.request_understanding_method = (
+                "local_deterministic"
+            )
+            metrics.request_understanding_ms = 0.0
+            metrics.request_understanding_openai_ms = 0.0
+            metrics.request_understanding_attempts = 0
+            metrics.request_status = "clarification"
+            metrics.clarification_reason = (
+                "elliptical_followup"
+            )
+            metrics.outcome = (
+                "clarification_elliptical_followup"
+            )
+            metrics.conversation_state_emitted = True
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+            metrics.log()
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=local_elliptical_clarification,
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+                conversation_state=(
+                    previous_conversation_state
+                ),
+            )
+
         outcome = understand_request(
             current_question=request.question,
             history=history_turns,
@@ -1973,6 +2242,83 @@ def resolve_legal_chat_response(
             result = outcome.result
 
             metrics.request_understanding_method = "semantic"
+
+        # The semantic classifier is probabilistic. A fresh request
+        # must never ask the user to provide country/topic again when
+        # the deterministic layer already found exactly one supported
+        # country and an unambiguous supported legal scope.
+        #
+        # Reuse the existing conservative grounded fallback rather
+        # than fabricate a semantic action. The original user question
+        # still reaches retrieval/generation, so precise wording such
+        # as employee-vs-contractor remains available to the answer
+        # model.
+        if (
+            result.status == "clarification"
+            and previous_conversation_state is None
+            and len(current_country_scope.available_codes) == 1
+            and not current_country_scope.unavailable_codes
+            and current_legal_scope.is_supported
+            and not hints.strong_contact_signal
+            and not hints.comparison_signal
+        ):
+            metrics.request_understanding_confidence = (
+                result.confidence
+            )
+            metrics.request_understanding_method = (
+                "semantic_clarification_recovered"
+            )
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "deterministic_single_legal_scope"
+            )
+
+            response = _resolve_conservative_fallback(
+                request=request,
+                hints=hints,
+                current_country_scope=current_country_scope,
+                current_legal_scope=current_legal_scope,
+                metrics=metrics,
+                search_function=search_function,
+                generation_client=generation_client,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_multiplier=rerank_pool_multiplier,
+                max_context_characters=max_context_characters,
+                max_source_characters=max_source_characters,
+            )
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+            metrics.log()
+
+            return response
+
+        # A fresh, explicit whole-domain employment-law overview
+        # is deterministic enough to normalize even when semantic
+        # understanding returned a technically "resolved" result.
+        #
+        # Without this, stochastic understanding can incorrectly
+        # narrow "employment law in Germany" to Working Conditions,
+        # Hiring, etc., which prevents the dedicated broad retrieval
+        # path from ever running.
+        broad_overview_result = (
+            _try_local_broad_legal_overview_result(
+                question=request.question,
+                previous_conversation_state=(
+                    previous_conversation_state
+                ),
+                hints=hints,
+                current_country_scope=current_country_scope,
+            )
+        )
+
+        if broad_overview_result is not None:
+            result = broad_overview_result
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "broad_legal_overview"
+            )
 
         metrics.request_understanding_confidence = result.confidence
         metrics.contextual_question_used = result.is_follow_up
@@ -2135,6 +2481,19 @@ def resolve_legal_chat_response(
 
             response_conversation_state = None
 
+            # A contextual clarification derived from one existing
+            # legal action must not erase that action. The user's next
+            # reply should continue from the same country/topic rather
+            # than restart the conversation.
+            if (
+                transition_outcome.contextual_clarification_answer
+                is not None
+                and previous_conversation_state is not None
+            ):
+                response_conversation_state = (
+                    previous_conversation_state
+                )
+
             if transition_outcome.pending_clarification is not None:
                 response_conversation_state = (
                     build_next_conversation_state(
@@ -2188,6 +2547,14 @@ def resolve_legal_chat_response(
                     )
                 }
             )
+
+        response = response.model_copy(
+            update={
+                "answer": sanitize_user_facing_legal_answer(
+                    response.answer
+                )
+            }
+        )
 
         metrics.total_ms = (
             perf_counter() - total_started_at

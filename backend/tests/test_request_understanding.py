@@ -953,7 +953,12 @@ class UnderstandRequestTests(unittest.TestCase):
         self.assertEqual(outcome.result.status, "resolved")
 
     def test_invalid_json_text_yields_none_result(self) -> None:
-        client = FakeUnderstandingClient(["this is not JSON at all"])
+        client = FakeUnderstandingClient(
+            [
+                "this is not JSON at all",
+                "this is still not JSON",
+            ]
+        )
 
         outcome = understand_request(
             current_question="q",
@@ -972,7 +977,9 @@ class UnderstandRequestTests(unittest.TestCase):
         payload = _resolved_result(
             actions=[_legal_action(type="not_a_real_type")]
         )
-        client = FakeUnderstandingClient([json.dumps(payload)])
+        client = FakeUnderstandingClient(
+            [json.dumps(payload), json.dumps(payload)]
+        )
 
         outcome = understand_request(
             current_question="q",
@@ -984,6 +991,34 @@ class UnderstandRequestTests(unittest.TestCase):
 
         self.assertIsNone(outcome.result)
         self.assertEqual(outcome.error, "invalid_response")
+
+    def test_invalid_response_then_valid_response_retries_once(
+        self,
+    ) -> None:
+        client = FakeUnderstandingClient(
+            [
+                "not valid JSON",
+                json.dumps(_resolved_result()),
+            ]
+        )
+
+        outcome = understand_request(
+            current_question="q",
+            history=[],
+            hints=DeterministicHints(),
+            catalog_provider=_fake_catalog_provider(),
+            generation_client=client,
+        )
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(outcome.attempts, 2)
+        self.assertTrue(outcome.retry_triggered)
+        self.assertEqual(
+            outcome.retry_reason,
+            "invalid_response",
+        )
+        self.assertIsNotNone(outcome.result)
+        self.assertIsNone(outcome.error)
 
     def test_configuration_error_yields_none_result_with_zero_attempts(
         self,

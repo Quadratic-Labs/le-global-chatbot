@@ -6896,3 +6896,160 @@ class EditRestoreConversationConsistencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class LastMileChatHardeningR3Tests(unittest.TestCase):
+    """Last-mile regressions found during the real client canary."""
+
+    def test_bare_refusal_followup_is_local_clarification_and_keeps_state(
+        self,
+    ) -> None:
+        class UnexpectedUnderstandingClient:
+            def generate(
+                self,
+                instructions,
+                input_text,
+                text_format=None,
+            ):
+                raise AssertionError(
+                    "Request Understanding must not be called."
+                )
+
+        state = ConversationState(
+            version=1,
+            actions=[
+                ConversationActionState(
+                    type="legal_information",
+                    country_codes=["AU"],
+                    legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                    subject_text=(
+                        "notice period requirements for termination"
+                    ),
+                    search_concepts=[
+                        ConversationSearchConcept(
+                            terms=[
+                                "notice period",
+                                "termination notice",
+                            ]
+                        )
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            ],
+            focus_action_index=0,
+            ordered_country_codes=[],
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question="What if the employee refuses?",
+                conversation_state=state,
+            ),
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            understanding_client=UnexpectedUnderstandingClient(),
+        )
+
+        self.assertFalse(response.grounded)
+        self.assertEqual(response.sources, [])
+        self.assertIsNotNone(response.conversation_state)
+        self.assertEqual(
+            response.conversation_state.actions[0].country_codes,
+            ["AU"],
+        )
+        self.assertIn("Australia", response.answer)
+        self.assertIn(
+            "What exactly is the employee refusing",
+            response.answer,
+        )
+        self.assertNotIn(
+            "contact details",
+            response.answer.casefold(),
+        )
+
+    def test_spurious_semantic_clarification_with_known_country_and_topic_recovers(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="clarification",
+                actions=[],
+                is_follow_up=False,
+                clarification_reason="ambiguous_request",
+                current_message_delta=_current_message_delta(
+                    context_operation="independent",
+                ),
+            )
+        )
+
+        generation_client = FakeGenerationClient(
+            answer=(
+                "Australia\n"
+                "- Notice is required before termination [1]."
+            )
+        )
+
+        def fake_search(request):
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    LegalSearchHit(
+                        score=10.0,
+                        document_id="document-au",
+                        chunk_id="chunk-au-notice",
+                        country="Australia",
+                        country_code="AU",
+                        legal_topic=(
+                            "Termination of Employment Contracts"
+                        ),
+                        document_type="comparator",
+                        language="en",
+                        section=(
+                            "Termination of Employment Contracts"
+                        ),
+                        subsection="Notice",
+                        content=(
+                            "Notice is required before termination."
+                        ),
+                        source_filename=(
+                            "Labour and Employment Law in "
+                            "Australia 2026.docx"
+                        ),
+                        source_format="docx",
+                        reference_year=2026,
+                    )
+                ],
+            )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What notice period applies when dismissing "
+                    "an employee in Australia?"
+                ),
+            ),
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            search_function=fake_search,
+            generation_client=generation_client,
+            understanding_client=understanding_client,
+        )
+
+        self.assertTrue(response.grounded)
+        self.assertIn("Australia", response.answer)
+        self.assertNotIn(
+            "Could you clarify your question",
+            response.answer,
+        )
+        self.assertNotIn(
+            "specify the country",
+            response.answer,
+        )
