@@ -29,6 +29,7 @@ from app.models.chat import (
     LegalChatRequest,
     LegalChatResponse,
 )
+from app.models.conversation_state import ConversationPendingClarification
 from app.models.conversation_state import ConversationState
 from app.services.assistant_help import (
     build_assistant_help_answer,
@@ -2234,7 +2235,47 @@ def resolve_legal_chat_response(
             metrics.outcome = (
                 "clarification_elliptical_followup"
             )
-            metrics.conversation_state_emitted = True
+            # This fast-path returns before semantic understanding
+            # and conversation_transition. Preserve the established
+            # legal action AND explicitly record that the next user
+            # message is expected to provide the missing subject
+            # detail; otherwise routing would depend on history alone.
+            response_conversation_state = (
+                previous_conversation_state
+            )
+
+            if (
+                previous_conversation_state is not None
+                and len(previous_conversation_state.actions) == 1
+                and previous_conversation_state.actions[0].type
+                == "legal_information"
+                and previous_conversation_state.actions[0].country_codes
+            ):
+                active_action = (
+                    previous_conversation_state.actions[0]
+                )
+
+                response_conversation_state = (
+                    previous_conversation_state.model_copy(
+                        update={
+                            "pending_clarification": (
+                                ConversationPendingClarification(
+                                    reason="subject_detail",
+                                    candidate_action_types=[
+                                        "legal_information"
+                                    ],
+                                    candidate_country_codes=list(
+                                        active_action.country_codes
+                                    ),
+                                )
+                            )
+                        }
+                    )
+                )
+
+            metrics.conversation_state_emitted = (
+                response_conversation_state is not None
+            )
             metrics.total_ms = (
                 perf_counter() - total_started_at
             ) * 1000
@@ -2247,9 +2288,7 @@ def resolve_legal_chat_response(
                 model=None,
                 retrieval_total=0,
                 sources=[],
-                conversation_state=(
-                    previous_conversation_state
-                ),
+                conversation_state=response_conversation_state,
             )
 
         outcome = understand_request(
@@ -2583,15 +2622,36 @@ def resolve_legal_chat_response(
                 )
 
             if transition_outcome.pending_clarification is not None:
-                response_conversation_state = (
-                    build_next_conversation_state(
-                        executed=[],
-                        pending_clarification=(
-                            transition_outcome.pending_clarification
-                        ),
-                    )
+                pending_clarification = (
+                    transition_outcome.pending_clarification
                 )
-                metrics.conversation_state_emitted = True
+
+                if (
+                    pending_clarification.reason
+                    == "subject_detail"
+                    and previous_conversation_state is not None
+                ):
+                    response_conversation_state = (
+                        previous_conversation_state.model_copy(
+                            update={
+                                "pending_clarification":
+                                    pending_clarification
+                            }
+                        )
+                    )
+                else:
+                    response_conversation_state = (
+                        build_next_conversation_state(
+                            executed=[],
+                            pending_clarification=(
+                                pending_clarification
+                            ),
+                        )
+                    )
+
+                metrics.conversation_state_emitted = (
+                    response_conversation_state is not None
+                )
 
             metrics.total_ms = (
                 perf_counter() - total_started_at

@@ -826,17 +826,10 @@
                     turn.status = "success";
                     turn.answer = renumbered.answer;
                     turn.sources = renumbered.sources;
-                    // Only a genuine legal/contact/comparison/mixed
-                    // answer carries a conversation_state with at
-                    // least one resolved action - never a
-                    // clarification, an out-of-scope refusal, or any
-                    // other dead end (see buildAssistantBubble).
+                    // Routing state may survive a clarification.
+                    // Grounding is the authoritative disclaimer signal.
                     turn.hasDisclaimer = Boolean(
-                        conversationState
-                        && Array.isArray(
-                            conversationState.actions
-                        )
-                        && conversationState.actions.length > 0
+                        response.grounded
                     );
                 } catch (error) {
                     if (

@@ -907,14 +907,66 @@ legal_topics bucket:
   for a genuinely broad question about a whole topic area.
 Leave all four null for a contact action.
 
-Country resolution: you are given every country the product currently
-has validated documents for, as "CODE: Name" pairs. Resolve country
-names, aliases, demonyms/national adjectives (e.g. a Spanish person or
-company refers to Spain), and well-known cities unambiguously located in
-one of these countries, to that country's code. Only ever output a code
-from that list. If a place is ambiguous, or not confidently one of these
-countries, do not guess - leave it out (this surfaces as a clarification
-instead).
+Country resolution: you are given every country the
+product currently has validated documents for, as "CODE: Name" pairs.
+
+IMPORTANT: country_codes represents the LEGAL JURISDICTION(S) the user
+wants the employment-law answer for. It is not a list of every country,
+nationality, city or geographic reference appearing in the message.
+
+First determine the semantic role of every geographic reference.
+
+Possible roles include:
+- requested legal jurisdiction;
+- travel destination;
+- nationality;
+- residence;
+- customer/vendor location;
+- company headquarters or office;
+- another factual location.
+
+An incidental geographic reference does NOT by itself replace an
+already active legal jurisdiction.
+
+Examples:
+
+German vacation-law context:
+"I already booked the trip."
+=> continue the German vacation-law question.
+
+German vacation-law context:
+"I will go to Spain."
+=> Spain is the destination. Keep Germany as the legal jurisdiction.
+
+German employment-law context:
+"The employee is Spanish."
+=> nationality does not switch the jurisdiction to Spain.
+
+German employment-law context:
+"Our biggest customer is in Spain."
+=> customer location does not switch the jurisdiction to Spain.
+
+By contrast, these explicitly request another legal jurisdiction:
+"And Spain?"
+"What about Spain?"
+"How does this work in Spain?"
+"The same issue in Spain."
+"Under Spanish law?"
+"How does the same issue work under Spanish law?"
+
+Against one active legal-information action, those are normally
+replace_country operations. They are NOT comparisons merely because
+the conversation previously concerned another country.
+
+Use comparison only when the user actually asks to compare, contrast,
+identify differences between or jointly analyse jurisdictions.
+
+Resolve country names, aliases, demonyms/national adjectives and
+well-known cities only AFTER determining the semantic role.
+
+Only output supported country codes. If the LEGAL jurisdiction itself
+is genuinely ambiguous, ask for the missing clarification rather than
+guessing.
 
 Explicit filters: if the request already carries explicit country codes,
 legal topics, or subsections, treat them as binding constraints, not
