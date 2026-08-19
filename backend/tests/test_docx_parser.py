@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from docx import Document
 from docx.oxml import OxmlElement
@@ -11,6 +12,7 @@ from app.core.legal_taxonomy import get_canonical_legal_topic
 from app.core.subsection_taxonomy import get_subsection_topic_override
 from app.services.docx_parser import (
     build_contact_chunk_content,
+    extract_contacts_from_docx,
     parse_contact_blocks,
     parse_docx_sections,
 )
@@ -1593,6 +1595,101 @@ class ContactBlockParsingTests(unittest.TestCase):
             contact.email or "",
         )
 
+    def test_postal_code_before_real_phone_does_not_win(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Atsumi & Sakai",
+                "Japan",
+                (
+                    "Fukoku Seimei Bldg., Reception: 16 F, "
+                    "2-2-2 Uchisaiwaicho, Chiyoda-ku, "
+                    "100-0011 Tokyo, +81 355 012 111"
+                ),
+                "www.aplaw.jp/en/",
+            ],
+            [
+                "CONTACT PERSON",
+                "Tatsuo Yamashima",
+                "tatsuo.yamashima@aplaw.jp",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks,
+            country="Japan",
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        contact = contacts[0]
+
+        self.assertEqual(
+            contact.phone,
+            "+81 355 012 111",
+        )
+
+        self.assertIn(
+            "100-0011 Tokyo",
+            contact.address or "",
+        )
+
+        self.assertNotIn(
+            "+81 355 012 111",
+            contact.address or "",
+        )
+
+        self.assertEqual(
+            contact.member_firm,
+            "Atsumi & Sakai",
+        )
+
+        self.assertEqual(
+            contact.contact_person,
+            "Tatsuo Yamashima",
+        )
+
+
+    def test_postal_code_line_before_local_phone_prefers_phone(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Example Firm",
+                "100-0011 Tokyo",
+                "03 5501 2111",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        self.assertEqual(
+            contacts[0].phone,
+            "03 5501 2111",
+        )
+
+        self.assertIn(
+            "100-0011 Tokyo",
+            contacts[0].address or "",
+        )
+
+        self.assertNotIn(
+            "03 5501 2111",
+            contacts[0].address or "",
+        )
+
+
     def test_multiple_documents_worth_of_contacts_are_all_kept(
         self,
     ) -> None:
@@ -1723,6 +1820,399 @@ class ContactBlockParsingTests(unittest.TestCase):
             "Website",
             content,
         )
+
+
+
+
+class PlainParagraphContactFallbackTests(unittest.TestCase):
+    """Contract for contacts stored in ordinary DOCX paragraphs."""
+
+    def test_france_plain_paragraph_contact_is_extracted(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "france-body-contact.docx"
+            )
+
+            document = Document()
+
+            document.add_paragraph("FRANCE")
+            document.add_paragraph(
+                "EMPLOYMENT LAW OVERVIEWS 2025 - 2026"
+            )
+            document.add_paragraph(
+                "FLICHY GRANGÉ AVOCATS"
+            )
+
+            document.add_heading(
+                "I. GENERAL OVERVIEW",
+                level=1,
+            )
+            document.add_paragraph(
+                "Representative employment-law content."
+            )
+
+            document.add_paragraph(
+                "Caroline Scherrmann and Florence Bacquet"
+            )
+            document.add_paragraph(
+                "Partners, Flichy Grangé Avocats"
+            )
+            document.add_paragraph(
+                "scherrmann@flichy.com"
+            )
+            document.add_paragraph(
+                "bacquet@flichy.com"
+            )
+            document.add_paragraph(
+                "+33 1 56 62 30 00"
+            )
+
+            document.add_paragraph(
+                "YOUR L&E GLOBAL POC"
+            )
+            document.add_paragraph(
+                (
+                    "For all inquiries related to this project, "
+                    "please contact Jessica Stout, International "
+                    "Business Development Executive at L&E Global, "
+                    "at jessica.stout@leglobal.law."
+                )
+            )
+
+            document.save(file_path)
+
+            contacts = extract_contacts_from_docx(
+                file_path,
+                country="France",
+            )
+
+            self.assertEqual(
+                len(contacts),
+                1,
+            )
+
+            contact = contacts[0]
+
+            self.assertEqual(
+                contact.member_firm,
+                "Flichy Grangé Avocats",
+            )
+            self.assertEqual(
+                contact.contact_person,
+                (
+                    "Caroline Scherrmann and "
+                    "Florence Bacquet"
+                ),
+            )
+            self.assertEqual(
+                contact.email,
+                (
+                    "scherrmann@flichy.com, "
+                    "bacquet@flichy.com"
+                ),
+            )
+            self.assertEqual(
+                contact.phone,
+                "+33 1 56 62 30 00",
+            )
+            self.assertIsNone(contact.address)
+            self.assertIsNone(contact.website)
+
+            rendered = " ".join(
+                value
+                for value in (
+                    contact.member_firm,
+                    contact.contact_person,
+                    contact.email,
+                    contact.phone,
+                )
+                if value
+            )
+
+            self.assertNotIn(
+                "Jessica Stout",
+                rendered,
+            )
+            self.assertNotIn(
+                "jessica.stout@leglobal.law",
+                rendered,
+            )
+
+    def test_generic_plain_paragraph_contact_is_extracted(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "generic-body-contact.docx"
+            )
+
+            document = Document()
+
+            document.add_paragraph("FREEDONIA")
+            document.add_paragraph(
+                "Example Employment Law"
+            )
+
+            document.add_heading(
+                "Employment Contracts",
+                level=1,
+            )
+            document.add_paragraph(
+                "Representative legal information."
+            )
+
+            document.add_paragraph(
+                "Alex Example and Sam Sample"
+            )
+            document.add_paragraph(
+                "Partners, Example Employment Law"
+            )
+            document.add_paragraph(
+                "alex@example-law.test"
+            )
+            document.add_paragraph(
+                "sam@example-law.test"
+            )
+            document.add_paragraph(
+                "+99 123 456 789"
+            )
+
+            document.save(file_path)
+
+            contacts = extract_contacts_from_docx(
+                file_path,
+                country="Freedonia",
+            )
+
+            self.assertEqual(
+                len(contacts),
+                1,
+            )
+
+            contact = contacts[0]
+
+            self.assertEqual(
+                contact.member_firm,
+                "Example Employment Law",
+            )
+            self.assertEqual(
+                contact.contact_person,
+                "Alex Example and Sam Sample",
+            )
+            self.assertEqual(
+                contact.email,
+                (
+                    "alex@example-law.test, "
+                    "sam@example-law.test"
+                ),
+            )
+            self.assertEqual(
+                contact.phone,
+                "+99 123 456 789",
+            )
+
+    def test_project_poc_alone_is_not_member_firm_contact(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "project-poc-only.docx"
+            )
+
+            document = Document()
+
+            document.add_paragraph(
+                "YOUR L&E GLOBAL POC"
+            )
+            document.add_paragraph(
+                (
+                    "For all inquiries related to this project, "
+                    "please contact Jessica Stout, International "
+                    "Business Development Executive at L&E Global, "
+                    "at jessica.stout@leglobal.law."
+                )
+            )
+
+            document.save(file_path)
+
+            self.assertEqual(
+                extract_contacts_from_docx(
+                    file_path,
+                    country="France",
+                ),
+                [],
+            )
+
+    def test_firm_name_alone_is_not_a_contact(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "Portugal",
+                "SRS LEGAL",
+            ),
+            (
+                "Taiwan",
+                "Lee and Li, Attorneys-at-Law",
+            ),
+        )
+
+        for country, firm_name in cases:
+            with self.subTest(country=country):
+                with TemporaryDirectory() as temporary_directory:
+                    file_path = (
+                        Path(temporary_directory)
+                        / f"{country.lower()}-firm-only.docx"
+                    )
+
+                    document = Document()
+                    document.add_paragraph(
+                        country.upper()
+                    )
+                    document.add_paragraph(
+                        firm_name
+                    )
+                    document.add_heading(
+                        "GENERAL OVERVIEW",
+                        level=1,
+                    )
+                    document.add_paragraph(
+                        "Representative legal information."
+                    )
+
+                    document.save(file_path)
+
+                    self.assertEqual(
+                        extract_contacts_from_docx(
+                            file_path,
+                            country=country,
+                        ),
+                        [],
+                    )
+
+    def test_legal_reference_coordinates_do_not_become_contact(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "legal-references-only.docx"
+            )
+
+            document = Document()
+
+            document.add_paragraph(
+                "PHILIPPINES"
+            )
+            document.add_heading(
+                "Employment Benefits",
+                level=1,
+            )
+            document.add_paragraph(
+                (
+                    "More information may be obtained from the "
+                    "public labour authority at "
+                    "www.labour-authority.example."
+                )
+            )
+            document.add_paragraph(
+                (
+                    "The authority may also be reached at "
+                    "+63 2 8123 4567 for public information."
+                )
+            )
+
+            document.save(file_path)
+
+            self.assertEqual(
+                extract_contacts_from_docx(
+                    file_path,
+                    country="Philippines",
+                ),
+                [],
+            )
+
+    def test_existing_text_box_contact_keeps_priority(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = (
+                Path(temporary_directory)
+                / "legacy-textbox-priority.docx"
+            )
+
+            document = Document()
+
+            document.add_paragraph(
+                "Alternative Person"
+            )
+            document.add_paragraph(
+                "Partner, Alternative Firm"
+            )
+            document.add_paragraph(
+                "alternative@alternative.example"
+            )
+            document.add_paragraph(
+                "+44 20 0000 0000"
+            )
+
+            document.save(file_path)
+
+            legacy_blocks = [
+                [
+                    "Stable Firm",
+                    "Testland",
+                    "1 Existing Street",
+                    "+1 555 111 2222",
+                    "www.stable.example",
+                ],
+                [
+                    "CONTACT PERSON",
+                    "Stable Person",
+                    "stable@stable.example",
+                ],
+            ]
+
+            with patch(
+                (
+                    "app.services.docx_parser."
+                    "extract_text_box_blocks"
+                ),
+                return_value=legacy_blocks,
+            ):
+                contacts = extract_contacts_from_docx(
+                    file_path,
+                    country="Testland",
+                )
+
+            self.assertEqual(
+                len(contacts),
+                1,
+            )
+
+            contact = contacts[0]
+
+            self.assertEqual(
+                contact.member_firm,
+                "Stable Firm",
+            )
+            self.assertEqual(
+                contact.contact_person,
+                "Stable Person",
+            )
+            self.assertEqual(
+                contact.email,
+                "stable@stable.example",
+            )
+            self.assertEqual(
+                contact.phone,
+                "+1 555 111 2222",
+            )
 
 
 if __name__ == "__main__":

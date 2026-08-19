@@ -1431,6 +1431,107 @@ def extract_text_box_blocks(
     return blocks
 
 
+def _select_contact_phone(
+    block: Sequence[str],
+) -> str | None:
+    """
+    Select the most plausible telephone number from a firm card.
+
+    A postal code can also satisfy the deliberately permissive
+    _PHONE_PATTERN. Searching the whole joined block and accepting
+    its first match therefore makes an address such as
+
+        100-0011 Tokyo, +81 355 012 111
+
+    incorrectly select 100-0011 as the telephone.
+
+    Evaluate every match independently instead. Prefer candidates
+    with at least eight digits, then explicit international numbers,
+    then a candidate occupying its whole visual line, and finally
+    the candidate containing the most digits.
+
+    If only a shorter candidate exists it is still preserved, so this
+    remains backwards-compatible with unusual short telephone formats.
+    """
+
+    candidates: list[
+        tuple[
+            tuple[int, int, int, int],
+            str,
+        ]
+    ] = []
+
+    for line in block[1:]:
+        normalized_line = _normalize_text(line)
+
+        for match in _PHONE_PATTERN.finditer(line):
+            candidate = match.group(0).strip()
+
+            if not candidate:
+                continue
+
+            digit_count = sum(
+                character.isdigit()
+                for character in candidate
+            )
+
+            score = (
+                int(digit_count >= 8),
+                int(candidate.startswith("+")),
+                int(
+                    _normalize_text(candidate)
+                    == normalized_line
+                ),
+                digit_count,
+            )
+
+            candidates.append(
+                (
+                    score,
+                    candidate,
+                )
+            )
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda item: item[0],
+    )[1]
+
+
+def _remove_contact_phone_from_address_line(
+    line: str,
+    phone: str | None,
+) -> str:
+    """
+    Remove the selected telephone from an address line while keeping
+    the rest of that line.
+
+    Some DOCX contact cards visually place the telephone at the end
+    of the same text-box paragraph as the postal address.
+    """
+
+    if not phone or phone not in line:
+        return line
+
+    cleaned = line.replace(
+        phone,
+        "",
+        1,
+    )
+
+    cleaned = _normalize_text(cleaned)
+    cleaned = _REPEATED_COMMA_PATTERN.sub(
+        ",",
+        cleaned,
+    )
+
+    return cleaned.strip(" ,")
+
+
+
 def parse_contact_blocks(
     blocks: Sequence[Sequence[str]],
     country: str | None = None,
@@ -1530,8 +1631,8 @@ def parse_contact_blocks(
             block
         )
 
-        phone_match = _PHONE_PATTERN.search(
-            joined
+        phone = _select_contact_phone(
+            block
         )
 
         website_match = _WEBSITE_PATTERN.search(
@@ -1540,26 +1641,37 @@ def parse_contact_blocks(
 
         if not (
             _EMAIL_PATTERN.search(joined)
-            or phone_match
+            or phone
         ):
             continue
 
-        address_lines = [
-            line
-            for line in block[1:]
-            if not (
-                phone_match
-                and line == phone_match.group(0)
-            )
-            and not (
+        address_lines: list[str] = []
+
+        for line in block[1:]:
+            if (
                 website_match
                 and line == website_match.group(0)
+            ):
+                continue
+
+            if (
+                normalized_country is not None
+                and line.casefold()
+                == normalized_country
+            ):
+                continue
+
+            address_line = (
+                _remove_contact_phone_from_address_line(
+                    line,
+                    phone,
+                )
             )
-            and (
-                normalized_country is None
-                or line.casefold() != normalized_country
-            )
-        ]
+
+            if address_line:
+                address_lines.append(
+                    address_line
+                )
 
         firm_entries.append(
             {
@@ -1568,11 +1680,7 @@ def parse_contact_blocks(
                     if block
                     else None
                 ),
-                "phone": (
-                    phone_match.group(0)
-                    if phone_match
-                    else None
-                ),
+                "phone": phone,
                 "website": (
                     website_match.group(0)
                     if website_match
@@ -1709,6 +1817,427 @@ def parse_contact_blocks(
     return contacts
 
 
+
+def _extract_standalone_contact_emails(
+    line: str,
+) -> list[str]:
+    """
+    Return emails only when the visual paragraph consists solely of
+    one or more email addresses.
+
+    This deliberately rejects emails embedded in ordinary prose, such
+    as a project-level L&E Global POC sentence.
+    """
+
+    normalized = _normalize_text(
+        line
+    )
+
+    if not normalized:
+        return []
+
+    candidate = re.sub(
+        r"(?i)\bmailto:",
+        "",
+        normalized,
+    )
+
+    matches = [
+        match.group(0)
+        for match in _EMAIL_PATTERN.finditer(
+            candidate
+        )
+    ]
+
+    if not matches:
+        return []
+
+    remainder = _EMAIL_PATTERN.sub(
+        "",
+        candidate,
+    )
+
+    remainder = re.sub(
+        r"[\s,;|/]+",
+        "",
+        remainder,
+    )
+
+    if remainder:
+        return []
+
+    return matches
+
+
+def _extract_standalone_contact_phone(
+    line: str,
+) -> str | None:
+    """
+    Return a telephone only when the whole paragraph is phone-like.
+
+    Legal prose containing a number therefore cannot become contact
+    data merely because the permissive phone regex finds a match.
+    """
+
+    normalized = _normalize_text(
+        line
+    )
+
+    if not normalized:
+        return None
+
+    candidates: list[
+        tuple[int, int, str]
+    ] = []
+
+    for match in _PHONE_PATTERN.finditer(
+        normalized
+    ):
+        candidate = match.group(0).strip()
+
+        digit_count = sum(
+            character.isdigit()
+            for character in candidate
+        )
+
+        if digit_count < 8:
+            continue
+
+        remainder = (
+            normalized[:match.start()]
+            + normalized[match.end():]
+        )
+
+        remainder = re.sub(
+            r"[\s,;:|/()\-]+",
+            "",
+            remainder,
+        )
+
+        if remainder:
+            continue
+
+        candidates.append(
+            (
+                int(candidate.startswith("+")),
+                digit_count,
+                candidate,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda item: (
+            item[0],
+            item[1],
+        ),
+    )[2]
+
+
+def _plain_contact_role_and_firm(
+    line: str,
+) -> tuple[str, str] | None:
+    """
+    Parse a high-confidence role/firm paragraph.
+
+    Examples:
+        Partners, Flichy Grangé Avocats
+        Partner, Example Employment Law
+
+    A firm name on its own is intentionally insufficient.
+    """
+
+    normalized = _normalize_text(
+        line
+    )
+
+    if not normalized:
+        return None
+
+    match = re.match(
+        (
+            r"^(?P<role>"
+            r"(?:managing\s+|senior\s+)?partners?"
+            r"|attorneys?"
+            r"|lawyers?"
+            r"|counsel"
+            r"|associates?"
+            r")"
+            r"\s*[,:\-]\s*"
+            r"(?P<firm>.+?)\s*$"
+        ),
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    if match is None:
+        return None
+
+    firm = _normalize_text(
+        match.group("firm")
+    )
+
+    if not firm:
+        return None
+
+    return (
+        _normalize_text(
+            match.group("role")
+        ),
+        firm,
+    )
+
+
+def _looks_like_plain_contact_person(
+    line: str,
+) -> bool:
+    """
+    Conservative validation for the person/persons paragraph that
+    precedes a role + firm line.
+    """
+
+    normalized = _normalize_text(
+        line
+    )
+
+    if not normalized:
+        return False
+
+    if len(normalized) > 120:
+        return False
+
+    if (
+        _EMAIL_PATTERN.search(normalized)
+        or _WEBSITE_PATTERN.search(normalized)
+        or _PHONE_PATTERN.search(normalized)
+    ):
+        return False
+
+    lowered = normalized.casefold()
+
+    if lowered.startswith(
+        (
+            "for ",
+            "please ",
+            "this ",
+            "the ",
+            "your ",
+            "contact ",
+            "www.",
+            "http://",
+            "https://",
+        )
+    ):
+        return False
+
+    words = normalized.split()
+
+    if not 2 <= len(words) <= 12:
+        return False
+
+    alphabetic_words = [
+        word
+        for word in words
+        if any(
+            character.isalpha()
+            for character in word
+        )
+    ]
+
+    return len(
+        alphabetic_words
+    ) >= 2
+
+
+def _extract_plain_paragraph_contacts(
+    file_path: Path,
+) -> list[ExtractedContact]:
+    """
+    Conservative fallback for organically-uploaded DOCX files whose
+    member-firm contact is stored in ordinary body paragraphs rather
+    than Word text boxes.
+
+    This is intentionally NOT a general scan for every email, phone,
+    URL, or firm name in the document.
+
+    A contact requires a local, coherent structure:
+
+        person/persons
+        role, member firm
+        standalone email(s)
+        optional standalone phone
+
+    That high-confidence shape prevents ordinary legal references,
+    government URLs, project-level POCs, and a bare authoring-firm
+    name from becoming contact records.
+
+    Existing text-box contacts never reach this function:
+    extract_contacts_from_docx() returns those first.
+    """
+
+    try:
+        from docx import Document as WordDocument
+
+        document = WordDocument(
+            file_path
+        )
+
+    except Exception:
+        # Contact extraction is optional metadata. Preserve the legacy
+        # behaviour of returning no contacts when this fallback cannot
+        # read the DOCX, rather than changing the document's legal
+        # parsing/error boundary.
+        return []
+
+    lines = [
+        normalized
+        for paragraph in document.paragraphs
+        if (
+            normalized := _normalize_text(
+                paragraph.text
+            )
+        )
+    ]
+
+    contacts: list[
+        ExtractedContact
+    ] = []
+
+    seen: set[
+        tuple[
+            str | None,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+
+    index = 0
+
+    while index < len(lines):
+        emails = (
+            _extract_standalone_contact_emails(
+                lines[index]
+            )
+        )
+
+        if not emails:
+            index += 1
+            continue
+
+        first_email_index = index
+        all_emails = list(
+            emails
+        )
+
+        index += 1
+
+        while index < len(lines):
+            additional = (
+                _extract_standalone_contact_emails(
+                    lines[index]
+                )
+            )
+
+            if not additional:
+                break
+
+            all_emails.extend(
+                additional
+            )
+
+            index += 1
+
+        if first_email_index < 2:
+            continue
+
+        role_line = lines[
+            first_email_index - 1
+        ]
+
+        person_line = lines[
+            first_email_index - 2
+        ]
+
+        role_and_firm = (
+            _plain_contact_role_and_firm(
+                role_line
+            )
+        )
+
+        if role_and_firm is None:
+            continue
+
+        if not _looks_like_plain_contact_person(
+            person_line
+        ):
+            continue
+
+        # Explicit defence against project-level/global POC regions.
+        nearby_start = max(
+            0,
+            first_email_index - 4,
+        )
+
+        nearby = " ".join(
+            lines[
+                nearby_start:
+                first_email_index + 1
+            ]
+        ).casefold()
+
+        if (
+            "l&e global poc" in nearby
+            or "l & e global poc" in nearby
+        ):
+            continue
+
+        _, member_firm = (
+            role_and_firm
+        )
+
+        phone = None
+
+        if index < len(lines):
+            phone = (
+                _extract_standalone_contact_phone(
+                    lines[index]
+                )
+            )
+
+        contact = ExtractedContact(
+            member_firm=member_firm,
+            contact_person=person_line,
+            email=", ".join(
+                all_emails
+            ),
+            phone=phone,
+            address=None,
+            website=None,
+        )
+
+        key = (
+            contact.member_firm,
+            contact.contact_person,
+            contact.email,
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+
+        contacts.append(
+            contact
+        )
+
+    return contacts
+
+
 def extract_contacts_from_docx(
     file_path: Path,
     country: str | None = None,
@@ -1730,11 +2259,18 @@ def extract_contacts_from_docx(
     if deterministic_contacts is not None:
         return deterministic_contacts
 
-    return parse_contact_blocks(
+    legacy_contacts = parse_contact_blocks(
         extract_text_box_blocks(
             file_path
         ),
         country=country,
+    )
+
+    if legacy_contacts:
+        return legacy_contacts
+
+    return _extract_plain_paragraph_contacts(
+        file_path
     )
 
 
