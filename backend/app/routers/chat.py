@@ -42,6 +42,7 @@ from app.services.conversation_transition import (
     ConversationTransitionError,
     apply_conversation_transition,
     build_next_conversation_state,
+    resolve_contextual_multi_country_contact_codes,
 )
 from app.services.conversation_meta import (
     append_personalised_legal_caution,
@@ -1769,6 +1770,31 @@ def _resolve_conservative_fallback(
     )
 
 
+def _legal_generation_user_question(
+    *,
+    original_question: str,
+    resolved_legal_question: str,
+    has_contact_actions: bool,
+) -> str:
+    """
+    Select the conversational question exposed to legal generation.
+
+    For a mixed legal + contact request, contact rendering is handled
+    deterministically later by _build_contact_section(). The legal
+    generator must therefore see only the resolved legal question and
+    must never speculate about contact availability.
+
+    Pure legal requests preserve the literal current user message so
+    challenge/follow-up wording such as "Are you sure?" still reaches
+    the legal generator unchanged.
+    """
+
+    if has_contact_actions:
+        return resolved_legal_question
+
+    return original_question
+
+
 def _aggregate_action_country_codes(
     resolved_action_countries: list[dict[str, object]],
 ) -> list[str]:
@@ -2065,7 +2091,13 @@ def _execute_resolved_plan(
                 max_context_characters=max_context_characters,
                 max_source_characters=max_source_characters,
                 metrics=metrics,
-                current_user_question=request.question,
+                current_user_question=(
+                    _legal_generation_user_question(
+                        original_question=request.question,
+                        resolved_legal_question=merged_question,
+                        has_contact_actions=bool(contact_actions),
+                    )
+                ),
                 action_specs=action_specs or None,
                 known_excluded_country_codes=(
                     merged_unavailable_codes or None
@@ -2401,9 +2433,20 @@ def resolve_legal_chat_response(
     # The incoming conversation_state is returned completely
     # unchanged - a help question must never advance, reset, or lose
     # whatever legal action/focus a prior turn had (section 15).
-    help_intent = detect_assistant_help_intent(
-        request.question,
-        tuple(country.code for country in COUNTRIES),
+    contextual_contact_country_codes = (
+        resolve_contextual_multi_country_contact_codes(
+            request.question,
+            request.conversation_state,
+        )
+    )
+
+    help_intent = (
+        None
+        if contextual_contact_country_codes is not None
+        else detect_assistant_help_intent(
+            request.question,
+            tuple(country.code for country in COUNTRIES),
+        )
     )
 
     if help_intent is not None:
@@ -2624,7 +2667,7 @@ def resolve_legal_chat_response(
         # resolved country must not be sent back to a generic
         # missing-country clarification from semantic understanding.
         if (
-            result.status == "clarification"
+            result.status in {"clarification", "unsupported"}
             and previous_conversation_state is None
             and hints.strong_contact_signal
             and (
@@ -2632,13 +2675,16 @@ def resolve_legal_chat_response(
             + len(current_country_scope.unavailable_codes)
             == 1
         )
+            and not current_legal_scope.is_supported
             and not hints.comparison_signal
         ):
             metrics.request_understanding_confidence = (
                 result.confidence
             )
             metrics.request_understanding_method = (
-                "semantic_contact_clarification_recovered"
+                "semantic_contact_unsupported_recovered"
+                if result.status == "unsupported"
+                else "semantic_contact_clarification_recovered"
             )
             metrics.semantic_result_overridden = True
             metrics.semantic_override_reason = (
@@ -2665,6 +2711,77 @@ def resolve_legal_chat_response(
             metrics.log()
 
             return response
+
+        # A deterministically recognized legal question for one
+        # country outside the validated corpus must not degrade to the
+        # generic out-of-scope answer merely because semantic
+        # understanding returned clarification/unsupported.
+        #
+        # Deliberately restricted to:
+        # - exactly one unavailable country,
+        # - a supported legal topic,
+        # - no contact intent,
+        # - no comparison intent.
+        #
+        # Thus unrelated questions such as weather in Tunisia remain
+        # genuinely out of scope.
+        if (
+            result.status in {"clarification", "unsupported"}
+            and previous_conversation_state is None
+            and not current_country_scope.available_codes
+            and len(current_country_scope.unavailable_codes) == 1
+            and current_legal_scope.is_supported
+            and not hints.strong_contact_signal
+            and not hints.comparison_signal
+        ):
+            metrics.request_understanding_confidence = (
+                result.confidence
+            )
+            metrics.request_understanding_method = (
+                "semantic_unavailable_legal_country_recovered"
+            )
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "deterministic_single_unavailable_legal_scope"
+            )
+
+            # A recognized country outside the validated corpus is
+            # already a complete deterministic answer. Never send it
+            # through RAG or the generic conservative fallback.
+            metrics.outcome = "fallback_unavailable_country"
+            metrics.retrieval_total = 0
+            metrics.selected_sources = 0
+            metrics.model = None
+            metrics.generation_attempts = 0
+
+            metrics.request_actions = ["legal_information"]
+            metrics.resolved_action_countries = [
+                {
+                    "type": "legal_information",
+                    "country_codes": [],
+                }
+            ]
+            metrics.resolved_country_codes = []
+            metrics.resolved_legal_topics = list(
+                current_legal_scope.legal_topics
+            )
+
+            metrics.total_ms = (
+                perf_counter() - total_started_at
+            ) * 1000
+            metrics.log()
+
+            return LegalChatResponse(
+                question=request.question.strip(),
+                answer=_unavailable_countries_answer(
+                    current_country_scope.unavailable_codes
+                ),
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+                conversation_state=None,
+            )
 
         if (
             result.status == "clarification"

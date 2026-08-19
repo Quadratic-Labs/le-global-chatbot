@@ -1431,6 +1431,107 @@ def extract_text_box_blocks(
     return blocks
 
 
+def _select_contact_phone(
+    block: Sequence[str],
+) -> str | None:
+    """
+    Select the most plausible telephone number from a firm card.
+
+    A postal code can also satisfy the deliberately permissive
+    _PHONE_PATTERN. Searching the whole joined block and accepting
+    its first match therefore makes an address such as
+
+        100-0011 Tokyo, +81 355 012 111
+
+    incorrectly select 100-0011 as the telephone.
+
+    Evaluate every match independently instead. Prefer candidates
+    with at least eight digits, then explicit international numbers,
+    then a candidate occupying its whole visual line, and finally
+    the candidate containing the most digits.
+
+    If only a shorter candidate exists it is still preserved, so this
+    remains backwards-compatible with unusual short telephone formats.
+    """
+
+    candidates: list[
+        tuple[
+            tuple[int, int, int, int],
+            str,
+        ]
+    ] = []
+
+    for line in block[1:]:
+        normalized_line = _normalize_text(line)
+
+        for match in _PHONE_PATTERN.finditer(line):
+            candidate = match.group(0).strip()
+
+            if not candidate:
+                continue
+
+            digit_count = sum(
+                character.isdigit()
+                for character in candidate
+            )
+
+            score = (
+                int(digit_count >= 8),
+                int(candidate.startswith("+")),
+                int(
+                    _normalize_text(candidate)
+                    == normalized_line
+                ),
+                digit_count,
+            )
+
+            candidates.append(
+                (
+                    score,
+                    candidate,
+                )
+            )
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda item: item[0],
+    )[1]
+
+
+def _remove_contact_phone_from_address_line(
+    line: str,
+    phone: str | None,
+) -> str:
+    """
+    Remove the selected telephone from an address line while keeping
+    the rest of that line.
+
+    Some DOCX contact cards visually place the telephone at the end
+    of the same text-box paragraph as the postal address.
+    """
+
+    if not phone or phone not in line:
+        return line
+
+    cleaned = line.replace(
+        phone,
+        "",
+        1,
+    )
+
+    cleaned = _normalize_text(cleaned)
+    cleaned = _REPEATED_COMMA_PATTERN.sub(
+        ",",
+        cleaned,
+    )
+
+    return cleaned.strip(" ,")
+
+
+
 def parse_contact_blocks(
     blocks: Sequence[Sequence[str]],
     country: str | None = None,
@@ -1530,8 +1631,8 @@ def parse_contact_blocks(
             block
         )
 
-        phone_match = _PHONE_PATTERN.search(
-            joined
+        phone = _select_contact_phone(
+            block
         )
 
         website_match = _WEBSITE_PATTERN.search(
@@ -1540,26 +1641,37 @@ def parse_contact_blocks(
 
         if not (
             _EMAIL_PATTERN.search(joined)
-            or phone_match
+            or phone
         ):
             continue
 
-        address_lines = [
-            line
-            for line in block[1:]
-            if not (
-                phone_match
-                and line == phone_match.group(0)
-            )
-            and not (
+        address_lines: list[str] = []
+
+        for line in block[1:]:
+            if (
                 website_match
                 and line == website_match.group(0)
+            ):
+                continue
+
+            if (
+                normalized_country is not None
+                and line.casefold()
+                == normalized_country
+            ):
+                continue
+
+            address_line = (
+                _remove_contact_phone_from_address_line(
+                    line,
+                    phone,
+                )
             )
-            and (
-                normalized_country is None
-                or line.casefold() != normalized_country
-            )
-        ]
+
+            if address_line:
+                address_lines.append(
+                    address_line
+                )
 
         firm_entries.append(
             {
@@ -1568,11 +1680,7 @@ def parse_contact_blocks(
                     if block
                     else None
                 ),
-                "phone": (
-                    phone_match.group(0)
-                    if phone_match
-                    else None
-                ),
+                "phone": phone,
                 "website": (
                     website_match.group(0)
                     if website_match

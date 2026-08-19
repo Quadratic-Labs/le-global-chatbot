@@ -1593,6 +1593,101 @@ class ContactBlockParsingTests(unittest.TestCase):
             contact.email or "",
         )
 
+    def test_postal_code_before_real_phone_does_not_win(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Atsumi & Sakai",
+                "Japan",
+                (
+                    "Fukoku Seimei Bldg., Reception: 16 F, "
+                    "2-2-2 Uchisaiwaicho, Chiyoda-ku, "
+                    "100-0011 Tokyo, +81 355 012 111"
+                ),
+                "www.aplaw.jp/en/",
+            ],
+            [
+                "CONTACT PERSON",
+                "Tatsuo Yamashima",
+                "tatsuo.yamashima@aplaw.jp",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks,
+            country="Japan",
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        contact = contacts[0]
+
+        self.assertEqual(
+            contact.phone,
+            "+81 355 012 111",
+        )
+
+        self.assertIn(
+            "100-0011 Tokyo",
+            contact.address or "",
+        )
+
+        self.assertNotIn(
+            "+81 355 012 111",
+            contact.address or "",
+        )
+
+        self.assertEqual(
+            contact.member_firm,
+            "Atsumi & Sakai",
+        )
+
+        self.assertEqual(
+            contact.contact_person,
+            "Tatsuo Yamashima",
+        )
+
+
+    def test_postal_code_line_before_local_phone_prefers_phone(
+        self,
+    ) -> None:
+        blocks = [
+            [
+                "Example Firm",
+                "100-0011 Tokyo",
+                "03 5501 2111",
+            ],
+        ]
+
+        contacts = parse_contact_blocks(
+            blocks
+        )
+
+        self.assertEqual(
+            len(contacts),
+            1,
+        )
+
+        self.assertEqual(
+            contacts[0].phone,
+            "03 5501 2111",
+        )
+
+        self.assertIn(
+            "100-0011 Tokyo",
+            contacts[0].address or "",
+        )
+
+        self.assertNotIn(
+            "03 5501 2111",
+            contacts[0].address or "",
+        )
+
+
     def test_multiple_documents_worth_of_contacts_are_all_kept(
         self,
     ) -> None:

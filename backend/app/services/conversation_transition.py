@@ -267,6 +267,177 @@ def _explicit_same_subject_country_codes(
     return semantic_codes
 
 
+_CONTEXTUAL_CONTACT_REQUEST_PATTERN = re.compile(
+    r"\b(?:give|send|provide|show)\s+(?:me|us)\b"
+    r"|\b(?:can|could|would)\s+you\s+"
+    r"(?:give|send|provide|show)\b"
+    r"|\b(?:can|could|may)\s+i\s+(?:have|get)\b"
+    r"|\bi\s+(?:need|want|would\s+like)\b"
+    r"|\bwho\s+(?:can|should)\s+i\s+"
+    r"(?:contact|reach|email|call)\b"
+    r"|\bhow\s+(?:can|do|should)\s+i\s+"
+    r"(?:contact|reach|email|call)\b",
+    re.IGNORECASE,
+)
+
+_CONTEXTUAL_CONTACT_OBJECT_PATTERN = re.compile(
+    r"\b(?:contacts?|contact\s+(?:details?|information|info)"
+    r"|member\s+firms?|lawyers?)\b",
+    re.IGNORECASE,
+)
+
+_CONTEXTUAL_COUNTRY_GROUP_PATTERN = re.compile(
+    r"\b(?:both|these|those|all|the)\b"
+    r".{0,30}\bcountr(?:y|ies)\b",
+    re.IGNORECASE,
+)
+
+_CONTEXTUAL_PRONOUN_GROUP_PATTERN = re.compile(
+    r"\b(?:both|all)\s+of\s+(?:them|these|those)\b",
+    re.IGNORECASE,
+)
+
+_CONTEXTUAL_CONTACT_COUNT_PATTERN = re.compile(
+    r"\b(?:both|all\s+(?:two|three|four|five|six))\s+contacts?\b"
+    r"|\bcontacts?\s+(?:for|from)\s+"
+    r"(?:both|all\s+(?:two|three|four|five|six))\b",
+    re.IGNORECASE,
+)
+
+_CONTEXTUAL_NUMBER_WORDS = {
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+}
+
+
+def resolve_contextual_multi_country_contact_codes(
+    question: str,
+    conversation_state: ConversationState | None,
+) -> list[str] | None:
+    """
+    Resolve an explicit contextual contact request against the
+    countries already carried by the structured conversation state.
+
+    None means this is not a contextual multi-country contact request.
+    [] means it is contextual, but the requested cardinality is
+    ambiguous against the current state and must not be guessed.
+    A non-empty list is the exact ordered country scope to use.
+    """
+
+    if conversation_state is None:
+        return None
+
+    ordered_codes: list[str] = []
+
+    def add_codes(values: list[str]) -> None:
+        for value in values:
+            code = value.strip().upper()
+
+            if code and code not in ordered_codes:
+                ordered_codes.append(code)
+
+    add_codes(list(conversation_state.ordered_country_codes))
+
+    if len(ordered_codes) < 2:
+        ordered_codes = []
+
+        for action in conversation_state.actions:
+            add_codes(list(action.country_codes))
+
+    if len(ordered_codes) < 2:
+        return None
+
+    normalized = _normalize_followup_text(question)
+
+    if not _CONTEXTUAL_CONTACT_REQUEST_PATTERN.search(normalized):
+        return None
+
+    if not _CONTEXTUAL_CONTACT_OBJECT_PATTERN.search(normalized):
+        return None
+
+    has_context_reference = bool(
+        _CONTEXTUAL_COUNTRY_GROUP_PATTERN.search(normalized)
+        or _CONTEXTUAL_PRONOUN_GROUP_PATTERN.search(normalized)
+        or _CONTEXTUAL_CONTACT_COUNT_PATTERN.search(normalized)
+    )
+
+    if not has_context_reference:
+        return None
+
+    requested_count: int | None = None
+
+    if re.search(r"\bboth\b", normalized):
+        requested_count = 2
+    else:
+        for word, count in _CONTEXTUAL_NUMBER_WORDS.items():
+            if re.search(
+                rf"\b(?:all\s+)?{word}\b",
+                normalized,
+            ):
+                requested_count = count
+                break
+
+    if (
+        requested_count is not None
+        and requested_count != len(ordered_codes)
+    ):
+        # Example: "both" with a three-country state.
+        # Never arbitrarily select two countries.
+        return []
+
+    return ordered_codes
+
+
+def _correct_result_for_contextual_multi_country_contact(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    current_question: str | None,
+) -> RequestUnderstandingResult:
+    """
+    A request such as "give me the contacts for both countries"
+    explicitly changes the active objective to Contact while reusing
+    the already-known multi-country scope.
+
+    The structured state, not the language model, is authoritative for
+    which countries "both/all/these countries" refers to.
+    """
+
+    if current_question is None:
+        return result
+
+    country_codes = resolve_contextual_multi_country_contact_codes(
+        current_question,
+        conversation_state,
+    )
+
+    if country_codes is None or not country_codes:
+        return result
+
+    return RequestUnderstandingResult(
+        status="resolved",
+        actions=[
+            RequestUnderstandingAction(
+                type="contact",
+                country_codes=country_codes,
+            )
+        ],
+        is_follow_up=True,
+        confidence=1.0,
+        clarification_reason=None,
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=["contact"],
+            explicit_country_codes=country_codes,
+            explicit_legal_topics=[],
+            explicit_subject_text=None,
+            context_operation="change_action",
+        ),
+    )
+
+
 class ConversationTransitionError(RuntimeError):
     """
     Raised when the transition engine hits a genuinely unexpected
@@ -1215,6 +1386,126 @@ def _resolve_contact_missing_country_pending(
     )
 
 
+def _correct_delta_for_unavailable_legal_country_switch(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+) -> RequestUnderstandingResult:
+    """
+    Preserve an explicit legal jurisdiction switch when the newly
+    requested country is recognized but is outside the validated
+    document corpus.
+
+    RequestUnderstanding is intentionally restricted to supported
+    country codes, so for e.g. "What is the notice period in
+    Tunisia?" it may correctly emit context_operation="replace_country"
+    while either leaving explicit_country_codes empty or incorrectly
+    retaining a previously supported country code. The deterministic
+    current-message unavailable-country detection is authoritative
+    for this narrow legal jurisdiction-switch case.
+
+    Without this correction, conversation transition interprets that
+    empty list as "keep the previous country", which can silently turn
+    a Tunisia question into an Italy answer.
+
+    The semantic status itself is deliberately not authoritative
+    here. A real legal jurisdiction switch to a country outside the
+    corpus may be classified as resolved, clarification or
+    unsupported. What is authoritative is the deterministic
+    combination below.
+
+    This correction is deliberately narrow:
+    - the current message must deterministically name exactly one
+      unavailable country and a supported legal topic;
+    - semantic context_operation may be independent, ambiguous,
+      replace_country, change_subject or similar because this field is
+      probabilistic; only an already-normalized "continue" or an
+      additive "add_country" is protected from replacement;
+    - exactly one unavailable current country must be known;
+    - the current message must contain a supported legal topic;
+    - contact/comparison requests are excluded.
+
+    It runs after incidental-travel correction, so a travel
+    destination such as "I will go to Tunisia" remains a continuation
+    of the existing legal jurisdiction rather than becoming one.
+    """
+
+    delta = result.current_message_delta
+
+    if (
+        # "continue" is authoritative here: the incidental-travel
+        # correction runs before this helper and deliberately changes
+        # destination-only messages such as "I will go to Tunisia"
+        # into a continuation of the existing jurisdiction.
+        delta.context_operation in {"continue", "add_country"}
+        or len(hints.current_unavailable_country_codes) != 1
+        or not hints.current_legal_topics
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or (
+            delta.explicit_action_types
+            and set(delta.explicit_action_types)
+            != {"legal_information"}
+        )
+    ):
+        return result
+
+    # _apply_transition deliberately uses two different mechanics:
+    #
+    # - with ONE previous legal action, a country continuation is
+    #   inherited only when the delta contains no explicit new
+    #   action/subject;
+    #
+    # - with SEVERAL previous actions, an explicit action type is
+    #   required to select which previous action is being continued.
+    #
+    # Normalize accordingly instead of forcing the same delta shape
+    # on both paths.
+    single_legal_action = (
+        len(conversation_state.actions) == 1
+        and conversation_state.actions[0].type
+        == "legal_information"
+    )
+
+    if single_legal_action:
+        normalized_action_types = []
+        normalized_legal_topics = []
+        normalized_subject_text = None
+    else:
+        normalized_action_types = [
+            "legal_information"
+        ]
+        normalized_legal_topics = list(
+            delta.explicit_legal_topics
+        )
+        normalized_subject_text = (
+            delta.explicit_subject_text
+        )
+
+    return result.model_copy(
+        update={
+            "current_message_delta": delta.model_copy(
+                update={
+                    "explicit_action_types": (
+                        normalized_action_types
+                    ),
+                    "explicit_country_codes": list(
+                        hints.current_unavailable_country_codes
+                    ),
+                    "explicit_legal_topics": (
+                        normalized_legal_topics
+                    ),
+                    "explicit_subject_text": (
+                        normalized_subject_text
+                    ),
+                    "context_operation": "replace_country",
+                }
+            )
+        }
+    )
+
+
 def apply_conversation_transition(
     *,
     result: RequestUnderstandingResult,
@@ -1280,6 +1571,13 @@ def apply_conversation_transition(
         hints=hints,
         current_question=current_question,
     )
+    result = (
+        _correct_delta_for_unavailable_legal_country_switch(
+            result=result,
+            conversation_state=canonicalized_state,
+            hints=hints,
+        )
+    )
 
     subject_detail_result = _correct_subject_detail_followup(
         result=result,
@@ -1324,6 +1622,12 @@ def apply_conversation_transition(
             hints,
             comparison_signal=False,
         )
+
+    result = _correct_result_for_contextual_multi_country_contact(
+        result=result,
+        conversation_state=canonicalized_state,
+        current_question=current_question,
+    )
 
     try:
         outcome = _apply_transition(
