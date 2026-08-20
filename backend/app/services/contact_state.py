@@ -70,6 +70,9 @@ class ContactRecord:
     phone: str | None = None
     address: str | None = None
     website: str | None = None
+    photo_filename: str | None = None
+    photo_content_type: str | None = None
+    photo_sha256: str | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -80,6 +83,9 @@ class ContactRecord:
             "phone": self.phone,
             "address": self.address,
             "website": self.website,
+            "photo_filename": self.photo_filename,
+            "photo_content_type": self.photo_content_type,
+            "photo_sha256": self.photo_sha256,
         }
 
     @staticmethod
@@ -110,6 +116,65 @@ class ContactRecord:
 
             return value
 
+        photo_filename = _optional_string("photo_filename")
+        photo_content_type = _optional_string("photo_content_type")
+        photo_sha256 = _optional_string("photo_sha256")
+
+        photo_values = (
+            photo_filename,
+            photo_content_type,
+            photo_sha256,
+        )
+
+        has_any_photo_metadata = any(
+            value is not None
+            for value in photo_values
+        )
+        has_all_photo_metadata = all(
+            value is not None
+            for value in photo_values
+        )
+
+        if has_any_photo_metadata and not has_all_photo_metadata:
+            raise ContactStateError(
+                "Persisted contact photo metadata must be either "
+                "fully present or fully absent."
+            )
+
+        if photo_filename is not None:
+            if (
+                Path(photo_filename).name != photo_filename
+                or "/" in photo_filename
+                or "\\" in photo_filename
+            ):
+                raise ContactStateError(
+                    "Persisted contact photo filename is unsafe."
+                )
+
+            if (
+                photo_content_type
+                not in {
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp",
+                }
+            ):
+                raise ContactStateError(
+                    "Persisted contact photo content type is unsupported."
+                )
+
+            if (
+                photo_sha256 is None
+                or len(photo_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in photo_sha256
+                )
+            ):
+                raise ContactStateError(
+                    "Persisted contact photo SHA-256 is invalid."
+                )
+
         return ContactRecord(
             contact_id=contact_id,
             member_firm=_optional_string("member_firm"),
@@ -118,6 +183,9 @@ class ContactRecord:
             phone=_optional_string("phone"),
             address=_optional_string("address"),
             website=_optional_string("website"),
+            photo_filename=photo_filename,
+            photo_content_type=photo_content_type,
+            photo_sha256=photo_sha256,
         )
 
 

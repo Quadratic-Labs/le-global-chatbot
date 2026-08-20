@@ -6894,6 +6894,129 @@ class EditRestoreConversationConsistencyTests(unittest.TestCase):
         self.assertNotIn("164,850", response.answer)
 
 
+
+
+class AssistantHistoryBoundingTests(unittest.TestCase):
+    """
+    Regression tests for assistant answers reused as conversation
+    history.
+
+    A response produced by the chatbot must not make the next request
+    invalid merely because that response exceeded the historical
+    per-message validation ceiling.
+
+    User input and malformed-history validation remain strict.
+    """
+
+    def test_long_assistant_history_is_bounded_before_validation(
+        self,
+    ) -> None:
+        long_answer = (
+            "Grounded legal answer. "
+            * 400
+        )
+
+        self.assertGreater(
+            len(long_answer),
+            4000,
+        )
+
+        request = LegalChatRequest(
+            question="And what about the penalties?",
+            history=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Compare anti-discrimination "
+                        "rules in France and Japan."
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": long_answer,
+                },
+            ],
+        )
+
+        self.assertEqual(
+            len(request.history[1].content),
+            4000,
+        )
+
+        self.assertEqual(
+            request.history[1].content,
+            long_answer[:4000],
+        )
+
+    def test_short_assistant_history_is_not_modified(
+        self,
+    ) -> None:
+        answer = (
+            "  France and Japan have different "
+            "anti-discrimination frameworks.  "
+        )
+
+        request = LegalChatRequest(
+            question="Are the penalties the same?",
+            history=[
+                {
+                    "role": "user",
+                    "content": "Compare France and Japan.",
+                },
+                {
+                    "role": "assistant",
+                    "content": answer,
+                },
+            ],
+        )
+
+        self.assertEqual(
+            request.history[1].content,
+            answer,
+        )
+
+    def test_long_user_history_remains_invalid(
+        self,
+    ) -> None:
+        with self.assertRaises(
+            ValidationError
+        ):
+            LegalChatRequest(
+                question="Follow-up question",
+                history=[
+                    {
+                        "role": "user",
+                        "content": "x" * 4001,
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Answer.",
+                    },
+                ],
+            )
+
+    def test_extra_field_remains_invalid_even_on_long_assistant(
+        self,
+    ) -> None:
+        with self.assertRaises(
+            ValidationError
+        ):
+            LegalChatRequest(
+                question="Follow-up question",
+                history=[
+                    {
+                        "role": "user",
+                        "content": "Question.",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "a" * 5000,
+                        "unexpected": "must stay forbidden",
+                    },
+                ],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 
