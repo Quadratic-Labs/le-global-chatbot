@@ -19,6 +19,52 @@ HISTORY_TOTAL_MAX_CHARACTERS = (
 class LegalChatHistoryMessage(BaseModel):
     """One prior turn of a conversation, supplied by the client."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_oversized_assistant_content(
+        cls,
+        value: object,
+    ) -> object:
+        """
+        Bound only oversized historical assistant answers before
+        field-level length validation.
+
+        The API itself can legitimately generate answers longer than
+        HISTORY_MESSAGE_MAX_CHARACTERS. Reusing such an answer as the
+        next request's history must therefore not make that next
+        request invalid.
+
+        User messages remain strict: an oversized user history entry
+        is still rejected by the existing Field(max_length=...).
+
+        Valid assistant content at or below the existing API limit is
+        returned byte-for-byte unchanged. Extra fields, invalid roles,
+        non-string content and every other malformed input are left
+        untouched so the existing Pydantic validation still rejects
+        them normally.
+        """
+
+        if not isinstance(value, dict):
+            return value
+
+        if value.get("role") != "assistant":
+            return value
+
+        content = value.get("content")
+
+        if not isinstance(content, str):
+            return value
+
+        if len(content) <= HISTORY_MESSAGE_MAX_CHARACTERS:
+            return value
+
+        bounded = dict(value)
+        bounded["content"] = content[
+            :HISTORY_MESSAGE_MAX_CHARACTERS
+        ]
+
+        return bounded
+
     role: str = Field(
         pattern=r"^(user|assistant)$",
         description="Either 'user' or 'assistant'.",
