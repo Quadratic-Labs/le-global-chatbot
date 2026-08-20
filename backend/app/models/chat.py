@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import Field as PydanticField
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models.conversation_state import ConversationState
@@ -254,6 +255,25 @@ class LegalAnswerSource(BaseModel):
         extra = "forbid"
 
 
+class LegalChatContact(BaseModel):
+    """Structured member-firm contact rendered by the chat frontend."""
+
+    contact_id: str
+    country_code: str
+
+    member_firm: str | None = None
+    contact_person: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    website: str | None = None
+
+    photo_url: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
 class LegalChatResponse(BaseModel):
     """Grounded legal answer and its cited sources."""
 
@@ -265,6 +285,10 @@ class LegalChatResponse(BaseModel):
 
     retrieval_total: int
     sources: list[LegalAnswerSource]
+
+    contacts: list[LegalChatContact] = PydanticField(
+        default_factory=list
+    )
 
     conversation_state: ConversationState | None = None
 
