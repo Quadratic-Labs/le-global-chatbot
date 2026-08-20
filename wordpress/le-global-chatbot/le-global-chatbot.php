@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.8.2
+ * Version: 0.8.5
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.8.2';
+    private const VERSION = '0.8.5';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -62,6 +62,16 @@ final class LE_Global_Chatbot_Plugin
         add_action(
             'rest_api_init',
             [self::class, 'register_rest_routes']
+        );
+
+        add_action(
+            'wp_ajax_le_global_contact_photo',
+            [self::class, 'proxy_contact_photo']
+        );
+
+        add_action(
+            'wp_ajax_nopriv_le_global_contact_photo',
+            [self::class, 'proxy_contact_photo']
         );
 
         add_action(
@@ -268,6 +278,13 @@ final class LE_Global_Chatbot_Plugin
             data-config-endpoint="<?php
                 echo esc_url(
                     $rest_base . '/config'
+                );
+            ?>"
+            data-contact-photo-endpoint="<?php
+                echo esc_url(
+                    admin_url(
+                        'admin-ajax.php?action=le_global_contact_photo'
+                    )
                 );
             ?>"
             data-chat-endpoint="<?php
@@ -988,6 +1005,104 @@ final class LE_Global_Chatbot_Plugin
                 : 502
         );
     }
+
+    public static function proxy_contact_photo(): void
+    {
+        $contact_id = isset($_GET['contact_id'])
+            ? trim((string) wp_unslash($_GET['contact_id']))
+            : '';
+
+        $sha256 = isset($_GET['sha256'])
+            ? trim((string) wp_unslash($_GET['sha256']))
+            : '';
+
+        if (
+            !preg_match('/^[A-Za-z0-9._-]{1,200}$/D', $contact_id)
+            || !preg_match('/^[0-9a-f]{64}$/D', $sha256)
+        ) {
+            status_header(404);
+            exit;
+        }
+
+        $configuration = self::get_backend_configuration();
+
+        if (is_wp_error($configuration)) {
+            status_header(503);
+            exit;
+        }
+
+        $backend_url = (
+            untrailingslashit($configuration['url'])
+            . '/api/v1/contact-photos/'
+            . rawurlencode($contact_id)
+            . '/'
+            . $sha256
+        );
+
+        $response = wp_remote_get(
+            $backend_url,
+            [
+                'timeout' => 20,
+                'headers' => [
+                    'X-API-Key' => $configuration['api_key'],
+                ],
+            ]
+        );
+
+        if (is_wp_error($response)) {
+            status_header(502);
+            exit;
+        }
+
+        $status = wp_remote_retrieve_response_code($response);
+
+        if ($status !== 200) {
+            status_header($status > 0 ? $status : 502);
+            exit;
+        }
+
+        $content_type = strtolower(
+            trim(
+                (string) wp_remote_retrieve_header(
+                    $response,
+                    'content-type'
+                )
+            )
+        );
+
+        if (
+            !in_array(
+                $content_type,
+                ['image/jpeg', 'image/png', 'image/webp'],
+                true
+            )
+        ) {
+            status_header(502);
+            exit;
+        }
+
+        status_header(200);
+        header('Content-Type: ' . $content_type);
+        header('X-Content-Type-Options: nosniff');
+
+        $etag = wp_remote_retrieve_header($response, 'etag');
+        $cache = wp_remote_retrieve_header(
+            $response,
+            'cache-control'
+        );
+
+        if ($etag !== '') {
+            header('ETag: ' . $etag);
+        }
+
+        if ($cache !== '') {
+            header('Cache-Control: ' . $cache);
+        }
+
+        echo wp_remote_retrieve_body($response);
+        exit;
+    }
+
 
     private static function get_backend_configuration()
     {

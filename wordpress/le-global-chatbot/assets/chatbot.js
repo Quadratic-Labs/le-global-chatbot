@@ -147,6 +147,40 @@
      * is what reduces the remaining entries to a safely alternating,
      * complete-pairs-only list.
      */
+    function normalizePublicContacts(rawContacts) {
+        if (!Array.isArray(rawContacts)) {
+            return [];
+        }
+
+        return rawContacts
+            .filter((item) => (
+                item
+                && typeof item === "object"
+                && typeof item.contact_id === "string"
+                && item.contact_id.trim() !== ""
+            ))
+            .map((item) => {
+                const clean = (name) => (
+                    typeof item[name] === "string"
+                        && item[name].trim() !== ""
+                        ? item[name].trim()
+                        : null
+                );
+
+                return {
+                    contact_id: item.contact_id.trim(),
+                    country_code: clean("country_code"),
+                    member_firm: clean("member_firm"),
+                    contact_person: clean("contact_person"),
+                    email: clean("email"),
+                    phone: clean("phone"),
+                    address: clean("address"),
+                    website: clean("website"),
+                    photo_url: clean("photo_url"),
+                };
+            });
+    }
+
     function normalizeStoredConversationState(rawConversationState) {
         if (
             !rawConversationState
@@ -219,6 +253,10 @@
                         )
                     );
                 }
+
+                message.contacts = normalizePublicContacts(
+                    entry.contacts
+                );
 
                 message.hasDisclaimer = Boolean(
                     entry.hasDisclaimer
@@ -385,6 +423,9 @@
                         sources: Array.isArray(turn.sources)
                             ? turn.sources
                             : [],
+                        contacts: normalizePublicContacts(
+                            turn.contacts
+                        ),
                         hasDisclaimer: Boolean(
                             turn.hasDisclaimer
                         ),
@@ -467,6 +508,9 @@
                     )
                         ? assistantMessage.sources
                         : [],
+                    contacts: normalizePublicContacts(
+                        assistantMessage.contacts
+                    ),
                     hasDisclaimer: Boolean(
                         assistantMessage.hasDisclaimer
                     ),
@@ -494,6 +538,9 @@
     function initializeWidget(widget) {
         const configEndpoint = widget.dataset.configEndpoint;
         const chatEndpoint = widget.dataset.chatEndpoint;
+        const contactPhotoEndpoint = (
+            widget.dataset.contactPhotoEndpoint || ""
+        );
 
         const form = widget.querySelector(
             ".le-global-chatbot__composer"
@@ -685,6 +732,7 @@
                     status: "pending",
                     answer: null,
                     sources: [],
+                    contacts: [],
                     errorMessage: null,
                 };
 
@@ -826,6 +874,7 @@
                     turn.status = "success";
                     turn.answer = renumbered.answer;
                     turn.sources = renumbered.sources;
+                    turn.contacts = normalizePublicContacts(response.contacts);
                     // Routing state may survive a clarification.
                     // Grounding is the authoritative disclaimer signal.
                     turn.hasDisclaimer = Boolean(
@@ -1239,15 +1288,42 @@
             );
 
             answerElement.textContent = turn.answer || "";
-            assistantBubble.appendChild(
-                answerElement
+
+            const contacts = normalizePublicContacts(
+                turn.contacts
             );
 
             const sources = Array.isArray(turn.sources)
                 ? turn.sources
                 : [];
 
-            if (sources.length > 0) {
+            const contactOnly = (
+                contacts.length > 0
+                && sources.length > 0
+                && sources.every((source) => (
+                    String(
+                        source.subsection
+                        || source.section
+                        || ""
+                    )
+                        .trim()
+                        .toLowerCase() === "contact"
+                ))
+            );
+
+            if (!contactOnly) {
+                assistantBubble.appendChild(
+                    answerElement
+                );
+            }
+
+            if (contacts.length > 0) {
+                assistantBubble.appendChild(
+                    buildContactCardsSection(contacts)
+                );
+            }
+
+            if (sources.length > 0 && !contactOnly) {
                 assistantBubble.appendChild(
                     buildSourcesSection(
                         sources
@@ -1277,6 +1353,122 @@
             }
 
             return assistantBubble;
+        }
+
+        function buildContactCardsSection(contacts) {
+            const section = document.createElement("section");
+            section.className = "le-global-chatbot__contact-cards";
+
+            contacts.forEach((contact) => {
+                const card = document.createElement("article");
+                card.className = "le-global-chatbot__contact-card";
+
+                if (contact.photo_url && contactPhotoEndpoint) {
+                    const match = contact.photo_url.match(
+                        /\/([0-9a-f]{64})$/
+                    );
+
+                    if (match) {
+                        const image = document.createElement("img");
+                        const separator = contactPhotoEndpoint.includes("?")
+                            ? "&"
+                            : "?";
+
+                        image.className = "le-global-chatbot__contact-photo";
+                        image.alt = contact.contact_person
+                            ? contact.contact_person
+                            : "Contact";
+                        image.loading = "lazy";
+                        image.src = (
+                            contactPhotoEndpoint
+                            + separator
+                            + "contact_id="
+                            + encodeURIComponent(contact.contact_id)
+                            + "&sha256="
+                            + encodeURIComponent(match[1])
+                        );
+
+                        card.appendChild(image);
+                    }
+                }
+
+                const body = document.createElement("div");
+                body.className = "le-global-chatbot__contact-body";
+
+                const addText = (value, className) => {
+                    if (!value) {
+                        return;
+                    }
+
+                    const line = document.createElement("div");
+                    line.className = className;
+                    line.textContent = value;
+                    body.appendChild(line);
+                };
+
+                addText(
+                    contact.contact_person,
+                    "le-global-chatbot__contact-name"
+                );
+                addText(
+                    contact.member_firm,
+                    "le-global-chatbot__contact-firm"
+                );
+
+                if (contact.email) {
+                    const link = document.createElement("a");
+                    link.textContent = contact.email;
+
+                    if (/^[^@\s]+@[^@\s]+$/.test(contact.email)) {
+                        link.href = "mailto:" + contact.email;
+                    }
+
+                    body.appendChild(link);
+                }
+
+                if (contact.phone) {
+                    const link = document.createElement("a");
+                    link.textContent = contact.phone;
+                    link.href = "tel:" + contact.phone.replace(
+                        /[^+0-9]/g,
+                        ""
+                    );
+                    body.appendChild(link);
+                }
+
+                addText(
+                    contact.address,
+                    "le-global-chatbot__contact-address"
+                );
+
+                if (contact.website) {
+                    try {
+                        const url = new URL(contact.website);
+
+                        if (
+                            url.protocol === "http:"
+                            || url.protocol === "https:"
+                        ) {
+                            const link = document.createElement("a");
+                            link.textContent = contact.website;
+                            link.href = url.href;
+                            link.target = "_blank";
+                            link.rel = "noopener noreferrer";
+                            body.appendChild(link);
+                        }
+                    } catch {
+                        addText(
+                            contact.website,
+                            "le-global-chatbot__contact-website"
+                        );
+                    }
+                }
+
+                card.appendChild(body);
+                section.appendChild(card);
+            });
+
+            return section;
         }
 
         function buildSourcesSection(sources) {
