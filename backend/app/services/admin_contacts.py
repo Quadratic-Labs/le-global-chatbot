@@ -58,6 +58,18 @@ from app.services.admin_modification_marker import (
     reset_admin_modified,
     write_admin_modified_marker,
 )
+from app.services.contact_people import (
+    associate_contact_photos,
+)
+from app.services.contact_photos import (
+    ContactPhotoExtractionError,
+    extract_contact_photo_candidates,
+)
+from app.services.contact_photo_store import (
+    ContactPhotoStorageError,
+    delete_contact_photo,
+    write_contact_photo_atomic,
+)
 from app.services.contact_state import (
     ContactRecord,
     ContactState,
@@ -224,6 +236,119 @@ def _document_metadata_for_chunks(
     )
 
 
+
+def _contact_photo_filenames(
+    contacts: tuple[ContactRecord, ...],
+) -> set[str]:
+    return {
+        record.photo_filename
+        for record in contacts
+        if record.photo_filename is not None
+    }
+
+
+def _build_photo_aware_contact_records(
+    *,
+    source_directory: Path,
+    docx_path: Path,
+    contacts: Sequence[ExtractedContact],
+) -> tuple[ContactRecord, ...]:
+    """
+    Build freshly-seeded ContactRecords from one accepted DOCX.
+
+    Photo extraction/person association is deterministic. Contact IDs
+    are allocated before storing each person's image, so the durable
+    filename belongs to that stable contact identity.
+
+    If any image write fails, every image already created by THIS seed
+    attempt is removed before the original error is propagated.
+    """
+
+    try:
+        photos = extract_contact_photo_candidates(
+            docx_path,
+        )
+    except ContactPhotoExtractionError:
+        # A contact photo is optional. A DOCX already accepted by the
+        # document/contact pipeline must not become unusable solely
+        # because its image package cannot be inspected reliably.
+        # Fail closed to zero photo associations; never guess.
+        photos = []
+
+    associated = associate_contact_photos(
+        contacts,
+        photos,
+    )
+
+    records: list[ContactRecord] = []
+    created_photo_filenames: list[str] = []
+
+    try:
+        for contact in associated:
+            contact_id = new_contact_id()
+
+            photo_filename = None
+            photo_content_type = None
+            photo_sha256 = None
+
+            if contact.photo is not None:
+                stored = write_contact_photo_atomic(
+                    source_directory,
+                    contact_id,
+                    data=contact.photo.data,
+                    content_type=contact.photo.content_type,
+                )
+
+                created_photo_filenames.append(
+                    stored.filename
+                )
+
+                photo_filename = stored.filename
+                photo_content_type = stored.content_type
+                photo_sha256 = stored.sha256
+
+            records.append(
+                ContactRecord(
+                    contact_id=contact_id,
+                    member_firm=contact.member_firm,
+                    contact_person=contact.contact_person,
+                    email=contact.email,
+                    phone=contact.phone,
+                    address=contact.address,
+                    website=contact.website,
+                    photo_filename=photo_filename,
+                    photo_content_type=photo_content_type,
+                    photo_sha256=photo_sha256,
+                )
+            )
+
+        return tuple(records)
+
+    except Exception as original_error:
+        cleanup_error: Exception | None = None
+
+        for filename in reversed(
+            created_photo_filenames
+        ):
+            try:
+                delete_contact_photo(
+                    source_directory,
+                    filename,
+                )
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+
+        if cleanup_error is not None:
+            raise ContactPhotoStorageError(
+                "Contact photo seeding failed and its photo cleanup "
+                "was itself incomplete."
+            ) from cleanup_error
+
+        raise original_error
+
+
+
 def _contact_summary(record: ContactRecord) -> AdminContactSummary:
     return AdminContactSummary(
         contact_id=record.contact_id,
@@ -270,6 +395,37 @@ def _apply_contact_state_change(
     previous_marker = is_admin_modified_since_upload(
         source_directory,
         document_id,
+    )
+
+    previous_photo_filenames = {
+        record.photo_filename
+        for record in (
+            previous_state.contacts
+            if previous_state is not None
+            else ()
+        )
+        if record.photo_filename is not None
+    }
+
+    new_photo_filenames = {
+        record.photo_filename
+        for record in new_contacts
+        if record.photo_filename is not None
+    }
+
+    # Files referenced only by the candidate state were already
+    # materialized before this transactional state/index commit.
+    # They must disappear again if the transaction rolls back.
+    rollback_photo_filenames = (
+        new_photo_filenames
+        - previous_photo_filenames
+    )
+
+    # Files referenced only by the previous committed state may be
+    # removed, but strictly AFTER state + OpenSearch + marker commit.
+    superseded_photo_filenames = (
+        previous_photo_filenames
+        - new_photo_filenames
     )
 
     metadata = _document_metadata_for_chunks(document_metadata)
@@ -339,6 +495,14 @@ def _apply_contact_state_change(
                 previous_marker,
             )
 
+            for filename in sorted(
+                rollback_photo_filenames
+            ):
+                delete_contact_photo(
+                    source_directory,
+                    filename,
+                )
+
         except Exception as rollback_error:
             raise AdminDocumentRollbackError(
                 "A contact mutation failed for document "
@@ -350,6 +514,20 @@ def _apply_contact_state_change(
             "The contact change could not be completed: "
             f"{original_error}"
         ) from original_error
+
+    for filename in sorted(
+        superseded_photo_filenames
+    ):
+        try:
+            delete_contact_photo(
+                source_directory,
+                filename,
+            )
+        except ContactPhotoStorageError:
+            # The authoritative state already committed successfully.
+            # A stale unreferenced photo is safer than turning that
+            # successful transaction into a misleading failure.
+            pass
 
 
 def _load_country_code_and_metadata(
@@ -574,6 +752,11 @@ def update_contact(
             phone=fields.phone.strip(),
             address=fields.address.strip(),
             website=fields.website.strip(),
+            photo_filename=current_contacts[position].photo_filename,
+            photo_content_type=(
+                current_contacts[position].photo_content_type
+            ),
+            photo_sha256=current_contacts[position].photo_sha256,
         )
 
         new_contacts = (
@@ -741,9 +924,10 @@ def _reseed_contacts_from_current_docx_locked(
         country=country,
     )
 
-    new_contacts = tuple(
-        _extracted_contact_to_record(contact)
-        for contact in parsed_contacts
+    new_contacts = _build_photo_aware_contact_records(
+        source_directory=source_directory,
+        docx_path=resolved_source.path,
+        contacts=parsed_contacts,
     )
 
     _apply_contact_state_change(
@@ -821,40 +1005,135 @@ def reseed_contact_state_from_parsed_contacts(
     country_code: str,
     source_directory: Path,
     contacts: Sequence[ExtractedContact],
+    docx_path: Path | None = None,
 ) -> None:
     """
-    Entirely overwrite document_id's structured contact state with a
-    freshly-seeded one built from `contacts` (already parsed from a
-    just-accepted DOCX) - no merge with whatever was there before.
+    Entirely replace structured contact state from a just-accepted
+    DOCX.
 
-    Deliberately filesystem-only (no OpenSearch call, no locking): the
-    caller is the upload/replace transaction in
-    admin_document_replacement.py, which has ALREADY committed the new
-    DOCX and its derived OpenSearch chunks (including the Contact
-    chunk, built from these exact same `contacts` via chunk_builder's
-    own existing internal path) under its own lock, by the time this
-    runs - this only needs to record the same freshly-parsed contacts
-    as durable, individually-addressable, stable-ID-bearing structured
-    state for future Admin CRUD to build on, mirroring exactly how
-    delete_section_edit_state is already called as a post-commit step
-    in that same transaction.
+    When docx_path is supplied, contact photos are extracted,
+    deterministically associated, and persisted before the sidecar
+    commit.
+
+    This remains filesystem-only: the caller's DOCX/OpenSearch upload
+    transaction has already committed. This function guarantees its
+    own state/photo/marker atomicity but does not attempt to undo that
+    earlier document commit.
+
+    docx_path remains optional for backward compatibility with callers
+    that seed already-parsed contacts without a source DOCX.
     """
 
-    new_contacts = tuple(
-        _extracted_contact_to_record(contact)
-        for contact in contacts
-    )
-
-    write_contact_state_atomic(
+    previous_state = read_contact_state(
         source_directory,
-        ContactState(
-            document_id=document_id,
-            country_code=country_code,
-            contacts=new_contacts,
-        ),
+        document_id,
     )
 
-    reset_admin_modified(source_directory, document_id)
+    previous_marker = is_admin_modified_since_upload(
+        source_directory,
+        document_id,
+    )
+
+    if docx_path is None:
+        new_contacts = tuple(
+            _extracted_contact_to_record(contact)
+            for contact in contacts
+        )
+    else:
+        new_contacts = _build_photo_aware_contact_records(
+            source_directory=source_directory,
+            docx_path=docx_path,
+            contacts=contacts,
+        )
+
+    previous_photo_filenames = _contact_photo_filenames(
+        (
+            previous_state.contacts
+            if previous_state is not None
+            else ()
+        )
+    )
+
+    new_photo_filenames = _contact_photo_filenames(
+        new_contacts
+    )
+
+    rollback_photo_filenames = (
+        new_photo_filenames
+        - previous_photo_filenames
+    )
+
+    superseded_photo_filenames = (
+        previous_photo_filenames
+        - new_photo_filenames
+    )
+
+    try:
+        write_contact_state_atomic(
+            source_directory,
+            ContactState(
+                document_id=document_id,
+                country_code=country_code,
+                contacts=new_contacts,
+            ),
+        )
+
+        reset_admin_modified(
+            source_directory,
+            document_id,
+        )
+
+    except Exception as original_error:
+        try:
+            if previous_state is not None:
+                write_contact_state_atomic(
+                    source_directory,
+                    previous_state,
+                )
+            else:
+                delete_contact_state(
+                    source_directory,
+                    document_id,
+                )
+
+            write_admin_modified_marker(
+                source_directory,
+                document_id,
+                previous_marker,
+            )
+
+            for filename in sorted(
+                rollback_photo_filenames
+            ):
+                delete_contact_photo(
+                    source_directory,
+                    filename,
+                )
+
+        except Exception as rollback_error:
+            raise AdminDocumentRollbackError(
+                "Contact reseed failed and its filesystem rollback "
+                "was itself incomplete - manual recovery is required."
+            ) from rollback_error
+
+        raise original_error
+
+    # State + marker now authoritatively reference the new records.
+    # Superseded files are only garbage at this point.
+    for filename in sorted(
+        superseded_photo_filenames
+    ):
+        try:
+            delete_contact_photo(
+                source_directory,
+                filename,
+            )
+        except ContactPhotoStorageError:
+            # Do not convert an already-successful authoritative
+            # reseed into a false failure because stale unreferenced
+            # garbage could not be removed.
+            pass
+
 
 
 def apply_structured_contact_state_to_chunks(

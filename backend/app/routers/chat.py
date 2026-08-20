@@ -51,6 +51,11 @@ from app.services.conversation_meta import (
     resolve_conversation_meta,
 )
 
+from app.services.chat_contact_cards import (
+    CONTACT_COUNTRY_FALLBACK_CODES,
+    build_legal_chat_contacts,
+    resolve_public_contact_photo,
+)
 from app.services.country_detection import (
     CountryAvailability,
     CountryCatalogProvider,
@@ -105,6 +110,22 @@ router = APIRouter(
     prefix="/api/v1",
     tags=["Legal Chat"],
 )
+
+
+def _optional_contact_source_directory():
+    """Return the contact-card source directory when settings exist.
+
+    resolve_legal_chat_response is intentionally callable directly by
+    backend tests and internal code without bootstrapping the complete
+    deployment environment. Contact cards are additive/optional, so
+    missing application settings must never remove the already-valid
+    text answer.
+    """
+
+    try:
+        return get_settings().document_source_dir
+    except RuntimeError:
+        return None
 
 
 UNAVAILABLE_COUNTRIES_ANSWER_TEMPLATE: Final[str] = (
@@ -924,20 +945,6 @@ def _build_deterministic_hints(
     return hints, current_country_scope, current_legal_scope
 
 
-CONTACT_COUNTRY_FALLBACK_CODES: Final[dict[str, str]] = {
-    # Business rule (corrective gate, section 16): Slovakia has no
-    # Employment Law Overview of its own yet, so no indexed contact
-    # chunk exists for SK either - docx_parser.py extracts contact/
-    # member-firm details from that same per-country Overview document
-    # (see its own member_firm field), so no Overview means no contact
-    # chunk from that path. The client's member firm for Slovakia is
-    # reached through the Czech Republic office instead - contact
-    # routing only, never a legal-content or jurisdiction substitution
-    # (section 18): SK stays SK everywhere else (detection, policy,
-    # coverage) - see country_detection.py/admin_country_policy.py,
-    # neither of which this mapping touches.
-    "SK": "CZ",
-}
 
 
 def _build_contact_section(
@@ -1680,6 +1687,17 @@ def _resolve_conservative_fallback(
             current_country_scope.available_codes
         )
 
+        contacts = build_legal_chat_contacts(
+            source_directory=_optional_contact_source_directory(),
+            requested_country_codes=(
+                current_country_scope.available_codes
+            ),
+            unavailable_country_codes=(
+                current_country_scope.unavailable_codes
+            ),
+            sources=sources,
+        )
+
         return LegalChatResponse(
             question=request.question.strip(),
             answer=contact_answer,
@@ -1687,6 +1705,7 @@ def _resolve_conservative_fallback(
             model=None,
             retrieval_total=retrieval_total,
             sources=sources,
+            contacts=contacts,
         )
 
     if (
@@ -1867,6 +1886,7 @@ def _execute_resolved_plan(
 
     answer_parts: list[str] = []
     sources: list[LegalAnswerSource] = []
+    contacts = []
     grounded = False
     model_used: str | None = None
     retrieval_total = 0
@@ -2202,6 +2222,21 @@ def _execute_resolved_plan(
         if contact_answer:
             answer_parts.append(contact_answer)
 
+        contacts.extend(
+            build_legal_chat_contacts(
+                source_directory=(
+                    _optional_contact_source_directory()
+                ),
+                requested_country_codes=(
+                    action_scope.available_codes
+                ),
+                unavailable_country_codes=(
+                    action_scope.unavailable_codes
+                ),
+                sources=contact_sources,
+            )
+        )
+
         sources.extend(contact_sources)
 
         resolved_action_countries.append(
@@ -2263,6 +2298,7 @@ def _execute_resolved_plan(
         model=model_used,
         retrieval_total=retrieval_total,
         sources=sources,
+        contacts=contacts,
         conversation_state=next_conversation_state,
     )
 
@@ -3143,6 +3179,43 @@ def resolve_legal_chat_response(
         metrics.log()
 
         raise
+
+
+@router.get(
+    "/contact-photos/{contact_id}/{sha256}",
+    response_class=Response,
+)
+def get_public_contact_photo(
+    contact_id: str,
+    sha256: str,
+) -> Response:
+    """Return one validated public contact photo."""
+
+    settings = get_settings()
+
+    photo = resolve_public_contact_photo(
+        source_directory=settings.document_source_dir,
+        contact_id=contact_id,
+        sha256=sha256,
+    )
+
+    if photo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contact photo not found.",
+        )
+
+    return Response(
+        content=photo.data,
+        media_type=photo.content_type,
+        headers={
+            "ETag": f'"{photo.sha256}"',
+            "Cache-Control": (
+                "public, max-age=31536000, immutable"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.post(

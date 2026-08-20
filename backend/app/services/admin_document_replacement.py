@@ -1328,6 +1328,9 @@ def safe_upload_and_index_document(
                 from app.services.admin_contacts import (
                     reseed_contact_state_from_parsed_contacts,
                 )
+                from app.services.contact_photo_store import (
+                    ContactPhotoStorageError,
+                )
 
                 newly_parsed_contacts = extract_contacts_from_docx(
                     candidate_path,
@@ -1340,9 +1343,13 @@ def safe_upload_and_index_document(
                         country_code=country_code,
                         source_directory=source_directory,
                         contacts=newly_parsed_contacts,
+                        docx_path=candidate_path,
                     )
 
-                except OSError as error:
+                except (
+                    OSError,
+                    ContactPhotoStorageError,
+                ) as error:
                     raise AdminDocumentStorageError(
                         "The document was uploaded, but its contact "
                         "state could not be seeded from the new DOCX."
