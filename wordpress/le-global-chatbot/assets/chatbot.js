@@ -1311,7 +1311,11 @@
                 ))
             );
 
-            if (!contactOnly) {
+            if (contactOnly) {
+                assistantBubble.classList.add(
+                    "le-global-chatbot__message--contact-only"
+                );
+            } else {
                 assistantBubble.appendChild(
                     answerElement
                 );
@@ -1375,6 +1379,9 @@
                             : "?";
 
                         image.className = "le-global-chatbot__contact-photo";
+                        card.classList.add(
+                            "le-global-chatbot__contact-card--with-photo"
+                        );
                         image.alt = contact.contact_person
                             ? contact.contact_person
                             : "Contact";

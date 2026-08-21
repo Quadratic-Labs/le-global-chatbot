@@ -518,3 +518,134 @@
     overflow-wrap: break-word;
     word-break: normal;
 }
+
+
+/* Contact business-card layout v2 */
+.le-global-chatbot__message--assistant.le-global-chatbot__message--contact-only {
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 0;
+    background: transparent;
+}
+
+.le-global-chatbot__message--contact-only
+.le-global-chatbot__contact-cards {
+    width: 100%;
+    margin: 0;
+    gap: 14px;
+}
+
+.le-global-chatbot__contact-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
+    box-sizing: border-box;
+    gap: 14px;
+    padding: 16px;
+    margin: 0;
+    border: 1px solid #d9dee6;
+    border-radius: 14px;
+    background: #ffffff;
+    box-shadow: 0 2px 8px rgba(18, 45, 72, 0.06);
+}
+
+.le-global-chatbot__contact-card--with-photo {
+    grid-template-columns: 88px minmax(0, 1fr);
+}
+
+.le-global-chatbot__contact-photo {
+    width: 88px;
+    height: 104px;
+    object-fit: cover;
+    border-radius: 11px;
+    align-self: start;
+}
+
+.le-global-chatbot__contact-body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: 5px;
+    font-size: 14px;
+    line-height: 1.4;
+    color: #202b38;
+}
+
+.le-global-chatbot__contact-name {
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.25;
+    font-weight: 700;
+    color: #162435;
+}
+
+.le-global-chatbot__contact-firm {
+    margin: 0 0 3px;
+    font-size: 14px;
+    line-height: 1.35;
+    font-weight: 650;
+    color: #243448;
+}
+
+.le-global-chatbot__contact-body a {
+    display: block;
+    max-width: 100%;
+    color: #183b5b;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+}
+
+.le-global-chatbot__contact-address {
+    margin-top: 2px;
+    font-size: 13.5px;
+    line-height: 1.45;
+    color: #455363;
+    overflow-wrap: break-word;
+}
+
+.le-global-chatbot__contact-website {
+    font-size: 13.5px;
+    overflow-wrap: anywhere;
+}
+
+.le-global-chatbot__message--contact-only
+.le-global-chatbot__disclaimer {
+    margin: 14px 2px 0;
+}
+
+@media (max-width: 480px) {
+    .le-global-chatbot__contact-card {
+        padding: 13px;
+        gap: 12px;
+    }
+
+    .le-global-chatbot__contact-card--with-photo {
+        grid-template-columns: 74px minmax(0, 1fr);
+    }
+
+    .le-global-chatbot__contact-photo {
+        width: 74px;
+        height: 88px;
+    }
+
+    .le-global-chatbot__contact-body {
+        font-size: 13.5px;
+        gap: 4px;
+    }
+
+    .le-global-chatbot__contact-name {
+        font-size: 15px;
+    }
+
+    .le-global-chatbot__contact-firm {
+        font-size: 13.5px;
+    }
+
+    .le-global-chatbot__contact-address {
+        font-size: 13px;
+    }
+}

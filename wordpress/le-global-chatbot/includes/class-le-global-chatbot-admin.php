@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.8.1';
+    private const VERSION = '0.8.7';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -186,6 +186,21 @@ final class LE_Global_Chatbot_Admin
         add_action(
             'admin_post_' . self::CONTACT_DELETE_ACTION,
             [self::class, 'handle_delete_contact']
+        );
+
+        add_action(
+            'wp_ajax_le_global_admin_contact_photo_get',
+            [self::class, 'handle_get_contact_photo']
+        );
+
+        add_action(
+            'wp_ajax_le_global_admin_contact_photo_replace',
+            [self::class, 'handle_replace_contact_photo']
+        );
+
+        add_action(
+            'wp_ajax_le_global_admin_contact_photo_remove',
+            [self::class, 'handle_remove_contact_photo']
         );
 
         add_action(
@@ -3408,6 +3423,271 @@ final class LE_Global_Chatbot_Admin
      * remaining-SECTION rule, which is a wholly separate, unrelated
      * business rule this proxy never touches).
      */
+
+    /**
+     * Admin-only binary preview of one contact photo.
+     */
+    public static function handle_get_contact_photo(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACT_UPDATE_ACTION,
+            'nonce'
+        );
+
+        $document_id = self::read_document_id_for_json();
+        $contact_id = self::read_contact_id_for_json();
+        $configuration = self::get_backend_configuration();
+
+        if (is_wp_error($configuration)) {
+            status_header(503);
+            exit;
+        }
+
+        $url = (
+            untrailingslashit($configuration['url'])
+            . self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts/'
+            . rawurlencode($contact_id)
+            . '/photo'
+        );
+
+        $response = wp_remote_get(
+            $url,
+            [
+                'timeout' => 30,
+                'headers' => [
+                    'X-API-Key' => $configuration['api_key'],
+                ],
+            ]
+        );
+
+        if (is_wp_error($response)) {
+            status_header(502);
+            exit;
+        }
+
+        $status_code = wp_remote_retrieve_response_code(
+            $response
+        );
+
+        if ($status_code !== 200) {
+            status_header(
+                $status_code > 0 ? $status_code : 502
+            );
+            exit;
+        }
+
+        $content_type = strtolower(
+            trim(
+                (string) wp_remote_retrieve_header(
+                    $response,
+                    'content-type'
+                )
+            )
+        );
+
+        if (
+            !in_array(
+                $content_type,
+                ['image/jpeg', 'image/png', 'image/webp'],
+                true
+            )
+        ) {
+            status_header(502);
+            exit;
+        }
+
+        status_header(200);
+        header('Content-Type: ' . $content_type);
+        header('Cache-Control: no-store');
+        header('X-Content-Type-Options: nosniff');
+
+        echo wp_remote_retrieve_body($response);
+        exit;
+    }
+
+    /**
+     * Replace or create the optional photo of one contact.
+     */
+    public static function handle_replace_contact_photo(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACT_UPDATE_ACTION,
+            'nonce'
+        );
+
+        self::raise_execution_time_limit();
+
+        $document_id = self::read_document_id_for_json();
+        $contact_id = self::read_contact_id_for_json();
+
+        if (
+            !isset($_FILES['photo'])
+            || !is_array($_FILES['photo'])
+        ) {
+            wp_send_json_error(
+                ['detail' => 'Please choose an image file.'],
+                422
+            );
+        }
+
+        $file = $_FILES['photo'];
+        $error = (int) ($file['error'] ?? UPLOAD_ERR_NO_FILE);
+        $size = (int) ($file['size'] ?? 0);
+        $tmp_name = (string) ($file['tmp_name'] ?? '');
+
+        if ($error !== UPLOAD_ERR_OK || $tmp_name === '') {
+            wp_send_json_error(
+                ['detail' => 'The photo upload could not be read.'],
+                422
+            );
+        }
+
+        if ($size <= 0 || $size > 10 * 1024 * 1024) {
+            wp_send_json_error(
+                ['detail' => 'Photo must be smaller than 10 MiB.'],
+                422
+            );
+        }
+
+        $content_type = function_exists('wp_get_image_mime')
+            ? wp_get_image_mime($tmp_name)
+            : '';
+
+        if (
+            !in_array(
+                $content_type,
+                ['image/jpeg', 'image/png', 'image/webp'],
+                true
+            )
+        ) {
+            wp_send_json_error(
+                [
+                    'detail' => (
+                        'Only JPEG, PNG and WebP images '
+                        . 'are accepted.'
+                    ),
+                ],
+                422
+            );
+        }
+
+        $body = file_get_contents($tmp_name);
+
+        if ($body === false || $body === '') {
+            wp_send_json_error(
+                ['detail' => 'The photo upload could not be read.'],
+                422
+            );
+        }
+
+        $configuration = self::get_backend_configuration();
+
+        if (is_wp_error($configuration)) {
+            wp_send_json_error(
+                ['detail' => 'The backend is not configured.'],
+                503
+            );
+        }
+
+        $url = (
+            untrailingslashit($configuration['url'])
+            . self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts/'
+            . rawurlencode($contact_id)
+            . '/photo'
+        );
+
+        $response = wp_remote_request(
+            $url,
+            [
+                'method' => 'PUT',
+                'timeout' => 60,
+                'headers' => [
+                    'X-API-Key' => $configuration['api_key'],
+                    'Content-Type' => $content_type,
+                ],
+                'body' => $body,
+            ]
+        );
+
+        if (is_wp_error($response)) {
+            wp_send_json_error(
+                ['detail' => 'The photo could not be uploaded.'],
+                502
+            );
+        }
+
+        $status_code = wp_remote_retrieve_response_code(
+            $response
+        );
+
+        $decoded = json_decode(
+            wp_remote_retrieve_body($response),
+            true
+        );
+
+        if (!is_array($decoded)) {
+            $decoded = [
+                'detail' => 'The backend returned an invalid response.',
+            ];
+        }
+
+        if ($status_code >= 200 && $status_code < 300) {
+            wp_send_json_success(
+                $decoded,
+                $status_code
+            );
+        }
+
+        wp_send_json_error(
+            $decoded,
+            $status_code > 0 ? $status_code : 502
+        );
+    }
+
+    /**
+     * Remove only the photo; the contact itself remains unchanged.
+     */
+    public static function handle_remove_contact_photo(): void
+    {
+        self::assert_capability();
+
+        check_ajax_referer(
+            self::CONTACT_UPDATE_ACTION,
+            'nonce'
+        );
+
+        $document_id = self::read_document_id_for_json();
+        $contact_id = self::read_contact_id_for_json();
+
+        $result = self::request_backend(
+            'DELETE',
+            self::DOCUMENTS_PATH
+            . '/'
+            . rawurlencode($document_id)
+            . '/contacts/'
+            . rawurlencode($contact_id)
+            . '/photo',
+            null,
+            60
+        );
+
+        self::relay_json_result(
+            $result,
+            'The contact photo could not be removed.'
+        );
+    }
+
+
     public static function handle_delete_contact(): void
     {
         self::assert_capability();
