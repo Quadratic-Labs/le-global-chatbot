@@ -824,6 +824,83 @@ class ContactCrudTests(unittest.TestCase):
                     client=client,
                 )
 
+    def test_list_exposes_has_photo_true_for_a_contact_with_a_photo(
+        self,
+    ) -> None:
+        """
+        The safe photo-presence contract Admin/View needs (mission -
+        the diagnosed root cause of "no thumbnail" was a route path
+        mismatch, not this, but the Admin list blindly attempting a
+        photo fetch for every contact regardless of whether one exists
+        is itself worth fixing: no pointless 404 image requests for
+        contacts that never had a photo). Never photo_filename or any
+        filesystem path.
+        """
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            client = FakeContactOpenSearchClient()
+
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=DOCUMENT_ID,
+                    country_code="GB",
+                    contacts=(
+                        ContactRecord(
+                            contact_id=new_contact_id(),
+                            member_firm="Example & Partners",
+                            contact_person="Jane Doe",
+                            email="jane@example.com",
+                            phone="+1 555 0000",
+                            address="1 Example Street",
+                            website="https://example.com",
+                            photo_filename="deadbeef.jpg",
+                            photo_content_type="image/jpeg",
+                            photo_sha256="a" * 64,
+                        ),
+                    ),
+                ),
+            )
+
+            listing = list_contacts(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(len(listing.contacts), 1)
+            self.assertTrue(listing.contacts[0].has_photo)
+
+            serialized = listing.contacts[0].model_dump()
+            self.assertNotIn("photo_filename", serialized)
+            self.assertNotIn("photo_content_type", serialized)
+            self.assertNotIn("photo_sha256", serialized)
+
+    def test_list_exposes_has_photo_false_for_a_contact_without_a_photo(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            listing = list_contacts(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(len(listing.contacts), 1)
+            self.assertFalse(listing.contacts[0].has_photo)
+
 
 # =========================================================================
 # ROLLBACK

@@ -136,6 +136,53 @@ class AdminContactPhotoTests(unittest.TestCase):
                 normal_dependencies,
             )
 
+    def test_photo_route_paths_share_the_documents_prefix(self):
+        """
+        The WordPress Admin proxy (class-le-global-chatbot-admin.php)
+        builds every contact photo URL as DOCUMENTS_PATH + "/" +
+        document_id + "/contacts/" + contact_id + "/photo", where
+        DOCUMENTS_PATH is the exact same "/api/v1/admin/documents"
+        constant used to build the list/add/update/delete contact
+        URLs. The three photo routes must therefore share that same
+        prefix - if they don't, every request WordPress sends 404s
+        (the proven root cause of "Admin View/Edit shows no photo
+        thumbnail": the browser's <img> gets a 404 and its onerror
+        handler silently removes it).
+        """
+
+        contacts_list_route = next(
+            route
+            for route in router.routes
+            if route.path.endswith("/{document_id}/contacts")
+            and "GET" in route.methods
+        )
+        documents_prefix = contacts_list_route.path.removesuffix(
+            "/{document_id}/contacts"
+        )
+
+        # A list, not a set: the three photo routes (GET/PUT/DELETE)
+        # correctly share one IDENTICAL path string, differentiated
+        # only by HTTP method - deduplicating by path value would
+        # collapse them to one element even when the fix is correct.
+        photo_routes = [
+            route
+            for route in router.routes
+            if route.path.endswith(
+                "/{document_id}/contacts/{contact_id}/photo"
+            )
+        ]
+
+        self.assertEqual(3, len(photo_routes))
+
+        for route in photo_routes:
+            self.assertTrue(
+                route.path.startswith(documents_prefix + "/"),
+                f"{route.path!r} does not share the "
+                f"{documents_prefix!r} prefix WordPress's "
+                "DOCUMENTS_PATH constant assumes every Admin contact "
+                "route (including photo routes) uses",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

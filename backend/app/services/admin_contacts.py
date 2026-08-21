@@ -358,6 +358,7 @@ def _contact_summary(record: ContactRecord) -> AdminContactSummary:
         phone=record.phone,
         address=record.address,
         website=record.website,
+        has_photo=record.photo_filename is not None,
     )
 
 
