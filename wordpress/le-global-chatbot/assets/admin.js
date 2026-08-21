@@ -3313,11 +3313,12 @@
         function showStoredPhoto(
             control,
             documentId,
-            contactId
+            contactId,
+            hasPhoto
         ) {
             clearPhotoControl(control);
 
-            if (!documentId || !contactId) {
+            if (!hasPhoto || !documentId || !contactId) {
                 return;
             }
 
@@ -3562,21 +3563,23 @@
             const card = document.createElement("div");
             card.className = "le-global-chatbot-admin__contact-card";
 
-            const photo = document.createElement("img");
-            photo.className = (
-                "le-global-chatbot-admin__contact-card-photo"
-            );
-            photo.alt = contact.contact_person
-                ? `${contact.contact_person} photo`
-                : "Contact photo";
-            photo.src = contactPhotoUrl(
-                countrySelect.value,
-                contact.contact_id
-            );
-            photo.onerror = () => {
-                photo.remove();
-            };
-            card.appendChild(photo);
+            if (contact.has_photo) {
+                const photo = document.createElement("img");
+                photo.className = (
+                    "le-global-chatbot-admin__contact-card-photo"
+                );
+                photo.alt = contact.contact_person
+                    ? `${contact.contact_person} photo`
+                    : "Contact photo";
+                photo.src = contactPhotoUrl(
+                    countrySelect.value,
+                    contact.contact_id
+                );
+                photo.onerror = () => {
+                    photo.remove();
+                };
+                card.appendChild(photo);
+            }
 
             const fieldLabels = [
                 ["Member firm", contact.member_firm],
@@ -3738,7 +3741,8 @@
             showStoredPhoto(
                 editPhotoControl,
                 countrySelect.value,
-                contact.contact_id
+                contact.contact_id,
+                contact.has_photo
             );
 
             viewSubState = "edit-one";

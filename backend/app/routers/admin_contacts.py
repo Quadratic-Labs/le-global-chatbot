@@ -423,7 +423,7 @@ def delete_admin_document_contact(
         ) from error
 
 @router.get(
-    "/{document_id}/contacts/{contact_id}/photo",
+    "/documents/{document_id}/contacts/{contact_id}/photo",
     response_class=Response,
 )
 def get_admin_document_contact_photo(
@@ -459,7 +459,7 @@ def get_admin_document_contact_photo(
 
 
 @router.put(
-    "/{document_id}/contacts/{contact_id}/photo",
+    "/documents/{document_id}/contacts/{contact_id}/photo",
 )
 async def replace_admin_document_contact_photo(
     document_id: str,
@@ -518,7 +518,7 @@ async def replace_admin_document_contact_photo(
 
 
 @router.delete(
-    "/{document_id}/contacts/{contact_id}/photo",
+    "/documents/{document_id}/contacts/{contact_id}/photo",
 )
 def delete_admin_document_contact_photo(
     document_id: str,

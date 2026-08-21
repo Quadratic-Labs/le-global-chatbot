@@ -3455,13 +3455,23 @@ final class LE_Global_Chatbot_Admin
             . '/photo'
         );
 
+        $headers = [
+            'X-API-Key' => $configuration['api_key'],
+            'X-Admin-Key' => $configuration['admin_api_key'],
+        ];
+
+        $client_ip = self::get_client_ip();
+
+        if ($client_ip !== null) {
+            $headers['X-Forwarded-For'] = $client_ip;
+            $headers['X-Real-IP'] = $client_ip;
+        }
+
         $response = wp_remote_get(
             $url,
             [
                 'timeout' => 30,
-                'headers' => [
-                    'X-API-Key' => $configuration['api_key'],
-                ],
+                'headers' => $headers,
             ]
         );
 
@@ -3613,6 +3623,7 @@ final class LE_Global_Chatbot_Admin
                 'timeout' => 60,
                 'headers' => [
                     'X-API-Key' => $configuration['api_key'],
+                    'X-Admin-Key' => $configuration['admin_api_key'],
                     'Content-Type' => $content_type,
                 ],
                 'body' => $body,

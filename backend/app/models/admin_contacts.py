@@ -22,6 +22,7 @@ class AdminContactSummary(BaseModel):
     phone: str | None = None
     address: str | None = None
     website: str | None = None
+    has_photo: bool = False
 
     class Config:
         extra = "forbid"
