@@ -1918,6 +1918,10 @@
         }
 
         function isEditDirty() {
+            if (editPhotoControl.input.files.length > 0) {
+                return true;
+            }
+
             return (
                 editBaselineContent !== null
                 && (
@@ -2366,6 +2370,26 @@
                 updateSaveAvailability();
                 return;
             }
+            const pendingPhoto = (
+                editPhotoControl.input.files[0] || null
+            );
+
+            if (pendingPhoto) {
+                const photoSaved = await uploadContactPhoto(
+                    documentId,
+                    contactId,
+                    pendingPhoto
+                );
+
+                if (!photoSaved) {
+                    window.alert(
+                        "The contact details were saved, but the "
+                        + "photo could not be uploaded. You can retry "
+                        + "the photo from this Edit contact screen."
+                    );
+                }
+            }
+
 
             // A rename changes the section's own identity - the
             // update response's own document_id/section_id/legal_topic
@@ -2707,6 +2731,37 @@
                 updateAddSubmitAvailability();
                 return;
             }
+            const pendingPhoto = (
+                addPhotoControl.input.files[0] || null
+            );
+
+            const createdContactId = (
+                result
+                && result.payload
+                && result.payload.data
+                && typeof result.payload.data.contact_id === "string"
+            )
+                ? result.payload.data.contact_id
+                : "";
+
+            if (pendingPhoto) {
+                const photoSaved = (
+                    createdContactId
+                    && await uploadContactPhoto(
+                        documentId,
+                        createdContactId,
+                        pendingPhoto
+                    )
+                );
+
+                if (!photoSaved) {
+                    window.alert(
+                        "The contact was added, but the photo could "
+                        + "not be uploaded. Open Edit contact to retry."
+                    );
+                }
+            }
+
 
             // Re-fetch the sections list so the new section is
             // immediately available in Edit mode (mission "ORDER 8B",
@@ -3183,12 +3238,345 @@
             listEl.textContent = "";
         }
 
+
+        const CONTACT_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+        let photoBusy = false;
+
+        function contactPhotoUrl(documentId, contactId) {
+            const url = new URL(
+                config.adminPostUrl,
+                window.location.href
+            );
+
+            url.searchParams.set(
+                "action",
+                "le_global_admin_contact_photo_get"
+            );
+            url.searchParams.set(
+                "nonce",
+                config.contactUpdateNonce
+            );
+            url.searchParams.set("document_id", documentId);
+            url.searchParams.set("contact_id", contactId);
+            url.searchParams.set("_", String(Date.now()));
+
+            return url.toString();
+        }
+
+        function validatePhotoFile(file) {
+            if (!file) {
+                return null;
+            }
+
+            if (
+                ![
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp",
+                ].includes(file.type)
+            ) {
+                return "Choose a JPEG, PNG or WebP image.";
+            }
+
+            if (file.size > CONTACT_PHOTO_MAX_BYTES) {
+                return "The photo must be smaller than 10 MiB.";
+            }
+
+            return null;
+        }
+
+        function clearPhotoControl(control) {
+            if (control.objectUrl) {
+                URL.revokeObjectURL(control.objectUrl);
+                control.objectUrl = null;
+            }
+
+            control.input.value = "";
+            control.image.removeAttribute("src");
+            control.image.hidden = true;
+
+            if (control.removeButton) {
+                control.removeButton.hidden = true;
+            }
+        }
+
+        function showLocalPhoto(control, file) {
+            if (control.objectUrl) {
+                URL.revokeObjectURL(control.objectUrl);
+            }
+
+            control.objectUrl = URL.createObjectURL(file);
+            control.image.src = control.objectUrl;
+            control.image.hidden = false;
+        }
+
+        function showStoredPhoto(
+            control,
+            documentId,
+            contactId
+        ) {
+            clearPhotoControl(control);
+
+            if (!documentId || !contactId) {
+                return;
+            }
+
+            control.image.onload = () => {
+                control.image.hidden = false;
+
+                if (control.removeButton) {
+                    control.removeButton.hidden = false;
+                }
+            };
+
+            control.image.onerror = () => {
+                control.image.hidden = true;
+
+                if (control.removeButton) {
+                    control.removeButton.hidden = true;
+                }
+            };
+
+            control.image.src = contactPhotoUrl(
+                documentId,
+                contactId
+            );
+        }
+
+        function mountPhotoControl(anchorInput, kind) {
+            const host = (
+                anchorInput.closest("td")
+                || anchorInput.parentElement
+            );
+
+            const root = document.createElement("div");
+            root.className = (
+                "le-global-chatbot-admin__contact-photo-control"
+            );
+
+            const title = document.createElement("strong");
+            title.textContent = kind === "edit"
+                ? "Contact photo"
+                : "Photo (optional)";
+            root.appendChild(title);
+
+            const image = document.createElement("img");
+            image.className = (
+                "le-global-chatbot-admin__contact-photo-preview"
+            );
+            image.alt = "Contact photo preview";
+            image.hidden = true;
+            root.appendChild(image);
+
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = "image/jpeg,image/png,image/webp";
+            input.className = (
+                "le-global-chatbot-admin__contact-photo-input"
+            );
+            root.appendChild(input);
+
+            let removeButton = null;
+
+            if (kind === "edit") {
+                removeButton = document.createElement("button");
+                removeButton.type = "button";
+                removeButton.className = (
+                    "button le-global-chatbot-admin__contact-photo-remove"
+                );
+                removeButton.textContent = "Remove current photo";
+                removeButton.hidden = true;
+                root.appendChild(removeButton);
+            }
+
+            const note = document.createElement("small");
+            note.textContent = (
+                "JPEG, PNG or WebP. Maximum 10 MiB."
+            );
+            root.appendChild(note);
+
+            const control = {
+                root,
+                image,
+                input,
+                removeButton,
+                objectUrl: null,
+            };
+
+            input.addEventListener("change", () => {
+                const file = input.files[0] || null;
+                const error = validatePhotoFile(file);
+
+                if (error) {
+                    window.alert(error);
+                    clearPhotoControl(control);
+                    updateSaveAvailability();
+                    return;
+                }
+
+                if (file) {
+                    showLocalPhoto(control, file);
+                }
+
+                updateSaveAvailability();
+            });
+
+            host.appendChild(root);
+
+            return control;
+        }
+
+        const editPhotoControl = mountPhotoControl(
+            editWebsiteInput,
+            "edit"
+        );
+
+        const addPhotoControl = mountPhotoControl(
+            addWebsiteInput,
+            "add"
+        );
+
+        async function uploadContactPhoto(
+            documentId,
+            contactId,
+            file
+        ) {
+            const validationError = validatePhotoFile(file);
+
+            if (validationError) {
+                window.alert(validationError);
+                return false;
+            }
+
+            const formData = new FormData();
+            formData.set(
+                "action",
+                "le_global_admin_contact_photo_replace"
+            );
+            formData.set(
+                "nonce",
+                config.contactUpdateNonce
+            );
+            formData.set("document_id", documentId);
+            formData.set("contact_id", contactId);
+            formData.set("photo", file);
+
+            try {
+                const result = await fetchJson(
+                    config.adminPostUrl,
+                    {
+                        method: "POST",
+                        body: formData,
+                    }
+                );
+
+                return isSuccessful(result);
+            } catch {
+                return false;
+            }
+        }
+
+        async function removeCurrentContactPhoto() {
+            if (
+                photoBusy
+                || saving
+                || adding
+                || deleting
+            ) {
+                return;
+            }
+
+            const documentId = countrySelect.value;
+            const contactId = editIdInput.value;
+
+            if (!documentId || !contactId) {
+                return;
+            }
+
+            if (
+                !window.confirm(
+                    "Remove this contact's current photo?"
+                )
+            ) {
+                return;
+            }
+
+            photoBusy = true;
+            editPhotoControl.removeButton.disabled = true;
+
+            const formData = new FormData();
+            formData.set(
+                "action",
+                "le_global_admin_contact_photo_remove"
+            );
+            formData.set(
+                "nonce",
+                config.contactUpdateNonce
+            );
+            formData.set("document_id", documentId);
+            formData.set("contact_id", contactId);
+
+            let result;
+
+            try {
+                result = await fetchJson(
+                    config.adminPostUrl,
+                    {
+                        method: "POST",
+                        body: formData,
+                    }
+                );
+            } catch {
+                result = null;
+            }
+
+            photoBusy = false;
+            editPhotoControl.removeButton.disabled = false;
+
+            if (!isSuccessful(result)) {
+                setMessage(
+                    "The photo could not be removed.",
+                    "is-error"
+                );
+                return;
+            }
+
+            clearPhotoControl(editPhotoControl);
+
+            setMessage(
+                "✓ The contact photo was removed successfully.",
+                "is-success"
+            );
+        }
+
+        editPhotoControl.removeButton.addEventListener(
+            "click",
+            removeCurrentContactPhoto
+        );
+
+
         // Never innerHTML for anything derived from real contact data
         // (mission "ORDER 5D"'s own discipline, reused here) - every
         // node is built with createElement/textContent.
         function buildContactCard(contact) {
             const card = document.createElement("div");
             card.className = "le-global-chatbot-admin__contact-card";
+
+            const photo = document.createElement("img");
+            photo.className = (
+                "le-global-chatbot-admin__contact-card-photo"
+            );
+            photo.alt = contact.contact_person
+                ? `${contact.contact_person} photo`
+                : "Contact photo";
+            photo.src = contactPhotoUrl(
+                countrySelect.value,
+                contact.contact_id
+            );
+            photo.onerror = () => {
+                photo.remove();
+            };
+            card.appendChild(photo);
 
             const fieldLabels = [
                 ["Member firm", contact.member_firm],
@@ -3285,12 +3673,14 @@
                 input.disabled = true;
             });
             editBaseline = null;
+            clearPhotoControl(editPhotoControl);
         }
 
         function resetAddOnlyFields() {
             addFields.forEach(([, input]) => {
                 input.value = "";
             });
+            clearPhotoControl(addPhotoControl);
         }
 
         function resetToEmpty() {
@@ -3344,6 +3734,12 @@
                 input.value = editBaseline[key];
                 input.disabled = false;
             });
+
+            showStoredPhoto(
+                editPhotoControl,
+                countrySelect.value,
+                contact.contact_id
+            );
 
             viewSubState = "edit-one";
             setMessage("", null);

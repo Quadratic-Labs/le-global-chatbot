@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+from fastapi import Header, HTTPException, Request, Response, status
+
+from app.core.config import get_settings
+from app.services.admin_contact_photos import (
+    AdminContactPhotoError,
+    AdminContactPhotoNotFoundError,
+    read_admin_contact_photo,
+    remove_admin_contact_photo,
+    replace_admin_contact_photo,
+)
+
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -409,3 +421,128 @@ def delete_admin_document_contact(
                 document_id=document_id,
             ),
         ) from error
+
+@router.get(
+    "/{document_id}/contacts/{contact_id}/photo",
+    response_class=Response,
+)
+def get_admin_document_contact_photo(
+    document_id: str,
+    contact_id: str,
+) -> Response:
+    try:
+        photo = read_admin_contact_photo(
+            get_settings().document_source_dir,
+            document_id,
+            contact_id,
+        )
+    except AdminContactPhotoNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except AdminContactPhotoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    return Response(
+        content=photo.data,
+        media_type=photo.content_type,
+        headers={
+            "ETag": f'"{photo.sha256}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.put(
+    "/{document_id}/contacts/{contact_id}/photo",
+)
+async def replace_admin_document_contact_photo(
+    document_id: str,
+    contact_id: str,
+    request: Request,
+    content_type: str | None = Header(
+        default=None,
+        alias="Content-Type",
+    ),
+    content_length: int | None = Header(
+        default=None,
+        alias="Content-Length",
+    ),
+):
+    if (
+        content_length is not None
+        and content_length > 10 * 1024 * 1024
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Photo file exceeds the 10 MiB limit.",
+        )
+
+    body = await request.body()
+
+    if not body:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Photo file is empty.",
+        )
+
+    try:
+        photo = replace_admin_contact_photo(
+            get_settings().document_source_dir,
+            document_id,
+            contact_id,
+            data=body,
+            content_type=content_type or "",
+        )
+    except AdminContactPhotoNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except AdminContactPhotoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    return {
+        "document_id": document_id,
+        "contact_id": contact_id,
+        "photo_sha256": photo.sha256,
+    }
+
+
+@router.delete(
+    "/{document_id}/contacts/{contact_id}/photo",
+)
+def delete_admin_document_contact_photo(
+    document_id: str,
+    contact_id: str,
+):
+    try:
+        removed = remove_admin_contact_photo(
+            get_settings().document_source_dir,
+            document_id,
+            contact_id,
+        )
+    except AdminContactPhotoNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except AdminContactPhotoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    return {
+        "document_id": document_id,
+        "contact_id": contact_id,
+        "photo_removed": removed,
+    }

@@ -811,3 +811,43 @@
 .le-global-chatbot-admin__visually-hidden-input:focus-visible + * {
     outline: 2px solid #2271b1;
 }
+
+/* B3.19 — Contact photo CRUD */
+.le-global-chatbot-admin__contact-card-photo {
+    width: 86px;
+    height: 100px;
+    object-fit: cover;
+    float: left;
+    margin: 0 16px 10px 0;
+    border-radius: 8px;
+    border: 1px solid #dcdcde;
+    background: #f6f7f7;
+}
+
+.le-global-chatbot-admin__contact-photo-control {
+    display: grid;
+    gap: 8px;
+    max-width: 420px;
+    margin-top: 14px;
+    padding: 14px;
+    border: 1px solid #dcdcde;
+    border-radius: 8px;
+    background: #f6f7f7;
+}
+
+.le-global-chatbot-admin__contact-photo-preview {
+    width: 110px;
+    height: 128px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid #c3c4c7;
+    background: #fff;
+}
+
+.le-global-chatbot-admin__contact-photo-input {
+    max-width: 100%;
+}
+
+.le-global-chatbot-admin__contact-photo-remove {
+    width: fit-content;
+}
