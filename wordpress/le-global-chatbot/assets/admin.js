@@ -1918,10 +1918,6 @@
         }
 
         function isEditDirty() {
-            if (editPhotoControl.input.files.length > 0) {
-                return true;
-            }
-
             return (
                 editBaselineContent !== null
                 && (
@@ -2370,26 +2366,6 @@
                 updateSaveAvailability();
                 return;
             }
-            const pendingPhoto = (
-                editPhotoControl.input.files[0] || null
-            );
-
-            if (pendingPhoto) {
-                const photoSaved = await uploadContactPhoto(
-                    documentId,
-                    contactId,
-                    pendingPhoto
-                );
-
-                if (!photoSaved) {
-                    window.alert(
-                        "The contact details were saved, but the "
-                        + "photo could not be uploaded. You can retry "
-                        + "the photo from this Edit contact screen."
-                    );
-                }
-            }
-
 
             // A rename changes the section's own identity - the
             // update response's own document_id/section_id/legal_topic
@@ -2731,37 +2707,6 @@
                 updateAddSubmitAvailability();
                 return;
             }
-            const pendingPhoto = (
-                addPhotoControl.input.files[0] || null
-            );
-
-            const createdContactId = (
-                result
-                && result.payload
-                && result.payload.data
-                && typeof result.payload.data.contact_id === "string"
-            )
-                ? result.payload.data.contact_id
-                : "";
-
-            if (pendingPhoto) {
-                const photoSaved = (
-                    createdContactId
-                    && await uploadContactPhoto(
-                        documentId,
-                        createdContactId,
-                        pendingPhoto
-                    )
-                );
-
-                if (!photoSaved) {
-                    window.alert(
-                        "The contact was added, but the photo could "
-                        + "not be uploaded. Open Edit contact to retry."
-                    );
-                }
-            }
-
 
             // Re-fetch the sections list so the new section is
             // immediately available in Edit mode (mission "ORDER 8B",
@@ -3110,12 +3055,20 @@
                 return false;
             }
 
+            if (editPhotoControl.input.files.length > 0) {
+                return true;
+            }
+
             return editFields.some(
                 ([key, input]) => input.value !== editBaseline[key]
             );
         }
 
         function isAddDirty() {
+            if (addPhotoControl.input.files.length > 0) {
+                return true;
+            }
+
             return addFields.some(
                 ([, input]) => input.value.trim() !== ""
             );
@@ -3731,6 +3684,7 @@
                 phone: contact.phone || "",
                 address: contact.address || "",
                 website: contact.website || "",
+                has_photo: Boolean(contact.has_photo),
             };
 
             editFields.forEach(([key, input]) => {
@@ -3983,16 +3937,18 @@
                 result = null;
             }
 
-            saving = false;
-            saveButton.textContent = "Save changes";
-
             if (generation !== contactGeneration) {
+                // Cancel (or a fresh country pick) already reset the
+                // UI while this save was in flight - never touch
+                // controls it already reset or disabled.
+                saving = false;
                 return;
             }
 
-            countrySelect.disabled = false;
-
             if (!isSuccessful(result)) {
+                saving = false;
+                saveButton.textContent = "Save changes";
+                countrySelect.disabled = false;
                 cancelButton.disabled = false;
                 setMessage(
                     businessMessage(
@@ -4001,6 +3957,54 @@
                         + "been confirmed as completed. Please try "
                         + "again or contact support."
                     ),
+                    "is-error"
+                );
+                updateSaveAvailability();
+                return;
+            }
+
+            // Business fields are now committed - one Save click is
+            // one logical edit operation that may also carry a
+            // pending photo (mission "COMPLETE CONTACT PHOTO CRUD +
+            // DOCX SOURCE SYNCHRONIZATION", section 11); each backend
+            // mutation is independently atomic with the source DOCX,
+            // sequenced here rather than merged into one request. The
+            // baseline is refreshed immediately so a photo failure
+            // below never re-asks the user to redo the part that
+            // already succeeded.
+            editBaseline = {
+                has_photo: editBaseline ? editBaseline.has_photo : false,
+            };
+            editFields.forEach(([key, input]) => {
+                editBaseline[key] = input.value.trim();
+            });
+
+            const pendingPhoto = editPhotoControl.input.files[0] || null;
+            let photoFailed = false;
+
+            if (pendingPhoto) {
+                photoFailed = !(await uploadContactPhoto(
+                    documentId,
+                    contactId,
+                    pendingPhoto
+                ));
+            }
+
+            saving = false;
+            saveButton.textContent = "Save changes";
+
+            if (generation !== contactGeneration) {
+                return;
+            }
+
+            countrySelect.disabled = false;
+            cancelButton.disabled = false;
+
+            if (photoFailed) {
+                setMessage(
+                    "The contact details were saved, but the photo "
+                    + "could not be saved. You can retry the photo "
+                    + "from this Edit contact screen.",
                     "is-error"
                 );
                 updateSaveAvailability();
@@ -4069,16 +4073,15 @@
                 result = null;
             }
 
-            adding = false;
-            addSubmitButton.textContent = "Add contact";
-
             if (generation !== contactGeneration) {
+                adding = false;
                 return;
             }
 
-            countrySelect.disabled = false;
-
             if (!isSuccessful(result)) {
+                adding = false;
+                addSubmitButton.textContent = "Add contact";
+                countrySelect.disabled = false;
                 cancelButton.disabled = false;
                 setMessage(
                     businessMessage(
@@ -4093,10 +4096,55 @@
                 return;
             }
 
+            // The contact now exists - a pending photo is a SEPARATE,
+            // independently atomic mutation against the new
+            // contact_id (mission section 13): its own failure must
+            // never be reported as the contact itself failing to be
+            // added.
+            const pendingPhoto = addPhotoControl.input.files[0] || null;
+            const createdContactId = (
+                result.payload.data
+                && typeof result.payload.data.contact_id === "string"
+            )
+                ? result.payload.data.contact_id
+                : "";
+
+            let photoFailed = false;
+
+            if (pendingPhoto) {
+                photoFailed = !(
+                    createdContactId
+                    && await uploadContactPhoto(
+                        documentId,
+                        createdContactId,
+                        pendingPhoto
+                    )
+                );
+            }
+
+            adding = false;
+            addSubmitButton.textContent = "Add contact";
+
+            if (generation !== contactGeneration) {
+                return;
+            }
+
+            countrySelect.disabled = false;
+            cancelButton.disabled = false;
+
             resetAddOnlyFields();
             updateAddSubmitAvailability();
 
             await loadContacts(documentId);
+
+            if (photoFailed) {
+                setMessage(
+                    "The contact was added, but the photo could not "
+                    + "be saved. Open Edit contact to retry.",
+                    "is-error"
+                );
+                return;
+            }
 
             setMessage(
                 `✓ The contact was added successfully for `
@@ -4125,6 +4173,12 @@
                 editFields.forEach(([key, input]) => {
                     input.value = editBaseline[key];
                 });
+                showStoredPhoto(
+                    editPhotoControl,
+                    countrySelect.value,
+                    editIdInput.value,
+                    editBaseline.has_photo
+                );
                 updateSaveAvailability();
             }
 

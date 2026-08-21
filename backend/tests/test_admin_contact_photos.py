@@ -1,9 +1,24 @@
+"""
+Tests for Admin contact photo CRUD (mission "COMPLETE CONTACT PHOTO
+CRUD + DOCX SOURCE SYNCHRONIZATION").
+
+Every mutation test here backs onto a REAL corpus DOCX (temp copy,
+never the real file itself - see SOURCE_ROOT/_require_copy below,
+mirroring test_contact_photos.py's own established convention of
+skipping gracefully when /data/documents/source is unavailable rather
+than failing), through a small fake OpenSearch client that answers
+exactly the one read-only metadata lookup
+(_resolve_current_source_path) these mutations need - never a real
+network call, and never any reindexing.
+"""
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from app.routers.admin_contacts import router
 from app.services.admin_contact_photos import (
@@ -13,30 +28,169 @@ from app.services.admin_contact_photos import (
     remove_admin_contact_photo,
     replace_admin_contact_photo,
 )
+from app.services.admin_document_lifecycle import get_document_download
+from app.services.contact_photo_store import write_contact_photo_atomic
+from app.services.contact_photos import extract_contact_photo_candidates
 from app.services.contact_state import (
     ContactRecord,
     ContactState,
+    read_contact_state,
     write_contact_state_atomic,
 )
 
 
+SOURCE_ROOT = Path("/data/documents/source")
+
+_VALID_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffd9"
+)
+_VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000"
+    "000108060000001f15c4890000000a49444154789c63"
+    "60000002000100ffff03000006000557bfabd4000000"
+    "0049454e44ae426082"
+)
+
+
+class _FakePhotoOpenSearchClient:
+    """The one read-only metadata lookup contact photo mutations
+    need - never a reindex, never a real network call."""
+
+    def __init__(
+        self,
+        *,
+        document_id: str,
+        country_code: str,
+        country: str,
+        source_filename: str,
+        reference_year: int | None = 2026,
+    ) -> None:
+        self.document_id = document_id
+        self.country_code = country_code
+        self.country = country
+        self.source_filename = source_filename
+        self.reference_year = reference_year
+
+    def search(self, index: str, body: dict[str, Any]) -> dict[str, Any]:
+        del index
+
+        term = body.get("query", {}).get("term", {})
+
+        if term.get("document_id") != self.document_id:
+            return {"hits": {"hits": []}}
+
+        return {
+            "hits": {
+                "hits": [
+                    {
+                        "_source": {
+                            "document_id": self.document_id,
+                            "source_filename": self.source_filename,
+                            "country": self.country,
+                            "country_code": self.country_code,
+                            "reference_year": self.reference_year,
+                        }
+                    }
+                ]
+            }
+        }
+
+
 class AdminContactPhotoTests(unittest.TestCase):
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def _require_source_copy(self, filename: str) -> Path:
+        source = SOURCE_ROOT / filename
+
+        if not source.exists():
+            self.skipTest(
+                f"Real corpus source unavailable: {source}"
+            )
+
+        return source
+
+    def _seed_photo_bearing_contact(self) -> _FakePhotoOpenSearchClient:
+        """
+        Argentina (AR.docx), copied into this test's own
+        source_directory as AR.docx (the canonical
+        {COUNTRY_CODE}.docx storage name
+        resolve_document_source_path expects) - a real single
+        contact with a real existing photo, so REPLACE/REMOVE exercise
+        the actual DOCX-mutation code path, not a synthetic stand-in.
+        """
+
+        real_source = self._require_source_copy("AR.docx")
+        docx_path = self.root / "AR.docx"
+        shutil.copyfile(real_source, docx_path)
+
+        candidates = extract_contact_photo_candidates(docx_path)
+        assert len(candidates) == 1
+        photo = candidates[0]
+
+        stored = write_contact_photo_atomic(
+            self.root,
+            "contact-test",
+            data=photo.data,
+            content_type=photo.content_type,
+        )
 
         write_contact_state_atomic(
             self.root,
             ContactState(
-                document_id="doc-test",
-                country_code="BE",
+                document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                country_code="AR",
                 contacts=(
                     ContactRecord(
                         contact_id="contact-test",
-                        member_firm="Firm",
-                        contact_person="Person",
-                        email="p@example.com",
+                        member_firm="Allende & Brea",
+                        contact_person="Nicolás Grandi",
+                        email="ngrandi@allende.com",
+                        phone="+1",
+                        address="Address",
+                        website="https://example.com",
+                        photo_filename=stored.filename,
+                        photo_content_type=stored.content_type,
+                        photo_sha256=stored.sha256,
+                    ),
+                ),
+            ),
+        )
+
+        return _FakePhotoOpenSearchClient(
+            document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            country_code="AR",
+            country="Argentina",
+            source_filename="AR.docx",
+        )
+
+    def _seed_photo_less_contact(self) -> _FakePhotoOpenSearchClient:
+        """
+        Germany (DE.docx), copied in the same way - a real single
+        contact (Tobias Pusch) who genuinely has no photo yet, so a
+        PUT exercises the real ADD-into-the-document code path.
+        """
+
+        real_source = self._require_source_copy("DE.docx")
+        docx_path = self.root / "DE.docx"
+        shutil.copyfile(real_source, docx_path)
+
+        assert extract_contact_photo_candidates(docx_path) == []
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                country_code="DE",
+                contacts=(
+                    ContactRecord(
+                        contact_id="contact-test",
+                        member_firm="Pusch Wahlig Workplace Law",
+                        contact_person="Tobias Pusch",
+                        email="pusch@pwwl.de",
                         phone="+1",
                         address="Address",
                         website="https://example.com",
@@ -45,62 +199,390 @@ class AdminContactPhotoTests(unittest.TestCase):
             ),
         )
 
-    def tearDown(self):
-        self.temp.cleanup()
+        return _FakePhotoOpenSearchClient(
+            document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            country_code="DE",
+            country="Germany",
+            source_filename="DE.docx",
+        )
 
-    def test_replace_read_remove(self):
-        data = b"\xff\xd8\xff\xe0valid-test-image"
+    def _seed_belgium_two_contacts(self) -> _FakePhotoOpenSearchClient:
+        """
+        Belgium's real two-contact, two-photo document - to prove
+        isolation holds at the FULL service layer (ContactState +
+        photo store + source DOCX together), not merely at the raw
+        DOCX-primitive level test_contact_document_photos.py already
+        covers.
+        """
+
+        real_source = self._require_source_copy(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+        docx_path = self.root / "BE.docx"
+        shutil.copyfile(real_source, docx_path)
+
+        candidates = extract_contact_photo_candidates(docx_path)
+        by_name = {c.source_filename: c for c in candidates}
+        chris_photo = by_name["image2.jpg"]
+        nicolas_photo = by_name["image1.png"]
+
+        chris_stored = write_contact_photo_atomic(
+            self.root,
+            "chris-id",
+            data=chris_photo.data,
+            content_type=chris_photo.content_type,
+        )
+        nicolas_stored = write_contact_photo_atomic(
+            self.root,
+            "nicolas-id",
+            data=nicolas_photo.data,
+            content_type=nicolas_photo.content_type,
+        )
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id="doc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                country_code="BE",
+                contacts=(
+                    ContactRecord(
+                        contact_id="chris-id",
+                        member_firm="Van Olmen & Wynant",
+                        contact_person="Chris van Olmen",
+                        email="chris.van.olmen@vow.be",
+                        phone="+1",
+                        address="Address",
+                        website="https://example.com",
+                        photo_filename=chris_stored.filename,
+                        photo_content_type=chris_stored.content_type,
+                        photo_sha256=chris_stored.sha256,
+                    ),
+                    ContactRecord(
+                        contact_id="nicolas-id",
+                        member_firm="Van Olmen & Wynant",
+                        contact_person="Nicolas Simon",
+                        email="nicolas.simon@vow.be",
+                        phone="+1",
+                        address="Address",
+                        website="https://example.com",
+                        photo_filename=nicolas_stored.filename,
+                        photo_content_type=nicolas_stored.content_type,
+                        photo_sha256=nicolas_stored.sha256,
+                    ),
+                ),
+            ),
+        )
+
+        return _FakePhotoOpenSearchClient(
+            document_id="doc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            country_code="BE",
+            country="Belgium",
+            source_filename="BE.docx",
+        )
+
+    def test_belgium_two_contact_isolation_at_the_service_layer(
+        self,
+    ) -> None:
+        """Mission section 22, case 8: mutating Chris's photo must
+        never touch Nicolas's ContactState, photo file, or DOCX
+        image - and vice versa."""
+
+        client = self._seed_belgium_two_contacts()
+        docx_path = self.root / "BE.docx"
+        doc_id = (
+            "doc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+
+        original_state = read_contact_state(self.root, doc_id)
+        nicolas_before = next(
+            c for c in original_state.contacts
+            if c.contact_id == "nicolas-id"
+        )
+
+        replace_admin_contact_photo(
+            self.root,
+            doc_id,
+            "chris-id",
+            data=_VALID_JPEG,
+            content_type="image/jpeg",
+            client=client,
+        )
+
+        state_after = read_contact_state(self.root, doc_id)
+        nicolas_after = next(
+            c for c in state_after.contacts
+            if c.contact_id == "nicolas-id"
+        )
+
+        self.assertEqual(nicolas_before, nicolas_after)
+
+        docx_shas = {
+            c.sha256
+            for c in extract_contact_photo_candidates(docx_path)
+        }
+        self.assertIn(nicolas_before.photo_sha256, docx_shas)
+        self.assertEqual(2, len(docx_shas))
+
+        self.assertTrue(
+            remove_admin_contact_photo(
+                self.root, doc_id, "nicolas-id", client=client
+            )
+        )
+
+        final_state = read_contact_state(self.root, doc_id)
+        chris_final = next(
+            c for c in final_state.contacts
+            if c.contact_id == "chris-id"
+        )
+        self.assertIsNotNone(chris_final.photo_sha256)
+
+        final_docx_shas = {
+            c.sha256
+            for c in extract_contact_photo_candidates(docx_path)
+        }
+        self.assertEqual(1, len(final_docx_shas))
+        self.assertIn(chris_final.photo_sha256, final_docx_shas)
+
+    def test_add_photo_fails_closed_for_a_name_with_no_document_zone(
+        self,
+    ) -> None:
+        """
+        A brand-new contact's name will usually have no matching
+        "CONTACT PERSON" zone in the document at all (that IS the
+        common case for genuinely adding someone) - the deterministic,
+        never-guess design means this fails closed with a controlled
+        error rather than inserting the photo somewhere arbitrary
+        (mission sections 7C/13). Nothing must be written on failure.
+        """
+
+        client = self._seed_photo_less_contact()
+        docx_path = self.root / "DE.docx"
+        original_docx_bytes = docx_path.read_bytes()
+        doc_id = (
+            "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id=doc_id,
+                country_code="DE",
+                contacts=(
+                    ContactRecord(
+                        contact_id="contact-test",
+                        member_firm="Someone New GmbH",
+                        contact_person="Someone New",
+                        email="new@example.test",
+                        phone="+1",
+                        address="Address",
+                        website="https://example.com",
+                    ),
+                ),
+            ),
+        )
+
+        with self.assertRaises(AdminContactPhotoError):
+            replace_admin_contact_photo(
+                self.root,
+                doc_id,
+                "contact-test",
+                data=_VALID_JPEG,
+                content_type="image/jpeg",
+                client=client,
+            )
+
+        self.assertEqual(
+            original_docx_bytes, docx_path.read_bytes()
+        )
+        state = read_contact_state(self.root, doc_id)
+        self.assertIsNone(state.contacts[0].photo_sha256)
+
+    def test_replace_read_remove_syncs_the_source_docx(self) -> None:
+        client = self._seed_photo_bearing_contact()
+        docx_path = self.root / "AR.docx"
 
         photo = replace_admin_contact_photo(
             self.root,
-            "doc-test",
+            "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "contact-test",
-            data=data,
+            data=_VALID_JPEG,
             content_type="image/jpeg",
+            client=client,
         )
 
         self.assertEqual("image/jpeg", photo.content_type)
 
+        # The persisted source DOCX itself must now resolve to the
+        # NEW photo, not merely ContactState.
+        docx_shas = {
+            c.sha256
+            for c in extract_contact_photo_candidates(docx_path)
+        }
+        self.assertIn(photo.sha256, docx_shas)
+        self.assertEqual(1, len(docx_shas))
+
         loaded = read_admin_contact_photo(
-            self.root,
-            "doc-test",
-            "contact-test",
+            self.root, "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "contact-test"
         )
-        self.assertEqual(data, loaded.data)
+        self.assertEqual(_VALID_JPEG, loaded.data)
 
         self.assertTrue(
             remove_admin_contact_photo(
-                self.root,
-                "doc-test",
-                "contact-test",
+                self.root, "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "contact-test", client=client
             )
         )
 
         with self.assertRaises(AdminContactPhotoNotFoundError):
             read_admin_contact_photo(
-                self.root,
-                "doc-test",
-                "contact-test",
+                self.root, "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "contact-test"
             )
 
-    def test_fake_image_is_rejected(self):
+        # The removal must also be reflected in the source DOCX -
+        # not merely ContactState (mission Bug D).
+        self.assertEqual(
+            [], extract_contact_photo_candidates(docx_path)
+        )
+
+    def test_add_to_a_photo_less_contact_syncs_the_source_docx(
+        self,
+    ) -> None:
+        client = self._seed_photo_less_contact()
+        docx_path = self.root / "DE.docx"
+
+        photo = replace_admin_contact_photo(
+            self.root,
+            "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contact-test",
+            data=_VALID_PNG,
+            content_type="image/png",
+            client=client,
+        )
+
+        docx_candidates = extract_contact_photo_candidates(docx_path)
+        self.assertEqual(1, len(docx_candidates))
+        self.assertEqual(photo.sha256, docx_candidates[0].sha256)
+
+        state = read_contact_state(self.root, "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(
+            photo.sha256, state.contacts[0].photo_sha256
+        )
+
+    def test_replace_failure_leaves_the_source_docx_and_state_unchanged(
+        self,
+    ) -> None:
+        """
+        A photo whose SHA no longer matches anything in the source
+        DOCX (simulating drift/corruption) must fail closed - never
+        silently update ContactState while leaving the DOCX
+        unsynchronized (the mission's non-negotiable invariant).
+        """
+
+        client = self._seed_photo_bearing_contact()
+        docx_path = self.root / "AR.docx"
+        original_docx_bytes = docx_path.read_bytes()
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                country_code="AR",
+                contacts=(
+                    ContactRecord(
+                        contact_id="contact-test",
+                        member_firm="Allende & Brea",
+                        contact_person="Nicolás Grandi",
+                        email="ngrandi@allende.com",
+                        phone="+1",
+                        address="Address",
+                        website="https://example.com",
+                        photo_filename="contact-test--deadbeef.jpg",
+                        photo_content_type="image/jpeg",
+                        photo_sha256="0" * 64,
+                    ),
+                ),
+            ),
+        )
+
         with self.assertRaises(AdminContactPhotoError):
             replace_admin_contact_photo(
                 self.root,
-                "doc-test",
+                "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "contact-test",
+                data=_VALID_JPEG,
+                content_type="image/jpeg",
+                client=client,
+            )
+
+        self.assertEqual(
+            original_docx_bytes, docx_path.read_bytes()
+        )
+        state = read_contact_state(self.root, "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(
+            "0" * 64, state.contacts[0].photo_sha256
+        )
+
+    def test_downloaded_docx_reflects_a_replaced_photo(self) -> None:
+        """
+        Mission section 19 (mandatory): after a mutation, the SAME
+        backend document-download path Admin uses must reflect it -
+        not merely ContactState. get_document_download() is exactly
+        the function backing GET .../download.
+        """
+
+        client = self._seed_photo_bearing_contact()
+
+        photo = replace_admin_contact_photo(
+            self.root,
+            "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contact-test",
+            data=_VALID_JPEG,
+            content_type="image/jpeg",
+            client=client,
+        )
+
+        download = get_document_download(
+            document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            source_directory=self.root,
+            client=client,
+        )
+        self.addCleanup(
+            lambda: (
+                download.cleanup_path
+                and download.cleanup_path.unlink(missing_ok=True)
+            )
+        )
+
+        downloaded_shas = {
+            c.sha256
+            for c in extract_contact_photo_candidates(download.path)
+        }
+        self.assertIn(photo.sha256, downloaded_shas)
+        self.assertEqual(1, len(downloaded_shas))
+
+    def test_fake_image_is_rejected(self):
+        client = self._seed_photo_bearing_contact()
+
+        with self.assertRaises(AdminContactPhotoError):
+            replace_admin_contact_photo(
+                self.root,
+                "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "contact-test",
                 data=b"not-an-image",
                 content_type="image/jpeg",
+                client=client,
             )
 
     def test_mime_mismatch_is_rejected(self):
+        client = self._seed_photo_bearing_contact()
+
         with self.assertRaises(AdminContactPhotoError):
             replace_admin_contact_photo(
                 self.root,
-                "doc-test",
+                "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "contact-test",
                 data=b"\x89PNG\r\n\x1a\nfake",
                 content_type="image/jpeg",
+                client=client,
             )
 
     def test_photo_routes_keep_admin_security_dependencies(self):

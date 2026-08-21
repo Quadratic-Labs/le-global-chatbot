@@ -4575,10 +4575,11 @@ describe("contacts panel", () => {
     // needs its own small node here that supports exactly that.
     function makeFakeCardNode() {
         const node = {
-            value: "",
             textContent: "",
             className: "",
             type: "",
+            hidden: false,
+            files: [],
             _children: [],
             _listeners: {},
             appendChild(child) {
@@ -4588,7 +4589,28 @@ describe("contacts panel", () => {
             addEventListener(eventName, handler) {
                 node._listeners[eventName] = handler;
             },
+            removeAttribute() {},
         };
+
+        // A real <input type="file">.value = "" also clears its own
+        // .files (the one browser behavior clearPhotoControl()'s
+        // input.value = "" relies on to actually discard a pending
+        // selection, not merely hide it) - modeled here since these
+        // two properties are otherwise unrelated on a plain fake node.
+        let value = "";
+
+        Object.defineProperty(node, "value", {
+            get() {
+                return value;
+            },
+            set(next) {
+                value = next;
+
+                if (next === "") {
+                    node.files = [];
+                }
+            },
+        });
 
         return node;
     }
@@ -4653,6 +4675,14 @@ describe("contacts panel", () => {
         const editAddressInput = makeFakeGenericElement();
         const editWebsiteInput = makeFakeGenericElement();
 
+        // mountPhotoControl() anchors the photo control off this
+        // input via anchorInput.closest("td") || anchorInput.
+        // parentElement - the shared makeFakeGenericElement() has
+        // neither, so this test-only host stands in for the real
+        // <td> the actual admin page markup provides.
+        editWebsiteInput.closest = () => null;
+        editWebsiteInput.parentElement = makeFakeCardNode();
+
         [
             editMemberFirmInput,
             editContactPersonInput,
@@ -4673,6 +4703,9 @@ describe("contacts panel", () => {
         const addPhoneInput = makeFakeGenericElement();
         const addAddressInput = makeFakeGenericElement();
         const addWebsiteInput = makeFakeGenericElement();
+
+        addWebsiteInput.closest = () => null;
+        addWebsiteInput.parentElement = makeFakeCardNode();
 
         [
             addMemberFirmInput,
@@ -4760,6 +4793,15 @@ describe("contacts panel", () => {
 
         global.FormData = FakeFormData;
 
+        // mountPhotoControl()'s showLocalPhoto() calls the browser's
+        // URL.createObjectURL/revokeObjectURL - Node's own built-in
+        // URL class has neither, so these are added (never replacing
+        // the class itself, which new URL(...) elsewhere in this
+        // file's code under test still needs) and removed again in
+        // afterEach.
+        global.URL.createObjectURL = (file) => `blob:fake/${file.name}`;
+        global.URL.revokeObjectURL = () => {};
+
         return {
             container,
             modeViewButton,
@@ -4818,6 +4860,8 @@ describe("contacts panel", () => {
         delete global.window;
         delete global.FormData;
         delete global.fetch;
+        delete global.URL.createObjectURL;
+        delete global.URL.revokeObjectURL;
         delete require.cache[require.resolve(ADMIN_JS_PATH)];
     });
 
@@ -4882,6 +4926,35 @@ describe("contacts panel", () => {
 
     function clickEditOnCard(index) {
         return clickCardAction(index, 0);
+    }
+
+    // mountPhotoControl() builds its own DOM subtree off the anchor
+    // input's host (anchorInput.parentElement here, since these fake
+    // inputs have no .closest("td")) - these dig back into that
+    // subtree by the exact className the real code assigns, the only
+    // way test code can reach a control never exposed via byId/dom.
+    function findPhotoControlRoot(anchorInput) {
+        return anchorInput.parentElement._children.find(
+            (child) => child.className
+                === "le-global-chatbot-admin__contact-photo-control"
+        );
+    }
+
+    function findPhotoControlInput(anchorInput) {
+        return findPhotoControlRoot(anchorInput)._children.find(
+            (child) => child.className
+                === "le-global-chatbot-admin__contact-photo-input"
+        );
+    }
+
+    function makeFakePhotoFile(name = "photo.jpg", type = "image/jpeg") {
+        return { name, size: 2048, type };
+    }
+
+    function selectPhotoFile(anchorInput, file) {
+        const input = findPhotoControlInput(anchorInput);
+        input.files = [file];
+        return input._listeners.change();
     }
 
     function clickDeleteOnCard(index) {
@@ -5169,6 +5242,66 @@ describe("contacts panel", () => {
         assert.equal(dom.messageEl.className.includes("is-success"), true);
     });
 
+    test("selecting a photo alone in Add mode does not enable Add contact (business fields are still required)", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        assert.equal(dom.addOnlyFields.hidden, false);
+
+        selectPhotoFile(dom.addWebsiteInput, makeFakePhotoFile());
+
+        assert.equal(
+            dom.addSubmitButton.disabled,
+            true,
+            "a contact record inherently needs its business fields, photo or not"
+        );
+    });
+
+    test("a successful Add with a pending photo uploads it against the newly created contact_id", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        fillAddFields(CONTACT_1);
+        selectPhotoFile(dom.addWebsiteInput, makeFakePhotoFile());
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-1" } } },
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            ONE_CONTACT_RESPONSE,
+        ]);
+
+        await clickAddSubmit();
+
+        assert.equal(fetchCalls.length, 3, "add contact, photo upload, then the contacts reload");
+        assert.equal(
+            fetchCalls[1].options.body.get("action"),
+            "le_global_admin_contact_photo_replace"
+        );
+        assert.equal(fetchCalls[1].options.body.get("contact_id"), "contact-1");
+        assert.match(dom.messageEl.textContent, /added successfully/);
+    });
+
+    test("a failed photo upload after a successful Add reports an honest partial failure", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        fillAddFields(CONTACT_1);
+        selectPhotoFile(dom.addWebsiteInput, makeFakePhotoFile());
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-1" } } },
+            { ok: true, status: 200, payload: { success: false } },
+            ONE_CONTACT_RESPONSE,
+        ]);
+
+        await clickAddSubmit();
+
+        assert.match(dom.messageEl.textContent, /photo could not be saved/);
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+    });
+
     test("adding a second contact when one already exists is allowed - never treated as a replace/edit", async () => {
         queueFetchResponses([ONE_CONTACT_RESPONSE]);
 
@@ -5289,6 +5422,128 @@ describe("contacts panel", () => {
 
         setField(dom.editMemberFirmInput, "Acme Legal SARL");
         assert.equal(dom.saveButton.disabled, true, "back to the baseline - nothing dirty");
+    });
+
+    // --- Contact photo: dirty-state, Cancel, combined Save (mission
+    // "COMPLETE CONTACT PHOTO CRUD + DOCX SOURCE SYNCHRONIZATION") ------
+
+    test("selecting a photo in Edit mode enables Save even though no text field changed", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        assert.equal(dom.saveButton.disabled, true, "unchanged baseline - nothing to save yet");
+
+        selectPhotoFile(dom.editWebsiteInput, makeFakePhotoFile());
+
+        assert.equal(
+            dom.saveButton.disabled,
+            false,
+            "a newly selected photo alone must enable Save (Bug A)"
+        );
+    });
+
+    test("selecting a photo for a contact that has no existing photo still enables Save", async () => {
+        const noPhotoContact = { ...CONTACT_1, has_photo: false };
+
+        queueFetchResponses([
+            {
+                ok: true,
+                status: 200,
+                payload: { success: true, data: { contacts: [noPhotoContact] } },
+            },
+        ]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        selectPhotoFile(dom.editWebsiteInput, makeFakePhotoFile());
+
+        assert.equal(dom.saveButton.disabled, false);
+    });
+
+    test("Cancel after selecting a photo discards the pending file and disables Save again", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        selectPhotoFile(dom.editWebsiteInput, makeFakePhotoFile());
+        assert.equal(dom.saveButton.disabled, false);
+
+        clickCancel();
+
+        assert.equal(
+            findPhotoControlInput(dom.editWebsiteInput).files.length,
+            0,
+            "Cancel must discard the pending file, not merely hide it"
+        );
+        assert.equal(
+            dom.saveButton.disabled,
+            true,
+            "with the pending file discarded and no text change, Save must be disabled again"
+        );
+    });
+
+    test("a successful Save with a pending photo uploads it after the text update succeeds", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        selectPhotoFile(dom.editWebsiteInput, makeFakePhotoFile());
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            ONE_CONTACT_RESPONSE,
+        ]);
+
+        await clickSave();
+
+        assert.equal(fetchCalls.length, 3, "text update, photo upload, then the contacts reload");
+        assert.equal(
+            fetchCalls[0].options.body.get("action"),
+            "le_global_chatbot_update_contact"
+        );
+        assert.equal(
+            fetchCalls[1].options.body.get("action"),
+            "le_global_admin_contact_photo_replace"
+        );
+        assert.equal(fetchCalls[1].options.body.get("contact_id"), "contact-1");
+        assert.match(dom.messageEl.textContent, /updated successfully/);
+    });
+
+    test("a failed photo upload after a successful text save reports an honest partial failure and keeps the pending file", async () => {
+        queueFetchResponses([ONE_CONTACT_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        clickEditOnCard(0);
+
+        selectPhotoFile(dom.editWebsiteInput, makeFakePhotoFile());
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            { ok: true, status: 200, payload: { success: false } },
+        ]);
+
+        await clickSave();
+
+        assert.match(dom.messageEl.textContent, /photo could not be saved/);
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+        assert.equal(
+            findPhotoControlInput(dom.editWebsiteInput).files.length,
+            1,
+            "a failed photo save must never silently discard the pending file"
+        );
+        assert.equal(
+            dom.saveButton.disabled,
+            false,
+            "Save must re-enable so the user can retry the still-pending photo"
+        );
     });
 
     test("a successful Save posts the update with the exact contact_id and reloads the list", async () => {

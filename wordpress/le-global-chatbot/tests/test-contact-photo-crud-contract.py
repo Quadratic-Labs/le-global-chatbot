@@ -34,12 +34,18 @@ class ContactPhotoCrudContract(unittest.TestCase):
         self.assertIn("removeCurrentContactPhoto", JS)
 
     def test_binary_preview_is_admin_only(self):
+        # The photo GET handler was migrated from the wp_ajax_* hook
+        # convention to admin_post_* (see git history: "fix(admin):
+        # route contact photo actions through admin-post") - the
+        # security property this test checks is unchanged (no
+        # unauthenticated *_nopriv_* variant is ever registered), only
+        # the hook prefix is.
         self.assertIn(
-            "wp_ajax_le_global_admin_contact_photo_get",
+            "admin_post_le_global_admin_contact_photo_get",
             PHP,
         )
         self.assertNotIn(
-            "wp_ajax_nopriv_le_global_admin_contact_photo_get",
+            "admin_post_nopriv_le_global_admin_contact_photo_get",
             PHP,
         )
 

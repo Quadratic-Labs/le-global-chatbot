@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.8.7';
+    private const VERSION = '0.8.8';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 
@@ -189,17 +189,17 @@ final class LE_Global_Chatbot_Admin
         );
 
         add_action(
-            'wp_ajax_le_global_admin_contact_photo_get',
+            'admin_post_le_global_admin_contact_photo_get',
             [self::class, 'handle_get_contact_photo']
         );
 
         add_action(
-            'wp_ajax_le_global_admin_contact_photo_replace',
+            'admin_post_le_global_admin_contact_photo_replace',
             [self::class, 'handle_replace_contact_photo']
         );
 
         add_action(
-            'wp_ajax_le_global_admin_contact_photo_remove',
+            'admin_post_le_global_admin_contact_photo_remove',
             [self::class, 'handle_remove_contact_photo']
         );
 

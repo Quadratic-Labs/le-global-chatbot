@@ -94,13 +94,24 @@ class ContactPhotoExtractionError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ContactPhotoCandidate:
-    """One deterministically accepted contact-photo image."""
+    """One deterministically accepted contact-photo image.
+
+    relationship_id/media_path are the image's own OPC identity within
+    the source package - internal extraction detail, never surfaced
+    through the Admin API (mirroring ContactRecord.photo_filename's own
+    "never exposed" rule); they exist here so a later mutation
+    (contact_document_photos.py) can locate the SAME accepted image
+    this extractor already found, without re-deriving the geometry/
+    zone rules a second time.
+    """
 
     source_filename: str
     content_type: str
     data: bytes
     sha256: str
     reason: str
+    relationship_id: str = ""
+    media_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -769,6 +780,10 @@ def extract_contact_photo_candidates(
                         data=blob,
                         sha256=digest,
                         reason=reason,
+                        relationship_id=(
+                            candidate.relationship_id
+                        ),
+                        media_path=candidate.media_path,
                     )
                 )
 
