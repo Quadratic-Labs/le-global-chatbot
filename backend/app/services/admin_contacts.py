@@ -28,6 +28,7 @@ reseed_contacts_from_current_docx below); no merge ever happens.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -52,11 +53,21 @@ from app.services.admin_document_lifecycle import (
     _get_document_metadata,
     _required_string,
 )
+from app.services.admin_document_sections import (
+    _fsync_path,
+    _make_temp_docx_path,
+)
 from app.services.admin_modification_marker import (
     is_admin_modified_since_upload,
     mark_admin_modified,
     reset_admin_modified,
     write_admin_modified_marker,
+)
+from app.services.contact_document_area import (
+    ContactAreaError,
+    ContactPhotoPayload,
+    rebuild_canonical_contact_table,
+    resolve_untracked_contact_photo,
 )
 from app.services.contact_people import (
     associate_contact_photos,
@@ -68,6 +79,7 @@ from app.services.contact_photos import (
 from app.services.contact_photo_store import (
     ContactPhotoStorageError,
     delete_contact_photo,
+    read_contact_photo,
     write_contact_photo_atomic,
 )
 from app.services.contact_state import (
@@ -85,6 +97,7 @@ from app.services.country_lock import (
 from app.services.document_chunk_builder import (
     DocumentMetadata,
     build_contact_chunk_for_contacts,
+    validate_docx_format,
 )
 from app.services.document_indexer import (
     replace_document_contact_chunk,
@@ -609,6 +622,225 @@ def list_contacts(
     )
 
 
+def _resolve_source_path_for_mutation(
+    *,
+    source_directory: Path,
+    document_metadata: dict[str, Any],
+    country_code: str,
+) -> Path:
+    """The CURRENT persisted source DOCX for one document, resolved
+    the same way admin_contact_photos.py already does for every DOCX
+    mutation - a read-only OpenSearch-metadata-derived lookup, never a
+    reindex."""
+
+    source_filename = _required_string(
+        document_metadata, "source_filename"
+    )
+
+    try:
+        resolved = resolve_document_source_path(
+            source_root=source_directory,
+            country_code=country_code,
+            source_filename=source_filename,
+        )
+
+    except DocumentSourceConflictError as error:
+        raise AdminContactMutationFailedError(
+            "The source DOCX could not be unambiguously resolved."
+        ) from error
+
+    if resolved.path is None:
+        raise AdminContactMutationFailedError(
+            "The source DOCX file is missing."
+        )
+
+    return resolved.path
+
+
+def _stage_and_commit_source_document(
+    *,
+    source_path: Path,
+    new_document_bytes: bytes,
+) -> None:
+    """
+    Write, fsync, validate, then atomically replace the persisted
+    source DOCX - the same staging discipline
+    admin_document_sections.py/admin_contact_photos.py already use for
+    every other DOCX mutation (temp file in the same directory, fsync,
+    validate, then os.replace). Guarantees zero mutation to
+    source_path unless this returns normally.
+
+    The trailing directory fsync is deliberately best-effort: by the
+    time os.replace above returns, the new content is already the
+    durable content at source_path - raising for a directory-entry
+    fsync failure here would escape both this function's own staging
+    rollback and the caller's ContactState rollback, leaving a
+    committed DOCX mutation with no matching ContactState entry.
+    """
+
+    temp_path = _make_temp_docx_path(source_path)
+
+    try:
+        temp_path.write_bytes(new_document_bytes)
+        _fsync_path(temp_path)
+        validate_docx_format(temp_path)
+        os.replace(temp_path, source_path)
+
+    except Exception as error:
+        temp_path.unlink(missing_ok=True)
+        raise AdminContactMutationFailedError(
+            f"The updated source document could not be saved: {error}"
+        ) from error
+
+    try:
+        _fsync_path(source_path.parent)
+    except OSError:
+        pass
+
+
+def _restore_source_document(
+    *,
+    source_path: Path,
+    original_bytes: bytes,
+) -> None:
+    """
+    Restore the source DOCX to its exact pre-mutation bytes after a
+    DOCX mutation committed but the following ContactState/index
+    commit failed. Uses the SAME temp-file + fsync + validate +
+    os.replace staging as _stage_and_commit_source_document (never a
+    direct, non-atomic write onto the live source_path), so a crash
+    or I/O error mid-restore can never leave source_path truncated.
+    """
+
+    temp_path = _make_temp_docx_path(source_path)
+
+    try:
+        temp_path.write_bytes(original_bytes)
+        _fsync_path(temp_path)
+        validate_docx_format(temp_path)
+        os.replace(temp_path, source_path)
+
+    except Exception as error:
+        temp_path.unlink(missing_ok=True)
+        raise AdminDocumentRollbackError(
+            "A contact mutation failed and the source document could "
+            "not be restored to its original state - manual recovery "
+            "is required."
+        ) from error
+
+    try:
+        _fsync_path(source_path.parent)
+    except OSError:
+        pass
+
+
+def _resolve_contact_photo(
+    record: ContactRecord,
+    *,
+    source_directory: Path,
+    source_path: Path,
+    country: str | None,
+) -> ContactPhotoPayload | None:
+    """
+    The authoritative photo bytes for one contact about to be written
+    into the rebuilt canonical table - the Admin photo store's own
+    copy when this contact has ever had an explicit photo mutation
+    (photo_filename set), or otherwise whatever the CURRENT persisted
+    source still shows as that contact's own organic photo (see
+    contact_document_area.resolve_untracked_contact_photo) - so
+    rebuilding the canonical area from ContactState alone never
+    silently drops a photo the document still visibly has.
+    """
+
+    if record.photo_filename is not None:
+        try:
+            data = read_contact_photo(
+                source_directory, record.photo_filename
+            )
+        except ContactPhotoStorageError as error:
+            raise AdminContactMutationFailedError(
+                f"The contact's own stored photo could not be read: "
+                f"{error}"
+            ) from error
+
+        return ContactPhotoPayload(
+            data=data,
+            content_type=record.photo_content_type or "image/jpeg",
+        )
+
+    try:
+        return resolve_untracked_contact_photo(
+            source_path,
+            contact_person=record.contact_person,
+            country=country,
+        )
+    except ContactAreaError as error:
+        raise AdminContactMutationFailedError(str(error)) from error
+
+
+def _synchronize_source_document(
+    *,
+    source_directory: Path,
+    document_metadata: dict[str, Any],
+    country_code: str,
+    all_records: tuple[ContactRecord, ...],
+) -> tuple[Path, bytes]:
+    """
+    Rebuild the ENTIRE persisted canonical contact area from the
+    complete intended contact list - the one mechanism behind every
+    mutation (Add and Delete here, and replace-photo in
+    admin_contact_photos.py), so the source DOCX is always the full,
+    current ContactState rendered fresh as one standard Word table,
+    never a series of independent surgical edits that can drift apart
+    from it.
+
+    Always returns (source_path, original_bytes) - the DOCX has always
+    been committed by the time this returns, so the caller can restore
+    original_bytes if the following ContactState commit fails.
+    """
+
+    source_path = _resolve_source_path_for_mutation(
+        source_directory=source_directory,
+        document_metadata=document_metadata,
+        country_code=country_code,
+    )
+    country = _required_string(document_metadata, "country")
+    original_bytes = source_path.read_bytes()
+
+    extracted_contacts = tuple(
+        _record_to_extracted_contact(record) for record in all_records
+    )
+    photos = tuple(
+        _resolve_contact_photo(
+            record,
+            source_directory=source_directory,
+            source_path=source_path,
+            country=country,
+        )
+        for record in all_records
+    )
+
+    try:
+        new_document_bytes = rebuild_canonical_contact_table(
+            source_path,
+            contacts=extracted_contacts,
+            photos=photos,
+            country=country,
+        )
+    except ContactAreaError as error:
+        raise AdminContactMutationFailedError(
+            f"The contact area could not be synchronized into the "
+            f"source document: {error}"
+        ) from error
+
+    _stage_and_commit_source_document(
+        source_path=source_path,
+        new_document_bytes=new_document_bytes,
+    )
+
+    return source_path, original_bytes
+
+
 def add_contact(
     *,
     document_id: str,
@@ -621,6 +853,15 @@ def add_contact(
     Append one new contact - duplicates (identical field values to an
     existing contact) are explicitly allowed; the new record always
     gets its own fresh, distinct contact_id regardless.
+
+    Also synchronizes the persisted source DOCX with the new contact -
+    rebuilding its canonical contact table from the complete current
+    contact list (see _synchronize_source_document) - as ONE
+    transaction together with the ContactState/index commit: if the
+    DOCX commits but the ContactState commit then fails, the DOCX is
+    restored to its exact prior bytes before the error propagates. A
+    successful Add Contact never leaves the source DOCX unsynchronized
+    with ContactState.
     """
 
     validated_document_id = _validate_document_id(document_id)
@@ -664,15 +905,32 @@ def add_contact(
 
         new_contacts = previous_contacts + (new_record,)
 
-        _apply_contact_state_change(
-            document_id=validated_document_id,
-            country_code=country_code,
-            source_directory=source_directory,
-            new_contacts=new_contacts,
-            document_metadata=document_metadata,
-            client=opensearch_client,
-            reset_marker=False,
+        committed_source_path, original_document_bytes = (
+            _synchronize_source_document(
+                source_directory=source_directory,
+                document_metadata=document_metadata,
+                country_code=country_code,
+                all_records=new_contacts,
+            )
         )
+
+        try:
+            _apply_contact_state_change(
+                document_id=validated_document_id,
+                country_code=country_code,
+                source_directory=source_directory,
+                new_contacts=new_contacts,
+                document_metadata=document_metadata,
+                client=opensearch_client,
+                reset_marker=False,
+            )
+
+        except Exception:
+            _restore_source_document(
+                source_path=committed_source_path,
+                original_bytes=original_document_bytes,
+            )
+            raise
 
     return AdminContactResponse(
         document_id=validated_document_id,
@@ -834,10 +1092,16 @@ def delete_contact(
             else ()
         )
 
-        if not any(
-            record.contact_id == validated_contact_id
-            for record in current_contacts
-        ):
+        deleted_record = next(
+            (
+                record
+                for record in current_contacts
+                if record.contact_id == validated_contact_id
+            ),
+            None,
+        )
+
+        if deleted_record is None:
             raise AdminContactNotFoundError(
                 document_id=validated_document_id,
                 contact_id=validated_contact_id,
@@ -849,15 +1113,32 @@ def delete_contact(
             if record.contact_id != validated_contact_id
         )
 
-        _apply_contact_state_change(
-            document_id=validated_document_id,
-            country_code=country_code,
-            source_directory=source_directory,
-            new_contacts=new_contacts,
-            document_metadata=document_metadata,
-            client=opensearch_client,
-            reset_marker=False,
+        committed_source_path, original_document_bytes = (
+            _synchronize_source_document(
+                source_directory=source_directory,
+                document_metadata=document_metadata,
+                country_code=country_code,
+                all_records=new_contacts,
+            )
         )
+
+        try:
+            _apply_contact_state_change(
+                document_id=validated_document_id,
+                country_code=country_code,
+                source_directory=source_directory,
+                new_contacts=new_contacts,
+                document_metadata=document_metadata,
+                client=opensearch_client,
+                reset_marker=False,
+            )
+
+        except Exception:
+            _restore_source_document(
+                source_path=committed_source_path,
+                original_bytes=original_document_bytes,
+            )
+            raise
 
     return AdminContactDeleteResponse(
         document_id=validated_document_id,

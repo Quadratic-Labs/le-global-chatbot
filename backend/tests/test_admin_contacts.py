@@ -17,11 +17,15 @@ need SOME deterministic contact list as input).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+from docx import Document
 
 from app.services.admin_contacts import (
     AdminContactMutationFailedError,
@@ -35,6 +39,7 @@ from app.services.admin_contacts import (
     reseed_contacts_from_current_docx,
     update_contact,
 )
+from app.services.admin_contact_photos import replace_admin_contact_photo
 from app.services.admin_document_lifecycle import (
     AdminDocumentRollbackError,
     reindex_indexed_document,
@@ -46,6 +51,12 @@ from app.services.admin_modification_marker import (
     is_admin_modified_since_upload,
     mark_admin_modified,
 )
+from app.services.contact_document_area import (
+    ContactPhotoPayload,
+    rebuild_canonical_contact_table,
+)
+from app.services.contact_photo_store import write_contact_photo_atomic
+from app.services.contact_photos import extract_contact_photo_candidates
 from app.services.contact_state import (
     ContactRecord,
     ContactState,
@@ -56,7 +67,11 @@ from app.services.contact_state import (
 from app.models.admin_contacts import AdminContactWriteRequest
 from app.models.admin_documents import AdminDocumentListResponse, AdminDocumentSummary
 from app.models.document import DocumentChunk
-from app.services.docx_parser import ExtractedContact
+from app.services.docx_parser import (
+    CONTACT_TABLE_HIDDEN_MARKER,
+    ExtractedContact,
+    extract_contacts_from_docx,
+)
 from app.services.document_indexer import DocumentIndexingResult
 
 
@@ -93,6 +108,35 @@ def _real_document_id_for(country_code: str, language: str = "en") -> str:
 
 DOCUMENT_ID = _real_document_id_for("GB")
 OTHER_DOCUMENT_ID = _real_document_id_for("FR")
+
+
+def _make_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    """A minimal but well-formed, real-sized RGB PNG - python-docx's
+    own image-header parser (used to compute a photo's proportional
+    height in the canonical table) needs real dimensions, unlike a
+    degenerate single-pixel fixture."""
+
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data))
+        )
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    image_data = zlib.compress(raw)
+    return (
+        signature
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", image_data)
+        + chunk(b"IEND", b"")
+    )
 
 
 def _write_request(
@@ -390,6 +434,25 @@ def _seeded_contact_chunk(
     }
 
 
+def _seed_placeholder_source_docx(
+    source_directory: Path, filename: str = "GB.docx"
+) -> None:
+    """
+    A minimal, valid, structurally-empty DOCX - just enough for
+    resolve_document_source_path to find a real file on disk. Add/
+    Delete Contact always rebuild the persisted source's canonical
+    contact table now, regardless of whether this placeholder has any
+    prior contact structure at all, so these tests exercise that
+    rebuild too (harmlessly, against a document with no real legal
+    content) alongside the ContactState/OpenSearch chunk mutation they
+    were originally written for.
+    """
+
+    document = Document()
+    document.add_paragraph("Placeholder document body.")
+    document.save(str(source_directory / filename))
+
+
 # =========================================================================
 # STATE: sidecar read/write/atomic/absent-vs-empty
 # =========================================================================
@@ -513,6 +576,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_add_appends_with_fresh_stable_id(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -541,6 +605,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_add_syncs_the_opensearch_contact_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -563,6 +628,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_zero_one_and_multiple_contacts(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             listing = list_contacts(
@@ -616,6 +682,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_duplicate_contacts_have_distinct_ids(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -639,6 +706,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_update_preserves_id_and_position(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -691,6 +759,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_delete_removes_only_the_requested_contact(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -736,6 +805,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_delete_last_contact_removes_stale_contact_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -775,6 +845,7 @@ class ContactCrudTests(unittest.TestCase):
     def test_legal_topic_chunks_are_never_touched(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
 
             client = FakeContactOpenSearchClient(
                 chunks={
@@ -882,6 +953,7 @@ class ContactCrudTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -911,6 +983,7 @@ class ContactRollbackTests(unittest.TestCase):
     def test_index_failure_restores_previous_state_and_marker(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -977,6 +1050,7 @@ class ContactRollbackTests(unittest.TestCase):
     def test_rollback_itself_failing_raises_rollback_error(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
             client = FakeContactOpenSearchClient()
 
             with _patched_indexer(client):
@@ -1036,6 +1110,657 @@ def _summary(
         source_file_present=True,
         status="indexed",
     )
+
+
+SOURCE_ROOT = Path("/data/documents/source")
+
+
+class ContactPhotoDeleteSyncTests(unittest.TestCase):
+    """
+    Mission "FIX ONLY THE REMAINING ADMIN CONTACT <-> SOURCE DOCX
+    SYNCHRONIZATION PROBLEMS", requirement 1: deleting a contact must
+    remove ONLY that contact's own photo from the persisted source
+    DOCX, using the SAME deterministic SHA-256 association already
+    proven in contact_document_photos.py - never position, filename,
+    or a second, unrelated image-deletion implementation.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.document_id = _real_document_id_for("AU")
+
+    def _require_copy(self, filename: str) -> Path:
+        source = SOURCE_ROOT / filename
+
+        if not source.exists():
+            self.skipTest(f"Real corpus source unavailable: {source}")
+
+        original_bytes = source.read_bytes()
+        copy_path = self.root / filename
+        copy_path.write_bytes(original_bytes)
+
+        self.addCleanup(
+            lambda: self.assertEqual(
+                original_bytes,
+                source.read_bytes(),
+                f"{source} was mutated by this test.",
+            )
+        )
+
+        return copy_path
+
+    def _seed_two_contacts_with_photos(self) -> tuple[str, str]:
+        """
+        A real AU.docx with Michael Harmer's own real photo, plus a
+        second contact added the same way Add Contact would (via
+        rebuild_canonical_contact_table), each contact's own photo
+        embedded for real, independently. Returns (michael_sha256,
+        second_sha256).
+        """
+
+        docx_path = self._require_copy("AU.docx")
+
+        michael_photo = extract_contact_photo_candidates(docx_path)[0]
+        second_photo_data = _make_png(183, 234, (80, 120, 200))
+
+        jane_contact = ExtractedContact(
+            member_firm="Second Firm Pty Ltd",
+            contact_person="Jane Secondary",
+            email="jane.secondary@secondfirm.com.au",
+            phone="+61 2 9000 0000",
+            address="100 Test Street, Level 5",
+            website="www.secondfirm.com.au",
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            docx_path,
+            contacts=(
+                ExtractedContact(
+                    member_firm="HARMERS WORKPLACE LAWYERS",
+                    contact_person="Michael Harmer",
+                    email="michael.harmer@harmers.com.au",
+                    phone="+61 292 674 322",
+                    address="31 Market Street, Level 27 St Martins Tower",
+                    website="www.harmers.com.au",
+                ),
+                jane_contact,
+            ),
+            photos=(
+                ContactPhotoPayload(
+                    data=michael_photo.data,
+                    content_type=michael_photo.content_type,
+                ),
+                ContactPhotoPayload(
+                    data=second_photo_data, content_type="image/png"
+                ),
+            ),
+            country="Australia",
+        )
+        docx_path.write_bytes(new_bytes)
+
+        michael_stored = write_contact_photo_atomic(
+            self.root,
+            "michael-id",
+            data=michael_photo.data,
+            content_type=michael_photo.content_type,
+        )
+        second_stored = write_contact_photo_atomic(
+            self.root,
+            "jane-id",
+            data=second_photo_data,
+            content_type="image/png",
+        )
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id=self.document_id,
+                country_code="AU",
+                contacts=(
+                    ContactRecord(
+                        contact_id="michael-id",
+                        member_firm="HARMERS WORKPLACE LAWYERS",
+                        contact_person="Michael Harmer",
+                        email="michael.harmer@harmers.com.au",
+                        phone="+61 292 674 322",
+                        address="31 Market Street, Level 27 St Martins Tower",
+                        website="www.harmers.com.au",
+                        photo_filename=michael_stored.filename,
+                        photo_content_type=michael_stored.content_type,
+                        photo_sha256=michael_stored.sha256,
+                    ),
+                    ContactRecord(
+                        contact_id="jane-id",
+                        member_firm="Second Firm Pty Ltd",
+                        contact_person="Jane Secondary",
+                        email="jane.secondary@secondfirm.com.au",
+                        phone="+61 2 9000 0000",
+                        address="100 Test Street, Level 5",
+                        website="www.secondfirm.com.au",
+                        photo_filename=second_stored.filename,
+                        photo_content_type=second_stored.content_type,
+                        photo_sha256=second_stored.sha256,
+                    ),
+                ),
+            ),
+        )
+
+        return michael_stored.sha256, second_stored.sha256
+
+    def test_delete_contact_with_photo_removes_only_its_own_image(
+        self,
+    ) -> None:
+        docx_path = self.root / "AU.docx"
+        michael_sha, jane_sha = self._seed_two_contacts_with_photos()
+
+        client = FakeContactOpenSearchClient(
+            document_id=self.document_id,
+            country_code="AU",
+            country="Australia",
+            source_filename="AU.docx",
+        )
+
+        with _patched_indexer(client):
+            delete_contact(
+                document_id=self.document_id,
+                contact_id="jane-id",
+                source_directory=self.root,
+                client=client,
+            )
+
+        remaining_shas = {
+            c.sha256 for c in extract_contact_photo_candidates(docx_path)
+        }
+        self.assertIn(
+            michael_sha, remaining_shas,
+            "the other contact's own photo must remain byte/"
+            "functionally intact",
+        )
+        self.assertNotIn(
+            jane_sha, remaining_shas,
+            "no stale photo of the deleted contact may remain "
+            "anywhere in the DOCX",
+        )
+        self.assertEqual(1, len(remaining_shas))
+
+        state = read_contact_state(self.root, self.document_id)
+        self.assertEqual(1, len(state.contacts))
+        self.assertEqual("michael-id", state.contacts[0].contact_id)
+
+    def test_delete_mutation_failure_restores_source_docx_byte_for_byte(
+        self,
+    ) -> None:
+        docx_path = self.root / "AU.docx"
+        self._seed_two_contacts_with_photos()
+
+        original_bytes = docx_path.read_bytes()
+
+        client = FakeContactOpenSearchClient(
+            document_id=self.document_id,
+            country_code="AU",
+            country="Australia",
+            source_filename="AU.docx",
+        )
+
+        with self.assertRaises(AdminContactMutationFailedError):
+            with _patched_indexer(client, fail_bulk=True):
+                delete_contact(
+                    document_id=self.document_id,
+                    contact_id="jane-id",
+                    source_directory=self.root,
+                    client=client,
+                )
+
+        self.assertEqual(
+            original_bytes, docx_path.read_bytes(),
+            "the source DOCX must be restored to its exact original "
+            "bytes when the ContactState/index commit fails after the "
+            "photo was already removed",
+        )
+
+        state = read_contact_state(self.root, self.document_id)
+        self.assertEqual(2, len(state.contacts))
+
+    def test_delete_contact_without_a_photo_still_removes_its_text(
+        self,
+    ) -> None:
+        """A contact with no photo_sha256 at all must still have its
+        own TEXT block removed from the persisted source DOCX -
+        deleting a contact must never leave its name/email/firm behind
+        just because it never had a photo."""
+
+        docx_path = self._require_copy("AU.docx")
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id=self.document_id,
+                country_code="AU",
+                contacts=(
+                    ContactRecord(
+                        contact_id="michael-id",
+                        member_firm="HARMERS WORKPLACE LAWYERS",
+                        contact_person="Michael Harmer",
+                        email="michael.harmer@harmers.com.au",
+                        phone="+61 292 674 322",
+                        address="31 Market Street",
+                        website="www.harmers.com.au",
+                    ),
+                ),
+            ),
+        )
+
+        client = FakeContactOpenSearchClient(
+            document_id=self.document_id,
+            country_code="AU",
+            country="Australia",
+            source_filename="AU.docx",
+        )
+
+        with _patched_indexer(client):
+            delete_contact(
+                document_id=self.document_id,
+                contact_id="michael-id",
+                source_directory=self.root,
+                client=client,
+            )
+
+        with zipfile.ZipFile(docx_path) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode("utf-8", errors="ignore")
+
+        self.assertNotIn("Michael Harmer", document_xml)
+        self.assertNotIn("michael.harmer@harmers.com.au", document_xml)
+
+        remaining = extract_contacts_from_docx(docx_path, country="Australia")
+        self.assertEqual(0, len(remaining))
+
+    def _seed_contact_a_only(self, docx_path: Path) -> str:
+        """Contact A (Michael Harmer) exactly as AU.docx's own native
+        organic block already reads, with his own real embedded photo
+        registered in ContactState - the document's starting state
+        before an Admin-added contact B exists at all."""
+
+        michael_photo = extract_contact_photo_candidates(docx_path)[0]
+        michael_stored = write_contact_photo_atomic(
+            self.root,
+            "michael-id",
+            data=michael_photo.data,
+            content_type=michael_photo.content_type,
+        )
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id=self.document_id,
+                country_code="AU",
+                contacts=(
+                    ContactRecord(
+                        contact_id="michael-id",
+                        member_firm="HARMERS WORKPLACE LAWYERS",
+                        contact_person="Michael Harmer",
+                        email="michael.harmer@harmers.com.au",
+                        phone="+61 292 674 322",
+                        address="31 Market Street",
+                        website="www.harmers.com.au",
+                        photo_filename=michael_stored.filename,
+                        photo_content_type=michael_stored.content_type,
+                        photo_sha256=michael_stored.sha256,
+                    ),
+                ),
+            ),
+        )
+
+        return michael_stored.sha256
+
+    def _add_contact_b_with_photo_via_real_admin_flow(
+        self, client: FakeContactOpenSearchClient
+    ) -> tuple[str, bytes]:
+        """Exercises the REAL, two-call Admin surface exactly as an
+        operator would use it - add_contact() (text only) followed by
+        replace_admin_contact_photo() (attaches the photo, rebuilding
+        the canonical table again) - never the lower-level
+        rebuild_canonical_contact_table() primitive directly.
+        Returns (contact_b_id, photo_b_bytes)."""
+
+        jane_photo_data = _make_png(183, 234, (80, 120, 200))
+
+        with _patched_indexer(client):
+            response = add_contact(
+                document_id=self.document_id,
+                fields=_write_request(
+                    member_firm="Second Firm Pty Ltd",
+                    contact_person="Jane Secondary",
+                    email="jane.secondary@secondfirm.com.au",
+                    phone="+61 2 9000 0000",
+                    address="100 Test Street, Level 5",
+                    website="www.secondfirm.com.au",
+                ),
+                source_directory=self.root,
+                client=client,
+            )
+
+        with _patched_indexer(client):
+            replace_admin_contact_photo(
+                self.root,
+                self.document_id,
+                response.contact_id,
+                data=jane_photo_data,
+                content_type="image/png",
+                client=client,
+            )
+
+        return response.contact_id, jane_photo_data
+
+    def test_admin_added_contact_b_fully_removed_from_source_on_delete(
+        self,
+    ) -> None:
+        """The user's mandatory focused test: ADD contact B + photo B
+        (via the real two-call Admin surface, onto a document that
+        already carries contact A natively), then DELETE contact B,
+        then prove directly against the PERSISTED source DOCX that
+        contact B's text and photo are gone while contact A's text and
+        photo remain - byte-level proof, not ContactState alone."""
+
+        docx_path = self._require_copy("AU.docx")
+        michael_sha = self._seed_contact_a_only(docx_path)
+
+        client = FakeContactOpenSearchClient(
+            document_id=self.document_id,
+            country_code="AU",
+            country="Australia",
+            source_filename="AU.docx",
+        )
+
+        contact_b_id, jane_photo_data = (
+            self._add_contact_b_with_photo_via_real_admin_flow(client)
+        )
+        jane_sha = hashlib.sha256(jane_photo_data).hexdigest()
+
+        # Sanity check before delete: contact B is genuinely present
+        # in the persisted source, not merely in ContactState.
+        with zipfile.ZipFile(docx_path) as archive:
+            pre_delete_xml = archive.read(
+                "word/document.xml"
+            ).decode("utf-8", errors="ignore")
+        self.assertIn("Jane Secondary", pre_delete_xml)
+        pre_delete_shas = {
+            c.sha256 for c in extract_contact_photo_candidates(docx_path)
+        }
+        self.assertIn(jane_sha, pre_delete_shas)
+
+        with _patched_indexer(client):
+            delete_contact(
+                document_id=self.document_id,
+                contact_id=contact_b_id,
+                source_directory=self.root,
+                client=client,
+            )
+
+        with zipfile.ZipFile(docx_path) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode("utf-8", errors="ignore")
+        remaining_shas = {
+            c.sha256 for c in extract_contact_photo_candidates(docx_path)
+        }
+
+        contact_b_text_in_source = (
+            "Jane Secondary" in document_xml
+            or "jane.secondary@secondfirm.com.au" in document_xml
+        )
+        contact_b_photo_in_source = jane_sha in remaining_shas
+        contact_a_text_in_source = (
+            "Michael Harmer" in document_xml
+            and "michael.harmer@harmers.com.au" in document_xml
+        )
+        contact_a_photo_in_source = michael_sha in remaining_shas
+
+        print(
+            f"CONTACT_B_TEXT_IN_SOURCE="
+            f"{'YES' if contact_b_text_in_source else 'NO'}"
+        )
+        print(
+            f"CONTACT_B_PHOTO_IN_SOURCE="
+            f"{'YES' if contact_b_photo_in_source else 'NO'}"
+        )
+        print(
+            f"CONTACT_A_TEXT_IN_SOURCE="
+            f"{'YES' if contact_a_text_in_source else 'NO'}"
+        )
+        print(
+            f"CONTACT_A_PHOTO_IN_SOURCE="
+            f"{'YES' if contact_a_photo_in_source else 'NO'}"
+        )
+
+        self.assertFalse(
+            contact_b_text_in_source,
+            "deleted contact B's own text must not survive in the "
+            "persisted source DOCX",
+        )
+        self.assertFalse(
+            contact_b_photo_in_source,
+            "deleted contact B's own photo must not survive in the "
+            "persisted source DOCX",
+        )
+        self.assertTrue(
+            contact_a_text_in_source,
+            "surviving contact A's own text must remain untouched",
+        )
+        self.assertTrue(
+            contact_a_photo_in_source,
+            "surviving contact A's own photo must remain untouched",
+        )
+
+        remaining_contacts = extract_contacts_from_docx(
+            docx_path, country="Australia"
+        )
+        self.assertEqual(1, len(remaining_contacts))
+        self.assertEqual(
+            "Michael Harmer", remaining_contacts[0].contact_person
+        )
+
+    def test_admin_added_contact_b_delete_failure_restores_source_byte_for_byte(
+        self,
+    ) -> None:
+        """Same admin-added contact B scenario, but the ContactState/
+        index commit fails after the source DOCX has already been
+        rewritten to remove contact B's text+photo - the source must
+        be restored to its EXACT prior bytes (with contact B still
+        present), never left half-mutated."""
+
+        docx_path = self._require_copy("AU.docx")
+        self._seed_contact_a_only(docx_path)
+
+        client = FakeContactOpenSearchClient(
+            document_id=self.document_id,
+            country_code="AU",
+            country="Australia",
+            source_filename="AU.docx",
+        )
+
+        contact_b_id, _ = (
+            self._add_contact_b_with_photo_via_real_admin_flow(client)
+        )
+
+        original_bytes = docx_path.read_bytes()
+
+        with self.assertRaises(AdminContactMutationFailedError):
+            with _patched_indexer(client, fail_bulk=True):
+                delete_contact(
+                    document_id=self.document_id,
+                    contact_id=contact_b_id,
+                    source_directory=self.root,
+                    client=client,
+                )
+
+        self.assertEqual(
+            original_bytes,
+            docx_path.read_bytes(),
+            "the source DOCX must be restored to its exact original "
+            "bytes (contact B's text and photo both still present) "
+            "when the ContactState/index commit fails after the "
+            "source rewrite already succeeded",
+        )
+
+        state = read_contact_state(self.root, self.document_id)
+        self.assertEqual(2, len(state.contacts))
+        self.assertIn(
+            contact_b_id, {c.contact_id for c in state.contacts}
+        )
+
+
+class AddContactFallbackSynchronizationTests(unittest.TestCase):
+    """
+    Mission "FIX ONLY THE REMAINING ADMIN CONTACT <-> SOURCE DOCX
+    SYNCHRONIZATION PROBLEMS", requirement 2: a document with no
+    detected two-box contact area (PT.docx - proven structure-less by
+    test_contact_document_area.py's own
+    test_fails_closed_with_no_structural_reference_at_all) must never
+    leave a successful Add Contact as ContactState-only. add_contact()
+    must fall back to document_contact_materializer.
+    persist_inline_contact_fallback() and commit that to the source -
+    SOURCE DOCX == CONTACT STATE == OPENSEARCH holds even here.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.document_id = _real_document_id_for("PT")
+
+    def _require_copy(self, filename: str) -> Path:
+        source = SOURCE_ROOT / filename
+
+        if not source.exists():
+            self.skipTest(f"Real corpus source unavailable: {source}")
+
+        original_bytes = source.read_bytes()
+        copy_path = self.root / filename
+        copy_path.write_bytes(original_bytes)
+
+        self.addCleanup(
+            lambda: self.assertEqual(
+                original_bytes,
+                source.read_bytes(),
+                f"{source} was mutated by this test.",
+            )
+        )
+
+        return copy_path
+
+    def _client(self) -> FakeContactOpenSearchClient:
+        return FakeContactOpenSearchClient(
+            document_id=self.document_id,
+            country_code="PT",
+            country="Portugal",
+            source_filename="PT.docx",
+        )
+
+    def test_add_contact_without_structural_area_still_synchronizes_source(
+        self,
+    ) -> None:
+        docx_path = self._require_copy("PT.docx")
+        original_bytes = docx_path.read_bytes()
+
+        client = self._client()
+
+        with _patched_indexer(client):
+            add_contact(
+                document_id=self.document_id,
+                fields=_write_request(
+                    member_firm="Someone New Lda",
+                    contact_person="Someone New",
+                    email="new@example.test",
+                    phone="+351 21 000 0000",
+                    address="Rua Nova 1",
+                    website="www.newfirm.test",
+                ),
+                source_directory=self.root,
+                client=client,
+            )
+
+        new_bytes = docx_path.read_bytes()
+
+        self.assertNotEqual(
+            original_bytes,
+            new_bytes,
+            "a successful Add Contact must always rewrite the "
+            "persisted source DOCX, even when the document has no "
+            "two-box contact area to clone the style of - "
+            "ContactState alone is never sufficient",
+        )
+
+        with zipfile.ZipFile(docx_path) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode("utf-8", errors="ignore")
+
+        self.assertIn("Someone New", document_xml)
+        self.assertIn("new@example.test", document_xml)
+        self.assertIn(CONTACT_TABLE_HIDDEN_MARKER, document_xml)
+        self.assertIn("<w:tbl>", document_xml)
+
+        state = read_contact_state(self.root, self.document_id)
+        self.assertEqual(1, len(state.contacts))
+
+    def test_second_add_replaces_rather_than_duplicates_the_fallback_block(
+        self,
+    ) -> None:
+        """Two sequential Add Contact calls against the same
+        structure-less document must each leave the source
+        synchronized with the FULL current contact list - never
+        stacking a second, stale fallback block alongside the first
+        (which would silently resurrect a deleted/superseded
+        rendering of the earlier contact)."""
+
+        docx_path = self._require_copy("PT.docx")
+        client = self._client()
+
+        with _patched_indexer(client):
+            add_contact(
+                document_id=self.document_id,
+                fields=_write_request(
+                    member_firm="First Firm Lda",
+                    contact_person="First Person",
+                    email="first@example.test",
+                ),
+                source_directory=self.root,
+                client=client,
+            )
+
+        with _patched_indexer(client):
+            add_contact(
+                document_id=self.document_id,
+                fields=_write_request(
+                    member_firm="Second Firm Lda",
+                    contact_person="Second Person",
+                    email="second@example.test",
+                ),
+                source_directory=self.root,
+                client=client,
+            )
+
+        with zipfile.ZipFile(docx_path) as archive:
+            document_xml = archive.read(
+                "word/document.xml"
+            ).decode("utf-8", errors="ignore")
+
+        self.assertIn("First Person", document_xml)
+        self.assertIn("Second Person", document_xml)
+        self.assertEqual(
+            1,
+            document_xml.count(CONTACT_TABLE_HIDDEN_MARKER),
+            "a second Add Contact must replace the one canonical "
+            "table with a fresh rendering of the full contact list, "
+            "never append a second one",
+        )
+
+        state = read_contact_state(self.root, self.document_id)
+        self.assertEqual(2, len(state.contacts))
 
 
 class ContactBootstrapTests(unittest.TestCase):
@@ -1641,7 +2366,7 @@ class ReseedContactsFromCurrentDocxTests(unittest.TestCase):
     def test_confirmed_reseed_discards_admin_edits(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             source_directory = Path(root)
-            (source_directory / "GB.docx").write_bytes(b"docx")
+            _seed_placeholder_source_docx(source_directory)
 
             client = FakeContactOpenSearchClient()
 

@@ -713,6 +713,9 @@ def _build_photo_run_xml(
     position_h_emu: int,
     position_v_emu: int,
     relative_from: str,
+    doc_pr_id: str = "700000002",
+    cnv_pr_id: str = "700000003",
+    relative_height: str = "251999999",
 ) -> str:
     """
     A minimal, DrawingML-only floating portrait run - deliberately the
@@ -721,6 +724,15 @@ def _build_photo_run_xml(
     HD-Photo compatibility layer): the goal is a document Word and
     LibreOffice both render correctly, not byte-parity with every
     possible existing photo's own optional extras.
+
+    doc_pr_id/cnv_pr_id/relative_height default to the original fixed
+    values (existing callers only ever add ONE new photo per document
+    at a time, so a fixed value has never collided) - a caller adding
+    a photo to a document that may already contain another freshly-
+    added photo (contact_document_area.py, adding a second-or-later
+    contact) must pass document-wide-unique values instead, since
+    wp:docPr/pic:cNvPr ids AND relativeHeight z-order values are all
+    required to be unique within the document.
     """
 
     return (
@@ -731,7 +743,7 @@ def _build_photo_run_xml(
         'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
         "<w:rPr><w:noProof/></w:rPr><w:drawing>"
         '<wp:anchor distT="0" distB="0" distL="114300" distR="114300" '
-        'simplePos="0" relativeHeight="251999999" behindDoc="0" '
+        f'simplePos="0" relativeHeight="{relative_height}" behindDoc="0" '
         'locked="0" layoutInCell="1" allowOverlap="1">'
         '<wp:simplePos x="0" y="0"/>'
         f'<wp:positionH relativeFrom="{relative_from}">'
@@ -743,13 +755,13 @@ def _build_photo_run_xml(
         f'<wp:extent cx="{width_emu}" cy="{height_emu}"/>'
         '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
         "<wp:wrapNone/>"
-        f'<wp:docPr id="700000002" name="Contact photo {relationship_id}"/>'
+        f'<wp:docPr id="{doc_pr_id}" name="Contact photo {relationship_id}"/>'
         "<wp:cNvGraphicFramePr/>"
         '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
         '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
         "<pic:pic>"
         "<pic:nvPicPr>"
-        '<pic:cNvPr id="700000003" name="Contact photo"/>'
+        f'<pic:cNvPr id="{cnv_pr_id}" name="Contact photo"/>'
         "<pic:cNvPicPr/>"
         "</pic:nvPicPr>"
         "<pic:blipFill>"

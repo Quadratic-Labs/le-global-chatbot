@@ -640,6 +640,100 @@ def materialize_effective_docx(
     return output.getvalue()
 
 
+def _find_existing_inline_fallback_paragraphs(
+    document: DocxDocument,
+) -> list:
+    """
+    The paragraph elements of a PREVIOUSLY persisted in-flow fallback
+    block, found via its own hidden start/end marker text - so a
+    repeated call (e.g. adding a second contact after the first one
+    already used this fallback) replaces rather than duplicates it.
+    Returns [] when no such block exists yet.
+    """
+
+    paragraphs = document.paragraphs
+    start_index: int | None = None
+    end_index: int | None = None
+
+    for index, paragraph in enumerate(paragraphs):
+        text = paragraph.text.strip()
+
+        if start_index is None:
+            if text == CONTACT_BOX_HIDDEN_MARKER:
+                start_index = index
+            continue
+
+        if text == CONTACT_BOX_HIDDEN_END_MARKER:
+            end_index = index
+            break
+
+    if start_index is None or end_index is None:
+        return []
+
+    return paragraphs[start_index:end_index + 1]
+
+
+def persist_inline_contact_fallback(
+    source_path: Path,
+    *,
+    contacts: Sequence[ExtractedContact],
+) -> bytes:
+    """
+    A safe, deterministic, PERSISTED fallback for a document with no
+    existing structural contact area to clone the style of (mission
+    "..." requirement 2: a successful Add Contact must never leave the
+    source DOCX unsynchronized with ContactState, even for a document
+    that never had one). Reuses the EXACT SAME hidden-marker in-flow-
+    paragraph mechanism this module already uses at download time -
+    guaranteed by ordinary document reflow to never overlap anything,
+    verified by direct LibreOffice rendering against the real corpus -
+    applied here directly to the PERSISTED source instead of an
+    ephemeral download copy.
+
+    Removes any PREVIOUSLY persisted fallback block first (found via
+    its own hidden marker), so a repeated call rebuilds from the
+    CURRENT full contact list rather than duplicating blocks. Never
+    writes to source_path itself - returns bytes for the caller to
+    stage/commit, exactly like every other primitive in this file.
+    """
+
+    source_bytes = source_path.read_bytes()
+    document = DocxDocument(BytesIO(source_bytes))
+
+    for paragraph in _find_existing_inline_fallback_paragraphs(document):
+        paragraph_element = paragraph._p
+        paragraph_element.getparent().remove(paragraph_element)
+
+    box_lines = _build_box_content_lines(list(contacts))
+
+    anchor_paragraph = document.paragraphs[0]
+
+    for paragraph in document.paragraphs:
+        if paragraph.text.strip():
+            anchor_paragraph = paragraph
+            break
+
+    from lxml import etree
+
+    wrapper_xml = (
+        '<w:tmp xmlns:w='
+        '"http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        + _build_inline_contact_paragraphs_xml(box_lines)
+        + "</w:tmp>"
+    )
+    wrapper_element = etree.fromstring(wrapper_xml.encode("utf-8"))
+
+    insertion_point = anchor_paragraph._p
+    for paragraph_element in list(wrapper_element):
+        insertion_point.addnext(paragraph_element)
+        insertion_point = paragraph_element
+
+    output = BytesIO()
+    document.save(output)
+
+    return output.getvalue()
+
+
 def _rewrite_document_xml_part(
     source_bytes: bytes,
     new_document_xml: str,

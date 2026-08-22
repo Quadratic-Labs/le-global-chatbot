@@ -2238,6 +2238,148 @@ def _extract_plain_paragraph_contacts(
     return contacts
 
 
+CONTACT_TABLE_HIDDEN_MARKER: Final[str] = "LE-GLOBAL-CONTACT-TABLE-V1"
+
+
+def _extract_canonical_table_contacts(
+    file_path: Path,
+    country: str | None = None,
+) -> list[ExtractedContact] | None:
+    """
+    Read the Admin-managed canonical contact table - a standard,
+    borderless, in-flow Word table this system itself writes into the
+    persisted source (one row per contact: a left cell with that
+    contact's own text fields, a right cell with its own inline
+    photo) - identified unambiguously by a hidden marker paragraph in
+    its own first cell, never by guessing which table in the document
+    is the contact one.
+
+    Returns None (never an empty list) when no such table is found, so
+    extract_contacts_from_docx() falls back to the legacy text-box
+    parser - an empty list is reserved for "the table is present and
+    genuinely lists zero contacts".
+
+    Each row's left cell is classified DIRECTLY using the same field
+    rules parse_contact_blocks() applies to the legacy text-box format
+    (member firm/address/phone/website before the CONTACT PERSON
+    marker, name/email after it) - but per-row, never through parse_
+    contact_blocks() itself: that function collects firm and person
+    blocks into two SEPARATE lists and deduplicates each before pairing
+    them back up position-by-position, a step designed for the legacy
+    format's own Choice/Fallback VML duplication artifact. Two DIFFERENT
+    canonical-table rows that happen to share the exact same contact
+    person and email (the "duplicates explicitly allowed" contract
+    add_contact() itself documents) would otherwise collapse into one
+    during that dedup, silently losing a genuine contact. Each row's
+    own firm+person lines are already correctly grouped by construction
+    here, so no cross-row collection, dedup, or pairing is needed at
+    all.
+    """
+
+    from docx import Document as WordDocument
+
+    try:
+        document = WordDocument(file_path)
+    except Exception:
+        return None
+
+    marker_table = None
+
+    for table in document.tables:
+        if not table.rows:
+            continue
+
+        first_cell_text = table.rows[0].cells[0].text
+
+        if CONTACT_TABLE_HIDDEN_MARKER in first_cell_text:
+            marker_table = table
+            break
+
+    if marker_table is None:
+        return None
+
+    normalized_country = (
+        _normalize_text(country).casefold() if country else None
+    )
+
+    contacts: list[ExtractedContact] = []
+
+    for row in marker_table.rows:
+        left_cell = row.cells[0]
+        lines = [
+            _normalize_text(paragraph.text)
+            for paragraph in left_cell.paragraphs
+            if _normalize_text(paragraph.text)
+            and CONTACT_TABLE_HIDDEN_MARKER not in paragraph.text
+        ]
+
+        if not lines:
+            continue
+
+        marker_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if line.strip().casefold() in _CONTACT_PERSON_MARKERS
+            ),
+            None,
+        )
+
+        firm_lines = (
+            lines[:marker_index] if marker_index is not None else lines
+        )
+        person_lines = (
+            lines[marker_index + 1:] if marker_index is not None else []
+        )
+
+        phone = _select_contact_phone(firm_lines)
+        website_match = _WEBSITE_PATTERN.search(" ".join(firm_lines))
+
+        address_lines: list[str] = []
+
+        for line in firm_lines[1:]:
+            if website_match and line == website_match.group(0):
+                continue
+
+            if (
+                normalized_country is not None
+                and line.casefold() == normalized_country
+            ):
+                continue
+
+            address_line = _remove_contact_phone_from_address_line(
+                line, phone
+            )
+
+            if address_line:
+                address_lines.append(address_line)
+
+        emails: list[str] = []
+        name_lines: list[str] = []
+
+        for line in person_lines:
+            email_match = _EMAIL_PATTERN.search(line)
+
+            if email_match:
+                emails.append(email_match.group(0))
+            else:
+                name_lines.append(line)
+
+        contact = ExtractedContact(
+            member_firm=firm_lines[0] if firm_lines else None,
+            contact_person=name_lines[0] if name_lines else None,
+            email=", ".join(emails) if emails else None,
+            phone=phone,
+            address=", ".join(address_lines) if address_lines else None,
+            website=website_match.group(0) if website_match else None,
+        )
+
+        if contact.has_any_field():
+            contacts.append(contact)
+
+    return contacts
+
+
 def extract_contacts_from_docx(
     file_path: Path,
     country: str | None = None,
@@ -2245,12 +2387,21 @@ def extract_contacts_from_docx(
     """
     Extract every validated contact card from one source DOCX.
 
-    Checks for the deterministic, Admin-managed block (mission "ORDER
-    8G-B2.1") first - present only on a DOCX this system itself
-    materialized for Download - and falls back to the ordinary
-    text-box-based legacy parser for every real, organically-uploaded
-    document, where that marker is never present.
+    Checks for the canonical Admin-managed table first (present only
+    on a document this mission's mechanism has itself rebuilt), then
+    the deterministic hidden-marker block (mission "ORDER 8G-B2.1") -
+    present only on a DOCX this system itself materialized for
+    Download - and falls back to the ordinary text-box-based legacy
+    parser for every real, organically-uploaded document, where
+    neither marker is ever present.
     """
+
+    canonical_table_contacts = _extract_canonical_table_contacts(
+        file_path, country=country
+    )
+
+    if canonical_table_contacts is not None:
+        return canonical_table_contacts
 
     deterministic_contacts = extract_deterministic_contact_blocks(
         file_path

@@ -633,6 +633,85 @@ def _collect_image_candidates(
     return candidates
 
 
+def _extract_canonical_table_photo_candidates(
+    file_path: Path,
+) -> list[ContactPhotoCandidate] | None:
+    """
+    Read contact photos directly from the Admin-managed canonical
+    contact table (see docx_parser.CONTACT_TABLE_HIDDEN_MARKER) - one
+    ordinary INLINE picture per row's own right cell, in row order.
+
+    Returns None (never an empty list) when no such table exists, so
+    extract_contact_photo_candidates() falls back to the legacy
+    floating-shape geometry heuristics below - an empty list means
+    "the table exists and genuinely has no photos yet" (every row is
+    photo-less).
+    """
+
+    from docx import Document as WordDocument
+
+    from app.services.docx_parser import CONTACT_TABLE_HIDDEN_MARKER
+
+    try:
+        document = WordDocument(file_path)
+    except Exception:
+        return None
+
+    marker_table = None
+
+    for table in document.tables:
+        if not table.rows:
+            continue
+
+        if CONTACT_TABLE_HIDDEN_MARKER in table.rows[0].cells[0].text:
+            marker_table = table
+            break
+
+    if marker_table is None:
+        return None
+
+    result: list[ContactPhotoCandidate] = []
+    seen_relationship_ids: set[str] = set()
+
+    for row in marker_table.rows:
+        if len(row.cells) < 2:
+            continue
+
+        blip = row.cells[1]._tc.find(f".//{{{_A_NS}}}blip")
+
+        if blip is None:
+            continue
+
+        relationship_id = blip.get(f"{{{_R_NS}}}embed")
+
+        if not relationship_id or relationship_id in seen_relationship_ids:
+            continue
+
+        seen_relationship_ids.add(relationship_id)
+
+        try:
+            image_part = document.part.related_parts[relationship_id]
+        except KeyError:
+            continue
+
+        blob = image_part.blob
+        source_filename = posixpath.basename(str(image_part.partname))
+
+        result.append(
+            ContactPhotoCandidate(
+                source_filename=source_filename,
+                content_type=_content_type(blob, source_filename),
+                data=blob,
+                sha256=hashlib.sha256(blob).hexdigest(),
+                reason="CANONICAL_TABLE",
+                relationship_id=relationship_id,
+                media_path=str(image_part.partname).lstrip("/"),
+            )
+        )
+
+    return result
+
+
 def extract_contact_photo_candidates(
     file_path: Path,
 ) -> list[ContactPhotoCandidate]:
@@ -658,6 +737,13 @@ def extract_contact_photo_candidates(
         raise ContactPhotoExtractionError(
             f"DOCX file does not exist: {path}"
         )
+
+    canonical_table_candidates = _extract_canonical_table_photo_candidates(
+        path
+    )
+
+    if canonical_table_candidates is not None:
+        return canonical_table_candidates
 
     try:
         with zipfile.ZipFile(
