@@ -41,15 +41,68 @@ from app.services.contact_state import (
 
 SOURCE_ROOT = Path("/data/documents/source")
 
-_VALID_JPEG = bytes.fromhex(
-    "ffd8ffe000104a46494600010100000100010000ffd9"
-)
-_VALID_PNG = bytes.fromhex(
-    "89504e470d0a1a0a0000000d49484452000000010000"
-    "000108060000001f15c4890000000a49444154789c63"
-    "60000002000100ffff03000006000557bfabd4000000"
-    "0049454e44ae426082"
-)
+def _make_valid_jpeg(width: int = 183, height: int = 234) -> bytes:
+    """
+    A minimal but REAL-SIZED, structurally complete baseline JPEG -
+    SOI/APP0(JFIF)/SOF0/SOS/EOI with plausible width/height, never a
+    degenerate single-pixel stub. python-docx's own image-header
+    parser (used to compute a photo's proportional height in the
+    canonical contact table) stops reading at the first SOS marker, so
+    the entropy-coded scan data itself can be a single placeholder
+    byte - only the headers before it need to be genuine.
+    """
+
+    import struct
+
+    soi = b"\xff\xd8"
+    app0_data = (
+        b"JFIF\x00\x01\x01\x00"
+        + struct.pack(">HH", 96, 96)
+        + b"\x00\x00"
+    )
+    app0 = b"\xff\xe0" + struct.pack(">H", len(app0_data) + 2) + app0_data
+    sof0_data = (
+        bytes([8])
+        + struct.pack(">HH", height, width)
+        + bytes([1, 1, 0x11, 0])
+    )
+    sof0 = b"\xff\xc0" + struct.pack(">H", len(sof0_data) + 2) + sof0_data
+    sos_data = bytes([1, 1, 0, 0, 63, 0])
+    sos = b"\xff\xda" + struct.pack(">H", len(sos_data) + 2) + sos_data
+    return soi + app0 + sof0 + sos + b"\x00\xff\xd9"
+
+
+def _make_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    """A minimal but well-formed, real-sized RGB PNG - see
+    _make_valid_jpeg's own docstring for why a degenerate single-pixel
+    fixture is not enough now that a photo's own proportional height
+    is computed from its real dimensions."""
+
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data))
+        )
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    image_data = zlib.compress(raw)
+    return (
+        signature
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", image_data)
+        + chunk(b"IEND", b"")
+    )
+
+
+_VALID_JPEG = _make_valid_jpeg()
+_VALID_PNG = _make_png(183, 234, (120, 80, 200))
 
 
 class _FakePhotoOpenSearchClient:
@@ -428,11 +481,12 @@ class AdminContactPhotoTests(unittest.TestCase):
     def _seed_zero_zone_country(self) -> _FakePhotoOpenSearchClient:
         """
         Portugal (PT.docx) - a real document with genuinely ZERO
-        "CONTACT PERSON" zones anywhere, used to prove a photo
-        insertion for a brand-new contact fails closed (never an
-        arbitrary document-end insertion) when there is truly no
-        contact area to anchor to at all, and that failure leaves
-        zero partial photo-related state behind.
+        "CONTACT PERSON" zones anywhere. The canonical contact table
+        mechanism rebuilds the whole contact area from ContactState
+        regardless of prior structure, so a photo mutation here now
+        succeeds (synchronizing a fresh table into the source) rather
+        than failing closed the way the old floating-shape-only
+        mechanism had to.
         """
 
         real_source = self._require_source_copy("PT.docx")
@@ -467,63 +521,37 @@ class AdminContactPhotoTests(unittest.TestCase):
             source_filename="PT.docx",
         )
 
-    def test_new_contact_photo_failure_leaves_zero_partial_state(
+    def test_new_contact_photo_for_a_zero_zone_document_still_syncs(
         self,
     ) -> None:
         """
-        Mission "FINAL BLOCKER", section 8: when a document has no
-        contact area at all to anchor a brand-new contact's photo to,
-        the failure must leave the newly-added contact's photo fields
-        exactly as they were (None) - the contact itself is never
-        partially created with a dangling photo reference, the source
-        DOCX is byte-for-byte untouched, and no orphaned photo file is
-        left in the photo store.
+        A document with no contact area at all still gets the new
+        photo synchronized into a freshly rebuilt canonical table -
+        the source DOCX is never left unsynchronized just because it
+        had no prior contact structure.
         """
 
         client = self._seed_zero_zone_country()
-        docx_path = self.root / "PT.docx"
-        original_docx_bytes = docx_path.read_bytes()
         doc_id = (
             "doc_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         )
 
-        with self.assertRaises(AdminContactPhotoError):
-            replace_admin_contact_photo(
-                self.root,
-                doc_id,
-                "contact-test",
-                data=_VALID_JPEG,
-                content_type="image/jpeg",
-                client=client,
-            )
-
-        self.assertEqual(
-            original_docx_bytes,
-            docx_path.read_bytes(),
-            "a failed photo insertion must never touch the source "
-            "DOCX",
+        photo = replace_admin_contact_photo(
+            self.root,
+            doc_id,
+            "contact-test",
+            data=_VALID_JPEG,
+            content_type="image/jpeg",
+            client=client,
         )
+
+        docx_path = self.root / "PT.docx"
+        docx_candidates = extract_contact_photo_candidates(docx_path)
+        self.assertEqual(1, len(docx_candidates))
+        self.assertEqual(photo.sha256, docx_candidates[0].sha256)
 
         state = read_contact_state(self.root, doc_id)
-        self.assertIsNone(
-            state.contacts[0].photo_sha256,
-            "the newly-added contact must not be left with a "
-            "dangling/partial photo reference",
-        )
-        self.assertIsNone(state.contacts[0].photo_filename)
-
-        photo_store_dir = self.root / ".admin-state" / "contact-photos"
-        orphaned_files = (
-            list(photo_store_dir.iterdir())
-            if photo_store_dir.exists()
-            else []
-        )
-        self.assertEqual(
-            [],
-            orphaned_files,
-            "a failed photo insertion must never leave an orphaned "
-            "physical photo file behind",
-        )
+        self.assertEqual(photo.sha256, state.contacts[0].photo_sha256)
 
     def test_replace_read_remove_syncs_the_source_docx(self) -> None:
         client = self._seed_photo_bearing_contact()
@@ -599,15 +627,19 @@ class AdminContactPhotoTests(unittest.TestCase):
         self,
     ) -> None:
         """
-        A photo whose SHA no longer matches anything in the source
-        DOCX (simulating drift/corruption) must fail closed - never
-        silently update ContactState while leaving the DOCX
-        unsynchronized (the mission's non-negotiable invariant).
+        A ContactState photo SHA that no longer matches anything in
+        the source DOCX (simulating drift/corruption) is never
+        consulted for a REPLACE - the canonical table is rebuilt fresh
+        from the newly-uploaded bytes directly, so a stale/corrupt
+        prior reference cannot block a legitimate new upload. This is
+        a deliberate improvement over the old floating-shape mechanism
+        (which had to locate the OLD sha in the document before it
+        could replace it): rebuilding the whole area from ContactState
+        every time eliminates this entire class of drift-driven
+        failure.
         """
 
         client = self._seed_photo_bearing_contact()
-        docx_path = self.root / "AR.docx"
-        original_docx_bytes = docx_path.read_bytes()
 
         write_contact_state_atomic(
             self.root,
@@ -631,23 +663,25 @@ class AdminContactPhotoTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaises(AdminContactPhotoError):
-            replace_admin_contact_photo(
-                self.root,
-                "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "contact-test",
-                data=_VALID_JPEG,
-                content_type="image/jpeg",
-                client=client,
-            )
+        photo = replace_admin_contact_photo(
+            self.root,
+            "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contact-test",
+            data=_VALID_JPEG,
+            content_type="image/jpeg",
+            client=client,
+        )
 
-        self.assertEqual(
-            original_docx_bytes, docx_path.read_bytes()
+        docx_path = self.root / "AR.docx"
+        docx_candidates = extract_contact_photo_candidates(docx_path)
+        self.assertEqual(1, len(docx_candidates))
+        self.assertEqual(photo.sha256, docx_candidates[0].sha256)
+
+        state = read_contact_state(
+            self.root,
+            "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
-        state = read_contact_state(self.root, "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        self.assertEqual(
-            "0" * 64, state.contacts[0].photo_sha256
-        )
+        self.assertEqual(photo.sha256, state.contacts[0].photo_sha256)
 
     def test_downloaded_docx_reflects_a_replaced_photo(self) -> None:
         """

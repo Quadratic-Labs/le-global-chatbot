@@ -2,16 +2,21 @@
 Admin CRUD for persisted contact photos.
 
 A contact photo is a real, permanent part of the persisted source DOCX
-(mission "COMPLETE CONTACT PHOTO CRUD + DOCX SOURCE SYNCHRONIZATION",
-section 6) - unlike Contact business-field text, which is only ever
-materialized into an EPHEMERAL copy at download time. Every mutation
-here therefore keeps four things in lockstep: the structured
-ContactState, the persisted source DOCX (via
-app.services.contact_document_photos' deterministic primitives), the
-physical photo store, and the admin-modified marker - reusing the SAME
-per-country lock and same-filesystem atomic-replace discipline
-app.services.admin_document_sections.py already established for every
-other DOCX mutation, rather than a parallel, lower-quality mechanism.
+- unlike Contact business-field text, which is only ever materialized
+into an EPHEMERAL copy at download time. Every mutation here therefore
+keeps four things in lockstep: the structured ContactState, the
+persisted source DOCX, the physical photo store, and the admin-
+modified marker - reusing the SAME per-country lock and same-
+filesystem atomic-replace discipline app.services.admin_document_
+sections.py already established for every other DOCX mutation, rather
+than a parallel, lower-quality mechanism.
+
+The source DOCX itself is synchronized by rebuilding its ENTIRE
+canonical contact table from the full current contact list (see
+app.services.contact_document_area.rebuild_canonical_contact_table) -
+the same one mechanism admin_contacts.py's Add/Delete Contact use -
+never a standalone floating-shape photo mutation independent of the
+surrounding text.
 """
 
 from __future__ import annotations
@@ -33,13 +38,15 @@ from app.services.admin_document_sections import (
     _fsync_path,
     _make_temp_docx_path,
 )
+from app.services.admin_contacts import (
+    _record_to_extracted_contact,
+    _resolve_contact_photo,
+)
 from app.services.admin_modification_marker import mark_admin_modified
-from app.services.contact_document_photos import (
-    ContactDocumentPhotoError,
-    add_contact_photo_to_document,
-    add_new_contact_photo_to_document,
-    remove_contact_photo_from_document,
-    replace_contact_photo_in_document,
+from app.services.contact_document_area import (
+    ContactAreaError,
+    ContactPhotoPayload,
+    rebuild_canonical_contact_table,
 )
 from app.services.contact_photo_store import (
     ContactPhotoStorageError,
@@ -115,15 +122,16 @@ def _state_and_contact(source_directory, document_id, contact_id):
     raise AdminContactPhotoNotFoundError("Contact not found.")
 
 
-def _resolve_current_source_path(
+def _resolve_current_source_path_and_country(
     *,
     document_id: str,
     source_directory: Path,
     client: OpenSearch,
-) -> Path:
+) -> tuple[Path, str | None]:
     """The CURRENT persisted source DOCX for one document - a
-    read-only OpenSearch metadata lookup, never a reindex (mission
-    section 20)."""
+    read-only OpenSearch metadata lookup, never a reindex - together
+    with its own country display name, needed by
+    rebuild_canonical_contact_table's own country-line filtering."""
 
     try:
         document_metadata = _get_document_metadata(
@@ -137,6 +145,7 @@ def _resolve_current_source_path(
     source_filename = _required_string(
         document_metadata, "source_filename"
     )
+    country = document_metadata.get("country")
 
     try:
         resolved = resolve_document_source_path(
@@ -154,7 +163,7 @@ def _resolve_current_source_path(
             "The source DOCX file is missing."
         )
 
-    return resolved.path
+    return resolved.path, country if isinstance(country, str) else None
 
 
 def _stage_and_commit_document_bytes(
@@ -326,55 +335,12 @@ def replace_admin_contact_photo(
             source_directory, document_id, contact_id
         )
 
-        source_path = _resolve_current_source_path(
+        source_path, country = _resolve_current_source_path_and_country(
             document_id=document_id,
             source_directory=source_directory,
             client=opensearch_client,
         )
         original_bytes = source_path.read_bytes()
-
-        other_contact_persons = tuple(
-            other.contact_person
-            for other in state.contacts
-            if other.contact_id != contact.contact_id
-            and other.contact_person
-        )
-
-        try:
-            if contact.photo_filename is not None:
-                new_document_bytes = replace_contact_photo_in_document(
-                    source_path,
-                    target_sha256=contact.photo_sha256,
-                    new_data=data,
-                    new_content_type=content_type,
-                )
-            else:
-                try:
-                    new_document_bytes = add_contact_photo_to_document(
-                        source_path,
-                        contact_person=contact.contact_person,
-                        new_data=data,
-                        new_content_type=content_type,
-                        other_contact_persons=other_contact_persons,
-                    )
-                except ContactDocumentPhotoError:
-                    # This contact's own name has no matching CONTACT
-                    # PERSON zone anywhere in the document yet - the
-                    # ordinary case for a contact just created via Add
-                    # Contact (mission "FINAL BLOCKER", section 3: a
-                    # brand-new name can never already have a zone).
-                    # Anchor to the document's own largest existing
-                    # CONTACT PERSON zone instead - never a name-based
-                    # search after the fact.
-                    new_document_bytes = (
-                        add_new_contact_photo_to_document(
-                            source_path,
-                            new_data=data,
-                            new_content_type=content_type,
-                        )
-                    )
-        except ContactDocumentPhotoError as error:
-            raise AdminContactPhotoError(str(error)) from error
 
         old_filename = contact.photo_filename
 
@@ -388,6 +354,46 @@ def replace_admin_contact_photo(
         except ContactPhotoStorageError as exc:
             raise AdminContactPhotoError(str(exc)) from exc
 
+        updated = replace(
+            contact,
+            photo_filename=stored.filename,
+            photo_content_type=stored.content_type,
+            photo_sha256=stored.sha256,
+        )
+
+        contacts = list(state.contacts)
+        contacts[index] = updated
+
+        extracted_contacts = tuple(
+            _record_to_extracted_contact(record) for record in contacts
+        )
+        photos = tuple(
+            (
+                ContactPhotoPayload(data=data, content_type=content_type)
+                if record.contact_id == contact_id
+                else _resolve_contact_photo(
+                    record,
+                    source_directory=source_directory,
+                    source_path=source_path,
+                    country=country,
+                )
+            )
+            for record in contacts
+        )
+
+        try:
+            new_document_bytes = rebuild_canonical_contact_table(
+                source_path,
+                contacts=extracted_contacts,
+                photos=photos,
+                country=country,
+            )
+        except ContactAreaError as error:
+            _delete_photo_best_effort(
+                source_directory, stored.filename
+            )
+            raise AdminContactPhotoError(str(error)) from error
+
         try:
             _stage_and_commit_document_bytes(
                 source_path=source_path,
@@ -398,16 +404,6 @@ def replace_admin_contact_photo(
                 source_directory, stored.filename
             )
             raise
-
-        updated = replace(
-            contact,
-            photo_filename=stored.filename,
-            photo_content_type=stored.content_type,
-            photo_sha256=stored.sha256,
-        )
-
-        contacts = list(state.contacts)
-        contacts[index] = updated
 
         try:
             write_contact_state_atomic(
@@ -478,27 +474,14 @@ def remove_admin_contact_photo(
         if contact.photo_filename is None:
             return False
 
-        source_path = _resolve_current_source_path(
+        source_path, country = _resolve_current_source_path_and_country(
             document_id=document_id,
             source_directory=source_directory,
             client=opensearch_client,
         )
         original_bytes = source_path.read_bytes()
 
-        try:
-            new_document_bytes = remove_contact_photo_from_document(
-                source_path,
-                target_sha256=contact.photo_sha256,
-            )
-        except ContactDocumentPhotoError as error:
-            raise AdminContactPhotoError(str(error)) from error
-
         old_filename = contact.photo_filename
-
-        _stage_and_commit_document_bytes(
-            source_path=source_path,
-            new_document_bytes=new_document_bytes,
-        )
 
         updated = replace(
             contact,
@@ -509,6 +492,38 @@ def remove_admin_contact_photo(
 
         contacts = list(state.contacts)
         contacts[index] = updated
+
+        extracted_contacts = tuple(
+            _record_to_extracted_contact(record) for record in contacts
+        )
+        photos = tuple(
+            (
+                None
+                if record.contact_id == contact_id
+                else _resolve_contact_photo(
+                    record,
+                    source_directory=source_directory,
+                    source_path=source_path,
+                    country=country,
+                )
+            )
+            for record in contacts
+        )
+
+        try:
+            new_document_bytes = rebuild_canonical_contact_table(
+                source_path,
+                contacts=extracted_contacts,
+                photos=photos,
+                country=country,
+            )
+        except ContactAreaError as error:
+            raise AdminContactPhotoError(str(error)) from error
+
+        _stage_and_commit_document_bytes(
+            source_path=source_path,
+            new_document_bytes=new_document_bytes,
+        )
 
         try:
             write_contact_state_atomic(
