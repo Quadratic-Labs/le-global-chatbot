@@ -3893,6 +3893,33 @@
             );
         }
 
+        // A silent, internal counterpart to deleteContact() above -
+        // used only to roll back a contact this SAME Add operation
+        // just created, when its required photo failed to save
+        // (mission "FINAL BLOCKER", section 8). Never guarded by the
+        // saving/adding/deleting flags (onAddSubmit is still mid-flow
+        // and already holds them), never shows its own message or
+        // confirmation prompt - the caller reports one single, honest
+        // outcome for the whole Add attempt.
+        async function rollbackContact(documentId, contactId) {
+            const formData = new FormData();
+            formData.set("action", config.contactDeleteAction);
+            formData.set("nonce", config.contactDeleteNonce);
+            formData.set("document_id", documentId);
+            formData.set("contact_id", contactId);
+
+            try {
+                const result = await fetchJson(config.adminPostUrl, {
+                    method: "POST",
+                    body: formData,
+                });
+
+                return isSuccessful(result);
+            } catch {
+                return false;
+            }
+        }
+
         async function onSave() {
             if (
                 saving || adding || deleting || saveButton.disabled
@@ -4132,19 +4159,43 @@
             countrySelect.disabled = false;
             cancelButton.disabled = false;
 
-            resetAddOnlyFields();
-            updateAddSubmitAvailability();
-
-            await loadContacts(documentId);
-
             if (photoFailed) {
+                // One logical Add: a contact that exists only because
+                // its own required photo failed to save is a
+                // partially-created contact, which must never remain
+                // (mission "FINAL BLOCKER", section 8) - roll it back
+                // rather than leaving it dangling, and report an
+                // honest full failure, never a partial success.
+                const rolledBack = Boolean(
+                    createdContactId
+                    && await rollbackContact(
+                        documentId,
+                        createdContactId
+                    )
+                );
+
+                await loadContacts(documentId);
+                updateAddSubmitAvailability();
+
                 setMessage(
-                    "The contact was added, but the photo could not "
-                    + "be saved. Open Edit contact to retry.",
+                    rolledBack
+                        ? "The contact could not be added because "
+                            + "its photo could not be saved. Please "
+                            + "try again."
+                        : "The contact's photo could not be saved, "
+                            + "and it could not be automatically "
+                            + "removed either. Please open Edit "
+                            + "contact and remove it, or retry the "
+                            + "photo there.",
                     "is-error"
                 );
                 return;
             }
+
+            resetAddOnlyFields();
+            updateAddSubmitAvailability();
+
+            await loadContacts(documentId);
 
             setMessage(
                 `✓ The contact was added successfully for `

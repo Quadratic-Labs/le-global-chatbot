@@ -5282,7 +5282,7 @@ describe("contacts panel", () => {
         assert.match(dom.messageEl.textContent, /added successfully/);
     });
 
-    test("a failed photo upload after a successful Add reports an honest partial failure", async () => {
+    test("a failed photo upload after a successful Add rolls back the new contact and reports a full failure", async () => {
         queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
 
         await selectCountry("doc_fr");
@@ -5293,12 +5293,61 @@ describe("contacts panel", () => {
         queueFetchResponses([
             { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-1" } } },
             { ok: true, status: 200, payload: { success: false } },
+            { ok: true, status: 200, payload: { success: true, data: {} } },
+            ZERO_CONTACTS_RESPONSE,
+        ]);
+
+        await clickAddSubmit();
+
+        assert.equal(
+            fetchCalls.length,
+            4,
+            "add, failed photo upload, rollback delete, then reload"
+        );
+        assert.equal(
+            fetchCalls[2].options.body.get("action"),
+            "le_global_chatbot_delete_contact",
+            "the just-created contact must be rolled back, mission 'FINAL BLOCKER' section 8"
+        );
+        assert.equal(
+            fetchCalls[2].options.body.get("contact_id"),
+            "contact-1"
+        );
+
+        assert.match(
+            dom.messageEl.textContent,
+            /could not be added because its photo could not be saved/,
+            "a rolled-back Add must report a full failure, never a partial success"
+        );
+        assert.doesNotMatch(
+            dom.messageEl.textContent,
+            /was added/,
+            "must never claim the contact was added when it was rolled back"
+        );
+        assert.equal(dom.messageEl.className.includes("is-error"), true);
+    });
+
+    test("if the rollback delete itself fails, an honest manual-cleanup message is shown", async () => {
+        queueFetchResponses([ZERO_CONTACTS_RESPONSE]);
+
+        await selectCountry("doc_fr");
+        fillAddFields(CONTACT_1);
+        selectPhotoFile(dom.addWebsiteInput, makeFakePhotoFile());
+
+        fetchCalls.length = 0;
+        queueFetchResponses([
+            { ok: true, status: 200, payload: { success: true, data: { contact_id: "contact-1" } } },
+            { ok: true, status: 200, payload: { success: false } },
+            { ok: true, status: 200, payload: { success: false } },
             ONE_CONTACT_RESPONSE,
         ]);
 
         await clickAddSubmit();
 
-        assert.match(dom.messageEl.textContent, /photo could not be saved/);
+        assert.match(
+            dom.messageEl.textContent,
+            /open Edit contact and remove it/i
+        );
         assert.equal(dom.messageEl.className.includes("is-error"), true);
     });
 

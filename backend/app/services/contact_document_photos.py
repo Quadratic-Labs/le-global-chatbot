@@ -11,7 +11,7 @@ a real, permanent part of the persisted document (see mission
 6): "The DOCX is not decorative backup data... photo CRUD MUST modify
 the real current DOCX."
 
-Three primitives, each locating its target through the SAME
+Four primitives, each locating its target through the SAME
 deterministic structural rules extract_contact_photo_candidates()
 already trusts (geometry, CONTACT PERSON zones, portrait-like display
 ratio) - never positional/order guessing, never OCR, never facial
@@ -30,12 +30,23 @@ recognition, never an LLM, never a country-specific branch:
         but ONLY when nothing else in the document still references
         them.
 
-    add_contact_photo_to_document - a brand-new floating image is
-        anchored inside the SAME paragraph that already carries the
-        target contact's own "CONTACT PERSON" zone (located by name,
-        the same zone extract_contact_photo_candidates() geometrically
-        associates a photo with), positioned so it passes that exact
-        same geometry-association rule.
+    add_contact_photo_to_document - for a contact who already has a
+        "CONTACT PERSON" zone naming them (located by name) but no
+        photo yet: a brand-new floating image is anchored right after
+        that SAME zone, positioned at that zone's own REAL, computed
+        anchor geometry so it genuinely overlaps it - never a fixed
+        generic guess, which only ever passes by accident when the
+        document happens to have no other photo at all.
+
+    add_new_contact_photo_to_document - for a BRAND-NEW contact, whose
+        name cannot possibly match any existing zone yet: anchors to
+        the document's own largest existing "CONTACT PERSON" zone
+        instead (never a name-based search - mission "FINAL BLOCKER",
+        section 3). A photo's association with a specific
+        ContactRecord is always through ContactRecord.photo_sha256 in
+        ContactState, never through a zone's own text, so the new
+        photo does not need its own dedicated zone to be correctly
+        served.
 
 A target that cannot be located unambiguously (zero matches, or more
 than one - the same "never guess" discipline
@@ -63,6 +74,9 @@ from typing import Sequence
 from app.services.contact_photos import (
     ContactPhotoExtractionError,
     extract_contact_photo_candidates,
+)
+from app.services.document_contact_materializer import (
+    _find_all_contact_runs,
 )
 
 
@@ -112,8 +126,10 @@ def _tag_span(
     inner_start: int,
 ) -> tuple[int, int] | None:
     """
-    The (start, end) span of the <w:{tag_name}>...</w:{tag_name}>
+    The (start, end) span of the <{tag_name}>...</{tag_name}>
     element enclosing a position already known to be inside it -
+    tag_name is the FULL, namespace-qualified tag (e.g. "w:p", "w:r",
+    "wp:anchor") -
     balancing nested same-named tags rather than trusting the first
     closing tag found, since a floating shape's own txbxContent
     legitimately nests further <w:r>/<w:p> elements of its own (the
@@ -136,11 +152,11 @@ def _tag_span(
     """
 
     tag_pattern = re.compile(
-        rf"<w:{tag_name}(?:\s[^>]*)?/>"
-        rf"|<w:{tag_name}(?:\s[^>]*)?>"
-        rf"|</w:{tag_name}>"
+        rf"<{tag_name}(?:\s[^>]*)?/>"
+        rf"|<{tag_name}(?:\s[^>]*)?>"
+        rf"|</{tag_name}>"
     )
-    close_token = f"</w:{tag_name}>"
+    close_token = f"</{tag_name}>"
 
     open_stack: list[int] = []
 
@@ -191,7 +207,7 @@ def _run_span_for_relationship(
     if position == -1:
         return None
 
-    return _tag_span("r", document_xml, position)
+    return _tag_span("w:r", document_xml, position)
 
 
 def _relationship_targets(rels_xml: str) -> set[str]:
@@ -531,18 +547,29 @@ def remove_contact_photo_from_document(
     return new_zip_bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _LocatedZone:
+    paragraph_span: tuple[int, int]
+    run_span: tuple[int, int]
+
+
 def _locate_contact_person_zone(
     document_xml: str,
     contact_person: str,
     other_contact_persons: Sequence[str] = (),
-) -> tuple[int, int] | None:
+) -> _LocatedZone | None:
     """
-    The (start, end) span of the SINGLE <w:p>...</w:p> paragraph
-    carrying the target person's own "CONTACT PERSON" zone - located
-    by structural content (a txbxContent whose own text contains both
+    The target person's own "CONTACT PERSON" zone - located by
+    structural content (a txbxContent whose own text contains both
     the literal marker "CONTACT PERSON" and the target person's name),
     never by document-order position, so it stays correct regardless
-    of how many other contacts/zones the same document has.
+    of how many other contacts/zones the same document has. Returns
+    both the enclosing PARAGRAPH span (where a new run textually
+    belongs) and the enclosing RUN span (the shape's own <w:r>, both
+    its DrawingML Choice and legacy VML Fallback copies together -
+    used to read the zone's own real anchor geometry, so a new photo
+    can be positioned to genuinely overlap it rather than guessing a
+    fixed offset).
 
     Deduplicates by enclosing PARAGRAPH span, not by regex match: a
     floating shape's modern DrawingML copy and its legacy VML fallback
@@ -570,7 +597,7 @@ def _locate_contact_person_zone(
     ]
 
     seen_spans: set[tuple[int, int]] = set()
-    matches: list[tuple[int, int]] = []
+    matches: list[_LocatedZone] = []
 
     for match in _TEXT_BOX_CONTENT_PATTERN.finditer(document_xml):
         text = _textbox_plain_text(match.group(1)).casefold()
@@ -581,12 +608,12 @@ def _locate_contact_person_zone(
         ):
             continue
 
-        span = _tag_span("p", document_xml, match.start())
+        paragraph_span = _tag_span("w:p", document_xml, match.start())
 
-        if span is None or span in seen_spans:
+        if paragraph_span is None or paragraph_span in seen_spans:
             continue
 
-        seen_spans.add(span)
+        seen_spans.add(paragraph_span)
 
         if any(
             other in text
@@ -594,12 +621,88 @@ def _locate_contact_person_zone(
         ):
             continue
 
-        matches.append(span)
+        run_span = _tag_span("w:r", document_xml, match.start())
+
+        if run_span is None:
+            continue
+
+        matches.append(
+            _LocatedZone(
+                paragraph_span=paragraph_span,
+                run_span=run_span,
+            )
+        )
 
     if len(matches) != 1:
         return None
 
     return matches[0]
+
+
+@dataclass(frozen=True, slots=True)
+class _AnchorGeometry:
+    relative_from: str
+    x_emu: int
+    width_emu: int
+
+
+_POSITION_H_PATTERN = re.compile(
+    r'<wp:positionH\s+relativeFrom="([^"]*)"\s*>'
+    r'\s*<wp:posOffset>(-?\d+)</wp:posOffset>'
+)
+_EXTENT_PATTERN = re.compile(
+    r'<wp:extent\s+cx="(\d+)"\s+cy="(\d+)"'
+)
+
+
+def _anchor_geometry_in_span(
+    document_xml: str,
+    span: tuple[int, int],
+) -> _AnchorGeometry | None:
+    """
+    The real horizontal position/width extract_contact_photo_
+    candidates() itself reads (contact_photos.py's own
+    _anchor_geometry()) for the ONE floating shape occupying this
+    exact span - read directly from the raw XML slice a caller has
+    already isolated (e.g. via _tag_span), never a second full-
+    document lxml parse. None when no wp:anchor positionH/extent can
+    be found there at all - callers must fail closed rather than
+    guess a placement from an unknown geometry.
+    """
+
+    span_xml = document_xml[span[0]:span[1]]
+
+    position_match = _POSITION_H_PATTERN.search(span_xml)
+    extent_match = _EXTENT_PATTERN.search(span_xml)
+
+    if position_match is None or extent_match is None:
+        return None
+
+    return _AnchorGeometry(
+        relative_from=position_match.group(1),
+        x_emu=int(position_match.group(2)),
+        width_emu=int(extent_match.group(1)),
+    )
+
+
+def _centered_position_h_emu(
+    zone: _AnchorGeometry,
+    photo_width_emu: int,
+) -> int:
+    """
+    A horizontal offset that puts the new photo's own center exactly
+    at the target zone's own center - contact_photos.py's own
+    _geometry_matches_contact_zone() accepts a match whenever the
+    image's center falls anywhere inside [zone.x, zone.x2], so this
+    is satisfied by construction regardless of the zone's or the
+    photo's own relative width, never a fixed generic guess.
+    """
+
+    return (
+        zone.x_emu
+        + zone.width_emu // 2
+        - photo_width_emu // 2
+    )
 
 
 def _build_photo_run_xml(
@@ -681,16 +784,21 @@ def add_contact_photo_to_document(
 ) -> bytes:
     """
     Insert a brand-new photo for a contact who currently has none, as
-    an additional run inside the SAME paragraph that already carries
-    that person's own "CONTACT PERSON" zone (located by name - the
-    same zone extract_contact_photo_candidates() geometrically
-    associates a photo with). Positioned at that zone's own horizontal
-    offset so the round-trip geometry-association rule accepts it by
-    construction, never by luck.
+    an additional run right after the SAME paragraph that already
+    carries that person's own "CONTACT PERSON" zone (located by name).
+    Positioned at that zone's own REAL, computed horizontal offset
+    (read directly from its own <wp:anchor>, never a fixed generic
+    guess) so the round-trip geometry-association rule
+    extract_contact_photo_candidates() applies is satisfied by
+    construction - required for correctness the moment a document
+    has more than one photo total, since the extractor's fallback
+    ("exactly one remaining plausible portrait") only ever helps when
+    there is truly just one unassociated photo in the whole document.
 
     Fails closed (ContactDocumentPhotoError) when that zone cannot be
-    located unambiguously, or when the document has no "CONTACT
-    PERSON" zone at all for this person - never guesses a placement.
+    located unambiguously, when the document has no "CONTACT PERSON"
+    zone at all for this person, or when that zone's own anchor
+    geometry cannot be determined - never guesses a placement.
     """
 
     new_extension = _EXTENSION_BY_CONTENT_TYPE.get(new_content_type)
@@ -714,15 +822,26 @@ def add_contact_photo_to_document(
         ).decode("utf-8", errors="ignore")
         existing_names = set(archive.namelist())
 
-    zone_span = _locate_contact_person_zone(
+    located_zone = _locate_contact_person_zone(
         document_xml, contact_person, other_contact_persons
     )
 
-    if zone_span is None:
+    if located_zone is None:
         raise ContactDocumentPhotoError(
             f"Could not deterministically locate a unique CONTACT "
             f"PERSON zone for {contact_person!r} in the source "
             "document - refusing to guess a photo placement."
+        )
+
+    zone_geometry = _anchor_geometry_in_span(
+        document_xml, located_zone.run_span
+    )
+
+    if zone_geometry is None:
+        raise ContactDocumentPhotoError(
+            f"The CONTACT PERSON zone found for {contact_person!r} "
+            "has no determinable anchor geometry - refusing to guess "
+            "a photo placement."
         )
 
     relationship_id = _next_relationship_id(rels_xml)
@@ -733,12 +852,14 @@ def add_contact_photo_to_document(
         relationship_id=relationship_id,
         width_emu=_DEFAULT_PHOTO_WIDTH_EMU,
         height_emu=_DEFAULT_PHOTO_HEIGHT_EMU,
-        position_h_emu=_DEFAULT_POSITION_H_EMU,
+        position_h_emu=_centered_position_h_emu(
+            zone_geometry, _DEFAULT_PHOTO_WIDTH_EMU
+        ),
         position_v_emu=_DEFAULT_POSITION_V_EMU,
-        relative_from="page",
+        relative_from=zone_geometry.relative_from,
     )
 
-    zone_start, zone_end = zone_span
+    zone_end = located_zone.paragraph_span[1]
     new_document_xml = (
         document_xml[:zone_end]
         + run_xml
@@ -756,6 +877,157 @@ def add_contact_photo_to_document(
         content_types_xml,
         new_extension,
         content_type_for_extension,
+    )
+
+    new_zip_bytes = _rewrite_zip(
+        source_bytes,
+        replacements={
+            _DOCUMENT_XML_PART: new_document_xml,
+            _RELS_PART: new_rels_xml,
+            _CONTENT_TYPES_PART: new_content_types_xml,
+        },
+        add_parts={media_path: new_data},
+    )
+
+    _validate_addition(
+        new_zip_bytes,
+        expected_sha256=hashlib.sha256(new_data).hexdigest(),
+    )
+
+    return new_zip_bytes
+
+
+def add_new_contact_photo_to_document(
+    source_path: Path,
+    *,
+    new_data: bytes,
+    new_content_type: str,
+) -> bytes:
+    """
+    Anchor a BRAND-NEW contact's first photo - one who, by definition,
+    has no existing "CONTACT PERSON" zone anywhere in the document
+    yet, since they were just created - to the document's own largest
+    EXISTING "CONTACT PERSON" zone (by the same width*height
+    criterion document_contact_materializer.py's own single-contact
+    download path already uses to pick its "primary" run - but
+    filtered first to contact_photos.py's own narrower zone
+    definition specifically, "CONTACT PERSON" text, not merely
+    document_contact_materializer.py's broader "email or phone
+    pattern" contact-related-block test: a firm/address box matches
+    the latter but is never a zone extract_contact_photo_candidates()
+    itself would recognize, so anchoring to one would never actually
+    satisfy the round-trip check - confirmed directly against the
+    real Argentina corpus while building this). This is never a
+    name-based lookup (mission "FINAL BLOCKER", section 3):
+    add_contact_photo_to_document() above locates an EXISTING zone
+    that already names the target contact; a genuinely new contact's
+    name cannot possibly appear anywhere in the document yet, so there
+    is no "the right zone for this person" to search for.
+
+    A photo's association with a specific ContactRecord is always
+    through ContactRecord.photo_sha256 in ContactState - never through
+    a zone's own text (replace/remove above locate an EXISTING photo
+    by exact SHA-256, not by name either) - so the new photo does not
+    need its own dedicated "CONTACT PERSON <name>" text to be
+    correctly served to the public chatbot or found on the next
+    Admin GET; it only needs SOME accepted contact-related zone to
+    geometrically anchor to, with that zone's own REAL position read
+    directly from its anchor (never a fixed guess), so
+    extract_contact_photo_candidates() accepts it by construction even
+    when the document already has one or more OTHER photos.
+
+    Fails closed (ContactDocumentPhotoError) when the document has no
+    contact-related textbox at all to anchor to, or when that zone's
+    own geometry cannot be determined - never constructs one from
+    scratch and never inserts at an arbitrary position such as the
+    document's end (mission section 6).
+    """
+
+    new_extension = _EXTENSION_BY_CONTENT_TYPE.get(new_content_type)
+
+    if new_extension is None:
+        raise ContactDocumentPhotoError(
+            f"Unsupported photo content type: {new_content_type!r}."
+        )
+
+    source_bytes = source_path.read_bytes()
+
+    with zipfile.ZipFile(BytesIO(source_bytes)) as archive:
+        document_xml = archive.read(
+            _DOCUMENT_XML_PART
+        ).decode("utf-8", errors="ignore")
+        rels_xml = archive.read(
+            _RELS_PART
+        ).decode("utf-8", errors="ignore")
+        content_types_xml = archive.read(
+            _CONTENT_TYPES_PART
+        ).decode("utf-8", errors="ignore")
+        existing_names = set(archive.namelist())
+
+    contact_person_runs = [
+        run
+        for run in _find_all_contact_runs(document_xml)
+        if "contact person" in (
+            _textbox_plain_text(
+                document_xml[run.start:run.end]
+            ).casefold()
+        )
+    ]
+
+    if not contact_person_runs:
+        raise ContactDocumentPhotoError(
+            "This document has no existing CONTACT PERSON zone to "
+            "anchor a new contact's photo to - refusing to insert "
+            "one at an arbitrary position."
+        )
+
+    primary_run = max(
+        contact_person_runs,
+        key=lambda run: run.width_emu * run.height_emu,
+    )
+
+    zone_geometry = _anchor_geometry_in_span(
+        document_xml, (primary_run.start, primary_run.end)
+    )
+
+    if zone_geometry is None:
+        raise ContactDocumentPhotoError(
+            "The document's own contact area has no determinable "
+            "anchor geometry - refusing to guess a photo placement."
+        )
+
+    relationship_id = _next_relationship_id(rels_xml)
+    media_filename = _next_media_filename(existing_names, new_extension)
+    media_path = f"word/media/{media_filename}"
+
+    run_xml = _build_photo_run_xml(
+        relationship_id=relationship_id,
+        width_emu=_DEFAULT_PHOTO_WIDTH_EMU,
+        height_emu=_DEFAULT_PHOTO_HEIGHT_EMU,
+        position_h_emu=_centered_position_h_emu(
+            zone_geometry, _DEFAULT_PHOTO_WIDTH_EMU
+        ),
+        position_v_emu=_DEFAULT_POSITION_V_EMU,
+        relative_from=zone_geometry.relative_from,
+    )
+
+    insertion_point = primary_run.end
+    new_document_xml = (
+        document_xml[:insertion_point]
+        + run_xml
+        + document_xml[insertion_point:]
+    )
+
+    new_rels_xml = _add_relationship_entry(
+        rels_xml,
+        relationship_id,
+        target=f"media/{media_filename}",
+    )
+
+    new_content_types_xml = _ensure_default_extension(
+        content_types_xml,
+        new_extension,
+        new_content_type,
     )
 
     new_zip_bytes = _rewrite_zip(

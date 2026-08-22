@@ -24,6 +24,7 @@ from docx import Document
 from app.services.contact_document_photos import (
     ContactDocumentPhotoError,
     add_contact_photo_to_document,
+    add_new_contact_photo_to_document,
     remove_contact_photo_from_document,
     replace_contact_photo_in_document,
 )
@@ -329,6 +330,146 @@ class RealCorpusContactDocumentPhotoTests(unittest.TestCase):
                 new_data=_VALID_PNG,
                 new_content_type="image/png",
                 other_contact_persons=[],
+            )
+
+    def test_replace_of_the_existing_zone_now_uses_true_geometry(
+        self,
+    ) -> None:
+        """
+        Regression guard for the exact bug the "FINAL BLOCKER" mission
+        fixed: adding a photo for an EXISTING named zone must
+        genuinely geometrically overlap that zone (reason "GEOMETRY"),
+        never merely happen to be the sole remaining portrait in the
+        whole document (reason "UNIQUE_PORTRAIT") - the fallback only
+        ever works by coincidence and breaks the moment the document
+        has more than one photo total, exactly the scenario a
+        brand-new second contact's photo introduces.
+        """
+
+        path = self._require_copy("DE.docx")
+
+        new_bytes = add_contact_photo_to_document(
+            path,
+            contact_person="Tobias Pusch",
+            new_data=_VALID_PNG,
+            new_content_type="image/png",
+            other_contact_persons=[],
+        )
+
+        out = Path(self.temp.name) / "de_geometry.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+        self.assertEqual(1, len(candidates))
+        self.assertEqual("GEOMETRY", candidates[0].reason)
+
+    def test_add_new_contact_photo_anchors_to_the_largest_zone_alongside_an_existing_photo(
+        self,
+    ) -> None:
+        """
+        The mission's own core blocker scenario: a document that
+        ALREADY has one contact's photo, and a genuinely brand-new
+        second contact (whose name cannot possibly appear anywhere
+        yet) also gets a photo. Both must round-trip as independently
+        valid, GEOMETRY-reasoned candidates - never relying on the
+        "exactly one remaining portrait" fallback, which cannot
+        disambiguate once there is more than one unassociated photo.
+        """
+
+        path = self._require_copy("AR.docx")
+
+        original = extract_contact_photo_candidates(path)
+        self.assertEqual(1, len(original))
+        original_sha = original[0].sha256
+
+        original_paragraphs = len(Document(str(path)).paragraphs)
+
+        new_bytes = add_new_contact_photo_to_document(
+            path,
+            new_data=_VALID_JPEG,
+            new_content_type="image/jpeg",
+        )
+
+        out = Path(self.temp.name) / "ar_new_contact.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+        self.assertEqual(2, len(candidates))
+
+        for candidate in candidates:
+            self.assertEqual(
+                "GEOMETRY",
+                candidate.reason,
+                "must be a real geometric match, never a fallback "
+                "that only works by coincidence",
+            )
+
+        new_shas = {c.sha256 for c in candidates}
+        self.assertIn(original_sha, new_shas)
+        self.assertIn(
+            hashlib.sha256(_VALID_JPEG).hexdigest(), new_shas
+        )
+        self.assertEqual(
+            original_paragraphs, len(Document(str(out)).paragraphs)
+        )
+
+    def test_add_new_contact_photo_into_belgiums_shared_zone_isolates_existing_photos(
+        self,
+    ) -> None:
+        """
+        Belgium's shared "CONTACT PERSON" zone (Chris + Nicolas) is
+        the document's only (and therefore largest) CONTACT PERSON
+        zone - a brand-new third contact's photo anchors there too,
+        and must never disturb either of the two existing contacts'
+        own photos.
+        """
+
+        path = self._require_copy(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+
+        original_shas = {
+            c.sha256 for c in extract_contact_photo_candidates(path)
+        }
+        self.assertEqual(2, len(original_shas))
+
+        new_bytes = add_new_contact_photo_to_document(
+            path,
+            new_data=_VALID_PNG,
+            new_content_type="image/png",
+        )
+
+        out = Path(self.temp.name) / "belgium_new_contact.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+        new_shas = {c.sha256 for c in candidates}
+
+        self.assertEqual(3, len(new_shas))
+        self.assertTrue(original_shas.issubset(new_shas))
+        self.assertIn(
+            hashlib.sha256(_VALID_PNG).hexdigest(), new_shas
+        )
+
+    def test_add_new_contact_photo_fails_closed_with_no_contact_zone_at_all(
+        self,
+    ) -> None:
+        """
+        A document with genuinely zero "CONTACT PERSON" zones (no
+        structural home at all) must fail closed rather than insert
+        the photo at an arbitrary position such as the document's end
+        (mission section 6).
+        """
+
+        path = self._require_copy("PT.docx")
+
+        self.assertEqual(0, len(extract_contact_photo_candidates(path)))
+
+        with self.assertRaises(ContactDocumentPhotoError):
+            add_new_contact_photo_to_document(
+                path,
+                new_data=_VALID_JPEG,
+                new_content_type="image/jpeg",
             )
 
 

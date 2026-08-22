@@ -37,6 +37,7 @@ from app.services.admin_modification_marker import mark_admin_modified
 from app.services.contact_document_photos import (
     ContactDocumentPhotoError,
     add_contact_photo_to_document,
+    add_new_contact_photo_to_document,
     remove_contact_photo_from_document,
     replace_contact_photo_in_document,
 )
@@ -348,13 +349,30 @@ def replace_admin_contact_photo(
                     new_content_type=content_type,
                 )
             else:
-                new_document_bytes = add_contact_photo_to_document(
-                    source_path,
-                    contact_person=contact.contact_person,
-                    new_data=data,
-                    new_content_type=content_type,
-                    other_contact_persons=other_contact_persons,
-                )
+                try:
+                    new_document_bytes = add_contact_photo_to_document(
+                        source_path,
+                        contact_person=contact.contact_person,
+                        new_data=data,
+                        new_content_type=content_type,
+                        other_contact_persons=other_contact_persons,
+                    )
+                except ContactDocumentPhotoError:
+                    # This contact's own name has no matching CONTACT
+                    # PERSON zone anywhere in the document yet - the
+                    # ordinary case for a contact just created via Add
+                    # Contact (mission "FINAL BLOCKER", section 3: a
+                    # brand-new name can never already have a zone).
+                    # Anchor to the document's own largest existing
+                    # CONTACT PERSON zone instead - never a name-based
+                    # search after the fact.
+                    new_document_bytes = (
+                        add_new_contact_photo_to_document(
+                            source_path,
+                            new_data=data,
+                            new_content_type=content_type,
+                        )
+                    )
         except ContactDocumentPhotoError as error:
             raise AdminContactPhotoError(str(error)) from error
 

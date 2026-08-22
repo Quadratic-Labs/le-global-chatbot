@@ -343,21 +343,22 @@ class AdminContactPhotoTests(unittest.TestCase):
         self.assertEqual(1, len(final_docx_shas))
         self.assertIn(chris_final.photo_sha256, final_docx_shas)
 
-    def test_add_photo_fails_closed_for_a_name_with_no_document_zone(
+    def test_add_photo_for_a_brand_new_contact_falls_back_to_the_largest_zone(
         self,
     ) -> None:
         """
-        A brand-new contact's name will usually have no matching
-        "CONTACT PERSON" zone in the document at all (that IS the
-        common case for genuinely adding someone) - the deterministic,
-        never-guess design means this fails closed with a controlled
-        error rather than inserting the photo somewhere arbitrary
-        (mission sections 7C/13). Nothing must be written on failure.
+        Mission "FINAL BLOCKER": a brand-new contact's name will
+        usually have no matching "CONTACT PERSON" zone in the document
+        at all (that IS the common case for genuinely adding someone -
+        their name cannot possibly already appear anywhere). Rather
+        than failing closed here, this now anchors to the document's
+        own largest existing CONTACT PERSON zone (Tobias Pusch's own,
+        the only one in DE.docx) - never a name-based search, and
+        never disturbing that other contact's own zone or photo state.
         """
 
         client = self._seed_photo_less_contact()
         docx_path = self.root / "DE.docx"
-        original_docx_bytes = docx_path.read_bytes()
         doc_id = (
             "doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         )
@@ -381,6 +382,111 @@ class AdminContactPhotoTests(unittest.TestCase):
             ),
         )
 
+        photo = replace_admin_contact_photo(
+            self.root,
+            doc_id,
+            "contact-test",
+            data=_VALID_JPEG,
+            content_type="image/jpeg",
+            client=client,
+        )
+
+        docx_shas = {
+            c.sha256
+            for c in extract_contact_photo_candidates(docx_path)
+        }
+        self.assertEqual(1, len(docx_shas))
+        self.assertIn(photo.sha256, docx_shas)
+
+        state = read_contact_state(self.root, doc_id)
+        self.assertEqual(
+            photo.sha256, state.contacts[0].photo_sha256
+        )
+
+        download = get_document_download(
+            document_id=doc_id,
+            source_directory=self.root,
+            client=client,
+        )
+        self.addCleanup(
+            lambda: (
+                download.cleanup_path
+                and download.cleanup_path.unlink(missing_ok=True)
+            )
+        )
+        downloaded_shas = {
+            c.sha256
+            for c in extract_contact_photo_candidates(download.path)
+        }
+        self.assertIn(
+            photo.sha256,
+            downloaded_shas,
+            "the downloaded DOCX must contain the new contact's "
+            "photo, not merely ContactState",
+        )
+
+    def _seed_zero_zone_country(self) -> _FakePhotoOpenSearchClient:
+        """
+        Portugal (PT.docx) - a real document with genuinely ZERO
+        "CONTACT PERSON" zones anywhere, used to prove a photo
+        insertion for a brand-new contact fails closed (never an
+        arbitrary document-end insertion) when there is truly no
+        contact area to anchor to at all, and that failure leaves
+        zero partial photo-related state behind.
+        """
+
+        real_source = self._require_source_copy("PT.docx")
+        docx_path = self.root / "PT.docx"
+        shutil.copyfile(real_source, docx_path)
+
+        assert extract_contact_photo_candidates(docx_path) == []
+
+        write_contact_state_atomic(
+            self.root,
+            ContactState(
+                document_id="doc_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                country_code="PT",
+                contacts=(
+                    ContactRecord(
+                        contact_id="contact-test",
+                        member_firm="Someone New Lda",
+                        contact_person="Someone New",
+                        email="new@example.test",
+                        phone="+1",
+                        address="Address",
+                        website="https://example.com",
+                    ),
+                ),
+            ),
+        )
+
+        return _FakePhotoOpenSearchClient(
+            document_id="doc_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            country_code="PT",
+            country="Portugal",
+            source_filename="PT.docx",
+        )
+
+    def test_new_contact_photo_failure_leaves_zero_partial_state(
+        self,
+    ) -> None:
+        """
+        Mission "FINAL BLOCKER", section 8: when a document has no
+        contact area at all to anchor a brand-new contact's photo to,
+        the failure must leave the newly-added contact's photo fields
+        exactly as they were (None) - the contact itself is never
+        partially created with a dangling photo reference, the source
+        DOCX is byte-for-byte untouched, and no orphaned photo file is
+        left in the photo store.
+        """
+
+        client = self._seed_zero_zone_country()
+        docx_path = self.root / "PT.docx"
+        original_docx_bytes = docx_path.read_bytes()
+        doc_id = (
+            "doc_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        )
+
         with self.assertRaises(AdminContactPhotoError):
             replace_admin_contact_photo(
                 self.root,
@@ -392,10 +498,32 @@ class AdminContactPhotoTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            original_docx_bytes, docx_path.read_bytes()
+            original_docx_bytes,
+            docx_path.read_bytes(),
+            "a failed photo insertion must never touch the source "
+            "DOCX",
         )
+
         state = read_contact_state(self.root, doc_id)
-        self.assertIsNone(state.contacts[0].photo_sha256)
+        self.assertIsNone(
+            state.contacts[0].photo_sha256,
+            "the newly-added contact must not be left with a "
+            "dangling/partial photo reference",
+        )
+        self.assertIsNone(state.contacts[0].photo_filename)
+
+        photo_store_dir = self.root / ".admin-state" / "contact-photos"
+        orphaned_files = (
+            list(photo_store_dir.iterdir())
+            if photo_store_dir.exists()
+            else []
+        )
+        self.assertEqual(
+            [],
+            orphaned_files,
+            "a failed photo insertion must never leave an orphaned "
+            "physical photo file behind",
+        )
 
     def test_replace_read_remove_syncs_the_source_docx(self) -> None:
         client = self._seed_photo_bearing_contact()
