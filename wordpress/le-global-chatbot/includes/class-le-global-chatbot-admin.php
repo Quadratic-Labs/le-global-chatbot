@@ -4001,18 +4001,36 @@ final class LE_Global_Chatbot_Admin
         return [$documents, null];
     }
 
+    /**
+     * Returns a RAW url - never HTML-escaped. wp_nonce_url() returns
+     * an already-escaped ("&amp;"-joined) url, which is only correct
+     * directly inside an HTML attribute; every OTHER consumer of this
+     * value (the JSON catalog payload fetch_document_catalog() feeds
+     * to the JS-rendered documents table, in particular) would then
+     * either leave literal "&amp;" text in a real navigation url, or
+     * double-escape it, both of which corrupt document_id/_wpnonce
+     * into unparsceable query keys (the exact incident this function
+     * name is now permanently associated with - see
+     * tests/admin-documents.test.php's own
+     * "build_download_url returns a raw url" coverage).
+     *
+     * Callers are responsible for escaping exactly once, for their
+     * OWN boundary: esc_url() for an HTML href, nothing extra needed
+     * for a JSON response body (json_encode() never HTML-escapes "&"),
+     * esc_url_raw() for a redirect Location header.
+     */
     private static function build_download_url(
         string $document_id
     ): string {
-        return wp_nonce_url(
-            add_query_arg(
-                [
-                    'action' => self::DOWNLOAD_ACTION,
-                    'document_id' => $document_id,
-                ],
-                admin_url('admin-post.php')
-            ),
-            self::DOWNLOAD_ACTION . ':' . $document_id
+        return add_query_arg(
+            [
+                'action' => self::DOWNLOAD_ACTION,
+                'document_id' => $document_id,
+                '_wpnonce' => wp_create_nonce(
+                    self::DOWNLOAD_ACTION . ':' . $document_id
+                ),
+            ],
+            admin_url('admin-post.php')
         );
     }
 

@@ -107,7 +107,7 @@ from typing import Sequence
 from zipfile import ZipFile
 
 from docx import Document as WordDocument
-from docx.enum.table import WD_ALIGN_VERTICAL, WD_ROW_HEIGHT_RULE
+from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_LINE_SPACING
 from docx.image.image import Image as DocxImage
 from docx.oxml import OxmlElement
@@ -147,8 +147,17 @@ _R_EMBED_ATTR = f'{{{_NSMAP["r"]}}}embed'
 
 _SRC_RECT_PATTERN = re.compile(r"<a:srcRect\b")
 
-_PHOTO_COLUMN_WIDTH_EMU = 1_143_000
+# The right (photo) column as a fraction of the table's own usable
+# width - a percentage, never a fixed EMU width, so the table always
+# fits whatever page size/margins a given document actually has.
+_RIGHT_COLUMN_WIDTH_RATIO = 0.29
+# The photo's own rendered width - independent of the column's width
+# (a wider column just adds whitespace around it) - kept equal to the
+# already Word-validated canary's own photo size.
 _PHOTO_TARGET_WIDTH_EMU = 990_600
+# Visual gap between one contact's row and the next, applied as a
+# table-wide bottom cell margin rather than an empty paragraph.
+_ROW_SEPARATION_PT = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,19 +385,34 @@ def _reset_line_spacing(paragraph):
     paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
 
 
+def _new_cell_paragraph(cell, *, used_first: bool):
+    """One fresh table-cell paragraph, reusing the cell's own default
+    first paragraph exactly once - with line spacing reset (see
+    _reset_line_spacing) and space_before/space_after both pinned to
+    an explicit value by the caller, never left to the document's own
+    inherited style default, so cell-to-cell spacing stays predictable
+    regardless of which fields a given contact happens to have."""
+
+    paragraph = cell.paragraphs[0] if not used_first else cell.add_paragraph()
+    _reset_line_spacing(paragraph)
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(0)
+    return paragraph
+
+
 def _fill_text_cell(
     cell, contact: ExtractedContact, *, hidden_marker: str | None
 ) -> None:
-    used_first_paragraph = False
+    """LEFT cell: member firm, address, phone, website only - the
+    contact person/email block now lives in the RIGHT cell, directly
+    under its own photo (see _fill_photo_and_person_cell)."""
+
+    used_first = False
 
     def _next_paragraph():
-        nonlocal used_first_paragraph
-        if not used_first_paragraph:
-            used_first_paragraph = True
-            paragraph = cell.paragraphs[0]
-        else:
-            paragraph = cell.add_paragraph()
-        _reset_line_spacing(paragraph)
+        nonlocal used_first
+        paragraph = _new_cell_paragraph(cell, used_first=used_first)
+        used_first = True
         return paragraph
 
     if hidden_marker:
@@ -397,62 +421,107 @@ def _fill_text_cell(
         marker_run.font.size = Pt(1)
 
     if contact.member_firm:
-        firm_run = _next_paragraph().add_run(contact.member_firm)
+        paragraph = _next_paragraph()
+        paragraph.paragraph_format.space_after = Pt(9)
+        firm_run = paragraph.add_run(contact.member_firm)
         firm_run.bold = True
 
-    for value in (contact.address, contact.phone, contact.website):
+    for value in (contact.address, contact.phone):
         if value:
-            _next_paragraph().add_run(value)
+            paragraph = _next_paragraph()
+            paragraph.paragraph_format.space_after = Pt(2)
+            paragraph.add_run(value)
 
-    _next_paragraph()
+    if contact.website:
+        _next_paragraph().add_run(contact.website)
 
-    label_run = _next_paragraph().add_run("CONTACT PERSON")
+
+def _fill_photo_and_person_cell(
+    cell, contact: ExtractedContact, photo: ContactPhotoPayload | None
+) -> None:
+    """RIGHT cell: the photo (if any) at the top, then - in the SAME
+    standard table cell, never a separate floating object - CONTACT
+    PERSON/name/email directly below it. A photo-less contact starts
+    the CONTACT PERSON block at the top of the cell instead of
+    reserving a blank photo-shaped area."""
+
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    used_first = False
+
+    def _next_paragraph():
+        nonlocal used_first
+        paragraph = _new_cell_paragraph(cell, used_first=used_first)
+        used_first = True
+        return paragraph
+
+    has_photo = photo is not None
+
+    if photo is not None:
+        photo_paragraph = _next_paragraph()
+        photo_paragraph.paragraph_format.space_after = Pt(6)
+
+        try:
+            native_image = DocxImage.from_blob(photo.data)
+            height_emu = round(
+                _PHOTO_TARGET_WIDTH_EMU
+                * native_image.px_height
+                / native_image.px_width
+            )
+
+            photo_paragraph.add_run().add_picture(
+                BytesIO(photo.data),
+                width=Emu(_PHOTO_TARGET_WIDTH_EMU),
+                height=Emu(height_emu),
+            )
+        except Exception as error:
+            raise ContactAreaError(
+                f"The contact's photo could not be embedded as a "
+                f"standard inline picture: {error}"
+            ) from error
+
+    label_paragraph = _next_paragraph()
+    label_paragraph.paragraph_format.space_before = (
+        Pt(5) if has_photo else Pt(0)
+    )
+    label_paragraph.paragraph_format.space_after = Pt(2)
+    label_run = label_paragraph.add_run("CONTACT PERSON")
     label_run.bold = True
 
     if contact.contact_person:
-        _next_paragraph().add_run(contact.contact_person)
+        name_paragraph = _next_paragraph()
+        name_paragraph.paragraph_format.space_after = Pt(2)
+        name_paragraph.add_run(contact.contact_person)
 
     if contact.email:
         _next_paragraph().add_run(contact.email)
 
 
-def _fill_photo_cell(
-    cell, photo: ContactPhotoPayload | None
-) -> int | None:
-    """Embeds the photo and returns its own rendered height in EMU, so
-    the caller can also give the row an explicit minimum height as a
-    second, independent safety net alongside _reset_line_spacing's own
-    fix for the same underlying clipping - belt and braces, since a
-    real Word document's own docDefaults are outside this module's
-    control and a different baseline could combine an exact line
-    height with some other row-height quirk."""
+def _set_table_cell_margins(table, *, bottom_pt: float) -> None:
+    """A default BOTTOM cell margin, applied table-wide - the visual
+    separation between one contact's row and the next, without any
+    artificial blank paragraph. Kept off row height entirely (no
+    fixed/minimum row height is set anywhere in this module): a cell
+    margin adds space AROUND a row's own naturally-grown content
+    instead of constraining that content's own height."""
 
-    if photo is None:
-        return None
+    table_properties = table._tbl.tblPr
+    cell_margins = OxmlElement("w:tblCellMar")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:w"), str(round(bottom_pt * 20)))
+    bottom.set(qn("w:type"), "dxa")
+    cell_margins.append(bottom)
+    table_properties.append(cell_margins)
 
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-    _reset_line_spacing(cell.paragraphs[0])
 
-    try:
-        native_image = DocxImage.from_blob(photo.data)
-        height_emu = round(
-            _PHOTO_TARGET_WIDTH_EMU
-            * native_image.px_height
-            / native_image.px_width
-        )
+def _prevent_row_split(row) -> None:
+    """Best-effort: keep one contact's row from splitting across a
+    page boundary (standard w:cantSplit) - "if practical", since a
+    single contact whose own content is genuinely taller than one
+    page can still split; this only prevents an ordinary row from
+    being cut for no reason."""
 
-        cell.paragraphs[0].add_run().add_picture(
-            BytesIO(photo.data),
-            width=Emu(_PHOTO_TARGET_WIDTH_EMU),
-            height=Emu(height_emu),
-        )
-    except Exception as error:
-        raise ContactAreaError(
-            f"The contact's photo could not be embedded as a standard "
-            f"inline picture: {error}"
-        ) from error
-
-    return height_emu
+    row_properties = row._tr.get_or_add_trPr()
+    row_properties.append(OxmlElement("w:cantSplit"))
 
 
 def _build_canonical_table(
@@ -468,12 +537,15 @@ def _build_canonical_table(
     usable_width_emu = int(
         section.page_width - section.left_margin - section.right_margin
     )
-    text_column_width_emu = max(
-        usable_width_emu - _PHOTO_COLUMN_WIDTH_EMU, Emu(1)
+    right_column_width_emu = round(
+        usable_width_emu * _RIGHT_COLUMN_WIDTH_RATIO
+    )
+    left_column_width_emu = max(
+        usable_width_emu - right_column_width_emu, Emu(1)
     )
 
     for column, width_emu in zip(
-        table.columns, (text_column_width_emu, _PHOTO_COLUMN_WIDTH_EMU)
+        table.columns, (left_column_width_emu, right_column_width_emu)
     ):
         column.width = Emu(width_emu)
 
@@ -481,6 +553,7 @@ def _build_canonical_table(
             cell.width = Emu(width_emu)
 
     _remove_table_borders(table)
+    _set_table_cell_margins(table, bottom_pt=_ROW_SEPARATION_PT)
 
     for row_index, (contact, photo) in enumerate(zip(contacts, photos)):
         row = table.rows[row_index]
@@ -491,11 +564,8 @@ def _build_canonical_table(
                 CONTACT_TABLE_HIDDEN_MARKER if row_index == 0 else None
             ),
         )
-        photo_height_emu = _fill_photo_cell(row.cells[1], photo)
-
-        if photo_height_emu is not None:
-            row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
-            row.height = Emu(photo_height_emu)
+        _fill_photo_and_person_cell(row.cells[1], contact, photo)
+        _prevent_row_split(row)
 
     return table
 

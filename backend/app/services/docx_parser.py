@@ -2248,21 +2248,22 @@ def _extract_canonical_table_contacts(
     """
     Read the Admin-managed canonical contact table - a standard,
     borderless, in-flow Word table this system itself writes into the
-    persisted source (one row per contact: a left cell with that
-    contact's own text fields, a right cell with its own inline
-    photo) - identified unambiguously by a hidden marker paragraph in
-    its own first cell, never by guessing which table in the document
-    is the contact one.
+    persisted source (one row per contact: a LEFT cell with that
+    contact's own member firm/address/phone/website, a RIGHT cell with
+    its own inline photo followed by its own CONTACT PERSON/name/email)
+    - identified unambiguously by a hidden marker paragraph in the
+    first row's left cell, never by guessing which table in the
+    document is the contact one.
 
     Returns None (never an empty list) when no such table is found, so
     extract_contacts_from_docx() falls back to the legacy text-box
     parser - an empty list is reserved for "the table is present and
     genuinely lists zero contacts".
 
-    Each row's left cell is classified DIRECTLY using the same field
+    Each row's two cells are classified DIRECTLY using the same field
     rules parse_contact_blocks() applies to the legacy text-box format
-    (member firm/address/phone/website before the CONTACT PERSON
-    marker, name/email after it) - but per-row, never through parse_
+    (member firm/address/phone/website in one cell, the CONTACT PERSON
+    marker/name/email in the other) - but per-row, never through parse_
     contact_blocks() itself: that function collects firm and person
     blocks into two SEPARATE lists and deduplicates each before pairing
     them back up position-by-position, a step designed for the legacy
@@ -2305,32 +2306,22 @@ def _extract_canonical_table_contacts(
     contacts: list[ExtractedContact] = []
 
     for row in marker_table.rows:
-        left_cell = row.cells[0]
-        lines = [
+        firm_lines = [
             _normalize_text(paragraph.text)
-            for paragraph in left_cell.paragraphs
+            for paragraph in row.cells[0].paragraphs
             if _normalize_text(paragraph.text)
             and CONTACT_TABLE_HIDDEN_MARKER not in paragraph.text
         ]
+        person_lines = [
+            _normalize_text(paragraph.text)
+            for paragraph in row.cells[1].paragraphs
+            if _normalize_text(paragraph.text)
+            and paragraph.text.strip().casefold()
+            not in _CONTACT_PERSON_MARKERS
+        ]
 
-        if not lines:
+        if not firm_lines and not person_lines:
             continue
-
-        marker_index = next(
-            (
-                index
-                for index, line in enumerate(lines)
-                if line.strip().casefold() in _CONTACT_PERSON_MARKERS
-            ),
-            None,
-        )
-
-        firm_lines = (
-            lines[:marker_index] if marker_index is not None else lines
-        )
-        person_lines = (
-            lines[marker_index + 1:] if marker_index is not None else []
-        )
 
         phone = _select_contact_phone(firm_lines)
         website_match = _WEBSITE_PATTERN.search(" ".join(firm_lines))

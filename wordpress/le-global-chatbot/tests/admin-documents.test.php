@@ -178,6 +178,106 @@ function esc_attr(string $text): string
     return $text;
 }
 
+/**
+ * Mirrors the ONE property every check below depends on: WordPress's
+ * real esc_url() turns a bare "&" into the HTML entity "&#038;" for
+ * safe HTML-attribute display, and ALSO normalizes an
+ * already-present "&amp;" (exactly what wp_nonce_url() itself used to
+ * produce) to that same "&#038;" - via wp_kses_normalize_entities()
+ * plus a dedicated str_replace('&amp;', '&#038;', ...) in real
+ * WordPress. This is WHY the double-escaping incident this file
+ * guards against did not literally show "&amp;amp;" in the PHP-
+ * rendered <a href> path (a bare "&" and an already-escaped "&amp;"
+ * both collapse to the same single "&#038;" here) - the incident
+ * instead reached production through the JSON/JS rendering path
+ * (assets/admin.js's own escapeHtml(), which has no such
+ * normalization and single-escapes whatever string it is given,
+ * verbatim).
+ */
+function esc_url(string $url): string
+{
+    $url = preg_replace(
+        '/&(?!(?:amp|lt|gt|quot|#0*39|#0*38);)/',
+        '&#038;',
+        $url
+    );
+
+    return str_replace('&amp;', '&#038;', $url);
+}
+
+function admin_url(string $path = ''): string
+{
+    return 'https://example.test/wp-admin/' . ltrim($path, '/');
+}
+
+/**
+ * The one call shape this plugin actually uses: add_query_arg(array
+ * $args, string $url). Real WordPress's own add_query_arg() returns a
+ * RAW url with bare "&" separators (never HTML-escaped) - this stub
+ * matches that exactly via http_build_query()'s own default "&"
+ * separator.
+ */
+function add_query_arg(array $args, string $url): string
+{
+    $parts = parse_url($url);
+    $existing_query = [];
+
+    if (!empty($parts['query'])) {
+        parse_str($parts['query'], $existing_query);
+    }
+
+    $query = array_merge($existing_query, $args);
+    $base = (
+        ($parts['scheme'] ?? 'https') . '://'
+        . ($parts['host'] ?? '')
+        . ($parts['path'] ?? '')
+    );
+
+    return $base . '?' . http_build_query($query, '', '&');
+}
+
+/**
+ * A deterministic, action-bound test nonce - real WordPress salts
+ * this with a rotating per-install/per-session secret; the ONE
+ * property every check here actually depends on is that the SAME
+ * action string always produces the SAME token and a DIFFERENT
+ * action string always produces a DIFFERENT one, which this
+ * reproduces exactly.
+ */
+function wp_create_nonce($action = -1): string
+{
+    return substr(md5('test-nonce-secret:' . $action), 0, 10);
+}
+
+function wp_verify_nonce(string $nonce, $action = -1): bool
+{
+    return hash_equals(wp_create_nonce($action), $nonce);
+}
+
+/**
+ * render_document_row() (invoked in full, below, to verify the
+ * rendered Download link) also renders sibling reindex/delete forms
+ * that call wp_nonce_field() directly - a minimal, real-shaped hidden
+ * input is enough; no test here inspects its contents.
+ */
+function wp_nonce_field(
+    $action = -1,
+    string $name = '_wpnonce',
+    bool $referer = true,
+    bool $echo = true
+) {
+    $field = (
+        '<input type="hidden" name="' . $name . '" '
+        . 'value="' . wp_create_nonce($action) . '">'
+    );
+
+    if ($echo) {
+        echo $field;
+    }
+
+    return $field;
+}
+
 function sanitize_key(string $value): string
 {
     return strtolower(preg_replace('/[^a-z0-9_\-]/', '', strtolower($value)) ?? '');
@@ -715,6 +815,341 @@ check(
         'application/vnd.openxmlformats-'
     ),
     true
+);
+
+// =====================================================================
+// build_download_url() raw-url contract (production double-escaping
+// incident: wp_nonce_url() returns an HTML-escaped url; a SECOND
+// esc_url() at render time - or, worse, shipping that pre-escaped
+// string as if it were raw JSON data for assets/admin.js's own
+// escapeHtml() to escape a SECOND time - corrupted document_id/
+// _wpnonce into unparseable query keys and produced "The document
+// identifier is invalid.").
+//
+// build_download_url() must now return a RAW url; every consumer
+// escapes exactly once, for its OWN boundary.
+// =====================================================================
+
+$download_action_constant = (
+    new ReflectionClass('LE_Global_Chatbot_Admin')
+)->getConstant('DOWNLOAD_ACTION');
+
+$REALISTIC_DOCUMENT_IDS = [
+    'doc_' . str_repeat('a1b2c3d4e5f60718', 4),
+    'doc_' . str_repeat('9f8e7d6c5b4a3021', 4),
+    'doc_' . str_repeat('0123456789abcdef', 4),
+];
+
+foreach ($REALISTIC_DOCUMENT_IDS as $document_id) {
+    check(
+        "build_download_url produces a well-formed 64-hex document id fixture ({$document_id})",
+        (bool) preg_match('/^doc_[0-9a-f]{64}$/', $document_id),
+        true
+    );
+
+    $raw_url = invoke_private_static(
+        'build_download_url',
+        [$document_id]
+    );
+
+    // 1. Contains the three required pieces.
+    check(
+        "raw url contains action=le_global_chatbot_download_document ({$document_id})",
+        str_contains(
+            $raw_url,
+            'action=' . $download_action_constant
+        ),
+        true
+    );
+    check(
+        "raw url contains document_id=<exact id> ({$document_id})",
+        str_contains($raw_url, 'document_id=' . $document_id),
+        true
+    );
+    check(
+        "raw url contains _wpnonce= ({$document_id})",
+        (bool) preg_match('/(?:^|&)_wpnonce=/', $raw_url),
+        true
+    );
+
+    // 2. Never contains any double-escaping artifact - the exact
+    // permanent regression guard: a future change that reintroduces
+    // wp_nonce_url() (or any other pre-escaped producer) inside
+    // build_download_url() would fail these checks immediately.
+    foreach (['&amp;', '&#038;', '&amp;amp;', '%26amp%3B'] as $artifact) {
+        check(
+            "raw url does not contain \"{$artifact}\" ({$document_id})",
+            str_contains($raw_url, $artifact),
+            false
+        );
+    }
+
+    // 3. Parsed as a real query string, exactly the three expected
+    // keys are present, each exactly once.
+    $query_string = (string) parse_url($raw_url, PHP_URL_QUERY);
+    parse_str($query_string, $parsed_query);
+
+    check(
+        "parsed query has exactly action/document_id/_wpnonce, nothing else ({$document_id})",
+        array_keys($parsed_query),
+        ['action', 'document_id', '_wpnonce']
+    );
+
+    $key_occurrences = array_count_values(
+        array_map(
+            static fn ($pair) => explode('=', $pair, 2)[0],
+            explode('&', $query_string)
+        )
+    );
+    check(
+        "each of action/document_id/_wpnonce appears exactly once in the raw query ({$document_id})",
+        $key_occurrences,
+        ['action' => 1, 'document_id' => 1, '_wpnonce' => 1]
+    );
+
+    // 4. document_id survives byte-for-byte.
+    check(
+        "document_id is byte-for-byte unchanged after the round trip ({$document_id})",
+        $parsed_query['document_id'] ?? null,
+        $document_id
+    );
+
+    // 5. The generated nonce validates against the EXACT action
+    // handle_download() itself checks (self::DOWNLOAD_ACTION . ':' .
+    // $document_id) - and does NOT validate against a different
+    // document_id's action, proving it is genuinely bound to this
+    // one document, not a generic/shared token.
+    check(
+        "the generated nonce validates against the exact download-handler action ({$document_id})",
+        wp_verify_nonce(
+            $parsed_query['_wpnonce'] ?? '',
+            $download_action_constant . ':' . $document_id
+        ),
+        true
+    );
+    check(
+        "the generated nonce does NOT validate against a different document_id's action ({$document_id})",
+        wp_verify_nonce(
+            $parsed_query['_wpnonce'] ?? '',
+            $download_action_constant . ':' . $document_id . '-tampered'
+        ),
+        false
+    );
+}
+
+// --- 6. Existing download-handler nonce verification still passes -----
+//
+// handle_download() itself calls check_admin_referer(DOWNLOAD_ACTION
+// . ':' . $document_id) - this file's own stub collapses that to the
+// $GLOBALS['__test_nonce_valid'] toggle (see the file docstring for
+// why a real per-action simulation is not needed for THAT gate); what
+// matters here is that the fix did not disturb this call in any way.
+$download_reflection_for_nonce = new ReflectionMethod(
+    'LE_Global_Chatbot_Admin',
+    'handle_download'
+);
+$download_source_for_nonce = implode(
+    '',
+    array_slice(
+        file($download_reflection_for_nonce->getFileName()),
+        $download_reflection_for_nonce->getStartLine() - 1,
+        (
+            $download_reflection_for_nonce->getEndLine()
+            - $download_reflection_for_nonce->getStartLine() + 1
+        )
+    )
+);
+check(
+    'handle_download still verifies the nonce against DOWNLOAD_ACTION . ":" . $document_id',
+    str_contains(
+        $download_source_for_nonce,
+        'check_admin_referer('
+    )
+    && str_contains(
+        $download_source_for_nonce,
+        "self::DOWNLOAD_ACTION . ':' . \$document_id"
+    ),
+    true
+);
+
+// Not re-invoking handle_download() end-to-end here on purpose: past
+// its nonce gate it calls wp_remote_get() directly against a real
+// backend configuration (get_backend_configuration()), neither of
+// which this file stubs (see the file's own docstring for why a full
+// success round-trip through handle_download is proven by the real
+// Chromium canary instead, never this CLI harness). The nonce
+// contract itself - a VALID, correctly-bound nonce - is already fully
+// proven above via wp_verify_nonce() directly against the exact
+// action string check_admin_referer() uses.
+
+// =====================================================================
+// Rendered HTML download link contract - the ACTUAL markup a browser
+// receives, parsed with a real HTML parser (never fragile string
+// replacement), for the row render_document_row() itself produces.
+// =====================================================================
+
+function invoke_render_document_row(
+    array $document,
+    array $conflicted_country_codes = []
+): string {
+    $reflection = new ReflectionClass('LE_Global_Chatbot_Admin');
+    $method = $reflection->getMethod('render_document_row');
+    $method->setAccessible(true);
+
+    ob_start();
+    $method->invoke(null, $document, $conflicted_country_codes);
+
+    return ob_get_clean();
+}
+
+check(
+    'a real HTML parser (ext-dom) is available to verify the rendered download link',
+    class_exists('DOMDocument'),
+    true
+);
+
+foreach ($REALISTIC_DOCUMENT_IDS as $document_id) {
+    $row_html = invoke_render_document_row([
+        'document_id' => $document_id,
+        'country' => 'Australia',
+        'country_code' => 'AU',
+        'source_filename' => 'AU.docx',
+        'reference_year' => 2026,
+        'source_file_present' => true,
+        'status' => 'indexed',
+    ]);
+
+    $document_dom = new DOMDocument();
+    libxml_use_internal_errors(true);
+    $document_dom->loadHTML(
+        '<!DOCTYPE html><html><body><table><tbody>'
+        . $row_html
+        . '</tbody></table></body></html>'
+    );
+    libxml_clear_errors();
+
+    $download_href = null;
+
+    foreach ($document_dom->getElementsByTagName('a') as $anchor) {
+        if (trim($anchor->textContent) === 'Download') {
+            $download_href = $anchor->getAttribute('href');
+            break;
+        }
+    }
+
+    check(
+        "the rendered row has a Download link with an href ({$document_id})",
+        $download_href !== null,
+        true
+    );
+
+    // DOMDocument::getAttribute() already returns the attribute value
+    // exactly as a browser would (fully entity-decoded) - this is the
+    // real browser-parsing semantics the mandatory test requires,
+    // never a manual string replace.
+    $decoded_query = (string) parse_url($download_href ?? '', PHP_URL_QUERY);
+    parse_str($decoded_query, $decoded_params);
+
+    check(
+        "the parsed href query contains exactly action/document_id/_wpnonce ({$document_id})",
+        array_keys($decoded_params),
+        ['action', 'document_id', '_wpnonce']
+    );
+    check(
+        "the parsed href has no \"amp;document_id\" or \"amp;_wpnonce\" key ({$document_id})",
+        (
+            isset($decoded_params['amp;document_id'])
+            || isset($decoded_params['amp;_wpnonce'])
+        ),
+        false
+    );
+    check(
+        "document_id in the rendered href is identical to the original ({$document_id})",
+        $decoded_params['document_id'] ?? null,
+        $document_id
+    );
+
+    // The href, once decoded exactly as the browser would, must be
+    // usable by the download handler without reaching "The document
+    // identifier is invalid." - simulate read_document_id()'s own
+    // validation directly against the DECODED document_id.
+    check(
+        "the decoded document_id from the rendered link passes read_document_id()'s own validation ({$document_id})",
+        (bool) preg_match(
+            '/^doc_[0-9a-f]{64}$/',
+            $decoded_params['document_id'] ?? ''
+        ),
+        true
+    );
+}
+
+// =====================================================================
+// The failure mode itself: a malformed ("&amp;"-joined, as literal
+// text) navigation url does NOT parse to the same request parameters
+// as the correct ("&"-joined) form - this is preserved as a permanent
+// record of the incident, never as something the application (or the
+// backend) is made to tolerate.
+// =====================================================================
+
+$malformed_literal_url = (
+    '?action=le_global_chatbot_download_document'
+    . '&amp;document_id=doc_' . str_repeat('a', 64)
+    . '&amp;_wpnonce=abc123'
+);
+$wellformed_url = (
+    '?action=le_global_chatbot_download_document'
+    . '&document_id=doc_' . str_repeat('a', 64)
+    . '&_wpnonce=abc123'
+);
+
+parse_str((string) parse_url($malformed_literal_url, PHP_URL_QUERY), $malformed_parsed);
+parse_str((string) parse_url($wellformed_url, PHP_URL_QUERY), $wellformed_parsed);
+
+check(
+    'a literal "&amp;"-joined query string does NOT parse to a usable document_id key',
+    array_key_exists('document_id', $malformed_parsed),
+    false
+);
+check(
+    'the SAME query, correctly "&"-joined, DOES parse to a usable document_id key',
+    $wellformed_parsed['document_id'] ?? null,
+    'doc_' . str_repeat('a', 64)
+);
+check(
+    'the malformed form instead produces a nonsensical "amp;document_id" key - exactly what production observed',
+    array_key_exists('amp;document_id', $malformed_parsed),
+    true
+);
+
+// Now prove the application itself never GENERATES the malformed
+// form as an actual navigation url - across every fixture above, the
+// raw url and the rendered/decoded href both already proved this
+// (loop above); this final check locks in that the FIX is what
+// prevents generation, not any backend/server-side tolerance for the
+// malformed shape (grep the whole plugin, not just this one method,
+// for any remaining pre-escaped producer).
+// Tokenized, not a bare grep, specifically so this guard survives
+// this very file's own doc-comments naming wp_nonce_url() by name to
+// explain what NOT to do (a plain substring search would false-fail
+// on prose, exactly the "brittle global grep" the fix's own mission
+// warns against).
+$admin_php_source = file_get_contents(
+    __DIR__ . '/../includes/class-le-global-chatbot-admin.php'
+);
+$admin_php_code_only = '';
+
+foreach (token_get_all($admin_php_source) as $token) {
+    if (is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true)) {
+        continue;
+    }
+
+    $admin_php_code_only .= is_array($token) ? $token[1] : $token;
+}
+
+check(
+    'wp_nonce_url() is never CALLED anywhere in the plugin, outside comments (the one producer of this incident class)',
+    str_contains($admin_php_code_only, 'wp_nonce_url('),
+    false
 );
 
 // =====================================================================
