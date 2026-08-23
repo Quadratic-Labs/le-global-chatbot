@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "description": "Non-secret identifiers for the LIVE release/rollback compatibility smoke gate (scripts/release_compatibility_smoke.py). Every document_id/contact_id here is a real, currently-active production identifier (document_id is a deterministic sha256 of \"document-v2\\x1femployment-law-overview\\x1f<COUNTRY_CODE>\\x1fen\", contact_id is an opaque UUID-hex assigned by the backend) - deliberately NOT a fabricated/synthetic id, because the whole point of this gate is to prove a candidate backend can read data shaped exactly like what is already persisted. Contains no credentials, no file contents, no personal contact details beyond the same opaque ids WordPress itself already sends the backend on every real Admin request.",
+  "no_secrets_here": "This file must never contain an API key, admin key, password, or any document/photo byte content. Only ids, country codes, and small expectation numbers derived from a known-good baseline run.",
+  "documents": [
+    {
+      "document_id": "doc_d600fa6a2d9338014d4dc27fc828ff7d064faad31044e89d88c955abbbcd4157",
+      "country_code": "AU",
+      "source_filename": "AU.docx",
+      "role": "canonical_table_format",
+      "role_note": "The one production document whose PERSISTED source DOCX already contains the new canonical Admin-managed contact table (docx_parser.py's LE-GLOBAL-CONTACT-TABLE-V1 marker) rather than the legacy floating-shape contact box. This is the exact class of document candidate-ed292d7 cannot correctly index (see expected_min_chunk_count below).",
+      "expected_min_chunk_count": 60,
+      "expected_min_chunk_count_note": "Recorded from a known-good live run against le-global-backend:candidate-a3cb8e1 with this exact snapshot (scripts/release_compatibility_smoke.py DOCUMENT_LIST check). A candidate whose docx_parser cannot recognize the canonical contact table fails to build one contact chunk for this document and reports 59 - this is the live, empirical signal (not an HTTP error) that reproduces the candidate-ed292d7 incompatibility; see docs/RELEASE_COMPATIBILITY.md.",
+      "contacts": [
+        {
+          "contact_id": "3ce0bac3ff8e4a508e38378edb2bb3cb",
+          "has_photo": true
+        }
+      ]
+    },
+    {
+      "document_id": "doc_2a3515cea9591105748146f0a4f916cedfedd20d6369b90be8d8b5ddd1205294",
+      "country_code": "CA",
+      "source_filename": "CA.docx",
+      "role": "legacy_pre_canonical_format",
+      "role_note": "Persisted source DOCX still uses the legacy floating-shape contact box (last mutated before the canonical-table mechanism existed) - represents the bulk of the current corpus.",
+      "contacts": [
+        {
+          "contact_id": "f1e71ef8f16d45c3a2b481c6d0d5ea22",
+          "has_photo": true
+        }
+      ]
+    },
+    {
+      "document_id": "doc_2ff76a733a4bf25fb048efdd77d995f42fe7915cf2245aedaea1b78ad699eb88",
+      "country_code": "BE",
+      "source_filename": "Labour and Employment Law in Belgium 2026.docx",
+      "role": "multiple_contacts",
+      "role_note": "The one production document with more than one structured contact.",
+      "contacts": [
+        {
+          "contact_id": "100702794c474d2c9a0d91ba08c8f2a7",
+          "has_photo": true
+        },
+        {
+          "contact_id": "3ef7ced29841438aa1f8301469f6b6f3",
+          "has_photo": true
+        }
+      ]
+    },
+    {
+      "document_id": "doc_28b262920fea7217befd27a0b5d7a4456998485cb8a3b8e82a71b8cdb1c35f9b",
+      "country_code": "CL",
+      "source_filename": "CL.docx",
+      "role": "contact_without_photo",
+      "role_note": "A structured contact with no photo configured (photo_filename is null in ContactState).",
+      "contacts": [
+        {
+          "contact_id": "46bb1c3d0ba04a31af1fd654ee8e2168",
+          "has_photo": false
+        }
+      ]
+    }
+  ]
+}
