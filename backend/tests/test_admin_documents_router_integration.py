@@ -17,6 +17,7 @@ temp directory - never /data/documents/source, never a real cluster.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import tempfile
@@ -37,7 +38,6 @@ from app.services.contact_state import (
     ContactState,
     write_contact_state_atomic,
 )
-from app.services.docx_parser import extract_contacts_from_docx
 from tests.admin_invariants import (
     assert_chunk_count_matches,
     assert_no_orphan_chunks,
@@ -885,12 +885,11 @@ class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
             context.exception.detail["code"], "source_conflict"
         )
 
-    def test_download_with_no_contact_state_returns_source_unmaterialized(
+    def test_download_with_no_contact_state_returns_source_unchanged(
         self,
     ) -> None:
         # No sidecar ever written for this document_id - matches every
-        # existing test/document above, and confirms the fallback path
-        # is unchanged (mission "ORDER 8G-B2.1").
+        # existing test/document above.
         document_id = "doc_" + "a" * 64
         self.fake.add(
             document_id=document_id,
@@ -905,24 +904,34 @@ class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
             source_directory=self.source_dir,
         )
 
-        self.assertFalse(download.contacts_materialized)
-        self.assertIsNone(download.cleanup_path)
+        self.assertEqual(
+            download.path, self.source_dir / "AR.docx"
+        )
         self.assertEqual(
             download.path.read_bytes(), real_bytes
         )
 
-    def test_download_with_contact_state_returns_materialized_effective_docx(
+    def test_download_with_contact_state_still_returns_persisted_source_unchanged(
         self,
     ) -> None:
+        """
+        Mission "DOCX HARDENING" (2026-08-24): download is a pure read
+        of the persisted source, whether or not ContactState exists -
+        it must NEVER rebuild/reserialize a "materialized effective"
+        copy. Every Admin mutation already writes its effective result
+        into the source atomically before returning success, so a
+        real ContactState here changes nothing about what download
+        returns: it is not even read.
+        """
+
         document_id = "doc_" + "b" * 64
         self.fake.add(
             document_id=document_id,
             country_code="AR",
             source_filename="Argentina.docx",
         )
-        (self.source_dir / "AR.docx").write_bytes(
-            _build_real_docx_bytes("Argentina overview")
-        )
+        real_bytes = _build_real_docx_bytes("Argentina overview")
+        (self.source_dir / "AR.docx").write_bytes(real_bytes)
 
         write_contact_state_atomic(
             self.source_dir,
@@ -943,45 +952,45 @@ class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
             ),
         )
 
+        self.assertFalse(
+            hasattr(lifecycle_service, "read_contact_state"),
+            "get_document_download() must not even import "
+            "read_contact_state - a real ContactState sidecar must "
+            "have zero effect on what download returns",
+        )
+
         download = lifecycle_service.get_document_download(
             document_id=document_id,
             source_directory=self.source_dir,
         )
 
-        try:
-            self.assertTrue(download.contacts_materialized)
-            self.assertIsNotNone(download.cleanup_path)
-            self.assertTrue(download.cleanup_path.exists())
+        # The path IS the persisted source file directly - never a
+        # distinct temporary file.
+        self.assertEqual(
+            download.path, self.source_dir / "AR.docx"
+        )
+        self.assertEqual(
+            download.path.read_bytes(), real_bytes
+        )
 
-            reparsed = extract_contacts_from_docx(download.path)
-            self.assertEqual(len(reparsed), 1)
-            self.assertEqual(
-                reparsed[0].member_firm, "CURRENT FIRM"
-            )
-            self.assertEqual(
-                reparsed[0].email, "current@example.com"
-            )
-
-            # source itself is never touched
-            self.assertNotEqual(
-                download.path, self.source_dir / "AR.docx"
-            )
-        finally:
-            if download.cleanup_path is not None:
-                download.cleanup_path.unlink(missing_ok=True)
-
-    def test_materialization_failure_leaves_no_orphan_temp_file(
+    def test_repeated_downloads_of_unchanged_document_are_byte_identical(
         self,
     ) -> None:
-        document_id = "doc_" + "c" * 64
+        """
+        The exact regression this hardening exists for: the OLD
+        materializer produced a different SHA256 on every single call
+        for the same unchanged document. A pure byte read cannot do
+        that.
+        """
+
+        document_id = "doc_" + "d" * 64
         self.fake.add(
             document_id=document_id,
             country_code="AR",
             source_filename="Argentina.docx",
         )
-        (self.source_dir / "AR.docx").write_bytes(
-            _build_real_docx_bytes("Argentina overview")
-        )
+        real_bytes = _build_real_docx_bytes("Argentina overview")
+        (self.source_dir / "AR.docx").write_bytes(real_bytes)
 
         write_contact_state_atomic(
             self.source_dir,
@@ -997,33 +1006,52 @@ class DownloadHttpContractTests(AdminRouterIntegrationTestCase):
             ),
         )
 
-        temp_dir_before = {
-            entry.name
-            for entry in Path(tempfile.gettempdir()).iterdir()
-            if entry.suffix == ".docx"
-        }
+        hashes = set()
 
-        with patch(
-            "app.services.admin_document_lifecycle."
-            "materialize_effective_docx",
-            side_effect=RuntimeError("boom"),
-        ):
-            with self.assertRaises(RuntimeError):
-                lifecycle_service.get_document_download(
-                    document_id=document_id,
-                    source_directory=self.source_dir,
-                )
-
-        temp_dir_after = {
-            entry.name
-            for entry in Path(tempfile.gettempdir()).iterdir()
-            if entry.suffix == ".docx"
-        }
+        for _ in range(10):
+            download = lifecycle_service.get_document_download(
+                document_id=document_id,
+                source_directory=self.source_dir,
+            )
+            hashes.add(
+                hashlib.sha256(download.path.read_bytes()).hexdigest()
+            )
 
         self.assertEqual(
-            temp_dir_before,
-            temp_dir_after,
-            "a failed materialization must never leave a temp file behind",
+            len(hashes),
+            1,
+            "10 consecutive downloads of an unchanged document must "
+            "all have exactly the same SHA256",
+        )
+
+    def test_download_does_not_import_document_contact_materializer(
+        self,
+    ) -> None:
+        """
+        Structural guard against reintroducing document materialization
+        into the download endpoint (mission "DOCX HARDENING" section
+        11): the service module must not import
+        materialize_effective_docx at all - not "import it but never
+        call it", genuinely absent, so a future re-addition of the
+        import itself fails this test before anyone even wires it back
+        into get_document_download().
+        """
+
+        import inspect
+
+        source = inspect.getsource(lifecycle_service)
+
+        self.assertNotIn(
+            "materialize_effective_docx",
+            source,
+            "get_document_download() must never reference "
+            "materialize_effective_docx - download is a pure byte "
+            "read of the persisted source",
+        )
+        self.assertFalse(
+            hasattr(lifecycle_service, "materialize_effective_docx"),
+            "materialize_effective_docx must not be importable from "
+            "the download service module",
         )
 
 

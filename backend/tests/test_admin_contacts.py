@@ -42,6 +42,7 @@ from app.services.admin_contacts import (
 from app.services.admin_contact_photos import replace_admin_contact_photo
 from app.services.admin_document_lifecycle import (
     AdminDocumentRollbackError,
+    get_document_download,
     reindex_indexed_document,
 )
 from app.services.admin_document_replacement import (
@@ -975,6 +976,313 @@ class ContactCrudTests(unittest.TestCase):
 
 
 # =========================================================================
+# DOWNLOAD BYTE-STABILITY (mission "DOCX HARDENING", 2026-08-24)
+#
+# The invariant this section proves: download is a PURE READ.
+# get_document_download() no longer rebuilds/reserializes anything -
+# every mutation below already persists its effective DOCX atomically
+# before returning, so download's job is just to hand back exactly
+# those bytes, unchanged, every time.
+# =========================================================================
+
+
+class DownloadByteStabilityTests(unittest.TestCase):
+    def _sha(self, path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_persisted_source_sha_equals_download_sha(self) -> None:
+        """A: sha256(persisted source) == sha256(download body)."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(download.path, persisted_path)
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+    def test_ten_consecutive_downloads_are_byte_identical(self) -> None:
+        """B: 10 consecutive downloads of an unchanged document all
+        have exactly the same SHA256."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            hashes = {
+                self._sha(
+                    get_document_download(
+                        document_id=DOCUMENT_ID,
+                        source_directory=source_directory,
+                        client=client,
+                    ).path
+                )
+                for _ in range(10)
+            }
+
+            self.assertEqual(len(hashes), 1)
+
+    def test_download_changes_nothing(self) -> None:
+        """C: download changes neither the source file (mtime/size)
+        nor ContactState nor the OpenSearch chunk set."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            stat_before = persisted_path.stat()
+            state_before = read_contact_state(source_directory, DOCUMENT_ID)
+            chunks_before = dict(client.chunks)
+
+            get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            stat_after = persisted_path.stat()
+            state_after = read_contact_state(source_directory, DOCUMENT_ID)
+
+            self.assertEqual(stat_before.st_mtime_ns, stat_after.st_mtime_ns)
+            self.assertEqual(stat_before.st_size, stat_after.st_size)
+            self.assertEqual(state_before, state_after)
+            self.assertEqual(chunks_before, client.chunks)
+
+    def test_download_never_reaches_docx_writing_code(self) -> None:
+        """D: download must never invoke materialize_effective_docx,
+        python-docx's Document.save, or the canonical contact
+        rebuild - patch all three to explode, and prove download
+        still succeeds untouched."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_bytes = (source_directory / "GB.docx").read_bytes()
+
+            with patch(
+                "app.services.contact_document_area."
+                "rebuild_canonical_contact_table",
+                side_effect=AssertionError(
+                    "download must never rebuild the canonical table"
+                ),
+            ), patch(
+                "docx.document.Document.save",
+                side_effect=AssertionError(
+                    "download must never call Document.save"
+                ),
+            ):
+                download = get_document_download(
+                    document_id=DOCUMENT_ID,
+                    source_directory=source_directory,
+                    client=client,
+                )
+                downloaded_bytes = download.path.read_bytes()
+
+        self.assertEqual(downloaded_bytes, persisted_bytes)
+
+    def test_source_equals_download_after_add_with_photo(self) -> None:
+        """E: after Contact Add + photo, persisted source == downloaded
+        bytes."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                replace_admin_contact_photo(
+                    source_directory,
+                    DOCUMENT_ID,
+                    contact.contact_id,
+                    data=_make_png(64, 64, (10, 20, 30)),
+                    content_type="image/png",
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+    def test_source_equals_download_after_update(self) -> None:
+        """F: after Contact Update, persisted source == downloaded
+        bytes."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                update_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=contact.contact_id,
+                    fields=_write_request(member_firm="Updated Firm"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+    def test_source_equals_download_after_photo_replacement(self) -> None:
+        """G: after photo replacement, persisted source == downloaded
+        bytes."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                replace_admin_contact_photo(
+                    source_directory,
+                    DOCUMENT_ID,
+                    contact.contact_id,
+                    data=_make_png(64, 64, (10, 20, 30)),
+                    content_type="image/png",
+                    client=client,
+                )
+                replace_admin_contact_photo(
+                    source_directory,
+                    DOCUMENT_ID,
+                    contact.contact_id,
+                    data=_make_png(32, 96, (200, 100, 50)),
+                    content_type="image/png",
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+    def test_source_equals_download_after_delete(self) -> None:
+        """H: after Contact Delete, persisted source == downloaded
+        bytes."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                first = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(member_firm="Firm A"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(member_firm="Firm B"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                delete_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=first.contact_id,
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+
+# =========================================================================
 # ROLLBACK
 # =========================================================================
 
@@ -1621,9 +1929,15 @@ class AddContactFallbackSynchronizationTests(unittest.TestCase):
     test_contact_document_area.py's own
     test_fails_closed_with_no_structural_reference_at_all) must never
     leave a successful Add Contact as ContactState-only. add_contact()
-    must fall back to document_contact_materializer.
-    persist_inline_contact_fallback() and commit that to the source -
-    SOURCE DOCX == CONTACT STATE == OPENSEARCH holds even here.
+    must fall back to contact_document_area.rebuild_canonical_contact_
+    table()'s own no-existing-area handling (_default_insertion_anchor)
+    and commit that to the source - SOURCE DOCX == CONTACT STATE ==
+    OPENSEARCH holds even here. (This docstring previously named
+    document_contact_materializer.persist_inline_contact_fallback() -
+    that function was superseded by the canonical-table mechanism and
+    removed entirely, mission "DOCX HARDENING", 2026-08-24; this test's
+    own assertions below already proved the canonical table, not that
+    function, was the real fallback in use.)
     """
 
     def setUp(self) -> None:

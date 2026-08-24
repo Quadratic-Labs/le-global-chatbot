@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -31,14 +30,8 @@ from app.services.admin_document_replacement import (
 from app.services.country_lock import (
     country_lock,
 )
-from app.services.contact_state import (
-    read_contact_state,
-)
 from app.services.document_chunk_builder import (
     build_document_chunks_from_docx,
-)
-from app.services.document_contact_materializer import (
-    materialize_effective_docx,
 )
 from app.services.document_indexer import (
     DEFAULT_BULK_CHUNK_SIZE,
@@ -401,21 +394,27 @@ class DocumentDownload:
     """
     The file backing one Download response.
 
-    `path` is what FileResponse should actually stream - either the
-    real persisted source DOCX (contacts_materialized=False, no
-    structured Contact state to reflect - never currently expected in
-    production, only a defensive fallback), or a freshly-built
-    temporary "effective" copy (contacts_materialized=True) combining
-    that same source's legal content with its CURRENT structured
-    Contact state (mission "ORDER 8G-B2.1"). `cleanup_path`, when set,
-    is a temporary file the caller must delete once the response has
-    been sent - never the persisted source itself.
+    `path` is always the real persisted source DOCX, streamed exactly
+    as it sits on disk. Every Admin mutation (contact add/update/
+    delete, photo add/replace/delete, section add/update/delete,
+    upload/replace) already writes its effective result directly into
+    the persisted source, atomically, before returning success - so a
+    download has nothing left to build: it is a pure read of bytes
+    some earlier write already committed. Deliberately no longer has a
+    materialized-temp-file variant (mission "DOCX HARDENING",
+    2026-08-24): that path used to rebuild the DOCX package on every
+    single download regardless of whether the persisted source already
+    correctly reflected current contacts, producing a different SHA256
+    on every call and, for any document whose contact area is the
+    canonical Admin-managed table, silently duplicating every
+    contact's text a second time as plain in-flow paragraphs (the
+    materializer's own floating-shape-reuse path never fires once a
+    document's Contact box no longer exists to reuse, unconditionally
+    falling through to its "insert fresh paragraphs" branch instead).
     """
 
     path: Path
     download_filename: str
-    contacts_materialized: bool = False
-    cleanup_path: Path | None = None
 
 
 def get_document_download(
@@ -425,18 +424,17 @@ def get_document_download(
     client: OpenSearch | None = None,
 ) -> DocumentDownload:
     """
-    Resolve the effective DOCX to stream for GET .../download (mission
-    "ORDER 3", section 25; mission "ORDER 8G-B2.1" for the Contact
-    materialization added here).
+    Resolve the persisted source DOCX to stream for GET .../download
+    (mission "ORDER 3", section 25).
 
     Reuses exactly the same resolver reindex/delete already trust
     (resolve_document_source_path) - never a second, independent way
     to pick a source file, and never a client-supplied path: the
     client provides only document_id, this function does the rest.
-    Read-only against the persisted source and against structured
-    Contact state - never acquires the per-country lock, since a
-    download does not mutate anything and must not be serialized
-    behind writes, and never writes a Contact sidecar.
+    Pure read: never acquires the per-country lock (a download does
+    not mutate anything and must not be serialized behind writes),
+    never touches ContactState or section state, never opens the DOCX
+    with python-docx, never writes anywhere.
     """
 
     validated_document_id = _validate_document_id(
@@ -483,46 +481,6 @@ def get_document_download(
                 "The source DOCX file is missing."
             ),
             country_code,
-        )
-
-    contact_state = read_contact_state(
-        source_directory,
-        validated_document_id,
-    )
-
-    if contact_state is not None:
-        # Deferred import: admin_contacts.py imports from this module,
-        # so this module cannot import admin_contacts.py at module
-        # level without creating a cycle.
-        from app.services.admin_contacts import (
-            _record_to_extracted_contact,
-        )
-
-        effective_bytes = materialize_effective_docx(
-            source_path=resolved_source.path,
-            contacts=[
-                _record_to_extracted_contact(record)
-                for record in contact_state.contacts
-            ],
-        )
-
-        temporary_file = tempfile.NamedTemporaryFile(
-            suffix=".docx",
-            delete=False,
-        )
-
-        try:
-            temporary_file.write(effective_bytes)
-        finally:
-            temporary_file.close()
-
-        temporary_path = Path(temporary_file.name)
-
-        return DocumentDownload(
-            path=temporary_path,
-            download_filename=source_filename,
-            contacts_materialized=True,
-            cleanup_path=temporary_path,
         )
 
     return DocumentDownload(
