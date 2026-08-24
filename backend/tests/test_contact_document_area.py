@@ -578,6 +578,46 @@ class ContactDocumentAreaTests(unittest.TestCase):
                 path, contact_person="Michael Harmer", country="Australia"
             )
 
+    def test_multiple_emails_on_one_line_round_trip_preserved(self) -> None:
+        """Regression for the real France defect found by the
+        full-corpus mutation test: FR's actual contact carries two
+        email addresses on a single comma-joined line
+        ("scherrmann@flichy.com, bacquet@flichy.com"), because
+        ExtractedContact/ContactState model email as one string field
+        and the writer renders it verbatim as one line. The canonical
+        table reader used to recover only the first address via a
+        single regex .search(); the round-trip validator correctly
+        caught the loss and refused the rebuild with a
+        ContactAreaError, but the fix (using .findall() to recover
+        every address on the line) must let the exact real France
+        contact round-trip cleanly with both emails intact, in
+        order."""
+
+        path = self._require_copy("FR.docx")
+
+        flichy = ExtractedContact(
+            member_firm="Flichy Grangé Avocats",
+            contact_person="Caroline Scherrmann and Florence Bacquet",
+            email="scherrmann@flichy.com, bacquet@flichy.com",
+            phone="+33 1 56 62 30 00",
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            path,
+            contacts=(flichy,),
+            photos=(None,),
+            country="France",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="France")
+        self.assertEqual(1, len(reparsed))
+        self.assertEqual(
+            "scherrmann@flichy.com, bacquet@flichy.com",
+            reparsed[0].email,
+        )
+
 
 def _sha(data: bytes) -> str:
     import hashlib

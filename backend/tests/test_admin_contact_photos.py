@@ -461,12 +461,6 @@ class AdminContactPhotoTests(unittest.TestCase):
             source_directory=self.root,
             client=client,
         )
-        self.addCleanup(
-            lambda: (
-                download.cleanup_path
-                and download.cleanup_path.unlink(missing_ok=True)
-            )
-        )
         downloaded_shas = {
             c.sha256
             for c in extract_contact_photo_candidates(download.path)
@@ -706,12 +700,6 @@ class AdminContactPhotoTests(unittest.TestCase):
             document_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             source_directory=self.root,
             client=client,
-        )
-        self.addCleanup(
-            lambda: (
-                download.cleanup_path
-                and download.cleanup_path.unlink(missing_ok=True)
-            )
         )
 
         downloaded_shas = {

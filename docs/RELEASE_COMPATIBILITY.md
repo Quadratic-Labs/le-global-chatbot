@@ -214,32 +214,183 @@ either run (verified directly: identical `stat` mtimes on every
 production source file referenced by the manifest, before and after
 both runs).
 
-## Deployment rule
+## Deployment rule - now mechanically enforced
 
-A candidate image must satisfy **both** layers before it is deployed:
+`scripts/release_backend_candidate.py` is the **one** repository-owned
+entry point allowed to deploy or roll back `le-global-backend`. It
+exists because, before it, every deploy/rollback found in this
+investigation was an ad hoc, hand-written docker-compose override
+applied directly against `infra/compose.yml` with nothing in between -
+see the historical `/tmp/le-global-*.yml`,
+`/tmp/le-global-contact-rollback.yml`,
+`/tmp/le-global-emergency-rollback.yml`,
+`/tmp/le-global-restore-a3cb8e1.yml` files this investigation
+recovered from the actual incident. That gap - a real deploy path with
+no compatibility gate on it at all - is how a genuinely incompatible
+image could reach production in the first place.
 
 ```
-static contract tests (release-compatibility-contract.py)
-  +
-live compatibility smoke (scripts/release_compatibility_smoke.py)
-  = eligible to deploy
+candidate image
+     |
+     v
+STATIC_COMPATIBILITY   (release-compatibility-contract.py)
+     |
+     v
+LIVE_BACKEND_HEALTH / LIVE_DOCUMENT_LIST / LIVE_CONTACT_LIST /
+LIVE_CONTACT_PHOTO / LIVE_DOCUMENT_DOWNLOAD
+     (scripts/run_release_compatibility_smoke.sh - isolated network +
+      OpenSearch + Redis + the candidate, snapshot mounted read-only)
+     |
+     v
+RELEASE_COMPATIBILITY=PASS
+     |
+     v
+deployment allowed -> docker compose (ONLY with --deploy; never with
+                       --validate-only, which is also the default)
 ```
 
-**A rollback image must satisfy the exact same two gates**, run against
-a snapshot of *today's* persisted data - not the data that existed
-when that image was last in production. `container healthy != release
-compatible`, and `previously deployed successfully != safe rollback
-today`: both gates exist because health and prior deployment history
-tell you nothing about whether a given image's code can still read
-what is on disk *right now*.
+If any gate is not PASS, `deploy()` - the only function in this
+script that ever calls `docker compose` - is never invoked at all,
+whether or not `--deploy` was requested. There is exactly **one** code
+path, used identically for a forward deploy and a rollback: passing an
+older image tag does not skip, shortcut, or weaken a single gate.
+`container healthy != release compatible`, and `previously deployed
+successfully != safe rollback today` are not just documented anymore -
+they're the reason this script has no branch that treats an "old,
+previously-stable" image any differently from a brand-new one.
 
-This repository has no existing deployment/rollback pipeline script to
-wire this into (`scripts/` held no automation before this gate was
-added, and `admin/`/`wordpress-plugin/` are empty placeholders) - when
-one is built, it must call `scripts/release_compatibility_smoke.py`
-(after `scripts/run_release_compatibility_smoke.sh`-style isolated
-bootstrap, or an equivalent) and abort on `RELEASE_COMPATIBILITY=FAIL`,
-for both a forward deploy and a rollback.
+```sh
+# Check whether an image would be allowed to deploy - never touches
+# the running stack.
+python3 scripts/release_backend_candidate.py \
+    --image le-global-backend:candidate-abc123 --validate-only
+
+# Validate, and ONLY if every gate passes, actually apply that image
+# to the running stack (forward deploy or rollback - same command).
+python3 scripts/release_backend_candidate.py \
+    --image le-global-backend:candidate-abc123 --deploy
+```
+
+Empirical proof this blocks a real regression (ran 2026-08-23, same
+snapshot as above): `--deploy --image le-global-backend:candidate-ed292d7`
+reported `LIVE_DOCUMENT_LIST=FAIL` / `RELEASE_COMPATIBILITY=FAIL` /
+`DEPLOYMENT_GATE_ENFORCED=YES` and exited non-zero; `docker inspect
+le-global-backend` showed an identical image digest and container
+`Created` timestamp before and after the run - `docker compose` was
+never invoked. The equivalent run against `candidate-a3cb8e1` reported
+every gate `PASS`.
+
+**Status labels, kept unambiguous on purpose:** `STATIC_*` names are
+the source-only Layer 1 checks; `LIVE_*` names are real HTTP calls
+against an isolated running candidate (Layer 2); `RELEASE_COMPATIBILITY`
+is the combined verdict; `DEPLOYMENT_GATE_ENFORCED` /
+`ROLLBACK_GATE_ENFORCED` describe this script's own mechanical
+behavior (verified by `scripts/tests/test_release_backend_candidate.py`),
+never a documented-but-manual rule. Only this section, about this
+specific script, may claim "enforced" - everywhere else in this
+document that describes a *rule* rather than *this script's tested
+behavior*, "documented" is the correct word.
+
+## The unresolved Contact 400 - separate from the chunk-count regression
+
+Real production evidence (`docker logs le-global-wordpress`, Apache
+combined log, 2026-08-23 00:11-00:21 UTC) shows `list_contacts`
+requests genuinely returning HTTP 400 for several different
+document_ids, including ones (e.g. `AR`) that never touch the
+canonical-table code path at all. **This is a different, still
+unresolved symptom from the `ed292d7` chunk-count regression proven
+above - do not treat the chunk-count fix as having explained it.**
+
+What the investigation established, by directly reading every
+candidate code path and empirically testing the live boundary (never
+guessed):
+
+- `relay_json_result()` in `class-le-global-chatbot-admin.php` only
+  ever calls `wp_send_json_error($detail, $status_code)` with
+  `$status_code` set to whatever `wp_remote_retrieve_response_code()`
+  actually received - so the observed 400 is a REAL status code some
+  server sent, not a WordPress-side default or misreport.
+- Ruled out by direct code reading (both `candidate-a3cb8e1` and
+  `candidate-ed292d7` - `admin_contacts.py`, `admin_contact_photos.py`,
+  `admin_document_lifecycle.py`, `app/main.py`'s exception handler and
+  `ApiProtectionMiddleware` are all byte-identical or read in full):
+  no code path in either backend version's Contact service, routing,
+  global exception handling, or auth/rate-limit middleware can produce
+  a bare HTTP 400 for this endpoint - only 422/404/409/429/502/503.
+- Ruled out by direct code reading of the WordPress plugin: nonce
+  rejection (`check_ajax_referer`) dies with a bare `"-1"` body and
+  HTTP 200, never 400; `read_document_id_for_json()`'s own validation
+  uses 422; a transport/DNS failure or a non-JSON backend body both
+  map to WP_Error -> HTTP 503 in `relay_json_result()`, never 400.
+- Ruled out empirically: a raw, deliberately malformed HTTP request
+  sent directly to the live backend confirmed uvicorn's own
+  protocol-level 400 has a `text/plain` body ("Invalid HTTP request
+  received.") - which `json_decode()` rejects, so THAT class of 400
+  would surface to WordPress as 503, not 400, and cannot be the
+  observed mechanism either.
+- Ruled out: a network-alias collision with the one identifiable
+  leftover container on `le-global-network`
+  (`le-global-backend-candidate-2b4f669`) - it has no `backend` alias
+  registered, now or (given it was never recreated) at the incident
+  time.
+- The docker/journal timeline (reconstructed from `docker inspect`'s
+  `com.docker.compose.project.config_files` label plus
+  `journalctl -u docker`'s `sbJoin`/`stopping restart-manager` events
+  for `le-global-backend`) shows the FIRST 400 at 00:16:36 occurred
+  against a container recreated at 00:00:27 - a deployment with no
+  surviving override file - roughly **3 minutes before** the
+  `candidate-ed292d7` "emergency rollback" redeploy at 00:19:49, and
+  400s continued for at least 2 minutes AFTER that redeploy too (e.g.
+  00:21:15). The symptom therefore spans a container recreation and is
+  not specific to `candidate-ed292d7`'s code.
+- `request_backend()` never logged anything for a successful-but-error
+  HTTP round trip before this investigation (only for a hard transport
+  failure) - confirmed by an empty PHP error log for the entire
+  incident window. This is why the real status code could not be
+  recovered from application logs and had to be reconstructed from the
+  Apache access log instead.
+
+```
+CONTACT_400_ROOT_CAUSE=UNRESOLVED
+```
+
+Every hypothesis this investigation could construct from the available
+code and configuration was tested and eliminated; none of them survive
+contact with the evidence. The most defensible open candidates - a
+resource/concurrency condition during rapid, back-to-back manual
+testing of many document_ids and photo downloads right after each
+redeploy, or an HTTP/1.1 connection-reuse desync on a keep-alive
+connection between WordPress and the backend - are plausible but
+**not proven**, and are not claimed as the cause here. If this
+recurs, the observability change below (`request_backend()` now logs
+the real status code, method, and path for every non-2xx response, and
+separately flags a non-JSON body) should make the real mechanism
+immediately visible in the PHP error log, instead of requiring this
+kind of multi-hour forensic reconstruction again.
+
+## Observability: distinguishing backend failure classes
+
+`request_backend()` (`class-le-global-chatbot-admin.php`) now logs,
+for every proxied action, via PHP's own `error_log()`:
+
+- **A non-2xx HTTP response** (400/401/403/404/500/502/...): the real
+  status code, HTTP method, and path - e.g. `Backend returned a
+  non-success status (400) for GET
+  /api/v1/admin/documents/doc_.../contacts.`
+- **A non-JSON response body**: the same method/path plus the real
+  status code that came with the unparseable body.
+- **A transport/DNS/connect failure** (already logged before this
+  change): the WP_Error code from `wp_remote_request()`.
+
+None of these log lines ever include `X-Admin-Key`, `X-API-Key`, or
+response/document body content - only method, path (which contains
+only an opaque `document_id`, never document content), and the status
+code. A normal 2xx response logs nothing, so there is no added noise
+on the success path. WordPress's own nonce rejection
+(`check_ajax_referer`) remains self-diagnosing without a code change:
+its distinctive `"-1"`-body, HTTP-200 signature is already
+unambiguous in the Apache access log next to a genuine backend error.
+Covered by `wordpress/le-global-chatbot/tests/admin-contacts.test.php`.
 
 ## Rule going forward
 

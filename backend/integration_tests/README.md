@@ -146,3 +146,50 @@ They are fast and sufficient for logic and failure-injection testing.
 This harness exists for the things a fake cannot tell you: genuine
 network behavior, real OpenSearch response latency/behavior at scale,
 and end-to-end multipart upload through the real FastAPI stack.
+
+## Canonical contact-table DOCX mutation matrix
+
+`docx_contact_mutation_matrix.py` drives the exact same isolated stack
+above (steps 1-3) through a real-HTTP differential matrix over the
+Admin Contact API: rebuild-only, add (with/without photo), update text,
+replace photo, delete photo, a second consecutive update, and the
+add-photo-then-delete sequence, each starting from a clean baseline and
+each validated for ZIP/XML/relationship/docPr/sectPr integrity plus a
+python-docx reopen. Written 2026-08-24 investigating a report that a
+real Admin Contact mutation produced a DOCX Microsoft Word refused to
+open - the exact real document and operation sequence were identified
+from live WordPress/backend access logs (never assumed), reproduced
+here, and validated clean across this matrix, an 8-cycle repeated
+add/photo/delete stress run, and large PNG/JPEG photo variants; no
+defect was found. Kept as permanent regression coverage per that
+investigation's own conclusion (documents currently-verified-correct
+behavior, not a fix for a confirmed defect).
+
+Run it against step 3's backend, using a read-write snapshot (prepare
+one with `scripts/prepare_release_compatibility_snapshot.py`, then
+`chmod -R a+rwX` it - this script mutates it repeatedly by design) and
+clean backups of the DOCX/ContactState/photo to reset to between
+stages:
+
+```sh
+docker cp docx_contact_mutation_matrix.py admin-e2e-backend:/tmp/matrix.py
+docker exec admin-e2e-backend python /tmp/matrix.py \
+  --base-url http://localhost:8000 \
+  --api-key test-api-access-key --admin-key test-admin-key \
+  --document-id <doc_id> --original-contact-id <hex> \
+  --original-member-firm "..." --original-contact-person "..." \
+  --original-email "..." --original-phone "..." \
+  --original-address "..." --original-website "..." \
+  --snapshot-source-dir /data/documents/source \
+  --docx-filename <COUNTRY>.docx \
+  --original-docx-backup /tmp/clean.docx \
+  --original-state-backup /tmp/clean-state.json \
+  --original-photo-name <contact_id>--<sha256>.jpg
+```
+
+Cross-check any output separately with LibreOffice headless
+(`libreoffice --headless --convert-to pdf ...`) - not scripted here,
+since it requires LibreOffice on the runner rather than inside the
+backend image. Neither this script nor LibreOffice succeeding is proof
+Microsoft Word itself accepts the file; treat a clean matrix run as
+strong evidence, not a substitute for opening a real canary in Word.

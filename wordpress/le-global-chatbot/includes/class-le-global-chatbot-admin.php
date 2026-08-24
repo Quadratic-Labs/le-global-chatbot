@@ -4282,11 +4282,45 @@ final class LE_Global_Chatbot_Admin
                     $decoded_body
                 )
             ) {
+                error_log(
+                    sprintf(
+                        '[L&E Global Chatbot] Backend response for '
+                        . '%s %s was not valid JSON (HTTP %d).',
+                        strtoupper($method),
+                        $path,
+                        $status_code
+                    )
+                );
+
                 return new WP_Error(
                     'le_global_admin_invalid_response',
                     'The legal document service returned an invalid response.'
                 );
             }
+        }
+
+        // Every caller of request_backend() treats a status outside
+        // 200-299 as an error and shows the admin only a generic,
+        // friendly fallback message (relay_json_result()) - this is
+        // the ONE place, for every proxied action, that the REAL
+        // upstream status code is ever observable at all. Logging it
+        // here (method + path + status only - never headers, never
+        // the response body, so X-Admin-Key/X-API-Key/document
+        // content can never reach this log) is what makes a genuine
+        // backend 400/401/403/404/500/502 immediately distinguishable
+        // after the fact, instead of requiring exactly the kind of
+        // multi-hour forensic reconstruction this log line exists
+        // because of.
+        if ($status_code < 200 || $status_code >= 300) {
+            error_log(
+                sprintf(
+                    '[L&E Global Chatbot] Backend returned a '
+                    . 'non-success status (%d) for %s %s.',
+                    $status_code,
+                    strtoupper($method),
+                    $path
+                )
+            );
         }
 
         return [

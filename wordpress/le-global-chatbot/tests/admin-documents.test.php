@@ -817,6 +817,60 @@ check(
     true
 );
 
+// --- handle_download byte-transparency (mission "DOCX HARDENING",
+// 2026-08-24, section 9/10): live-proven byte-for-byte identical
+// (backend-direct vs WordPress-admin-post) as long as this function's
+// body never gains a SECOND output statement between the backend
+// fetch and the raw echo - any HTML wrapper, debug dump, or stray
+// whitespace outside PHP tags placed there would silently corrupt
+// every real download. Token-aware (like the wp_nonce_url guard
+// above): a doc-comment mentioning "echo" in prose must never
+// false-fail this.
+
+$download_tokens = token_get_all('<?php ' . $download_source);
+$download_code_only = '';
+
+foreach ($download_tokens as $token) {
+    if (is_array($token)) {
+        if (in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+        $download_code_only .= $token[1];
+    } else {
+        $download_code_only .= $token;
+    }
+}
+
+$echo_statement_count = preg_match_all(
+    '/\becho\b/',
+    $download_code_only
+);
+
+check(
+    'handle_download contains exactly one echo statement (the raw body)',
+    $echo_statement_count,
+    1
+);
+check(
+    'handle_download\'s one echo is $body itself, not a wrapped/concatenated value',
+    (bool) preg_match('/echo\s+\$body\s*;/', $download_code_only),
+    true
+);
+check(
+    'handle_download never calls print/print_r/var_dump/var_export/printf '
+    . '(any of which would contaminate the binary response body)',
+    (bool) preg_match(
+        '/\b(print|print_r|var_dump|var_export|printf)\s*\(/',
+        $download_code_only
+    ),
+    false
+);
+check(
+    'the echo of $body is the statement immediately before exit',
+    (bool) preg_match('/echo\s+\$body\s*;\s*exit\s*;/', $download_code_only),
+    true
+);
+
 // =====================================================================
 // build_download_url() raw-url contract (production double-escaping
 // incident: wp_nonce_url() returns an HTML-escaped url; a SECOND

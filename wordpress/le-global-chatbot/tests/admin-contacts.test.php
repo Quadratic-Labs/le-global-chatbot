@@ -436,6 +436,99 @@ check(
     [false, 404, 'No indexed document was found for this identifier.']
 );
 
+// --- observability: request_backend() must log enough to distinguish
+// a real backend 400/401/403/404/500/502 after the fact - the exact
+// gap that turned a real, already-captured production 400 into a
+// many-hour forensic reconstruction (docs/RELEASE_COMPATIBILITY.md's
+// "Contact 400 investigation"), because relay_json_result() itself
+// only ever shows the admin a single generic fallback message and
+// request_backend() previously never logged a successful-but-error
+// HTTP round trip at all - only a hard transport failure.
+
+function capture_error_log(callable $body): string
+{
+    $log_path = tempnam(sys_get_temp_dir(), 'le-global-test-error-log-');
+    $previous_error_log = ini_set('error_log', $log_path);
+
+    try {
+        $body();
+
+        return file_get_contents($log_path) ?: '';
+    } finally {
+        ini_set('error_log', $previous_error_log);
+        @unlink($log_path);
+    }
+}
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID]);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(400, [
+    'detail' => ['code' => 'some_backend_error', 'message' => 'Bad request.'],
+]);
+$logged = capture_error_log(function () {
+    invoke_handler('handle_list_contacts');
+});
+check(
+    'a real backend 400 is logged with its exact status code, method, and path',
+    [
+        str_contains($logged, '400'),
+        str_contains($logged, 'GET'),
+        str_contains($logged, '/documents/' . $VALID_DOCUMENT_ID . '/contacts'),
+    ],
+    [true, true, true]
+);
+check(
+    'the non-2xx log line never contains the configured admin/API keys',
+    [
+        str_contains($logged, 'test-admin-key'),
+        str_contains($logged, 'test-api-key'),
+    ],
+    [false, false]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID]);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(401, [
+    'detail' => 'Invalid or missing administration key.',
+]);
+$logged = capture_error_log(function () {
+    invoke_handler('handle_list_contacts');
+});
+check(
+    'a real backend 401 is logged distinctly from a 400 (exact status code present)',
+    str_contains($logged, '401'),
+    true
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID]);
+$GLOBALS['__test_fake_backend_response'] = [
+    'response' => ['code' => 400, 'message' => ''],
+    'body' => 'Invalid HTTP request received.',
+];
+$logged = capture_error_log(function () {
+    invoke_handler('handle_list_contacts');
+});
+check(
+    'a non-JSON backend body is logged as invalid JSON, with its real status code',
+    [
+        str_contains($logged, 'not valid JSON'),
+        str_contains($logged, '400'),
+    ],
+    [true, true]
+);
+
+reset_state(['document_id' => $VALID_DOCUMENT_ID]);
+$GLOBALS['__test_fake_backend_response'] = fake_backend_json_response(200, [
+    'document_id' => $VALID_DOCUMENT_ID,
+    'contacts' => [],
+]);
+$logged = capture_error_log(function () {
+    invoke_handler('handle_list_contacts');
+});
+check(
+    'a normal 200 response logs nothing at all (no noise on the success path)',
+    $logged,
+    ''
+);
+
 // --- add_contact forwarding + success/error propagation ---------------
 
 reset_state(['document_id' => $VALID_DOCUMENT_ID], $POSTED_CONTACT_FIELDS);
