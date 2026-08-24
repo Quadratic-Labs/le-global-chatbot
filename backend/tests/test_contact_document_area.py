@@ -73,6 +73,10 @@ def _make_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
 
 _VALID_PNG = _make_png(183, 234, (200, 50, 50))
 
+_WP_NS = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_PIC_NS = "{http://schemas.openxmlformats.org/drawingml/2006/picture}"
+
 
 class ContactDocumentAreaTests(unittest.TestCase):
 
@@ -148,6 +152,39 @@ class ContactDocumentAreaTests(unittest.TestCase):
         # closely related to, unlike a bare lxml.fromstring check).
         WordDocument(path)
 
+    def _decorative_top_and_bottom_wrapped_shapes(
+        self, document_xml: str
+    ) -> int:
+        """Count floating shapes wrapped topAndBottom that carry
+        neither real text nor a picture - contact_document_area.py's
+        own removal target for the legacy reserved-space rectangle
+        ("the tallest topAndBottom-wrapped shape with neither text nor
+        a picture", per its module docstring). Checking this semantic
+        invariant directly - rather than hardcoding an expected shape
+        count - stays correct whether or not a given source document
+        still happens to carry a decorative rectangle: real organic
+        content drifts over time (a page's own title text box, for
+        example, is also wrapped topAndBottom, has real text, and must
+        never be mistaken for a removal candidate)."""
+
+        root = ET.fromstring(document_xml)
+        decorative = 0
+
+        for anchor in root.iter(f"{_WP_NS}anchor"):
+            if anchor.find(f"{_WP_NS}wrapTopAndBottom") is None:
+                continue
+
+            has_text = any(
+                (node.text or "").strip()
+                for node in anchor.iter(f"{_W_NS}t")
+            )
+            has_picture = anchor.find(f".//{_PIC_NS}pic") is not None
+
+            if not has_text and not has_picture:
+                decorative += 1
+
+        return decorative
+
     def _table_xml(self, document_xml: str) -> str:
         marker_index = document_xml.find(CONTACT_TABLE_HIDDEN_MARKER)
         self.assertNotEqual(
@@ -165,7 +202,18 @@ class ContactDocumentAreaTests(unittest.TestCase):
     ) -> None:
         """Test items 1 and 2: canonicalizing AU's own organic contact
         area leaves no large empty band (Introduction follows the new
-        table directly) and the sole contact keeps its own photo."""
+        table directly) and the sole contact keeps its own photo.
+
+        The "no empty band" check asserts the semantic contract
+        directly (no decorative, text-less/picture-less
+        topAndBottom-wrapped shape survives, and no NEW one is
+        introduced) rather than a hardcoded shape count: AU's own real
+        content has drifted since this test was written and its
+        current baseline no longer carries a separate removable
+        reserved-space rectangle at all (verified directly against the
+        real corpus - AU's only topAndBottom-wrapped shape today is
+        its own title text box, which legitimately survives
+        unchanged)."""
 
         path = self._require_copy("AU.docx")
 
@@ -215,20 +263,28 @@ class ContactDocumentAreaTests(unittest.TestCase):
             "all - only ordinary inline content",
         )
 
-        # No large reserved band: the legacy reserved-space rectangle
-        # is gone (the baseline's OTHER wrapTopAndBottom shape - its
-        # own cover-page title textbox, which has real text and is
-        # never a removal candidate - legitimately survives, so this
-        # compares counts rather than asserting zero). Each shape
-        # contributes exactly one "wrapTopAndBottom" substring match
-        # (its own DrawingML Choice branch only - the VML Fallback
-        # branch spells it differently, type="topAndBottom"), so
-        # removing exactly the rectangle drops the count by exactly 1.
+        # No large reserved band: no decorative, text-less/picture-less
+        # topAndBottom-wrapped shape (the legacy reserved-space
+        # rectangle) survives canonicalization - whether or not this
+        # particular source document still happened to carry one.
+        # Real content wrapped the same way (a title text box) is
+        # never a removal candidate and must be untouched.
         self.assertEqual(
-            original_wrap_count - 1,
+            0,
+            self._decorative_top_and_bottom_wrapped_shapes(document_xml),
+            "no decorative, text-less, picture-less topAndBottom "
+            "rectangle may survive canonicalization",
+        )
+        # Each real shape contributes exactly one "wrapTopAndBottom"
+        # substring match (its own DrawingML Choice branch only - the
+        # VML Fallback branch spells it differently,
+        # type="topAndBottom"), so canonicalization must never
+        # introduce a NEW one.
+        self.assertLessEqual(
             document_xml.count("wrapTopAndBottom"),
-            "exactly the reserved-space rectangle must be gone, "
-            "leaving only the title textbox's own occurrence",
+            original_wrap_count,
+            "canonicalization must never introduce a new "
+            "topAndBottom-wrapped shape",
         )
 
         reparsed = extract_contacts_from_docx(path, country="Australia")
@@ -577,6 +633,46 @@ class ContactDocumentAreaTests(unittest.TestCase):
             resolve_untracked_contact_photo(
                 path, contact_person="Michael Harmer", country="Australia"
             )
+
+    def test_multiple_emails_on_one_line_round_trip_preserved(self) -> None:
+        """Regression for the real France defect found by the
+        full-corpus mutation test: FR's actual contact carries two
+        email addresses on a single comma-joined line
+        ("scherrmann@flichy.com, bacquet@flichy.com"), because
+        ExtractedContact/ContactState model email as one string field
+        and the writer renders it verbatim as one line. The canonical
+        table reader used to recover only the first address via a
+        single regex .search(); the round-trip validator correctly
+        caught the loss and refused the rebuild with a
+        ContactAreaError, but the fix (using .findall() to recover
+        every address on the line) must let the exact real France
+        contact round-trip cleanly with both emails intact, in
+        order."""
+
+        path = self._require_copy("FR.docx")
+
+        flichy = ExtractedContact(
+            member_firm="Flichy Grangé Avocats",
+            contact_person="Caroline Scherrmann and Florence Bacquet",
+            email="scherrmann@flichy.com, bacquet@flichy.com",
+            phone="+33 1 56 62 30 00",
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            path,
+            contacts=(flichy,),
+            photos=(None,),
+            country="France",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="France")
+        self.assertEqual(1, len(reparsed))
+        self.assertEqual(
+            "scherrmann@flichy.com, bacquet@flichy.com",
+            reparsed[0].email,
+        )
 
 
 def _sha(data: bytes) -> str:

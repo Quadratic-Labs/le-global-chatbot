@@ -954,9 +954,18 @@ def update_contact(
     client: OpenSearch | None = None,
     lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
 ) -> AdminContactResponse:
-    """Save new field values for one existing contact - its
-    contact_id and its position among the document's contacts are both
-    preserved."""
+    """
+    Save new field values for one existing contact - its contact_id
+    and its position among the document's contacts are both preserved.
+
+    Also synchronizes the persisted source DOCX with the new field
+    values - rebuilding its canonical contact table from the complete
+    current contact list (see _synchronize_source_document), the same
+    way add_contact/delete_contact do - as ONE transaction together
+    with the ContactState/index commit: if the DOCX commits but the
+    ContactState commit then fails, the DOCX is restored to its exact
+    prior bytes before the error propagates.
+    """
 
     validated_document_id = _validate_document_id(document_id)
     validated_contact_id = contact_id.strip()
@@ -1024,15 +1033,32 @@ def update_contact(
             + current_contacts[position + 1:]
         )
 
-        _apply_contact_state_change(
-            document_id=validated_document_id,
-            country_code=country_code,
-            source_directory=source_directory,
-            new_contacts=new_contacts,
-            document_metadata=document_metadata,
-            client=opensearch_client,
-            reset_marker=False,
+        committed_source_path, original_document_bytes = (
+            _synchronize_source_document(
+                source_directory=source_directory,
+                document_metadata=document_metadata,
+                country_code=country_code,
+                all_records=new_contacts,
+            )
         )
+
+        try:
+            _apply_contact_state_change(
+                document_id=validated_document_id,
+                country_code=country_code,
+                source_directory=source_directory,
+                new_contacts=new_contacts,
+                document_metadata=document_metadata,
+                client=opensearch_client,
+                reset_marker=False,
+            )
+
+        except Exception:
+            _restore_source_document(
+                source_path=committed_source_path,
+                original_bytes=original_document_bytes,
+            )
+            raise
 
     return AdminContactResponse(
         document_id=validated_document_id,

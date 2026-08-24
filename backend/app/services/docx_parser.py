@@ -2349,10 +2349,23 @@ def _extract_canonical_table_contacts(
         name_lines: list[str] = []
 
         for line in person_lines:
-            email_match = _EMAIL_PATTERN.search(line)
+            # A contact can legitimately have more than one email
+            # (e.g. two named individuals sharing a firm entry), and
+            # the writer side (_fill_photo_and_person_cell) renders
+            # them all as ONE comma-joined line, exactly mirroring
+            # ContactState's own single `email` string field - so a
+            # single line can itself contain multiple addresses.
+            # findall() (not search()) is required to recover all of
+            # them, in the order they were written, or a round-trip
+            # silently drops every email after the first (the real
+            # France incident: "scherrmann@flichy.com,
+            # bacquet@flichy.com" on one line lost the second address
+            # and the canonical rebuild's own round-trip check
+            # correctly rejected the mutation rather than persist it).
+            line_emails = _EMAIL_PATTERN.findall(line)
 
-            if email_match:
-                emails.append(email_match.group(0))
+            if line_emails:
+                emails.extend(line_emails)
             else:
                 name_lines.append(line)
 
