@@ -2241,6 +2241,116 @@ def _extract_plain_paragraph_contacts(
 CONTACT_TABLE_HIDDEN_MARKER: Final[str] = "LE-GLOBAL-CONTACT-TABLE-V1"
 
 
+def _score_phone_candidate(line: str) -> tuple[int, int, int, int]:
+    """The best _PHONE_PATTERN match score for one line, using the
+    same scoring shape as _select_contact_phone - reused here to
+    identify WHICH line of a canonical table's firm cell is the phone
+    line, never to extract a phone substring out of it. A line with no
+    match at all scores the sentinel (0, 0, 0, 0)."""
+
+    normalized_line = _normalize_text(line)
+    best = (0, 0, 0, 0)
+
+    for match in _PHONE_PATTERN.finditer(line):
+        candidate = match.group(0).strip()
+
+        if not candidate:
+            continue
+
+        digit_count = sum(character.isdigit() for character in candidate)
+
+        score = (
+            int(digit_count >= 8),
+            int(candidate.startswith("+")),
+            int(_normalize_text(candidate) == normalized_line),
+            digit_count,
+        )
+
+        if score > best:
+            best = score
+
+    return best
+
+
+def _classify_canonical_firm_lines(
+    firm_lines: Sequence[str],
+) -> tuple[str | None, str | None, str | None, list[int]]:
+    """
+    Recover member_firm/phone/website from one canonical table row's
+    left-cell lines BY CONTENT, not by fixed position - the writer
+    (_fill_text_cell) always emits member_firm/address/phone/website
+    in that order but SKIPS whichever fields are empty, so a contact
+    with no member_firm at all has its phone (or whichever field comes
+    next) land on line 0. Reading line 0 as "always the firm name"
+    would misclassify that value.
+
+    - phone: the line with the strongest _PHONE_PATTERN signal, if
+      any, compared across EVERY line (including line 0). Its ENTIRE
+      text becomes the phone value - the writer never shares a line
+      between two fields, so any trailing annotation an Admin typed as
+      part of the phone value (e.g. "+1 555 0100 (mobile)") is
+      preserved verbatim rather than leaking into address.
+    - website: the one remaining line that is, IN ITS ENTIRETY, just a
+      URL - exactly how the writer places contact.website alone on its
+      own paragraph. An address sentence that merely MENTIONS a URL
+      (e.g. "...please see www.example.com.") keeps that mention as
+      ordinary prose, untouched: fullmatch fails for a line that has
+      anything else on it, by construction.
+    - member_firm: line 0, unless line 0 was itself claimed above as
+      the phone or website line (member_firm was empty and that
+      field's value landed there instead).
+
+    Returns (member_firm, phone, website, remaining_line_indices) -
+    the last being every index not claimed by any of the three, for
+    the caller to treat as address candidates.
+    """
+
+    phone_index: int | None = None
+    best_score = (0, 0, 0, 0)
+
+    for index, line in enumerate(firm_lines):
+        score = _score_phone_candidate(line)
+
+        if score > best_score:
+            best_score = score
+            phone_index = index
+
+    phone = firm_lines[phone_index] if phone_index is not None else None
+
+    website_index: int | None = None
+    website: str | None = None
+
+    for index, line in enumerate(firm_lines):
+        if index == phone_index:
+            continue
+
+        match = _WEBSITE_PATTERN.fullmatch(line)
+
+        if match:
+            website_index = index
+            website = match.group(0)
+            break
+
+    member_firm_index: int | None = 0 if firm_lines else None
+
+    if member_firm_index in (phone_index, website_index):
+        member_firm_index = None
+
+    member_firm = (
+        firm_lines[member_firm_index]
+        if member_firm_index is not None
+        else None
+    )
+
+    remaining_indices = [
+        index
+        for index in range(len(firm_lines))
+        if index not in (member_firm_index, phone_index, website_index)
+    ]
+
+    return member_firm, phone, website, remaining_indices
+
+
 def _extract_canonical_table_contacts(
     file_path: Path,
     country: str | None = None,
@@ -2323,14 +2433,14 @@ def _extract_canonical_table_contacts(
         if not firm_lines and not person_lines:
             continue
 
-        phone = _select_contact_phone(firm_lines)
-        website_match = _WEBSITE_PATTERN.search(" ".join(firm_lines))
+        member_firm, phone, website, address_line_indices = (
+            _classify_canonical_firm_lines(firm_lines)
+        )
 
         address_lines: list[str] = []
 
-        for line in firm_lines[1:]:
-            if website_match and line == website_match.group(0):
-                continue
+        for index in address_line_indices:
+            line = firm_lines[index]
 
             if (
                 normalized_country is not None
@@ -2338,12 +2448,7 @@ def _extract_canonical_table_contacts(
             ):
                 continue
 
-            address_line = _remove_contact_phone_from_address_line(
-                line, phone
-            )
-
-            if address_line:
-                address_lines.append(address_line)
+            address_lines.append(line)
 
         emails: list[str] = []
         name_lines: list[str] = []
@@ -2370,12 +2475,12 @@ def _extract_canonical_table_contacts(
                 name_lines.append(line)
 
         contact = ExtractedContact(
-            member_firm=firm_lines[0] if firm_lines else None,
+            member_firm=member_firm,
             contact_person=name_lines[0] if name_lines else None,
             email=", ".join(emails) if emails else None,
             phone=phone,
             address=", ".join(address_lines) if address_lines else None,
-            website=website_match.group(0) if website_match else None,
+            website=website,
         )
 
         if contact.has_any_field():

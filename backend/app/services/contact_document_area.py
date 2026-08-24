@@ -748,6 +748,25 @@ def rebuild_canonical_contact_table(
     return new_bytes
 
 
+# Every structured field the canonical table's writer owns - the full
+# round-trip contract a rebuild must preserve, not just contact_person/
+# email. A field shift (e.g. a phone value landing in member_firm, or
+# a website value landing in address) must fail validation exactly
+# like a lost contact would.
+_VALIDATED_CONTACT_FIELDS = (
+    "member_firm",
+    "address",
+    "phone",
+    "website",
+    "contact_person",
+    "email",
+)
+
+
+def _normalized_field_value(contact: ExtractedContact, field: str) -> str:
+    return _normalize_text(getattr(contact, field) or "").casefold()
+
+
 def _validate_canonical_table(
     new_bytes: bytes,
     *,
@@ -756,8 +775,9 @@ def _validate_canonical_table(
     country: str | None,
 ) -> None:
     """Structural, not just SHA: the rebuilt table must round-trip back
-    out as exactly the intended contacts, in order, with their own
-    photos - otherwise no change is saved at all."""
+    out as exactly the intended contacts, in order, in every
+    structured field the writer owns, with their own photos -
+    otherwise no change is saved at all."""
 
     temp_path = _write_temp_docx(new_bytes)
 
@@ -779,16 +799,19 @@ def _validate_canonical_table(
         )
 
     for expected, actual in zip(expected_contacts, reparsed):
-        if (
-            _normalize_text(expected.contact_person or "").casefold()
-            != _normalize_text(actual.contact_person or "").casefold()
-            or _normalize_text(expected.email or "").casefold()
-            != _normalize_text(actual.email or "").casefold()
-        ):
+        mismatched_fields = [
+            field
+            for field in _VALIDATED_CONTACT_FIELDS
+            if _normalized_field_value(expected, field)
+            != _normalized_field_value(actual, field)
+        ]
+
+        if mismatched_fields:
             raise ContactAreaError(
                 "The rebuilt canonical table did not round-trip back "
-                "out with the same contacts in the same order - no "
-                "change was saved."
+                "out with the same contacts in the same order - "
+                f"field(s) changed: {', '.join(mismatched_fields)} - "
+                "no change was saved."
             )
 
     if any(sha is not None for sha in expected_photo_shas):

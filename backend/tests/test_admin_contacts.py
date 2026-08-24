@@ -1283,6 +1283,235 @@ class DownloadByteStabilityTests(unittest.TestCase):
 
 
 # =========================================================================
+# UPDATE MUST SYNCHRONIZE THE SOURCE DOCX (not just ContactState)
+# =========================================================================
+
+
+class UpdateContactPersistsToSourceTests(unittest.TestCase):
+    """
+    Regression coverage for a real bug: update_contact() used to only
+    write ContactState/OpenSearch, never calling
+    _synchronize_source_document() the way add_contact()/
+    delete_contact() both already did - so a real Admin "Update
+    Contact" text edit reported success and the ContactState/list
+    endpoints reflected the new value, but the actual persisted (and
+    therefore downloadable) source DOCX silently kept serving the OLD
+    value until some unrelated later mutation happened to trigger a
+    fresh rebuild. This was masked before the "DOCX HARDENING" mission
+    made download a pure byte read - the OLD download path used to
+    call materialize_effective_docx() on every GET, which rebuilt
+    fresh from ContactState regardless, hiding the gap.
+
+    test_source_equals_download_after_update above only proves
+    download reads exactly what's on disk - it does NOT prove the
+    disk copy actually reflects the update, since download and the
+    persisted file are the same bytes by construction even when
+    update_contact never wrote anything new. These tests inspect the
+    actual DOCX content instead of only comparing two reads of
+    whatever is already there.
+    """
+
+    def _sha(self, path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_update_persists_new_value_into_source_docx_and_download(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(member_firm="Firm A"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                update_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=contact.contact_id,
+                    fields=_write_request(member_firm="Firm B"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+
+            persisted_contacts = extract_contacts_from_docx(
+                persisted_path, country=None
+            )
+            self.assertEqual(1, len(persisted_contacts))
+            self.assertEqual("Firm B", persisted_contacts[0].member_firm)
+            self.assertNotEqual(
+                "Firm A", persisted_contacts[0].member_firm,
+                "the old value must no longer be the effective contact "
+                "value in the persisted document",
+            )
+
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+            downloaded_contacts = extract_contacts_from_docx(
+                download.path, country=None
+            )
+            self.assertEqual(1, len(downloaded_contacts))
+            self.assertEqual(
+                "Firm B", downloaded_contacts[0].member_firm
+            )
+
+    def test_repeated_updates_persist_the_final_value(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(member_firm="Firm A"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                update_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=contact.contact_id,
+                    fields=_write_request(member_firm="Firm B"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                update_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=contact.contact_id,
+                    fields=_write_request(member_firm="Firm C"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            persisted_contacts = extract_contacts_from_docx(
+                persisted_path, country=None
+            )
+
+            self.assertEqual(1, len(persisted_contacts))
+            self.assertEqual("Firm C", persisted_contacts[0].member_firm)
+
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            downloaded_contacts = extract_contacts_from_docx(
+                download.path, country=None
+            )
+            self.assertEqual(
+                "Firm C", downloaded_contacts[0].member_firm
+            )
+
+    def test_update_persists_when_contact_has_no_existing_photo(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(
+                        member_firm="Firm A", phone="+1 555 0100"
+                    ),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                update_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=contact.contact_id,
+                    fields=_write_request(
+                        member_firm="Firm A", phone="+1 555 9999"
+                    ),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            persisted_contacts = extract_contacts_from_docx(
+                persisted_path, country=None
+            )
+
+            self.assertEqual(1, len(persisted_contacts))
+            self.assertEqual("+1 555 9999", persisted_contacts[0].phone)
+
+            photos = extract_contact_photo_candidates(persisted_path)
+            self.assertEqual(0, len(photos))
+
+    def test_update_persists_when_contact_already_has_a_photo(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(member_firm="Firm A"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+                replace_admin_contact_photo(
+                    source_directory,
+                    DOCUMENT_ID,
+                    contact.contact_id,
+                    data=_make_png(64, 64, (10, 20, 30)),
+                    content_type="image/png",
+                    client=client,
+                )
+                update_contact(
+                    document_id=DOCUMENT_ID,
+                    contact_id=contact.contact_id,
+                    fields=_write_request(member_firm="Firm A Updated"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            persisted_contacts = extract_contacts_from_docx(
+                persisted_path, country=None
+            )
+
+            self.assertEqual(1, len(persisted_contacts))
+            self.assertEqual(
+                "Firm A Updated", persisted_contacts[0].member_firm
+            )
+
+            photos = extract_contact_photo_candidates(persisted_path)
+            self.assertEqual(
+                1, len(photos),
+                "a text-only update must not drop the contact's "
+                "already-attached photo",
+            )
+
+            download = get_document_download(
+                document_id=DOCUMENT_ID,
+                source_directory=source_directory,
+                client=client,
+            )
+            self.assertEqual(
+                self._sha(download.path), self._sha(persisted_path)
+            )
+
+
+# =========================================================================
 # ROLLBACK
 # =========================================================================
 
@@ -1354,6 +1583,47 @@ class ContactRollbackTests(unittest.TestCase):
                     source_directory, DOCUMENT_ID
                 )
             )
+
+    def test_update_index_failure_restores_previous_source_and_state(
+        self,
+    ) -> None:
+        """Mirrors test_index_failure_restores_previous_state_and_marker
+        above, for update_contact()'s own new source-DOCX
+        synchronization: if the ContactState/index commit fails AFTER
+        the DOCX has already been rebuilt with the new value, the DOCX
+        must be restored to its exact prior bytes, not left holding
+        the new value while ContactState still reports the old one."""
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            _seed_placeholder_source_docx(source_directory)
+            client = FakeContactOpenSearchClient()
+
+            with _patched_indexer(client):
+                contact = add_contact(
+                    document_id=DOCUMENT_ID,
+                    fields=_write_request(member_firm="Firm A"),
+                    source_directory=source_directory,
+                    client=client,
+                )
+
+            persisted_path = source_directory / "GB.docx"
+            bytes_before = persisted_path.read_bytes()
+
+            with _patched_indexer(client, fail_bulk=True):
+                with self.assertRaises(AdminContactMutationFailedError):
+                    update_contact(
+                        document_id=DOCUMENT_ID,
+                        contact_id=contact.contact_id,
+                        fields=_write_request(member_firm="Firm B"),
+                        source_directory=source_directory,
+                        client=client,
+                    )
+
+            self.assertEqual(bytes_before, persisted_path.read_bytes())
+
+            state = read_contact_state(source_directory, DOCUMENT_ID)
+            self.assertEqual(state.contacts[0].member_firm, "Firm A")
 
     def test_rollback_itself_failing_raises_rollback_error(self) -> None:
         with tempfile.TemporaryDirectory() as root:

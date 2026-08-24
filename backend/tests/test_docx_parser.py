@@ -15,6 +15,7 @@ from app.services.docx_parser import (
     extract_contacts_from_docx,
     parse_contact_blocks,
     parse_docx_sections,
+    _classify_canonical_firm_lines,
 )
 
 
@@ -2213,6 +2214,166 @@ class PlainParagraphContactFallbackTests(unittest.TestCase):
                 contact.phone,
                 "+1 555 111 2222",
             )
+
+
+class ClassifyCanonicalFirmLinesTests(unittest.TestCase):
+    """
+    Direct, corpus-independent coverage of
+    _classify_canonical_firm_lines - the canonical table reader's
+    field classifier, fixed to be semantic (content-based) rather
+    than position-only. Corpus regressions for the real documents
+    this was found against (IE/IN/US) live in
+    test_contact_document_area.py; these tests pin the underlying
+    classification rules precisely, for every input shape called out
+    by the mission: clean/international/spaced/+-prefixed phones,
+    a phone occupying the first line when member_firm is empty, a
+    phone with a trailing annotation, and a website mentioned inside
+    address prose vs. one on its own dedicated line.
+    """
+
+    def test_normal_case_all_four_fields_present(self) -> None:
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            [
+                "HARMERS WORKPLACE LAWYERS",
+                "31 Market Street, Level 27 St Martins Tower, NSW 2000 Sydney",
+                "+61 292 674 322",
+                "WWW.HARMERS.COM.AU",
+            ]
+        )
+        self.assertEqual("HARMERS WORKPLACE LAWYERS", member_firm)
+        self.assertEqual("+61 292 674 322", phone)
+        self.assertEqual("WWW.HARMERS.COM.AU", website)
+        self.assertEqual(
+            ["31 Market Street, Level 27 St Martins Tower, NSW 2000 Sydney"],
+            [
+                ["HARMERS WORKPLACE LAWYERS",
+                 "31 Market Street, Level 27 St Martins Tower, NSW 2000 Sydney",
+                 "+61 292 674 322", "WWW.HARMERS.COM.AU"][i]
+                for i in remaining
+            ],
+        )
+
+    def test_clean_phone(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+1 5551234567"])
+        self.assertEqual("+1 5551234567", phone)
+
+    def test_international_phone(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+81 355 012 111"])
+        self.assertEqual("+81 355 012 111", phone)
+
+    def test_phone_with_spaces(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+46 852 206 500"])
+        self.assertEqual("+46 852 206 500", phone)
+
+    def test_phone_with_plus_prefix(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+353 1 234 5678"])
+        self.assertEqual("+353 1 234 5678", phone)
+
+    def test_phone_without_plus_prefix(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["1 212 545 4050"])
+        self.assertEqual("1 212 545 4050", phone)
+
+    def test_phone_as_first_firm_side_line_no_member_firm(self) -> None:
+        """Quirk B: a contact whose member_firm/address/website are
+        all empty has its phone land on line 0 - it must still be
+        recognized as phone, never misread as member_firm."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            ["+1 555 000 0000"]
+        )
+        self.assertIsNone(member_firm)
+        self.assertEqual("+1 555 000 0000", phone)
+        self.assertIsNone(website)
+        self.assertEqual([], remaining)
+
+    def test_phone_with_trailing_annotation_preserved_whole(self) -> None:
+        """Quirk A: a phone value with a trailing annotation must be
+        preserved in its ENTIRETY as the phone field - never split,
+        with the remainder leaking into address."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            [
+                "Cederquist",
+                "Hovslagargatan 3, SE-111 96 Stockholm",
+                "+46 852 206 500 (updated)",
+                "www.cederquist.se",
+            ]
+        )
+        self.assertEqual("Cederquist", member_firm)
+        self.assertEqual("+46 852 206 500 (updated)", phone)
+        self.assertEqual("www.cederquist.se", website)
+        self.assertEqual(
+            ["Hovslagargatan 3, SE-111 96 Stockholm"],
+            [
+                [
+                    "Cederquist",
+                    "Hovslagargatan 3, SE-111 96 Stockholm",
+                    "+46 852 206 500 (updated)",
+                    "www.cederquist.se",
+                ][i]
+                for i in remaining
+            ],
+        )
+
+    def test_phone_as_first_line_with_annotation_combined(self) -> None:
+        """Quirk A and Quirk B together: no member_firm AND a phone
+        annotation on the same, first line."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            ["+353 1 234 5678 (mobile)"]
+        )
+        self.assertIsNone(member_firm)
+        self.assertEqual("+353 1 234 5678 (mobile)", phone)
+        self.assertEqual([], remaining)
+
+    def test_website_mentioned_inside_address_prose_is_not_extracted(self) -> None:
+        """Quirk C: an address sentence that merely MENTIONS a URL
+        (with its own sentence-ending punctuation attached) must never
+        be misread as the website field - only a line that is, in its
+        entirety, just a URL is the dedicated website field."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            [
+                "Jackson Lewis PC",
+                "USA, 666 Third Avenue, 29th Floor, 10017 New York, Jackson "
+                "Lewis has over 60 offices throughout the USA. , For "
+                "information, please see www.jacksonlewis.com.",
+                "1 212 545 4050",
+                "www.jacksonlewis.com",
+            ]
+        )
+        self.assertEqual("Jackson Lewis PC", member_firm)
+        self.assertEqual("1 212 545 4050", phone)
+        self.assertEqual("www.jacksonlewis.com", website)
+        remaining_lines = [
+            [
+                "Jackson Lewis PC",
+                "USA, 666 Third Avenue, 29th Floor, 10017 New York, Jackson "
+                "Lewis has over 60 offices throughout the USA. , For "
+                "information, please see www.jacksonlewis.com.",
+                "1 212 545 4050",
+                "www.jacksonlewis.com",
+            ][i]
+            for i in remaining
+        ]
+        self.assertEqual(1, len(remaining_lines))
+        self.assertIn("please see www.jacksonlewis.com.", remaining_lines[0])
+
+    def test_no_phone_or_website_present(self) -> None:
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            ["Some Firm Ltd", "123 Some Street"]
+        )
+        self.assertEqual("Some Firm Ltd", member_firm)
+        self.assertIsNone(phone)
+        self.assertIsNone(website)
+        self.assertEqual([1], remaining)
+
+    def test_empty_firm_lines(self) -> None:
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines([])
+        self.assertIsNone(member_firm)
+        self.assertIsNone(phone)
+        self.assertIsNone(website)
+        self.assertEqual([], remaining)
 
 
 if __name__ == "__main__":

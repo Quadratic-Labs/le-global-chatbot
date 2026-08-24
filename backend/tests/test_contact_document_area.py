@@ -20,6 +20,7 @@ import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document as WordDocument
 
@@ -72,6 +73,10 @@ def _make_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
 
 
 _VALID_PNG = _make_png(183, 234, (200, 50, 50))
+
+_WP_NS = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_PIC_NS = "{http://schemas.openxmlformats.org/drawingml/2006/picture}"
 
 
 class ContactDocumentAreaTests(unittest.TestCase):
@@ -148,6 +153,39 @@ class ContactDocumentAreaTests(unittest.TestCase):
         # closely related to, unlike a bare lxml.fromstring check).
         WordDocument(path)
 
+    def _decorative_top_and_bottom_wrapped_shapes(
+        self, document_xml: str
+    ) -> int:
+        """Count floating shapes wrapped topAndBottom that carry
+        neither real text nor a picture - contact_document_area.py's
+        own removal target for the legacy reserved-space rectangle
+        ("the tallest topAndBottom-wrapped shape with neither text nor
+        a picture", per its module docstring). Checking this semantic
+        invariant directly - rather than hardcoding an expected shape
+        count - stays correct whether or not a given source document
+        still happens to carry a decorative rectangle: real organic
+        content drifts over time (a page's own title text box, for
+        example, is also wrapped topAndBottom, has real text, and must
+        never be mistaken for a removal candidate)."""
+
+        root = ET.fromstring(document_xml)
+        decorative = 0
+
+        for anchor in root.iter(f"{_WP_NS}anchor"):
+            if anchor.find(f"{_WP_NS}wrapTopAndBottom") is None:
+                continue
+
+            has_text = any(
+                (node.text or "").strip()
+                for node in anchor.iter(f"{_W_NS}t")
+            )
+            has_picture = anchor.find(f".//{_PIC_NS}pic") is not None
+
+            if not has_text and not has_picture:
+                decorative += 1
+
+        return decorative
+
     def _table_xml(self, document_xml: str) -> str:
         marker_index = document_xml.find(CONTACT_TABLE_HIDDEN_MARKER)
         self.assertNotEqual(
@@ -165,7 +203,18 @@ class ContactDocumentAreaTests(unittest.TestCase):
     ) -> None:
         """Test items 1 and 2: canonicalizing AU's own organic contact
         area leaves no large empty band (Introduction follows the new
-        table directly) and the sole contact keeps its own photo."""
+        table directly) and the sole contact keeps its own photo.
+
+        The "no empty band" check asserts the semantic contract
+        directly (no decorative, text-less/picture-less
+        topAndBottom-wrapped shape survives, and no NEW one is
+        introduced) rather than a hardcoded shape count: AU's own real
+        content has drifted since this test was written and its
+        current baseline no longer carries a separate removable
+        reserved-space rectangle at all (verified directly against the
+        real corpus - AU's only topAndBottom-wrapped shape today is
+        its own title text box, which legitimately survives
+        unchanged)."""
 
         path = self._require_copy("AU.docx")
 
@@ -215,20 +264,28 @@ class ContactDocumentAreaTests(unittest.TestCase):
             "all - only ordinary inline content",
         )
 
-        # No large reserved band: the legacy reserved-space rectangle
-        # is gone (the baseline's OTHER wrapTopAndBottom shape - its
-        # own cover-page title textbox, which has real text and is
-        # never a removal candidate - legitimately survives, so this
-        # compares counts rather than asserting zero). Each shape
-        # contributes exactly one "wrapTopAndBottom" substring match
-        # (its own DrawingML Choice branch only - the VML Fallback
-        # branch spells it differently, type="topAndBottom"), so
-        # removing exactly the rectangle drops the count by exactly 1.
+        # No large reserved band: no decorative, text-less/picture-less
+        # topAndBottom-wrapped shape (the legacy reserved-space
+        # rectangle) survives canonicalization - whether or not this
+        # particular source document still happened to carry one.
+        # Real content wrapped the same way (a title text box) is
+        # never a removal candidate and must be untouched.
         self.assertEqual(
-            original_wrap_count - 1,
+            0,
+            self._decorative_top_and_bottom_wrapped_shapes(document_xml),
+            "no decorative, text-less, picture-less topAndBottom "
+            "rectangle may survive canonicalization",
+        )
+        # Each real shape contributes exactly one "wrapTopAndBottom"
+        # substring match (its own DrawingML Choice branch only - the
+        # VML Fallback branch spells it differently,
+        # type="topAndBottom"), so canonicalization must never
+        # introduce a NEW one.
+        self.assertLessEqual(
             document_xml.count("wrapTopAndBottom"),
-            "exactly the reserved-space rectangle must be gone, "
-            "leaving only the title textbox's own occurrence",
+            original_wrap_count,
+            "canonicalization must never introduce a new "
+            "topAndBottom-wrapped shape",
         )
 
         reparsed = extract_contacts_from_docx(path, country="Australia")
@@ -617,6 +674,167 @@ class ContactDocumentAreaTests(unittest.TestCase):
             "scherrmann@flichy.com, bacquet@flichy.com",
             reparsed[0].email,
         )
+
+    def test_ie_empty_firm_cell_phone_addition_round_trips(self) -> None:
+        """Quirk B, real case: IE's real contact (Aoife Bradley) has
+        member_firm/address/phone/website all empty. Giving her a
+        phone value must land it as phone - never misread as
+        member_firm (which the writer would otherwise never have
+        written in the first place, since it was empty to begin
+        with)."""
+
+        path = self._require_copy("IE.docx")
+        baseline = extract_contacts_from_docx(path, country="Ireland")
+        self.assertEqual(1, len(baseline))
+        self.assertIsNone(baseline[0].member_firm)
+        self.assertIsNone(baseline[0].phone)
+
+        with_phone = ExtractedContact(
+            contact_person=baseline[0].contact_person,
+            phone="+353 1 234 5678",
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            path,
+            contacts=(with_phone,),
+            photos=(None,),
+            country="Ireland",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="Ireland")
+        self.assertEqual(1, len(reparsed))
+        self.assertIsNone(reparsed[0].member_firm)
+        self.assertEqual("+353 1 234 5678", reparsed[0].phone)
+
+    def test_in_empty_firm_cell_phone_addition_round_trips(self) -> None:
+        """Quirk B, real case: IN's real contact (Avik Biswas) has the
+        same all-empty firm side as IE's."""
+
+        path = self._require_copy("IN.docx")
+        baseline = extract_contacts_from_docx(path, country="India")
+        self.assertEqual(1, len(baseline))
+        self.assertIsNone(baseline[0].member_firm)
+        self.assertIsNone(baseline[0].phone)
+
+        with_phone = ExtractedContact(
+            contact_person=baseline[0].contact_person,
+            email=baseline[0].email,
+            phone="+91 11 4567 8900",
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            path,
+            contacts=(with_phone,),
+            photos=(None,),
+            country="India",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="India")
+        self.assertEqual(1, len(reparsed))
+        self.assertIsNone(reparsed[0].member_firm)
+        self.assertEqual("+91 11 4567 8900", reparsed[0].phone)
+
+    def test_us_noop_rebuild_preserves_embedded_url_and_website(self) -> None:
+        """Quirk C, real case: US's real address is a prose sentence
+        that mentions "www.jacksonlewis.com." (with its own
+        sentence-ending period), and website is the separate, clean
+        "www.jacksonlewis.com". A no-op rebuild (identical fields, no
+        edit at all) must reproduce BOTH exactly - the embedded
+        mention must never be mistaken for the dedicated website
+        line, and the dedicated website line must never pick up the
+        sentence's trailing punctuation."""
+
+        path = self._require_copy("US.docx")
+        baseline = extract_contacts_from_docx(path, country="United States")
+        self.assertEqual(1, len(baseline))
+        self.assertIn("please see www.jacksonlewis.com.", baseline[0].address)
+        self.assertEqual("www.jacksonlewis.com", baseline[0].website)
+
+        new_bytes = rebuild_canonical_contact_table(
+            path,
+            contacts=tuple(baseline),
+            photos=(None,),
+            country="United States",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="United States")
+        self.assertEqual(1, len(reparsed))
+        self.assertEqual(baseline[0].address, reparsed[0].address)
+        self.assertEqual("www.jacksonlewis.com", reparsed[0].website)
+
+    def test_phone_with_trailing_annotation_round_trips(self) -> None:
+        """Quirk A, real case: AU's real phone value, given a
+        trailing annotation an Admin might legitimately type (e.g.
+        "(mobile)"), must round-trip as ONE whole phone value -
+        never split, with the annotation leaking into address."""
+
+        path = self._require_copy("AU.docx")
+        baseline = extract_contacts_from_docx(path, country="Australia")[0]
+
+        annotated = ExtractedContact(
+            member_firm=baseline.member_firm,
+            contact_person=baseline.contact_person,
+            email=baseline.email,
+            phone=f"{baseline.phone} (mobile)",
+            address=baseline.address,
+            website=baseline.website,
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            path,
+            contacts=(annotated,),
+            photos=(None,),
+            country="Australia",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="Australia")
+        self.assertEqual(1, len(reparsed))
+        self.assertEqual(f"{baseline.phone} (mobile)", reparsed[0].phone)
+        self.assertEqual(baseline.address, reparsed[0].address)
+
+    def test_full_field_validator_rejects_a_field_shift(self) -> None:
+        """The strengthened _validate_canonical_table() must reject a
+        rebuild whose re-parsed contact shows a field-shift (a phone
+        value landing in member_firm) - not just a contact_person/
+        email mismatch. Simulated via a patched extract_contacts_
+        from_docx, since the real reader no longer produces this
+        shift on its own (that's the fix)."""
+
+        path = self._require_copy("AU.docx")
+        baseline = extract_contacts_from_docx(path, country="Australia")[0]
+
+        shifted = ExtractedContact(
+            member_firm=baseline.phone,
+            contact_person=baseline.contact_person,
+            email=baseline.email,
+            phone=None,
+            address=baseline.address,
+            website=baseline.website,
+        )
+
+        with patch(
+            "app.services.contact_document_area.extract_contacts_from_docx",
+            return_value=[shifted],
+        ):
+            with self.assertRaises(ContactAreaError) as raised:
+                rebuild_canonical_contact_table(
+                    path,
+                    contacts=(baseline,),
+                    photos=(None,),
+                    country="Australia",
+                )
+
+        message = str(raised.exception)
+        self.assertIn("member_firm", message)
+        self.assertIn("phone", message)
 
 
 def _sha(data: bytes) -> str:
