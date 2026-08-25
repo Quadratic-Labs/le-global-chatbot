@@ -3072,6 +3072,129 @@ class ReseedContactStateFromParsedContactsTests(unittest.TestCase):
             self.assertEqual(state.contacts, ())
 
 
+class BrazilStaleContactStateMigrationTests(unittest.TestCase):
+    """
+    Mission "FINAL CONTACT CRUD BLOCKER", item K: investigate why the
+    currently-PERSISTED ContactState for Brazil has address/phone
+    inverted (address="Rua Borges Lagoa, 1328, 04038-904 Sao Paulo,
+    +55 115 086 5000", phone="04038-904" - confirmed directly against
+    the real production sidecar for Brazil's current document_id).
+
+    This is NOT reproducible today from Brazil's real organic DOCX: a
+    fresh extract_contacts_from_docx() against the real corpus file
+    already returns the CORRECT split (phone="+55 115 086 5000",
+    address up to "...Sao Paulo" without the phone) - confirmed
+    directly. The persisted sidecar is a STALE artifact from an
+    earlier heuristic-parser generation, frozen in place because
+    every later Add attempt failed cleanly at the canonical-table
+    round-trip validation step (the bug this mission's writer/parser
+    fix addresses) BEFORE ever reaching a ContactState commit - so the
+    stale sidecar was never overwritten, correct or not.
+
+    This does NOT silently correct that production data. It proves the
+    SAFE MIGRATION PATH: an explicit reseed from the current on-disk
+    DOCX (reseed_contact_state_from_parsed_contacts / reseed_contacts_
+    from_current_docx) discards the stale sidecar and replaces it with
+    values freshly parsed from the current file - which are already
+    correct today. Recommendation: run this reseed explicitly for
+    Brazil's document_id as a deliberate, visible Admin action after
+    this fix ships - never automatically as a side effect of this PR.
+    """
+
+    def _require_copy(self, filename: str) -> Path:
+        source = SOURCE_ROOT / filename
+
+        if not source.exists():
+            self.skipTest(f"Real corpus source unavailable: {source}")
+
+        return source
+
+    def test_brazil_organic_docx_already_parses_correctly_today(
+        self,
+    ) -> None:
+        """Locks in today's correct legacy-heuristic behavior as a
+        permanent regression, so a future change to the organic
+        parser cannot silently reintroduce this exact inversion."""
+
+        path = self._require_copy(
+            "Labour and Employment Law in Brazil 2026.docx"
+        )
+
+        contacts = extract_contacts_from_docx(path, country="Brazil")
+
+        self.assertEqual(1, len(contacts))
+        self.assertEqual("Gabriela Lima", contacts[0].contact_person)
+        self.assertEqual("+55 115 086 5000", contacts[0].phone)
+        self.assertEqual(
+            "Rua Borges Lagoa, 1328, 04038-904 São Paulo",
+            contacts[0].address,
+        )
+
+    def test_reseed_from_current_docx_replaces_stale_inverted_state(
+        self,
+    ) -> None:
+        """The actual migration path, proven safe in isolation: seed a
+        SCRATCH ContactState with the exact stale, inverted values
+        currently persisted in real production, then reseed from the
+        real (scratch-copied) Brazil DOCX - the result must carry the
+        CORRECT values, never the stale ones, and never touch the real
+        production sidecar."""
+
+        path = self._require_copy(
+            "Labour and Employment Law in Brazil 2026.docx"
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            source_directory = Path(root)
+            document_id = _real_document_id_for("BR")
+
+            write_contact_state_atomic(
+                source_directory,
+                ContactState(
+                    document_id=document_id,
+                    country_code="BR",
+                    contacts=(
+                        _full_contact_record(
+                            member_firm="Tozzini Freire",
+                            contact_person="Gabriela Lima",
+                            email="glima@tozzinifreire.com.br",
+                            address=(
+                                "Rua Borges Lagoa, 1328, 04038-904 "
+                                "São Paulo, +55 115 086 5000"
+                            ),
+                            phone="04038-904",
+                            website="www.tozzinifreire.com.br",
+                        ),
+                    ),
+                ),
+            )
+
+            parsed = extract_contacts_from_docx(path, country="Brazil")
+
+            reseed_contact_state_from_parsed_contacts(
+                document_id=document_id,
+                country_code="BR",
+                source_directory=source_directory,
+                contacts=parsed,
+            )
+
+            migrated_state = read_contact_state(
+                source_directory, document_id
+            )
+
+            self.assertEqual(1, len(migrated_state.contacts))
+            migrated_contact = migrated_state.contacts[0]
+
+            self.assertEqual(
+                "+55 115 086 5000", migrated_contact.phone
+            )
+            self.assertEqual(
+                "Rua Borges Lagoa, 1328, 04038-904 São Paulo",
+                migrated_contact.address,
+            )
+            self.assertNotEqual("04038-904", migrated_contact.phone)
+
+
 class UploadReplaceReseedsContactsIntegrationTests(unittest.TestCase):
     """
     Real safe_upload_and_index_document, proving a genuine

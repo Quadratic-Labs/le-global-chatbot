@@ -130,6 +130,8 @@ from app.services.docx_parser import (
     extract_contacts_from_docx,
     find_plain_paragraph_contact_block_bounds,
     _FIELD_TAG_ADDRESS,
+    _FIELD_TAG_CONTACT_PERSON,
+    _FIELD_TAG_EMAIL,
     _FIELD_TAG_MEMBER_FIRM,
     _FIELD_TAG_PHONE,
     _FIELD_TAG_WEBSITE,
@@ -729,10 +731,12 @@ def _fill_photo_and_person_cell(
     if contact.contact_person:
         name_paragraph = _next_paragraph()
         name_paragraph.paragraph_format.space_after = Pt(2)
-        name_paragraph.add_run(contact.contact_person)
+        _add_tagged_run(
+            name_paragraph, _FIELD_TAG_CONTACT_PERSON, contact.contact_person
+        )
 
     if contact.email:
-        _next_paragraph().add_run(contact.email)
+        _add_tagged_run(_next_paragraph(), _FIELD_TAG_EMAIL, contact.email)
 
 
 def _set_table_cell_margins(table, *, bottom_pt: float) -> None:

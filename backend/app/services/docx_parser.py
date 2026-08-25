@@ -2338,16 +2338,33 @@ CONTACT_TABLE_HIDDEN_MARKER: Final[str] = "LE-GLOBAL-CONTACT-TABLE-V1"
 # _extract_canonical_table_contacts falls back to the same content-
 # based classification for that row, so an already-canonicalized real
 # document is never broken by this change.
+#
+# contact_person/email (the RIGHT cell) were originally left untagged,
+# still read via _EMAIL_PATTERN.findall() - reasonable at the time
+# since they were never the source of an observed field-shift bug, but
+# not actually deterministic: _EMAIL_PATTERN's local-part character
+# class is ASCII-only ([A-Za-z0-9._%+-]), so a real, legitimate email
+# with an accented local part (confirmed directly: "françois@...")
+# gets silently truncated to whatever ASCII suffix follows the
+# accented character, corrupting both email AND (since the truncated
+# prefix then fails to match as an email at all) misclassifying it as
+# a second contact_person line instead. Tagging these two fields the
+# same way as the LEFT cell removes the last content-dependent field
+# in a canonical row.
 _FIELD_TAG_MEMBER_FIRM: Final[str] = "LE-GLOBAL-FIELD-FIRM-V1:"
 _FIELD_TAG_ADDRESS: Final[str] = "LE-GLOBAL-FIELD-ADDRESS-V1:"
 _FIELD_TAG_PHONE: Final[str] = "LE-GLOBAL-FIELD-PHONE-V1:"
 _FIELD_TAG_WEBSITE: Final[str] = "LE-GLOBAL-FIELD-WEBSITE-V1:"
+_FIELD_TAG_CONTACT_PERSON: Final[str] = "LE-GLOBAL-FIELD-PERSON-V1:"
+_FIELD_TAG_EMAIL: Final[str] = "LE-GLOBAL-FIELD-EMAIL-V1:"
 
 _FIELD_TAGS_BY_NAME: Final[dict[str, str]] = {
     "member_firm": _FIELD_TAG_MEMBER_FIRM,
     "address": _FIELD_TAG_ADDRESS,
     "phone": _FIELD_TAG_PHONE,
     "website": _FIELD_TAG_WEBSITE,
+    "contact_person": _FIELD_TAG_CONTACT_PERSON,
+    "email": _FIELD_TAG_EMAIL,
 }
 _FIELD_NAMES_BY_TAG: Final[dict[str, str]] = {
     tag: name for name, tag in _FIELD_TAGS_BY_NAME.items()
@@ -2355,21 +2372,22 @@ _FIELD_NAMES_BY_TAG: Final[dict[str, str]] = {
 
 
 def _extract_tagged_canonical_fields(
-    firm_lines: Sequence[str],
+    lines: Sequence[str],
 ) -> dict[str, str] | None:
     """
-    Deterministically recover member_firm/address/phone/website from
-    one canonical row's left-cell lines when EVERY line carries one of
-    the hidden field tags above (a table written by the current
-    writer). Returns None - never a partial result - the instant any
-    line lacks a recognized tag, so the caller falls back to content-
-    based classification for that row as a whole (an older canonical
-    table, written before these tags existed).
+    Deterministically recover this canonical row's fields from one
+    cell's lines when EVERY line carries one of the hidden field tags
+    above (a table written by the current writer) - used for both the
+    left cell (member_firm/address/phone/website) and the right cell
+    (contact_person/email). Returns None - never a partial result -
+    the instant any line lacks a recognized tag, so the caller falls
+    back to content-based classification for that cell as a whole (an
+    older canonical table, written before these tags existed).
     """
 
     fields: dict[str, str] = {}
 
-    for line in firm_lines:
+    for line in lines:
         matched_tag = next(
             (tag for tag in _FIELD_NAMES_BY_TAG if line.startswith(tag)),
             None,
@@ -2615,34 +2633,53 @@ def _extract_canonical_table_contacts(
 
                 address_lines.append(line)
 
-        emails: list[str] = []
-        name_lines: list[str] = []
+        tagged_person_fields = _extract_tagged_canonical_fields(
+            person_lines
+        )
 
-        for line in person_lines:
-            # A contact can legitimately have more than one email
-            # (e.g. two named individuals sharing a firm entry), and
-            # the writer side (_fill_photo_and_person_cell) renders
-            # them all as ONE comma-joined line, exactly mirroring
-            # ContactState's own single `email` string field - so a
-            # single line can itself contain multiple addresses.
-            # findall() (not search()) is required to recover all of
-            # them, in the order they were written, or a round-trip
-            # silently drops every email after the first (the real
-            # France incident: "scherrmann@flichy.com,
-            # bacquet@flichy.com" on one line lost the second address
-            # and the canonical rebuild's own round-trip check
-            # correctly rejected the mutation rather than persist it).
-            line_emails = _EMAIL_PATTERN.findall(line)
+        if tagged_person_fields is not None:
+            # Every line in this cell carries its own hidden field tag
+            # - no content heuristic (nor _EMAIL_PATTERN, which is
+            # ASCII-local-part-only and can corrupt an accented email
+            # such as "françois@...") is consulted at all.
+            contact_person = tagged_person_fields.get("contact_person")
+            email = tagged_person_fields.get("email")
+        else:
+            # No tags at all - a canonical table written before this
+            # mechanism existed. Fall back to the same content-based
+            # classification this reader has always used.
+            emails: list[str] = []
+            name_lines: list[str] = []
 
-            if line_emails:
-                emails.extend(line_emails)
-            else:
-                name_lines.append(line)
+            for line in person_lines:
+                # A contact can legitimately have more than one email
+                # (e.g. two named individuals sharing a firm entry),
+                # and the writer side (_fill_photo_and_person_cell)
+                # renders them all as ONE comma-joined line, exactly
+                # mirroring ContactState's own single `email` string
+                # field - so a single line can itself contain multiple
+                # addresses. findall() (not search()) is required to
+                # recover all of them, in the order they were written,
+                # or a round-trip silently drops every email after the
+                # first (the real France incident:
+                # "scherrmann@flichy.com, bacquet@flichy.com" on one
+                # line lost the second address and the canonical
+                # rebuild's own round-trip check correctly rejected the
+                # mutation rather than persist it).
+                line_emails = _EMAIL_PATTERN.findall(line)
+
+                if line_emails:
+                    emails.extend(line_emails)
+                else:
+                    name_lines.append(line)
+
+            contact_person = name_lines[0] if name_lines else None
+            email = ", ".join(emails) if emails else None
 
         contact = ExtractedContact(
             member_firm=member_firm,
-            contact_person=name_lines[0] if name_lines else None,
-            email=", ".join(emails) if emails else None,
+            contact_person=contact_person,
+            email=email,
             phone=phone,
             address=", ".join(address_lines) if address_lines else None,
             website=website,

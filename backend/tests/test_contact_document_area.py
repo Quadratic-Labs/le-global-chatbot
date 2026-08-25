@@ -950,6 +950,96 @@ class ContactDocumentAreaTests(unittest.TestCase):
                         f"{empty_field!r} was empty",
                     )
 
+    def test_multiple_contacts_with_different_missing_fields_and_a_duplicate(
+        self,
+    ) -> None:
+        """Mission 'FINAL CONTACT CRUD BLOCKER', items C/D/E in one
+        table: several contacts with DIFFERENT missing-field shapes,
+        content deliberately chosen to fool a content-based classifier
+        (a postal code, a phone-like substring embedded in an address,
+        an apartment/unit number, a scheme-less URL, accented/unicode
+        names and an apostrophe), and an exact duplicate pair - all in
+        the SAME canonical table, at once. No field may shift into
+        another contact's slot, and duplicates must survive unmerged."""
+
+        path = self._require_copy("AU.docx")
+
+        firm_only = ExtractedContact(member_firm="Firm Only LLP")
+        person_email_only = ExtractedContact(
+            contact_person="Person Only", email="person-only@example.test"
+        )
+        fooling_shapes = ExtractedContact(
+            member_firm="Müller & O'Connell Associés",
+            address=(
+                "Apt #4B, 12 Rue de l'Église, 75008 Paris, "
+                "+33 1 23 45 67 89"
+            ),
+            phone="75008",
+            website="fooling-shapes.example",
+            contact_person="François O'Connell-Müller",
+            email="françois@fooling-shapes.example",
+        )
+        duplicate_a = ExtractedContact(
+            member_firm="Duplicate LLP",
+            contact_person="Duplicate Person",
+            email="duplicate@example.test",
+        )
+        duplicate_b = ExtractedContact(
+            member_firm="Duplicate LLP",
+            contact_person="Duplicate Person",
+            email="duplicate@example.test",
+        )
+
+        contacts = (
+            firm_only,
+            person_email_only,
+            fooling_shapes,
+            duplicate_a,
+            duplicate_b,
+        )
+        photos = (None,) * len(contacts)
+
+        new_bytes = rebuild_canonical_contact_table(
+            path, contacts=contacts, photos=photos, country="Australia",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="Australia")
+        self.assertEqual(list(contacts), reparsed)
+
+    def test_accented_email_local_part_never_corrupted(self) -> None:
+        """Real bug found while building the item C/D/E combinatorial
+        test above: _EMAIL_PATTERN's local-part character class is
+        ASCII-only, so an email with an accented local part (a
+        genuinely legitimate address, e.g. a French admin's own name)
+        was silently truncated on read-back, and the truncated
+        fragment then failed to even look like an email, spilling into
+        contact_person instead. contact_person/email are now tagged
+        the same deterministic way as the left cell's four fields, so
+        this no longer depends on _EMAIL_PATTERN at all for a
+        canonical table this code itself wrote."""
+
+        path = self._require_copy("AU.docx")
+
+        contact = ExtractedContact(
+            contact_person="François Müller",
+            email="françois.müller@example.test",
+        )
+
+        new_bytes = rebuild_canonical_contact_table(
+            path, contacts=(contact,), photos=(None,), country="Australia",
+        )
+        path.write_bytes(new_bytes)
+        self._structural_checks(path)
+
+        reparsed = extract_contacts_from_docx(path, country="Australia")
+        self.assertEqual(1, len(reparsed))
+        self.assertEqual("François Müller", reparsed[0].contact_person)
+        self.assertEqual(
+            "françois.müller@example.test", reparsed[0].email
+        )
+
     def test_webp_lossless_contact_photo_can_be_embedded(self) -> None:
         """Real bug, reproduced directly against pre-fix code: python-
         docx 1.2.0 has no WebP header parser at all, so ANY Add+Photo/
@@ -1833,6 +1923,8 @@ class ContactDocumentAreaTests(unittest.TestCase):
         # exactly as an untagged table always looked.
         from app.services.docx_parser import (
             _FIELD_TAG_ADDRESS,
+            _FIELD_TAG_CONTACT_PERSON,
+            _FIELD_TAG_EMAIL,
             _FIELD_TAG_MEMBER_FIRM,
             _FIELD_TAG_PHONE,
             _FIELD_TAG_WEBSITE,
@@ -1844,6 +1936,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
         for tag in (
             _FIELD_TAG_MEMBER_FIRM, _FIELD_TAG_ADDRESS,
             _FIELD_TAG_PHONE, _FIELD_TAG_WEBSITE,
+            _FIELD_TAG_CONTACT_PERSON, _FIELD_TAG_EMAIL,
         ):
             self.assertIn(
                 tag, document_xml,
@@ -1869,6 +1962,225 @@ def _sha(data: bytes) -> str:
     import hashlib
 
     return hashlib.sha256(data).hexdigest()
+
+
+def _build_synthetic_france_shaped_docx(path: Path) -> None:
+    """
+    A minimal, from-scratch DOCX matching France's own real structure
+    exactly enough to exercise find_plain_paragraph_contact_block_
+    bounds / split_combined_legacy_contact / rebuild_canonical_
+    contact_table the same way real FR.docx used to, before real Admin
+    usage canonicalized it in production (real corpus content drift -
+    see ContactDocumentAreaTests._france_split_contacts).
+
+    Shape: title -> padding body paragraphs (legal-looking filler, so
+    the eventual canonical table lands well past the document start,
+    matching the real "table must not land at the very start" check) ->
+    the legacy plain-paragraph contact block (person / role+firm /
+    comma-joined emails / phone) -> "YOUR L&E GLOBAL POC" -> Jessica
+    Stout (the project-level POC, never a member-firm contact) ->
+    disclaimer.
+    """
+
+    document = WordDocument()
+    document.add_paragraph("Employment Law Overview - France")
+
+    for index in range(12):
+        document.add_paragraph(
+            f"Filler legal paragraph number {index} with enough text "
+            "to look like real body content."
+        )
+
+    document.add_paragraph("Caroline Scherrmann and Florence Bacquet")
+    document.add_paragraph("Partners, Flichy Grangé Avocats")
+    document.add_paragraph("scherrmann@flichy.com, bacquet@flichy.com")
+    document.add_paragraph("+33 1 56 62 30 00")
+
+    document.add_paragraph("YOUR L&E GLOBAL POC")
+    document.add_paragraph("Jessica Stout")
+    document.add_paragraph("jstout@leglobal.law")
+
+    document.add_paragraph(
+        "Disclaimer: this publication is for informational purposes "
+        "only and does not constitute legal advice."
+    )
+
+    document.save(path)
+
+
+class FranceSyntheticContactCrudTests(unittest.TestCase):
+    """
+    Permanent, corpus-independent coverage of France's own special
+    contact shape (mission "FINAL CONTACT CRUD BLOCKER", item H) - a
+    synthetic fixture built fresh in setUp, immune to real corpus
+    content drift (unlike ContactDocumentAreaTests._france_split_
+    contacts, which now skips because real FR.docx has since been
+    canonicalized by genuine Admin usage in production).
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "france-synthetic.docx"
+        _build_synthetic_france_shaped_docx(self.path)
+
+    def _split_contacts(self) -> tuple[ExtractedContact, ExtractedContact]:
+        combined = extract_contacts_from_docx(
+            self.path, country="France"
+        )[0]
+        split = split_combined_legacy_contact(combined)
+        self.assertIsNotNone(split)
+        self.assertEqual(2, len(split))
+        return split[0], split[1]
+
+    def test_canonical_table_replaces_legacy_block_before_poc(
+        self,
+    ) -> None:
+        caroline, florence = self._split_contacts()
+
+        new_bytes = rebuild_canonical_contact_table(
+            self.path,
+            contacts=(caroline, florence),
+            photos=(None, None),
+            country="France",
+        )
+        self.path.write_bytes(new_bytes)
+
+        document = WordDocument(self.path)
+        full_text = "\n".join(p.text for p in document.paragraphs)
+
+        self.assertEqual(1, len(document.tables))
+        self.assertEqual(
+            0,
+            full_text.count("Caroline Scherrmann and Florence Bacquet"),
+            "the old legacy combined-name paragraph must be gone",
+        )
+        self.assertEqual(1, full_text.count("YOUR L&E GLOBAL POC"))
+        self.assertEqual(1, full_text.count("Jessica Stout"))
+
+        body_children = list(document.element.body)
+        table_position = next(
+            i for i, child in enumerate(body_children)
+            if child.tag.endswith("}tbl")
+        )
+        poc_position = next(
+            i for i, child in enumerate(body_children)
+            if child.tag.endswith("}p")
+            and "YOUR L&E GLOBAL POC" in "".join(
+                node.text or "" for node in child.iter()
+                if node.tag.endswith("}t")
+            )
+        )
+        self.assertLess(table_position, poc_position)
+        self.assertGreater(table_position, 10)
+
+        reparsed = extract_contacts_from_docx(self.path, country="France")
+        self.assertEqual(
+            ["Caroline Scherrmann", "Florence Bacquet"],
+            [c.contact_person for c in reparsed],
+        )
+
+    def test_add_temporary_contact_then_delete_round_trips(self) -> None:
+        caroline, florence = self._split_contacts()
+        temporary = ExtractedContact(
+            member_firm="Temp Firm",
+            contact_person="Temporary Person",
+            email="temp@example.com",
+        )
+
+        self.path.write_bytes(
+            rebuild_canonical_contact_table(
+                self.path, contacts=(caroline, florence),
+                photos=(None, None), country="France",
+            )
+        )
+        self.path.write_bytes(
+            rebuild_canonical_contact_table(
+                self.path, contacts=(caroline, florence, temporary),
+                photos=(None, None, None), country="France",
+            )
+        )
+
+        reparsed = extract_contacts_from_docx(self.path, country="France")
+        self.assertEqual(
+            ["Caroline Scherrmann", "Florence Bacquet", "Temporary Person"],
+            [c.contact_person for c in reparsed],
+        )
+
+        self.path.write_bytes(
+            rebuild_canonical_contact_table(
+                self.path, contacts=(caroline, florence),
+                photos=(None, None), country="France",
+            )
+        )
+
+        reparsed = extract_contacts_from_docx(self.path, country="France")
+        self.assertEqual(
+            ["Caroline Scherrmann", "Florence Bacquet"],
+            [c.contact_person for c in reparsed],
+        )
+
+    def test_photo_stays_with_the_correct_split_contact(self) -> None:
+        caroline, florence = self._split_contacts()
+        caroline_photo = ContactPhotoPayload(
+            data=_VALID_PNG, content_type="image/png"
+        )
+
+        self.path.write_bytes(
+            rebuild_canonical_contact_table(
+                self.path,
+                contacts=(caroline, florence),
+                photos=(caroline_photo, None),
+                country="France",
+            )
+        )
+
+        photos = extract_contact_photo_candidates(self.path)
+        self.assertEqual(1, len(photos))
+        self.assertEqual(_sha(caroline_photo.data), photos[0].sha256)
+
+        reparsed = extract_contacts_from_docx(self.path, country="France")
+        self.assertEqual(
+            ["Caroline Scherrmann", "Florence Bacquet"],
+            [c.contact_person for c in reparsed],
+        )
+
+    def test_clearing_website_persists_as_cleared(self) -> None:
+        caroline, florence = self._split_contacts()
+
+        with_website = ExtractedContact(
+            member_firm=caroline.member_firm,
+            contact_person=caroline.contact_person,
+            email=caroline.email,
+            phone=caroline.phone,
+            website="www.example.com",
+        )
+
+        self.path.write_bytes(
+            rebuild_canonical_contact_table(
+                self.path, contacts=(with_website, florence),
+                photos=(None, None), country="France",
+            )
+        )
+        reparsed = extract_contacts_from_docx(self.path, country="France")
+        self.assertEqual("www.example.com", reparsed[0].website)
+
+        cleared = ExtractedContact(
+            member_firm=caroline.member_firm,
+            contact_person=caroline.contact_person,
+            email=caroline.email,
+            phone=caroline.phone,
+            website=None,
+        )
+
+        self.path.write_bytes(
+            rebuild_canonical_contact_table(
+                self.path, contacts=(cleared, florence),
+                photos=(None, None), country="France",
+            )
+        )
+        reparsed = extract_contacts_from_docx(self.path, country="France")
+        self.assertIsNone(reparsed[0].website)
 
 
 if __name__ == "__main__":
