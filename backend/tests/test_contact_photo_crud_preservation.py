@@ -109,9 +109,9 @@ class ContactPhotoCrudPreservationTests(unittest.TestCase):
                 member_firm="Firm",
                 contact_person="Jane Doe",
                 email="jane@example.com",
-                phone="+32 NEW",
+                phone="+32 111 0200",
                 address="New address",
-                website="example.com",
+                website="www.example.com",
             )
 
             with (
@@ -163,7 +163,7 @@ class ContactPhotoCrudPreservationTests(unittest.TestCase):
 
             # Business values really changed.
             self.assertEqual(
-                "+32 NEW",
+                "+32 111 0200",
                 updated.phone,
             )
             self.assertEqual(

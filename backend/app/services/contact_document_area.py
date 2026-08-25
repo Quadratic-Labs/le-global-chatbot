@@ -128,6 +128,11 @@ from app.services.docx_parser import (
     CONTACT_TABLE_HIDDEN_MARKER,
     ExtractedContact,
     extract_contacts_from_docx,
+    find_plain_paragraph_contact_block_bounds,
+    _FIELD_TAG_ADDRESS,
+    _FIELD_TAG_MEMBER_FIRM,
+    _FIELD_TAG_PHONE,
+    _FIELD_TAG_WEBSITE,
 )
 
 
@@ -322,6 +327,47 @@ def _remove_legacy_carrier_and_get_anchor(
     return None
 
 
+def _remove_plain_paragraph_legacy_contact_block_and_get_anchor(
+    document,
+) -> tuple[bool, object | None]:
+    """
+    France-style legacy contact area: a member-firm contact stored in
+    ordinary body paragraphs (person/persons, role+firm, email(s),
+    optional phone) rather than a floating shape - see docx_parser.
+    find_plain_paragraph_contact_block_bounds. Removes exactly those
+    paragraphs and returns (True, anchor_element) where anchor_element
+    is the paragraph immediately preceding the block (None if the
+    block was the very first paragraph(s) in the body - the caller's
+    own existing "None means insert at body start" convention already
+    handles that correctly), so the new canonical table lands at the
+    EXACT same logical position the legacy block occupied.
+
+    Returns (False, None) when this document has no such block at all
+    - the caller must NOT then fall back to a generic default anchor
+    without first checking this: a document whose legacy contact area
+    genuinely exists here must never end up with its canonical table
+    inserted elsewhere while these paragraphs are silently left both
+    unremoved AND undetected.
+    """
+
+    bounds = find_plain_paragraph_contact_block_bounds(document)
+
+    if bounds is None:
+        return False, None
+
+    first_index, last_index = bounds
+    body_paragraphs = document.element.body.findall("w:p", _NSMAP)
+
+    anchor_element = (
+        body_paragraphs[first_index - 1] if first_index > 0 else None
+    )
+
+    for paragraph_element in body_paragraphs[first_index:last_index + 1]:
+        paragraph_element.getparent().remove(paragraph_element)
+
+    return True, anchor_element
+
+
 # --- Canonical table detection/removal ----------------------------------
 
 
@@ -400,6 +446,21 @@ def _new_cell_paragraph(cell, *, used_first: bool):
     return paragraph
 
 
+def _add_tagged_run(paragraph, tag: str, value: str):
+    """A hidden, zero-size run carrying `tag` immediately before the
+    real, visible run carrying `value`, both in the SAME paragraph -
+    invisible in any rendering (same technique as the table's own
+    hidden marker), and what lets _extract_canonical_table_contacts
+    read this exact field back deterministically, by tag, rather than
+    by guessing from the value's own shape. Returns the visible run
+    (the caller may still want to style it, e.g. bold)."""
+
+    tag_run = paragraph.add_run(tag)
+    tag_run.font.hidden = True
+    tag_run.font.size = Pt(1)
+    return paragraph.add_run(value)
+
+
 def _fill_text_cell(
     cell, contact: ExtractedContact, *, hidden_marker: str | None
 ) -> None:
@@ -423,17 +484,22 @@ def _fill_text_cell(
     if contact.member_firm:
         paragraph = _next_paragraph()
         paragraph.paragraph_format.space_after = Pt(9)
-        firm_run = paragraph.add_run(contact.member_firm)
+        firm_run = _add_tagged_run(
+            paragraph, _FIELD_TAG_MEMBER_FIRM, contact.member_firm
+        )
         firm_run.bold = True
 
-    for value in (contact.address, contact.phone):
+    for value, tag in (
+        (contact.address, _FIELD_TAG_ADDRESS),
+        (contact.phone, _FIELD_TAG_PHONE),
+    ):
         if value:
             paragraph = _next_paragraph()
             paragraph.paragraph_format.space_after = Pt(2)
-            paragraph.add_run(value)
+            _add_tagged_run(paragraph, tag, value)
 
     if contact.website:
-        _next_paragraph().add_run(contact.website)
+        _add_tagged_run(_next_paragraph(), _FIELD_TAG_WEBSITE, contact.website)
 
 
 def _fill_photo_and_person_cell(
@@ -719,7 +785,16 @@ def rebuild_canonical_contact_table(
         )
 
         if anchor_element is None:
-            anchor_element = _default_insertion_anchor(document)
+            plain_block_found, plain_anchor_element = (
+                _remove_plain_paragraph_legacy_contact_block_and_get_anchor(
+                    document
+                )
+            )
+
+            if plain_block_found:
+                anchor_element = plain_anchor_element
+            else:
+                anchor_element = _default_insertion_anchor(document)
 
     if contacts:
         table = _build_canonical_table(
@@ -748,6 +823,25 @@ def rebuild_canonical_contact_table(
     return new_bytes
 
 
+# Every structured field the canonical table's writer owns - the full
+# round-trip contract a rebuild must preserve, not just contact_person/
+# email. A field shift (e.g. a phone value landing in member_firm, or
+# a website value landing in address) must fail validation exactly
+# like a lost contact would.
+_VALIDATED_CONTACT_FIELDS = (
+    "member_firm",
+    "address",
+    "phone",
+    "website",
+    "contact_person",
+    "email",
+)
+
+
+def _normalized_field_value(contact: ExtractedContact, field: str) -> str:
+    return _normalize_text(getattr(contact, field) or "").casefold()
+
+
 def _validate_canonical_table(
     new_bytes: bytes,
     *,
@@ -756,8 +850,9 @@ def _validate_canonical_table(
     country: str | None,
 ) -> None:
     """Structural, not just SHA: the rebuilt table must round-trip back
-    out as exactly the intended contacts, in order, with their own
-    photos - otherwise no change is saved at all."""
+    out as exactly the intended contacts, in order, in every
+    structured field the writer owns, with their own photos -
+    otherwise no change is saved at all."""
 
     temp_path = _write_temp_docx(new_bytes)
 
@@ -779,16 +874,19 @@ def _validate_canonical_table(
         )
 
     for expected, actual in zip(expected_contacts, reparsed):
-        if (
-            _normalize_text(expected.contact_person or "").casefold()
-            != _normalize_text(actual.contact_person or "").casefold()
-            or _normalize_text(expected.email or "").casefold()
-            != _normalize_text(actual.email or "").casefold()
-        ):
+        mismatched_fields = [
+            field
+            for field in _VALIDATED_CONTACT_FIELDS
+            if _normalized_field_value(expected, field)
+            != _normalized_field_value(actual, field)
+        ]
+
+        if mismatched_fields:
             raise ContactAreaError(
                 "The rebuilt canonical table did not round-trip back "
-                "out with the same contacts in the same order - no "
-                "change was saved."
+                "out with the same contacts in the same order - "
+                f"field(s) changed: {', '.join(mismatched_fields)} - "
+                "no change was saved."
             )
 
     if any(sha is not None for sha in expected_photo_shas):

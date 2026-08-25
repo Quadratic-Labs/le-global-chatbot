@@ -11,10 +11,14 @@ from docx.text.paragraph import Paragraph
 from app.core.legal_taxonomy import get_canonical_legal_topic
 from app.core.subsection_taxonomy import get_subsection_topic_override
 from app.services.docx_parser import (
+    ExtractedContact,
     build_contact_chunk_content,
     extract_contacts_from_docx,
+    find_plain_paragraph_contact_block_bounds,
     parse_contact_blocks,
     parse_docx_sections,
+    split_combined_legacy_contact,
+    _classify_canonical_firm_lines,
 )
 
 
@@ -2213,6 +2217,344 @@ class PlainParagraphContactFallbackTests(unittest.TestCase):
                 contact.phone,
                 "+1 555 111 2222",
             )
+
+
+def _build_france_shaped_document(file_path: Path) -> None:
+    """The exact real France source layout (mission "FINAL CONTACT CRUD
+    CLOSURE"): legal content, then a legacy member-firm contact block
+    naming two people sharing one firm/phone, immediately before the
+    L&E Global POC block - never a synthetic table-only stand-in."""
+
+    document = Document()
+
+    document.add_paragraph("FRANCE")
+    document.add_paragraph("EMPLOYMENT LAW OVERVIEWS 2025 - 2026")
+    document.add_paragraph("FLICHY GRANGÉ AVOCATS")
+
+    document.add_heading("I. GENERAL OVERVIEW", level=1)
+    document.add_paragraph("Representative employment-law content.")
+
+    document.add_paragraph("Caroline Scherrmann and Florence Bacquet")
+    document.add_paragraph("Partners, Flichy Grangé Avocats")
+    document.add_paragraph("scherrmann@flichy.com")
+    document.add_paragraph("bacquet@flichy.com")
+    document.add_paragraph("+33 1 56 62 30 00")
+
+    document.add_paragraph("YOUR L&E GLOBAL POC")
+    document.add_paragraph(
+        (
+            "For all inquiries related to this project, please "
+            "contact Jessica Stout, International Business "
+            "Development Executive at L&E Global, at "
+            "jessica.stout@leglobal.law."
+        )
+    )
+    document.add_paragraph("Disclaimer text follows here.")
+
+    document.save(file_path)
+
+
+class FindPlainParagraphContactBlockBoundsTests(unittest.TestCase):
+    """Corpus-independent coverage of find_plain_paragraph_contact_
+    block_bounds - the structural anchor-finder contact_document_
+    area.py's canonicalizer uses so a France-style legacy contact
+    area (ordinary body paragraphs, no floating shape) gets its
+    canonical table replacement inserted at the SAME logical location,
+    never silently falling back to the document's start."""
+
+    def test_finds_the_exact_block_bounds_before_poc(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = Path(temporary_directory) / "france.docx"
+            _build_france_shaped_document(file_path)
+
+            document = Document(file_path)
+            bounds = find_plain_paragraph_contact_block_bounds(document)
+
+            self.assertIsNotNone(bounds)
+            first_index, last_index = bounds
+
+            self.assertEqual(
+                "Caroline Scherrmann and Florence Bacquet",
+                document.paragraphs[first_index].text,
+            )
+            self.assertEqual(
+                "+33 1 56 62 30 00",
+                document.paragraphs[last_index].text,
+            )
+
+            # The paragraph immediately after the block must be the
+            # POC heading, never legal content or the disclaimer -
+            # the block's own bounds must not over- or under-reach.
+            self.assertEqual(
+                "YOUR L&E GLOBAL POC",
+                document.paragraphs[last_index + 1].text,
+            )
+
+    def test_returns_none_when_no_plain_paragraph_block_exists(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            file_path = Path(temporary_directory) / "no-contact.docx"
+            document = Document()
+            document.add_paragraph("Just an ordinary legal document.")
+            document.add_paragraph("With no contact information at all.")
+            document.save(file_path)
+
+            reopened = Document(file_path)
+            self.assertIsNone(
+                find_plain_paragraph_contact_block_bounds(reopened)
+            )
+
+
+class SplitCombinedLegacyContactTests(unittest.TestCase):
+    """Corpus-independent coverage of split_combined_legacy_contact -
+    the narrow, deterministic normalization that turns a legacy
+    contact naming multiple people into one ExtractedContact per
+    person, only when the split is unambiguous."""
+
+    def test_splits_two_people_sharing_one_firm_and_phone(self) -> None:
+        combined = ExtractedContact(
+            member_firm="Flichy Grangé Avocats",
+            contact_person="Caroline Scherrmann and Florence Bacquet",
+            email="scherrmann@flichy.com, bacquet@flichy.com",
+            phone="+33 1 56 62 30 00",
+        )
+
+        split = split_combined_legacy_contact(combined)
+
+        self.assertIsNotNone(split)
+        self.assertEqual(2, len(split))
+
+        self.assertEqual("Caroline Scherrmann", split[0].contact_person)
+        self.assertEqual("scherrmann@flichy.com", split[0].email)
+        self.assertEqual("Florence Bacquet", split[1].contact_person)
+        self.assertEqual("bacquet@flichy.com", split[1].email)
+
+        for contact in split:
+            self.assertEqual("Flichy Grangé Avocats", contact.member_firm)
+            self.assertEqual("+33 1 56 62 30 00", contact.phone)
+
+    def test_returns_none_for_a_single_person_contact(self) -> None:
+        single = ExtractedContact(
+            member_firm="Some Firm",
+            contact_person="Jane Doe",
+            email="jane@example.com",
+        )
+
+        self.assertIsNone(split_combined_legacy_contact(single))
+
+    def test_returns_none_when_person_and_email_counts_mismatch(
+        self,
+    ) -> None:
+        mismatched = ExtractedContact(
+            member_firm="Some Firm",
+            contact_person="Jane Doe and John Roe",
+            email="jane@example.com",
+        )
+
+        self.assertIsNone(split_combined_legacy_contact(mismatched))
+
+    def test_never_splits_a_firm_name_containing_and(self) -> None:
+        """A firm name that happens to contain "and" is never at
+        risk: only contact_person is ever split, member_firm is
+        always copied through unchanged."""
+
+        firm_with_and = ExtractedContact(
+            member_firm="Smith and Jones LLP",
+            contact_person="Jane Doe",
+            email="jane@example.com",
+        )
+
+        self.assertIsNone(split_combined_legacy_contact(firm_with_and))
+
+    def test_splits_three_people(self) -> None:
+        combined = ExtractedContact(
+            member_firm="Big Firm LLP",
+            contact_person="Alice Smith, Bob Jones and Carol White",
+            email="alice@example.com, bob@example.com, carol@example.com",
+        )
+
+        split = split_combined_legacy_contact(combined)
+
+        self.assertIsNotNone(split)
+        self.assertEqual(3, len(split))
+        self.assertEqual(
+            ["Alice Smith", "Bob Jones", "Carol White"],
+            [c.contact_person for c in split],
+        )
+        self.assertEqual(
+            ["alice@example.com", "bob@example.com", "carol@example.com"],
+            [c.email for c in split],
+        )
+
+    def test_returns_none_without_email(self) -> None:
+        no_email = ExtractedContact(
+            member_firm="Some Firm",
+            contact_person="Jane Doe and John Roe",
+            email=None,
+        )
+
+        self.assertIsNone(split_combined_legacy_contact(no_email))
+
+
+class ClassifyCanonicalFirmLinesTests(unittest.TestCase):
+    """
+    Direct, corpus-independent coverage of
+    _classify_canonical_firm_lines - the canonical table reader's
+    field classifier, fixed to be semantic (content-based) rather
+    than position-only. Corpus regressions for the real documents
+    this was found against (IE/IN/US) live in
+    test_contact_document_area.py; these tests pin the underlying
+    classification rules precisely, for every input shape called out
+    by the mission: clean/international/spaced/+-prefixed phones,
+    a phone occupying the first line when member_firm is empty, a
+    phone with a trailing annotation, and a website mentioned inside
+    address prose vs. one on its own dedicated line.
+    """
+
+    def test_normal_case_all_four_fields_present(self) -> None:
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            [
+                "HARMERS WORKPLACE LAWYERS",
+                "31 Market Street, Level 27 St Martins Tower, NSW 2000 Sydney",
+                "+61 292 674 322",
+                "WWW.HARMERS.COM.AU",
+            ]
+        )
+        self.assertEqual("HARMERS WORKPLACE LAWYERS", member_firm)
+        self.assertEqual("+61 292 674 322", phone)
+        self.assertEqual("WWW.HARMERS.COM.AU", website)
+        self.assertEqual(
+            ["31 Market Street, Level 27 St Martins Tower, NSW 2000 Sydney"],
+            [
+                ["HARMERS WORKPLACE LAWYERS",
+                 "31 Market Street, Level 27 St Martins Tower, NSW 2000 Sydney",
+                 "+61 292 674 322", "WWW.HARMERS.COM.AU"][i]
+                for i in remaining
+            ],
+        )
+
+    def test_clean_phone(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+1 5551234567"])
+        self.assertEqual("+1 5551234567", phone)
+
+    def test_international_phone(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+81 355 012 111"])
+        self.assertEqual("+81 355 012 111", phone)
+
+    def test_phone_with_spaces(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+46 852 206 500"])
+        self.assertEqual("+46 852 206 500", phone)
+
+    def test_phone_with_plus_prefix(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["+353 1 234 5678"])
+        self.assertEqual("+353 1 234 5678", phone)
+
+    def test_phone_without_plus_prefix(self) -> None:
+        _, phone, _, _ = _classify_canonical_firm_lines(["1 212 545 4050"])
+        self.assertEqual("1 212 545 4050", phone)
+
+    def test_phone_as_first_firm_side_line_no_member_firm(self) -> None:
+        """Quirk B: a contact whose member_firm/address/website are
+        all empty has its phone land on line 0 - it must still be
+        recognized as phone, never misread as member_firm."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            ["+1 555 000 0000"]
+        )
+        self.assertIsNone(member_firm)
+        self.assertEqual("+1 555 000 0000", phone)
+        self.assertIsNone(website)
+        self.assertEqual([], remaining)
+
+    def test_phone_with_trailing_annotation_preserved_whole(self) -> None:
+        """Quirk A: a phone value with a trailing annotation must be
+        preserved in its ENTIRETY as the phone field - never split,
+        with the remainder leaking into address."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            [
+                "Cederquist",
+                "Hovslagargatan 3, SE-111 96 Stockholm",
+                "+46 852 206 500 (updated)",
+                "www.cederquist.se",
+            ]
+        )
+        self.assertEqual("Cederquist", member_firm)
+        self.assertEqual("+46 852 206 500 (updated)", phone)
+        self.assertEqual("www.cederquist.se", website)
+        self.assertEqual(
+            ["Hovslagargatan 3, SE-111 96 Stockholm"],
+            [
+                [
+                    "Cederquist",
+                    "Hovslagargatan 3, SE-111 96 Stockholm",
+                    "+46 852 206 500 (updated)",
+                    "www.cederquist.se",
+                ][i]
+                for i in remaining
+            ],
+        )
+
+    def test_phone_as_first_line_with_annotation_combined(self) -> None:
+        """Quirk A and Quirk B together: no member_firm AND a phone
+        annotation on the same, first line."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            ["+353 1 234 5678 (mobile)"]
+        )
+        self.assertIsNone(member_firm)
+        self.assertEqual("+353 1 234 5678 (mobile)", phone)
+        self.assertEqual([], remaining)
+
+    def test_website_mentioned_inside_address_prose_is_not_extracted(self) -> None:
+        """Quirk C: an address sentence that merely MENTIONS a URL
+        (with its own sentence-ending punctuation attached) must never
+        be misread as the website field - only a line that is, in its
+        entirety, just a URL is the dedicated website field."""
+
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            [
+                "Jackson Lewis PC",
+                "USA, 666 Third Avenue, 29th Floor, 10017 New York, Jackson "
+                "Lewis has over 60 offices throughout the USA. , For "
+                "information, please see www.jacksonlewis.com.",
+                "1 212 545 4050",
+                "www.jacksonlewis.com",
+            ]
+        )
+        self.assertEqual("Jackson Lewis PC", member_firm)
+        self.assertEqual("1 212 545 4050", phone)
+        self.assertEqual("www.jacksonlewis.com", website)
+        remaining_lines = [
+            [
+                "Jackson Lewis PC",
+                "USA, 666 Third Avenue, 29th Floor, 10017 New York, Jackson "
+                "Lewis has over 60 offices throughout the USA. , For "
+                "information, please see www.jacksonlewis.com.",
+                "1 212 545 4050",
+                "www.jacksonlewis.com",
+            ][i]
+            for i in remaining
+        ]
+        self.assertEqual(1, len(remaining_lines))
+        self.assertIn("please see www.jacksonlewis.com.", remaining_lines[0])
+
+    def test_no_phone_or_website_present(self) -> None:
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines(
+            ["Some Firm Ltd", "123 Some Street"]
+        )
+        self.assertEqual("Some Firm Ltd", member_firm)
+        self.assertIsNone(phone)
+        self.assertIsNone(website)
+        self.assertEqual([1], remaining)
+
+    def test_empty_firm_lines(self) -> None:
+        member_firm, phone, website, remaining = _classify_canonical_firm_lines([])
+        self.assertIsNone(member_firm)
+        self.assertIsNone(phone)
+        self.assertIsNone(website)
+        self.assertEqual([], remaining)
 
 
 if __name__ == "__main__":
