@@ -567,3 +567,29 @@ class OpenAIResponsesStreamClient:
                 error_message="OpenAI could not be reached.",
                 retryable=True,
             )
+
+
+def get_openai_answer_stream_client() -> OpenAIResponsesStreamClient:
+    """
+    Streaming counterpart to openai_responses.py's own
+    get_openai_answer_client() - same configured settings (API key,
+    model, reasoning effort, max output token budget), so the two
+    clients are guaranteed to receive identical generation parameters
+    by construction, never a hand-duplicated, driftable copy.
+    """
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+
+    if not settings.openai_api_key:
+        raise OpenAIConfigurationError(
+            "OPENAI_API_KEY is not configured."
+        )
+
+    return OpenAIResponsesStreamClient(
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        reasoning_effort=settings.openai_answer_reasoning_effort,
+        max_output_tokens=settings.openai_answer_max_output_tokens,
+    )

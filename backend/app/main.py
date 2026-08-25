@@ -31,6 +31,12 @@ from app.routers.admin_documents import (
 from app.routers.chat import (
     router as chat_router,
 )
+# Registers POST /api/v1/chat/stream onto the SAME router object
+# imported above (chat-streaming initiative, GATE S4) - imported here
+# purely for its module-level @router.post(...) side effect; nothing
+# in this file calls into it directly, and it needs no separate
+# include_router() call.
+import app.routers.chat_stream  # noqa: F401
 from app.routers.frontend_config import (
     router as frontend_config_router,
 )

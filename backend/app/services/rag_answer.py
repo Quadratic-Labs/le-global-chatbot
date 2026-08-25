@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 import dataclasses
 from dataclasses import dataclass, field
+from enum import Enum
 from time import perf_counter
 from typing import Final, Protocol
 
@@ -18,6 +20,11 @@ from app.clients.openai_responses import (
     OpenAIResponseError,
     get_openai_answer_client,
     get_openai_rerank_client,
+)
+from app.clients.openai_responses_stream import (
+    StreamEvent,
+    StreamEventType,
+    get_openai_answer_stream_client,
 )
 from app.core.country_registry import (
     UnknownCountryCodeError,
@@ -4058,64 +4065,80 @@ def _build_cited_sources(
     return sources
 
 
-def answer_legal_question(
-    request: LegalChatRequest,
-    search_function: SearchFunction = (
-        search_legal_documents
-    ),
-    generation_client: (
-        TextGenerationClient | None
-    ) = None,
-    rerank_enabled: bool = False,
-    rerank_pool_multiplier: int = 1,
-    max_context_characters: int = (
-        DEFAULT_MAX_CONTEXT_CHARACTERS
-    ),
-    max_source_characters: int = (
-        DEFAULT_MAX_SOURCE_CHARACTERS
-    ),
-    metrics: LegalChatMetrics | None = None,
-    subject_text: str | None = None,
-    search_concepts: list[SearchConceptLike] | None = None,
-    evidence_mode: str | None = None,
-    action_specs: list[LegalActionEvidenceSpec] | None = None,
-    known_excluded_country_codes: list[str] | None = None,
-    current_user_question: str | None = None,
-) -> LegalChatResponse:
+@dataclass(frozen=True, slots=True)
+class _EarlyExitAnswer:
+    """A complete LegalChatResponse decided BEFORE any generation was
+    attempted (no country, empty retrieval, or every requested country
+    fully insufficient) - returned by _prepare_grounded_generation
+    instead of a _PreparedGeneration when there is nothing to
+    generate."""
+
+    response: LegalChatResponse
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedGeneration:
     """
-    Retrieve legal chunks and generate one grounded answer.
+    Everything a caller needs to run ONE generation attempt (streaming
+    or not) and then validate/repair/assemble the final
+    LegalChatResponse - built by the ONE function that owns evidence-
+    gating/multi-spec preparation (_prepare_grounded_generation), so
+    answer_legal_question() and stream_answer_legal_question() can
+    never diverge in what gets retrieved, what context/model input is
+    built, or what instructions the model receives.
 
-    `subject_text`/`search_concepts`/`evidence_mode` are optional and,
-    when omitted (the default), leave every existing caller's
-    behavior completely unchanged. When given, they gate generation on
-    whether the retrieved evidence actually supports the precise
-    subject asked about, not merely the right broad legal_topic/
-    section (see evidence_coverage.py) - a country with no direct or
-    partial evidence never reaches generation at all, and is instead
-    answered with a targeted insufficiency message naming that exact
-    subject, never a generic panorama of the whole topic.
+    `instructions_prefix` already folds in SYSTEM_INSTRUCTIONS, the
+    broad-overview addendum (if applicable), any partial-evidence
+    instruction, and any excluded-country instruction - exactly the
+    string answer_legal_question's own first generation call used
+    inline before this extraction. A repair attempt appends its own
+    "\n\n" + repair-specific instructions to this SAME prefix, exactly
+    as before.
+    """
 
-    `action_specs`, when given (a mixed request naming more than one
-    legal-type action), takes over from the three flat parameters
-    above: each spec is retrieved with its own query enrichment and
-    graded independently against only its own concepts, so one
-    action's evidence can never satisfy another's, even when two specs
-    share a country - see LegalActionEvidenceSpec. Generation is still
-    exactly one combined OpenAI call.
+    request: LegalChatRequest
+    specs: list[LegalActionEvidenceSpec]
+    insufficient_codes_by_spec: list[set[str]]
+    selected_hits: list[LegalSearchHit]
+    retrieval_total: int
+    context_text: str
+    model_input: str
+    instructions_prefix: str
+    client: TextGenerationClient
+    insufficient_evidence_answer_parts: list[str]
 
-    `known_excluded_country_codes` names countries the caller has
-    already excluded from `request.country_codes` for a reason other
-    than evidence insufficiency (0.4.2 hardening: the conservative
-    understanding-fallback and the main resolved-plan path both build
-    a post-hoc "Note: X is not covered" message for a country outside
-    the supported corpus - that note is appended after generation, so
-    without this the generation model, still seeing that country
-    named in the raw question text, may address it anyway and invent
-    a heading the structure validator does not recognize, exactly the
-    documented cause of the excluded-country class of 502). Passing
-    them here folds them into the same excluded-country instruction as
-    an evidence-insufficient country, with no other effect - they were
-    never part of `request.country_codes` to begin with.
+
+def _prepare_grounded_generation(
+    request: LegalChatRequest,
+    search_function: SearchFunction,
+    generation_client: TextGenerationClient | None,
+    rerank_enabled: bool,
+    rerank_pool_multiplier: int,
+    max_context_characters: int,
+    max_source_characters: int,
+    metrics: LegalChatMetrics | None,
+    subject_text: str | None,
+    search_concepts: list[SearchConceptLike] | None,
+    evidence_mode: str | None,
+    action_specs: list[LegalActionEvidenceSpec] | None,
+    known_excluded_country_codes: list[str] | None,
+    current_user_question: str | None,
+) -> _EarlyExitAnswer | _PreparedGeneration:
+    """
+    Evidence-gating / multi-spec retrieval and prompt preparation -
+    extracted verbatim from answer_legal_question() (GATE S3B, chat-
+    streaming initiative) so the streaming path can reuse the EXACT
+    same logic instead of a second, driftable copy. Every line of
+    business logic here is unchanged from before this extraction;
+    only the three early-exit `return LegalChatResponse(...)`
+    statements were wrapped in _EarlyExitAnswer, and the trailing
+    context/model-input/instructions construction (previously inline
+    in answer_legal_question, after this same point) was pulled in so
+    ALL preparation output is captured in _PreparedGeneration.
+
+    See answer_legal_question()'s own docstring for what subject_text/
+    search_concepts/evidence_mode/action_specs/known_excluded_country_codes
+    mean - unchanged here.
     """
 
     specs = (
@@ -4156,13 +4179,15 @@ def answer_legal_question(
             metrics.repair_success = False
             metrics.repair_answer_returned = False
 
-        return LegalChatResponse(
-            question=request.question.strip(),
-            answer=MISSING_COUNTRY_ANSWER,
-            grounded=False,
-            model=None,
-            retrieval_total=0,
-            sources=[],
+        return _EarlyExitAnswer(
+            response=LegalChatResponse(
+                question=request.question.strip(),
+                answer=MISSING_COUNTRY_ANSWER,
+                grounded=False,
+                model=None,
+                retrieval_total=0,
+                sources=[],
+            )
         )
 
     broad_overview_request = (
@@ -4230,13 +4255,15 @@ def answer_legal_question(
             metrics.retrieval_total = retrieval_total
             metrics.selected_sources = 0
 
-        return LegalChatResponse(
-            question=request.question.strip(),
-            answer=NO_INFORMATION_ANSWER,
-            grounded=False,
-            model=None,
-            retrieval_total=retrieval_total,
-            sources=[],
+        return _EarlyExitAnswer(
+            response=LegalChatResponse(
+                question=request.question.strip(),
+                answer=NO_INFORMATION_ANSWER,
+                grounded=False,
+                model=None,
+                retrieval_total=retrieval_total,
+                sources=[],
+            )
         )
 
     # A country shared by two specs (e.g. a legal_information action and
@@ -4398,15 +4425,17 @@ def answer_legal_question(
             metrics.repair_success = False
             metrics.repair_answer_returned = False
 
-        return LegalChatResponse(
-            question=request.question.strip(),
-            answer="\n\n".join(
-                insufficient_evidence_answer_parts
-            ),
-            grounded=False,
-            model=None,
-            retrieval_total=retrieval_total,
-            sources=[],
+        return _EarlyExitAnswer(
+            response=LegalChatResponse(
+                question=request.question.strip(),
+                answer="\n\n".join(
+                    insufficient_evidence_answer_parts
+                ),
+                grounded=False,
+                model=None,
+                retrieval_total=retrieval_total,
+                sources=[],
+            )
         )
 
     seen_chunk_ids: set[str] = set()
@@ -4459,10 +4488,132 @@ def answer_legal_question(
         )
         metrics.model = client.model
 
+
+    context_text = _build_context(
+        selected_hits
+    )
+
     model_input = _build_model_input(
         request=request,
         hits=selected_hits,
         current_user_question=current_user_question,
+    )
+
+    instructions_prefix = (
+        SYSTEM_INSTRUCTIONS
+        + (
+            BROAD_OVERVIEW_INSTRUCTIONS
+            if broad_overview_request
+            else ""
+        )
+        + partial_evidence_instruction
+        + excluded_country_instruction
+    )
+
+    return _PreparedGeneration(
+        request=request,
+        specs=specs,
+        insufficient_codes_by_spec=insufficient_codes_by_spec,
+        selected_hits=selected_hits,
+        retrieval_total=retrieval_total,
+        context_text=context_text,
+        model_input=model_input,
+        instructions_prefix=instructions_prefix,
+        client=client,
+        insufficient_evidence_answer_parts=insufficient_evidence_answer_parts,
+    )
+
+
+def answer_legal_question(
+    request: LegalChatRequest,
+    search_function: SearchFunction = (
+        search_legal_documents
+    ),
+    generation_client: (
+        TextGenerationClient | None
+    ) = None,
+    rerank_enabled: bool = False,
+    rerank_pool_multiplier: int = 1,
+    max_context_characters: int = (
+        DEFAULT_MAX_CONTEXT_CHARACTERS
+    ),
+    max_source_characters: int = (
+        DEFAULT_MAX_SOURCE_CHARACTERS
+    ),
+    metrics: LegalChatMetrics | None = None,
+    subject_text: str | None = None,
+    search_concepts: list[SearchConceptLike] | None = None,
+    evidence_mode: str | None = None,
+    action_specs: list[LegalActionEvidenceSpec] | None = None,
+    known_excluded_country_codes: list[str] | None = None,
+    current_user_question: str | None = None,
+) -> LegalChatResponse:
+    """
+    Retrieve legal chunks and generate one grounded answer.
+
+    `subject_text`/`search_concepts`/`evidence_mode` are optional and,
+    when omitted (the default), leave every existing caller's
+    behavior completely unchanged. When given, they gate generation on
+    whether the retrieved evidence actually supports the precise
+    subject asked about, not merely the right broad legal_topic/
+    section (see evidence_coverage.py) - a country with no direct or
+    partial evidence never reaches generation at all, and is instead
+    answered with a targeted insufficiency message naming that exact
+    subject, never a generic panorama of the whole topic.
+
+    `action_specs`, when given (a mixed request naming more than one
+    legal-type action), takes over from the three flat parameters
+    above: each spec is retrieved with its own query enrichment and
+    graded independently against only its own concepts, so one
+    action's evidence can never satisfy another's, even when two specs
+    share a country - see LegalActionEvidenceSpec. Generation is still
+    exactly one combined OpenAI call.
+
+    `known_excluded_country_codes` names countries the caller has
+    already excluded from `request.country_codes` for a reason other
+    than evidence insufficiency (0.4.2 hardening: the conservative
+    understanding-fallback and the main resolved-plan path both build
+    a post-hoc "Note: X is not covered" message for a country outside
+    the supported corpus - that note is appended after generation, so
+    without this the generation model, still seeing that country
+    named in the raw question text, may address it anyway and invent
+    a heading the structure validator does not recognize, exactly the
+    documented cause of the excluded-country class of 502). Passing
+    them here folds them into the same excluded-country instruction as
+    an evidence-insufficient country, with no other effect - they were
+    never part of `request.country_codes` to begin with.
+    """
+
+    prepared = _prepare_grounded_generation(
+        request=request,
+        search_function=search_function,
+        generation_client=generation_client,
+        rerank_enabled=rerank_enabled,
+        rerank_pool_multiplier=rerank_pool_multiplier,
+        max_context_characters=max_context_characters,
+        max_source_characters=max_source_characters,
+        metrics=metrics,
+        subject_text=subject_text,
+        search_concepts=search_concepts,
+        evidence_mode=evidence_mode,
+        action_specs=action_specs,
+        known_excluded_country_codes=known_excluded_country_codes,
+        current_user_question=current_user_question,
+    )
+
+    if isinstance(prepared, _EarlyExitAnswer):
+        return prepared.response
+
+    request = prepared.request
+    specs = prepared.specs
+    insufficient_codes_by_spec = prepared.insufficient_codes_by_spec
+    selected_hits = prepared.selected_hits
+    retrieval_total = prepared.retrieval_total
+    context_text = prepared.context_text
+    model_input = prepared.model_input
+    client = prepared.client
+    insufficient_evidence_answer_parts = (
+        prepared.insufficient_evidence_answer_parts
     )
 
     def _generate_with_instructions(
@@ -4582,19 +4733,8 @@ def answer_legal_question(
 
         return hard_errors, soft_errors
 
-    context_text = _build_context(
-        selected_hits
-    )
-
     first_generated_text = _generate_with_instructions(
-        SYSTEM_INSTRUCTIONS
-        + (
-            BROAD_OVERVIEW_INSTRUCTIONS
-            if broad_overview_request
-            else ""
-        )
-        + partial_evidence_instruction
-        + excluded_country_instruction
+        prepared.instructions_prefix
     )
 
     first_hard_errors, first_soft_errors = _validate(
@@ -4624,14 +4764,7 @@ def answer_legal_question(
         repair_triggered = True
 
         repaired_generated_text = _generate_with_instructions(
-            SYSTEM_INSTRUCTIONS
-            + (
-                BROAD_OVERVIEW_INSTRUCTIONS
-                if broad_overview_request
-                else ""
-            )
-            + partial_evidence_instruction
-            + excluded_country_instruction
+            prepared.instructions_prefix
             + "\n\n"
             + _build_repair_instructions(
                 list(first_hard_errors)
@@ -4746,4 +4879,580 @@ def answer_legal_question(
             hits=selected_hits,
             citation_numbers=citation_numbers,
         ),
+    )
+
+
+# =============================================================================
+# STREAMING (chat-streaming initiative, GATE S3 + S3B)
+#
+# stream_answer_legal_question() below is an ADDITIVE, separate entry
+# point - answer_legal_question() above is behaviorally unmodified
+# (proven by its own full test suite, including evidence-gating,
+# passing unchanged after the S3B extraction below), and every
+# existing caller of it (the current /chat pipeline) is unaffected.
+#
+# Design: reuse every existing, already-shared primitive
+# (_retrieve_search_hits, _allocate_country_context_budgets,
+# _build_context, _build_model_input, _validate_answer_quality,
+# _build_repair_instructions, _build_cited_sources,
+# _deduplicate_adjacent_citations, _find_citation_numbers,
+# _validate_challenge_certainty_stability, _last_assistant_answer,
+# _validate_no_subject_drift, _validate_partial_answer_relevance) -
+# the SAME functions, called the SAME way, so prompt/retrieval/rerank/
+# evidence-gating equivalence with the non-streaming path holds BY
+# CONSTRUCTION, not by parallel maintenance.
+#
+# GATE S3B closed the parameter-parity gap GATE S3 explicitly flagged:
+# _prepare_grounded_generation() (defined just above
+# answer_legal_question(), extracted verbatim from what used to be its
+# own inline body) is now the ONE function owning evidence-gating/
+# multi-spec preparation - both answer_legal_question() and
+# stream_answer_legal_question() call it and consume its
+# _PreparedGeneration/_EarlyExitAnswer result the same way. There is no
+# longer a scope boundary: action_specs/subject_text/search_concepts/
+# evidence_mode/known_excluded_country_codes are fully supported here.
+# =============================================================================
+
+
+class StreamAnswerEventType(Enum):
+    """The only event shapes this service-level streaming primitive
+    ever yields. Transport-neutral: no HTTP, no NDJSON, no WordPress
+    awareness anywhere in this section - GATE S4 translates these."""
+
+    ANSWER_DELTA = "answer_delta"
+    VALIDATING = "validating"
+    DISCARD = "discard"
+    REPLACEMENT = "replacement"
+    FINALIZED = "finalized"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class StreamAnswerEvent:
+    """One unit of the internal streaming lifecycle.
+
+    Exactly one of the payload fields is populated, matching `type`:
+    delta_text for ANSWER_DELTA, replacement_text for REPLACEMENT,
+    result for FINALIZED, error_message/retryable for ERROR. VALIDATING
+    and DISCARD carry no payload - they are pure sequencing markers."""
+
+    type: StreamAnswerEventType
+    delta_text: str | None = None
+    replacement_text: str | None = None
+    result: LegalChatResponse | None = None
+    error_message: str | None = None
+    retryable: bool = False
+
+
+@dataclass(slots=True)
+class StreamAnswerTimings:
+    """
+    Service-level timing points for LATER FastAPI/browser
+    instrumentation (GATE S4/S5) - populated here as this primitive
+    progresses, wired into any actual metrics/logging pipeline in a
+    later gate. Never touches LegalChatMetrics's own existing fields.
+
+    retrieval_and_rerank_complete is ONE combined timestamp, not two:
+    _retrieve_search_hits() performs reranking internally when
+    rerank_enabled is set, and splitting that into two separately
+    observable timestamps would require changing that shared,
+    unmodified function's own internals - out of scope for this gate.
+    """
+
+    retrieval_and_rerank_complete: float | None = None
+    generation_start: float | None = None
+    first_provider_delta: float | None = None
+    provider_completion: float | None = None
+    validation_start: float | None = None
+    validation_end: float | None = None
+    repair_start: float | None = None
+    repair_end: float | None = None
+    finalization: float | None = None
+
+
+class TextStreamGenerationClient(Protocol):
+    """Streaming counterpart to TextGenerationClient above - the
+    interface stream_answer_legal_question requires for the final-
+    answer generation stage only. OpenAIResponsesStreamClient satisfies
+    this; so can any test double, without importing httpx."""
+
+    model: str
+
+    def stream(
+        self,
+        instructions: str,
+        input_text: str,
+    ) -> AsyncIterator[StreamEvent]:
+        """Yield StreamEvent objects for one streamed generation."""
+
+
+async def stream_answer_legal_question(
+    request: LegalChatRequest,
+    search_function: SearchFunction = search_legal_documents,
+    generation_client: TextGenerationClient | None = None,
+    stream_generation_client: TextStreamGenerationClient | None = None,
+    rerank_enabled: bool = False,
+    rerank_pool_multiplier: int = 1,
+    max_context_characters: int = (
+        DEFAULT_MAX_CONTEXT_CHARACTERS
+    ),
+    max_source_characters: int = (
+        DEFAULT_MAX_SOURCE_CHARACTERS
+    ),
+    metrics: LegalChatMetrics | None = None,
+    subject_text: str | None = None,
+    search_concepts: list[SearchConceptLike] | None = None,
+    evidence_mode: str | None = None,
+    action_specs: list[LegalActionEvidenceSpec] | None = None,
+    known_excluded_country_codes: list[str] | None = None,
+    current_user_question: str | None = None,
+    timings: StreamAnswerTimings | None = None,
+) -> AsyncIterator[StreamAnswerEvent]:
+    """
+    Streaming counterpart to answer_legal_question() - see module
+    section docstring above for the equivalence/reuse contract.
+
+    GATE S3B (chat-streaming initiative): full parameter parity with
+    answer_legal_question(), achieved by calling the SAME
+    _prepare_grounded_generation() both functions now share - never a
+    second, independently maintained copy of evidence-gating/multi-
+    spec logic. subject_text/search_concepts/evidence_mode/
+    action_specs/known_excluded_country_codes mean exactly what they
+    mean on answer_legal_question() - see its own docstring.
+
+    Guarantees, mirroring answer_legal_question()'s own exact
+    semantics - never weakened, never a new repair policy:
+
+    - a request with no country, with retrieval returning nothing, or
+      with every requested country fully evidence-insufficient,
+      finalizes immediately with the same static/insufficiency-based
+      fallback answer, no generation, no ANSWER_DELTA events at all;
+    - the first generation attempt streams ANSWER_DELTA events as text
+      arrives, using _validate_answer_quality() unchanged (plus the
+      same subject-drift/partial-relevance checks for evidence-gated
+      specs) once the complete text is accumulated;
+    - should_repair uses the EXACT same condition as today
+      (first_hard_errors or repairable_soft_errors);
+    - when no repair is needed, the streamed text simply settles -
+      FINALIZED is emitted with no DISCARD/REPLACEMENT;
+    - when repair is needed, the provisional text is DISCARDed and the
+      repair generation happens HIDDEN (never streamed - the mission's
+      own explicit requirement), using the exact same non-streaming
+      client.generate() call and the exact same three-way outcome
+      logic (repaired answer wins / first answer wins / both still
+      have hard errors) as answer_legal_question() today; a winning
+      answer is announced via REPLACEMENT with its complete text
+      before FINALIZED; a losing outcome (both attempts still hard-
+      erroring) yields ERROR, matching today's RagAnswerError;
+    - a provider failure before any delta yields ERROR directly; a
+      provider failure after one or more deltas DISCARDs first, so no
+      partial provisional answer is ever left implicitly accepted.
+    """
+
+    prepared = _prepare_grounded_generation(
+        request=request,
+        search_function=search_function,
+        generation_client=generation_client,
+        rerank_enabled=rerank_enabled,
+        rerank_pool_multiplier=rerank_pool_multiplier,
+        max_context_characters=max_context_characters,
+        max_source_characters=max_source_characters,
+        metrics=metrics,
+        subject_text=subject_text,
+        search_concepts=search_concepts,
+        evidence_mode=evidence_mode,
+        action_specs=action_specs,
+        known_excluded_country_codes=known_excluded_country_codes,
+        current_user_question=current_user_question,
+    )
+
+    if timings is not None:
+        timings.retrieval_and_rerank_complete = perf_counter()
+
+    if isinstance(prepared, _EarlyExitAnswer):
+        yield StreamAnswerEvent(
+            type=StreamAnswerEventType.FINALIZED,
+            result=prepared.response,
+        )
+        return
+
+    request = prepared.request
+    specs = prepared.specs
+    insufficient_codes_by_spec = prepared.insufficient_codes_by_spec
+    selected_hits = prepared.selected_hits
+    retrieval_total = prepared.retrieval_total
+    context_text = prepared.context_text
+    model_input = prepared.model_input
+    sync_client = prepared.client
+    insufficient_evidence_answer_parts = (
+        prepared.insufficient_evidence_answer_parts
+    )
+
+    stream_client = (
+        stream_generation_client
+        if stream_generation_client is not None
+        else get_openai_answer_stream_client()
+    )
+
+    if metrics is not None:
+        metrics.model = stream_client.model
+
+    def _validate(
+        answer: str,
+    ) -> tuple[list[QualityError], list[QualityError]]:
+        resolved_validation_question = request.question.strip()
+        literal_validation_question = (
+            current_user_question.strip()
+            if current_user_question
+            else ""
+        )
+
+        validation_question = (
+            literal_validation_question
+            + "\n"
+            + resolved_validation_question
+            if (
+                literal_validation_question
+                and literal_validation_question
+                != resolved_validation_question
+            )
+            else resolved_validation_question
+        )
+
+        hard_errors, soft_errors = _validate_answer_quality(
+            question=validation_question,
+            answer=answer,
+            country_codes=request.country_codes,
+            context=context_text,
+            hits=selected_hits,
+        )
+        hard_errors = list(
+            hard_errors
+        ) + _validate_challenge_certainty_stability(
+            current_user_question=(
+                current_user_question or request.question
+            ),
+            previous_assistant_answer=(
+                _last_assistant_answer(request)
+            ),
+            answer=answer,
+        )
+
+        for spec_index, spec in enumerate(specs):
+            if not (
+                spec.evidence_mode is not None
+                and spec.search_concepts
+            ):
+                continue
+
+            spec_codes = set(
+                _normalize_country_codes(spec.country_codes)
+            )
+            spec_own_insufficient = (
+                insufficient_codes_by_spec[spec_index]
+                if spec_index < len(insufficient_codes_by_spec)
+                else set()
+            )
+
+            if not (spec_codes - spec_own_insufficient):
+                continue
+
+            soft_errors = list(soft_errors) + _validate_no_subject_drift(
+                answer=answer,
+                search_concepts=spec.search_concepts,
+                evidence_mode=spec.evidence_mode,
+            )
+
+            soft_errors = (
+                list(soft_errors)
+                + _validate_partial_answer_relevance(
+                    answer=answer,
+                    search_concepts=spec.search_concepts,
+                    evidence_mode=spec.evidence_mode,
+                    country_codes=spec.country_codes,
+                )
+            )
+
+        return hard_errors, soft_errors
+
+    def _generate_sync_with_instructions(
+        instructions: str,
+    ) -> GeneratedText:
+        """The hidden, non-streaming repair generation - byte-for-byte
+        the same call shape as answer_legal_question()'s own
+        _generate_with_instructions, using the plain (non-streaming)
+        client so repair text is never provisionally visible."""
+
+        try:
+            call_started_at = perf_counter()
+
+            result = sync_client.generate(
+                instructions=instructions,
+                input_text=model_input,
+            )
+
+            elapsed_ms = (
+                perf_counter() - call_started_at
+            ) * 1000
+
+            if metrics is not None:
+                metrics.openai_ms += elapsed_ms
+                metrics.answer_generation_openai_ms += elapsed_ms
+
+        except OpenAIResponseError as error:
+            raise RagAnswerError(
+                "Grounded answer generation failed."
+            ) from error
+
+        return dataclasses.replace(
+            result,
+            text=_deduplicate_adjacent_citations(result.text),
+        )
+
+    instructions = prepared.instructions_prefix
+
+    if timings is not None:
+        timings.generation_start = perf_counter()
+
+    accumulated_chunks: list[str] = []
+    stream_error: StreamAnswerEvent | None = None
+    any_delta_emitted = False
+    generation_started_at = perf_counter()
+
+    async for stream_event in stream_client.stream(
+        instructions=instructions,
+        input_text=model_input,
+    ):
+        if stream_event.type == StreamEventType.DELTA:
+            if timings is not None and timings.first_provider_delta is None:
+                timings.first_provider_delta = perf_counter()
+
+            accumulated_chunks.append(stream_event.text or "")
+            any_delta_emitted = True
+
+            yield StreamAnswerEvent(
+                type=StreamAnswerEventType.ANSWER_DELTA,
+                delta_text=stream_event.text,
+            )
+
+        elif stream_event.type == StreamEventType.COMPLETED:
+            if timings is not None:
+                timings.provider_completion = perf_counter()
+
+        elif stream_event.type == StreamEventType.ERROR:
+            stream_error = StreamAnswerEvent(
+                type=StreamAnswerEventType.ERROR,
+                error_message=(
+                    stream_event.error_message
+                    or "OpenAI generation failed."
+                ),
+                retryable=stream_event.retryable,
+            )
+            break
+
+    if stream_error is not None:
+        # Provider failure semantics (mission section 7): DISCARD only
+        # if provisional text was already shown - a failure before any
+        # delta goes straight to ERROR.
+        if any_delta_emitted:
+            yield StreamAnswerEvent(type=StreamAnswerEventType.DISCARD)
+
+        if metrics is not None:
+            metrics.outcome = "generation_failed"
+            metrics.generation_attempts = 1
+
+        yield stream_error
+        return
+
+    if metrics is not None:
+        metrics.answer_generation_openai_ms += (
+            perf_counter() - generation_started_at
+        ) * 1000
+        metrics.openai_ms += (
+            perf_counter() - generation_started_at
+        ) * 1000
+
+    first_generated_text = GeneratedText(
+        text=_deduplicate_adjacent_citations(
+            "".join(accumulated_chunks)
+        ),
+        model=stream_client.model,
+    )
+
+    if timings is not None:
+        timings.validation_start = perf_counter()
+
+    yield StreamAnswerEvent(type=StreamAnswerEventType.VALIDATING)
+
+    first_hard_errors, first_soft_errors = _validate(
+        first_generated_text.text
+    )
+
+    if timings is not None:
+        timings.validation_end = perf_counter()
+
+    generation_attempts = 1
+    repair_triggered = False
+    repair_success = False
+    repair_answer_returned = False
+
+    final_generated_text = first_generated_text
+    final_hard_errors = first_hard_errors
+    final_soft_errors = first_soft_errors
+
+    repairable_soft_errors = [
+        error
+        for error in first_soft_errors
+        if error.error_type in REPAIR_TRIGGERING_SOFT_ERROR_TYPES
+    ]
+
+    should_repair = bool(
+        first_hard_errors or repairable_soft_errors
+    )
+
+    if should_repair:
+        repair_triggered = True
+
+        yield StreamAnswerEvent(type=StreamAnswerEventType.DISCARD)
+
+        if timings is not None:
+            timings.repair_start = perf_counter()
+
+        try:
+            repaired_generated_text = await asyncio.to_thread(
+                _generate_sync_with_instructions,
+                prepared.instructions_prefix
+                + "\n\n"
+                + _build_repair_instructions(
+                    list(first_hard_errors) + list(first_soft_errors)
+                ),
+            )
+        except RagAnswerError:
+            if timings is not None:
+                timings.repair_end = perf_counter()
+
+            if metrics is not None:
+                metrics.generation_attempts = 2
+                metrics.repair_triggered = True
+                metrics.repair_success = False
+                metrics.repair_answer_returned = False
+
+            yield StreamAnswerEvent(
+                type=StreamAnswerEventType.ERROR,
+                error_message="Grounded answer generation failed.",
+            )
+            return
+
+        if timings is not None:
+            timings.repair_end = perf_counter()
+
+        generation_attempts = 2
+
+        repaired_hard_errors, repaired_soft_errors = _validate(
+            repaired_generated_text.text
+        )
+
+        repaired_answer_was_returned = False
+
+        if not repaired_hard_errors:
+            repaired_answer_was_returned = True
+            final_generated_text = repaired_generated_text
+            final_hard_errors = repaired_hard_errors
+            final_soft_errors = repaired_soft_errors
+
+        elif not first_hard_errors:
+            final_generated_text = first_generated_text
+            final_hard_errors = first_hard_errors
+            final_soft_errors = first_soft_errors
+
+        else:
+            final_hard_errors = repaired_hard_errors
+            final_soft_errors = repaired_soft_errors
+
+        repair_answer_returned = bool(
+            repair_triggered
+            and generation_attempts > 1
+            and repaired_answer_was_returned
+        )
+
+    repair_success = bool(
+        repair_triggered
+        and not final_hard_errors
+        and not final_soft_errors
+    )
+
+    if metrics is not None:
+        metrics.generation_attempts = generation_attempts
+        metrics.repair_triggered = repair_triggered
+        metrics.repair_success = repair_success
+        metrics.repair_answer_returned = repair_answer_returned
+        metrics.initial_hard_error_types = sorted(
+            {error.error_type for error in first_hard_errors}
+        )
+        metrics.initial_soft_error_types = sorted(
+            {error.error_type for error in first_soft_errors}
+        )
+        metrics.final_hard_error_types = sorted(
+            {error.error_type for error in final_hard_errors}
+        )
+        metrics.final_soft_error_types = sorted(
+            {error.error_type for error in final_soft_errors}
+        )
+
+    if final_hard_errors:
+        yield StreamAnswerEvent(
+            type=StreamAnswerEventType.ERROR,
+            error_message=(
+                "The generated answer failed grounding validation."
+            ),
+        )
+        return
+
+    generated_text = final_generated_text
+
+    citation_numbers = _find_citation_numbers(
+        generated_text.text
+    )
+
+    if metrics is not None:
+        metrics.outcome = "generated"
+        metrics.model = generated_text.model
+
+    final_answer = "\n\n".join(
+        part
+        for part in (
+            generated_text.text,
+            *insufficient_evidence_answer_parts,
+        )
+        if part
+    )
+
+    result = LegalChatResponse(
+        question=request.question.strip(),
+        answer=final_answer,
+        grounded=True,
+        model=generated_text.model,
+        retrieval_total=retrieval_total,
+        sources=_build_cited_sources(
+            hits=selected_hits,
+            citation_numbers=citation_numbers,
+        ),
+    )
+
+    if repair_triggered:
+        # The winning text (repaired, or the first answer if repair
+        # degraded an already-good one) was never shown provisionally -
+        # announce its complete text before settling, per the
+        # mission's own required REPLACEMENT -> FINALIZED sequence.
+        yield StreamAnswerEvent(
+            type=StreamAnswerEventType.REPLACEMENT,
+            replacement_text=final_answer,
+        )
+
+    if timings is not None:
+        timings.finalization = perf_counter()
+
+    yield StreamAnswerEvent(
+        type=StreamAnswerEventType.FINALIZED,
+        result=result,
     )
