@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from time import perf_counter
-from typing import Final
+from typing import Final, TypeAlias
 from uuid import uuid4
 
 from fastapi import (
@@ -110,6 +110,17 @@ router = APIRouter(
     prefix="/api/v1",
     tags=["Legal Chat"],
 )
+
+
+# The one swappable seam _execute_resolved_plan/resolve_legal_chat_
+# response expose for streaming (chat-streaming initiative, GATE S4) -
+# see _execute_resolved_plan's own docstring. Loosely typed as
+# Callable[..., LegalChatResponse] (not a strict Protocol) since the
+# real call site (line ~2119) passes a mix of positional/keyword
+# arguments that answer_legal_question's own signature already
+# defines; the streaming bridge (app/routers/chat_stream.py) matches
+# it via functools.partial, never by redeclaring the signature here.
+AnswerGenerationFunction: TypeAlias = Callable[..., LegalChatResponse]
 
 
 def _optional_contact_source_directory():
@@ -1861,6 +1872,9 @@ def _execute_resolved_plan(
     rerank_pool_multiplier: int,
     max_context_characters: int,
     max_source_characters: int,
+    legal_answer_generation_fn: AnswerGenerationFunction = (
+        answer_legal_question
+    ),
 ) -> LegalChatResponse:
     """
     Execute every action RequestUnderstanding resolved.
@@ -1871,6 +1885,16 @@ def _execute_resolved_plan(
     covers every legal_information/comparison action combined; every
     contact action is resolved deterministically and appended, in
     order, after the legal answer.
+
+    `legal_answer_generation_fn` (chat-streaming initiative, GATE S4):
+    the ONE swappable seam this stable function exposes for streaming.
+    Defaults to answer_legal_question - byte-for-byte today's
+    behavior, unchanged for every existing caller. A caller wanting
+    real token streaming (app/routers/chat_stream.py) passes a
+    drop-in-compatible callable that bridges to
+    stream_answer_legal_question() instead - same call signature
+    (matched via functools.partial), so nothing else in this function
+    needs to know or care which one is running underneath.
     """
 
     contact_actions = result.actions_of_type("contact")
@@ -2102,7 +2126,7 @@ def _execute_resolved_plan(
             # request's other actions (0.4.2 hardening) - see
             # LegalActionEvidenceSpec. Still exactly one combined
             # generation call.
-            legal_response = answer_legal_question(
+            legal_response = legal_answer_generation_fn(
                 prepared_request,
                 search_function=search_function,
                 generation_client=generation_client,
@@ -2354,6 +2378,9 @@ def resolve_legal_chat_response(
     max_source_characters: int = (
         DEFAULT_MAX_SOURCE_CHARACTERS
     ),
+    legal_answer_generation_fn: AnswerGenerationFunction = (
+        answer_legal_question
+    ),
 ) -> LegalChatResponse:
     """
     Resolve one legal-chat request.
@@ -2366,6 +2393,12 @@ def resolve_legal_chat_response(
 
     Exactly one "legal_chat_performance" log event is emitted per
     call, on every path (clarification, resolved, fallback, or error).
+
+    `legal_answer_generation_fn` (chat-streaming initiative, GATE S4):
+    threaded straight through to _execute_resolved_plan's own
+    parameter of the same name - see its docstring. Defaults to
+    answer_legal_question, unchanged for every existing caller
+    (POST /api/v1/chat never passes anything else).
     """
 
     total_started_at = perf_counter()
@@ -3134,6 +3167,7 @@ def resolve_legal_chat_response(
             rerank_pool_multiplier=rerank_pool_multiplier,
             max_context_characters=max_context_characters,
             max_source_characters=max_source_characters,
+            legal_answer_generation_fn=legal_answer_generation_fn,
         )
 
         if requires_personalised_legal_caution(
@@ -3218,6 +3252,64 @@ def get_public_contact_photo(
     )
 
 
+def _build_comparison_source_budget_response(
+    *,
+    request: LegalChatRequest,
+    error: InvalidLegalChatRequestError,
+) -> LegalChatResponse:
+    """
+    The one friendly-200 (never an HTTP error) response
+    InvalidLegalChatRequestError's "comparison_source_budget" code
+    produces - extracted verbatim from legal_chat()'s own except
+    block (chat-streaming initiative, GATE S4) so
+    POST /api/v1/chat/stream can raise this exact same response
+    instead of a second, independently maintained copy of this text.
+    legal_chat()'s own regression coverage (test_chat.py's
+    FriendlyInvalidRequestHttpTests) protects this extraction.
+    """
+
+    country_count = error.details.get("country_count")
+
+    if (
+        not isinstance(country_count, int)
+        or country_count <= 0
+    ):
+        country_count = request.max_sources + 1
+
+    source_word = (
+        "source"
+        if request.max_sources == 1
+        else "sources"
+    )
+    country_word = (
+        "country"
+        if request.max_sources == 1
+        else "countries"
+    )
+
+    return LegalChatResponse(
+        question=request.question.strip(),
+        answer=(
+            f"This comparison includes "
+            f"{country_count} countries, but the "
+            f"current response can cite up to "
+            f"{request.max_sources} {source_word}. "
+            "To keep at least one source for each "
+            f"country, please choose up to "
+            f"{request.max_sources} {country_word} "
+            "or split the comparison into smaller "
+            "groups."
+        ),
+        grounded=False,
+        model=None,
+        retrieval_total=0,
+        sources=[],
+        conversation_state=(
+            request.conversation_state
+        ),
+    )
+
+
 @router.post(
     "/chat",
     response_model=LegalChatResponse,
@@ -3261,47 +3353,8 @@ def legal_chat(
 
     except InvalidLegalChatRequestError as error:
         if error.code == "comparison_source_budget":
-            country_count = error.details.get(
-                "country_count"
-            )
-
-            if (
-                not isinstance(country_count, int)
-                or country_count <= 0
-            ):
-                country_count = request.max_sources + 1
-
-            source_word = (
-                "source"
-                if request.max_sources == 1
-                else "sources"
-            )
-            country_word = (
-                "country"
-                if request.max_sources == 1
-                else "countries"
-            )
-
-            return LegalChatResponse(
-                question=request.question.strip(),
-                answer=(
-                    f"This comparison includes "
-                    f"{country_count} countries, but the "
-                    f"current response can cite up to "
-                    f"{request.max_sources} {source_word}. "
-                    "To keep at least one source for each "
-                    f"country, please choose up to "
-                    f"{request.max_sources} {country_word} "
-                    "or split the comparison into smaller "
-                    "groups."
-                ),
-                grounded=False,
-                model=None,
-                retrieval_total=0,
-                sources=[],
-                conversation_state=(
-                    request.conversation_state
-                ),
+            return _build_comparison_source_budget_response(
+                request=request, error=error,
             )
 
         raise HTTPException(
