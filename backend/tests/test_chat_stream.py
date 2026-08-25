@@ -28,10 +28,11 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 
 from app.clients.openai_responses import OpenAIConfigurationError
 from app.clients.openai_responses_stream import StreamEvent, StreamEventType
@@ -51,6 +52,13 @@ from app.routers.chat_stream import (
     _serialize_ndjson_record,
     legal_chat_stream,
 )
+from app.routers.chat import (
+    CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
+    legal_chat as real_legal_chat,
+    resolve_legal_chat_response as real_resolve_legal_chat_response,
+)
+from app.models.search import LegalSearchResponse
+from app.services.contact_state import ContactRecord, ContactState
 
 from tests.test_rag_answer import (
     FakeGenerationClient,
@@ -60,6 +68,19 @@ from tests.test_rag_answer import (
 from tests.test_stream_answer_legal_question import (
     FakeStreamGenerationClient,
     _RepairOnlyClient,
+)
+from tests.test_chat import (
+    FakeGenerationClient as ChatFakeGenerationClient,
+    FakeUnderstandingClient,
+    NoCallGenerationClient,
+    NoCallUnderstandingClient,
+    _FailingUnderstandingClient,
+    _build_contact_hit,
+    _catalog_provider,
+    _document_topic_provider,
+    _understanding_action,
+    _understanding_result,
+    _unexpected_search,
 )
 
 
@@ -212,6 +233,240 @@ async def _call_and_consume(coro) -> tuple[object, list[dict]]:
     return response, records
 
 
+def _reconstruct_response_from_ndjson(
+    records: list[dict],
+) -> LegalChatResponse:
+    """
+    Reconstructs the logical LegalChatResponse a real browser client
+    would build by applying protocol-v1 NDJSON records in order (GATE
+    S4B item 6) - the same rules a frontend implementation must
+    follow:
+
+        DELTA       -> append to the provisional answer
+        DISCARD     -> clear the provisional answer
+        REPLACEMENT -> replace the provisional answer outright
+        METADATA    -> every other LegalChatResponse field
+        DONE        -> terminal success
+        ERROR       -> terminal failure (raises - there is no
+                       logical response to reconstruct)
+
+    Used to prove /chat/stream's reconstructed response is equivalent
+    to the real /chat route's own LegalChatResponse for identical
+    inputs - never a second, independent definition of correctness.
+    """
+
+    provisional_answer = ""
+    metadata_payload: dict | None = None
+    terminal: str | None = None
+
+    for record in records:
+        record_type = record["type"]
+
+        if record_type == "delta":
+            provisional_answer += record["text"]
+        elif record_type == "discard":
+            provisional_answer = ""
+        elif record_type == "replacement":
+            provisional_answer = record["text"]
+        elif record_type == "metadata":
+            metadata_payload = {
+                key: value for key, value in record.items() if key != "type"
+            }
+        elif record_type == "done":
+            terminal = "done"
+        elif record_type == "error":
+            terminal = "error"
+
+    if terminal == "error":
+        raise AssertionError(
+            "Cannot reconstruct a LegalChatResponse from a stream "
+            "that terminated in an error record."
+        )
+
+    if terminal != "done":
+        raise AssertionError(
+            "NDJSON stream never reached a terminal done record."
+        )
+
+    if metadata_payload is None:
+        raise AssertionError(
+            "NDJSON stream reached done without ever sending metadata."
+        )
+
+    return LegalChatResponse(answer=provisional_answer, **metadata_payload)
+
+
+def _real_orchestration_pipeline(
+    *,
+    catalog_provider,
+    document_topic_provider,
+    search_function,
+    generation_client=None,
+    understanding_client=None,
+):
+    """
+    GATE S4B items 4/5/6: a pipeline stand-in with the SAME call
+    signature legal_chat_stream() uses when invoking
+    resolve_legal_chat_response (positional request, keyword
+    request_id/rerank_enabled/rerank_pool_multiplier/
+    max_context_characters/max_source_characters/
+    legal_answer_generation_fn) - but forwards into the REAL,
+    unmodified resolve_legal_chat_response (real_resolve_legal_chat_
+    response, imported directly from app.routers.chat rather than
+    through the app.routers.chat_stream name this module patches),
+    with the given fakes injected only for ITS OWN catalog_provider/
+    document_topic_provider/search_function/generation_client/
+    understanding_client parameters.
+
+    This exercises the REAL request-understanding/dispatch logic
+    (clarification, contact, assistant-help, insufficient-evidence,
+    comparison, fallback) end to end - unlike _DeterministicPipeline/
+    _GeneratingPipeline (which bypass that dispatch entirely), this is
+    "only a generic deterministic helper" no longer.
+    """
+
+    def _run(request, **kwargs):
+        return real_resolve_legal_chat_response(
+            request,
+            catalog_provider=catalog_provider,
+            document_topic_provider=document_topic_provider,
+            search_function=search_function,
+            generation_client=generation_client,
+            understanding_client=understanding_client,
+            **kwargs,
+        )
+
+    return _run
+
+
+def _run_real_chat_route(
+    request: LegalChatRequest,
+    *,
+    catalog_provider,
+    document_topic_provider,
+    search_function,
+    generation_client=None,
+    understanding_client=None,
+) -> LegalChatResponse:
+    """
+    Calls the REAL, unpatched POST /api/v1/chat route function
+    directly (mirroring test_chat.py's FriendlyInvalidRequestHttpTests
+    convention), with resolve_legal_chat_response itself replaced by
+    _real_orchestration_pipeline's forwarding wrapper.
+
+    resolve_legal_chat_response's own catalog_provider/
+    document_topic_provider/search_function parameters default to
+    get_legal_catalog/get_document_legal_topics_by_country/
+    search_legal_documents - but as ORDINARY PYTHON DEFAULT ARGUMENTS,
+    bound once at function-DEFINITION time. Patching those names in
+    app.routers.chat's module namespace afterward has no effect on an
+    already-bound default; only intercepting the
+    resolve_legal_chat_response CALL itself (a live global-name lookup
+    inside legal_chat()'s own body, resolved at call time) can inject
+    fakes here. Used only to build the "stable /chat" side of the
+    STABLE_VS_STREAM_EQUIVALENCE_MATRIX (GATE S4B item 6) - with the
+    SAME _real_orchestration_pipeline construction /chat/stream's own
+    equivalent test uses, so both sides get byte-identical fake
+    wiring.
+    """
+
+    pipeline = _real_orchestration_pipeline(
+        catalog_provider=catalog_provider,
+        document_topic_provider=document_topic_provider,
+        search_function=search_function,
+        generation_client=generation_client,
+        understanding_client=understanding_client,
+    )
+
+    with mock.patch(
+        "app.routers.chat.resolve_legal_chat_response", side_effect=pipeline,
+    ):
+        return real_legal_chat(
+            request=request,
+            response=Response(),
+            x_request_id="equivalence-baseline",
+        )
+
+
+def _make_comparison_fixture(
+    codes: list[str],
+    names: dict[str, str],
+    *,
+    max_sources: int,
+    legal_topics: list[str] | None = None,
+):
+    """
+    GATE S4B items 5/6: a real N-country comparison, dispatched
+    through the ACTUAL RequestUnderstanding "comparison" action type
+    and real multi-country retrieval/generation - not a mocked stand-
+    in for resolve_legal_chat_response itself.
+
+    Each country's fake search hit is given an EXPLICIT, distinct
+    chunk_id (test_rag_answer.py's _build_hit defaults chunk_id to the
+    fixed literal "chunk-1" for every call - reusing that default
+    across >1 country silently dedupes every country but one out of
+    selected_hits during merge, which then fails grounding validation
+    with a confusing "citation out of range"-shaped error; the S3
+    streaming tests already avoid this by passing distinct chunk_ids
+    explicitly - see test_stream_answer_legal_question.py's own
+    test_two_country_comparison).
+
+    Returns (request, pipeline, stream_client, expected_answer).
+    """
+
+    def fake_search(request: LegalSearchResponse) -> LegalSearchResponse:
+        code = request.country_codes[0]
+        return LegalSearchResponse(
+            query=request.query,
+            total=1,
+            limit=request.limit,
+            offset=0,
+            took_ms=1,
+            hits=[
+                _build_hit(
+                    country_code=code,
+                    country=names[code],
+                    chunk_id=f"chunk-{code.lower()}-1",
+                )
+            ],
+        )
+
+    answer = "\n\n".join(
+        f"{names[c]}\n- Supported by [{i}]."
+        for i, c in enumerate(codes, start=1)
+    )
+
+    understanding_client = FakeUnderstandingClient(
+        payload=_understanding_result(
+            actions=[
+                _understanding_action(
+                    "comparison",
+                    country_codes=codes,
+                    legal_topics=legal_topics or ["Working Conditions"],
+                )
+            ],
+        )
+    )
+
+    pipeline = _real_orchestration_pipeline(
+        catalog_provider=_catalog_provider,
+        document_topic_provider=_document_topic_provider,
+        search_function=fake_search,
+        generation_client=ChatFakeGenerationClient(answer=answer),
+        understanding_client=understanding_client,
+    )
+
+    stream_client = FakeStreamGenerationClient(_delta_events(answer))
+
+    request = LegalChatRequest(
+        question="Compare notice periods across these countries.",
+        country_codes=codes,
+        max_sources=max_sources,
+    )
+
+    return request, pipeline, stream_client, answer
+
+
 class SerializationSafetyTests(unittest.TestCase):
 
     def _decode_text_field(self, payload: dict, field: str) -> str:
@@ -350,23 +605,31 @@ class EventMappingTests(unittest.TestCase):
         )
 
 
+def _patch_chat_stream(*, pipeline, stream_client=None):
+    """Shared patch triple for exercising legal_chat_stream() through
+    a fake resolve_legal_chat_response - reused by every test class
+    that drives the route function directly."""
+
+    return (
+        mock.patch(
+            "app.routers.chat_stream.get_settings",
+            return_value=_fake_settings(),
+        ),
+        mock.patch(
+            "app.routers.chat_stream.resolve_legal_chat_response",
+            side_effect=pipeline,
+        ),
+        mock.patch(
+            "app.routers.chat_stream.get_openai_answer_stream_client",
+            return_value=stream_client,
+        ),
+    )
+
+
 class RouteMechanismTests(unittest.TestCase):
 
     def _patch(self, *, pipeline, stream_client=None):
-        return (
-            mock.patch(
-                "app.routers.chat_stream.get_settings",
-                return_value=_fake_settings(),
-            ),
-            mock.patch(
-                "app.routers.chat_stream.resolve_legal_chat_response",
-                side_effect=pipeline,
-            ),
-            mock.patch(
-                "app.routers.chat_stream.get_openai_answer_stream_client",
-                return_value=stream_client,
-            ),
-        )
+        return _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
 
     # -- PRE_STREAM_ERROR boundary -----------------------------------
 
@@ -654,6 +917,7 @@ class RouteMechanismTests(unittest.TestCase):
             )
         types = [r["type"] for r in records]
         self.assertIn("delta", types)
+        self.assertIn("discard", types)
         self.assertEqual(types[-1], "error")
         self.assertNotIn("metadata", types)
         self.assertNotIn("done", types)
@@ -716,6 +980,751 @@ class RouteMechanismTests(unittest.TestCase):
             )
         types = [r["type"] for r in records]
         self.assertNotIn("replacement", types)
+
+    # -- post_generation_failure (GATE S4B item 7) ----------------------
+
+    def test_post_generation_failure_after_finalized_discards_then_errors(
+        self,
+    ) -> None:
+        """
+        Generation completes cleanly (FINALIZED fires, no provider
+        ERROR) but _execute_resolved_plan's OWN post-processing then
+        raises before ever returning a LegalChatResponse - the
+        post_generation_failure branch (chat_stream.py). Whatever text
+        the client already received is no longer trustworthy (the
+        request as a whole failed, so it was never truly finalized),
+        so a DISCARD must precede the terminal error, and neither
+        metadata nor done may ever be emitted.
+        """
+
+        answer = (
+            "United Kingdom\n- The minimum notice is one week "
+            "in the stated circumstances [1]."
+        )
+        stream_client = FakeStreamGenerationClient(_delta_events(answer))
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(answer=answer),
+            raise_after=RuntimeError("post-processing failed"),
+        )
+        p1, p2, p3 = self._patch(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(request=generation_request, x_request_id="s-7"),
+                )
+            )
+        types = [r["type"] for r in records]
+
+        self.assertEqual("start", types[0])
+        self.assertIn("delta", types)
+        self.assertIn("discard", types)
+        self.assertEqual(types[-1], "error")
+        self.assertEqual(1, types.count("error"))
+        self.assertEqual(
+            "post_generation_failure", records[-1]["code"],
+        )
+        self.assertNotIn("metadata", types)
+        self.assertNotIn("done", types)
+
+    # -- Unknown pre-stream exception (GATE S4B item 8) ------------------
+
+    def test_unknown_pre_stream_exception_follows_unhandled_fastapi_path(
+        self,
+    ) -> None:
+        """
+        _map_pre_stream_exception_to_http only classifies 5 known
+        exception types; anything else must propagate unchanged - the
+        same "no HTTPException, no NDJSON error, just let FastAPI's
+        own default unhandled-exception path take over" behavior /chat
+        itself already has for an exception outside its own 5-type
+        except clause. Never silently downgraded to HTTP 200 + NDJSON
+        error merely because generation never started.
+        """
+
+        class _UnmappedError(Exception):
+            pass
+
+        p1, p2, p3 = self._patch(
+            pipeline=_RaisingPipeline(_UnmappedError("unexpected")),
+        )
+        with p1, p2, p3:
+            with self.assertRaises(_UnmappedError):
+                _run(
+                    legal_chat_stream(
+                        request=LegalChatRequest(question="A valid-length question."),
+                        x_request_id="pre-7",
+                    )
+                )
+
+
+class StreamMetricsTests(unittest.TestCase):
+    """
+    Tests for the "chat_stream_performance" structured log event
+    (GATE S4B items 2/3/9/17) - additive to, and never a replacement
+    for, the existing "legal_chat_performance" line.
+    """
+
+    LOGGER_NAME = "app.routers.chat_stream"
+
+    def _stream_metric_payloads(self, log_context) -> list[dict]:
+        """
+        Filters this logger's captured records down to only the
+        JSON "chat_stream_performance" lines - the SAME logger also
+        carries logger.exception(...) traceback text for
+        post_generation_failure, which is not JSON and must not be
+        mistaken for a second/duplicate metric record.
+        """
+
+        payloads = []
+        for record in log_context.records:
+            try:
+                payload = json.loads(record.getMessage())
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if payload.get("event") == "chat_stream_performance":
+                payloads.append(payload)
+        return payloads
+
+    def _single_stream_metric(self, log_context) -> dict:
+        """Asserts exactly ONE terminal metric record was emitted -
+        never a duplicate - and returns its payload."""
+
+        payloads = self._stream_metric_payloads(log_context)
+        self.assertEqual(1, len(payloads))
+        return payloads[0]
+
+    def test_direct_completion_emits_exactly_one_stream_completed_metric(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n- The minimum notice is one week "
+            "in the stated circumstances [1]."
+        )
+        stream_client = FakeStreamGenerationClient(_delta_events(answer))
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(answer=answer),
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=generation_request, x_request_id="metrics-1",
+                        ),
+                    )
+                )
+
+        payload = self._single_stream_metric(log_context)
+
+        self.assertEqual("stream_completed", payload["outcome"])
+        self.assertEqual("metrics-1", payload["request_id"])
+        self.assertIsNone(payload["error_code"])
+        self.assertFalse(payload["repair_triggered"])
+        self.assertIsNone(payload["repair_success"])
+        self.assertIsNone(payload["t1_understanding_complete"])
+        self.assertIsNone(payload["t3_rerank_complete"])
+        self.assertIsNotNone(payload["t2_retrieval_complete"])
+        self.assertIsNotNone(payload["t4_generation_start"])
+        self.assertIsNotNone(payload["t5_first_provider_delta"])
+        self.assertIsNotNone(payload["t6_first_fastapi_delta"])
+        self.assertIsNotNone(payload["t8_done"])
+        self.assertIsNotNone(payload["total_ms"])
+        self.assertNotIn("question", payload)
+        self.assertNotIn("answer", payload)
+
+    def test_repair_emits_repair_triggered_with_final_completion(
+        self,
+    ) -> None:
+        initial_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to unpaid "
+            "leave for family reasons [1]."
+        )
+        repaired_answer = (
+            "United Kingdom\n"
+            "- Employees are entitled to paid "
+            "parental leave for four weeks [1]."
+        )
+        stream_client = FakeStreamGenerationClient(_delta_events(initial_answer))
+        generation_request = LegalChatRequest(
+            question="What is the paid leave entitlement in the UK?",
+            country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=_RepairOnlyClient(answer=repaired_answer),
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=generation_request, x_request_id="metrics-2",
+                        ),
+                    )
+                )
+
+        payload = self._single_stream_metric(log_context)
+
+        self.assertEqual("stream_completed", payload["outcome"])
+        self.assertTrue(payload["repair_triggered"])
+        self.assertIsNotNone(payload["repair_start"])
+        self.assertIsNotNone(payload["repair_end"])
+        self.assertIsNotNone(payload["validation_start"])
+        self.assertIsNotNone(payload["validation_end"])
+
+    def test_provider_in_stream_error_emits_stream_error_metric(
+        self,
+    ) -> None:
+        events = _delta_events("Partial answer text")[:-1]
+        events.append(
+            StreamEvent(type=StreamEventType.ERROR, error_message="boom")
+        )
+        stream_client = FakeStreamGenerationClient(events)
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=generation_request, x_request_id="metrics-3",
+                        ),
+                    )
+                )
+
+        payload = self._single_stream_metric(log_context)
+
+        self.assertEqual("stream_error", payload["outcome"])
+        self.assertEqual("stream_generation_failed", payload["error_code"])
+        self.assertIsNone(payload["t8_done"])
+
+    def test_known_pre_stream_exception_emits_pre_stream_failure_metric(
+        self,
+    ) -> None:
+        p1, p2, p3 = _patch_chat_stream(
+            pipeline=_RaisingPipeline(InvalidLegalChatRequestError("bad request")),
+        )
+        with p1, p2, p3:
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_context:
+                with self.assertRaises(HTTPException):
+                    _run(
+                        legal_chat_stream(
+                            request=LegalChatRequest(
+                                question="A valid-length question.",
+                            ),
+                            x_request_id="metrics-4",
+                        )
+                    )
+
+        payload = self._single_stream_metric(log_context)
+
+        self.assertEqual("pre_stream_failure", payload["outcome"])
+        self.assertEqual(
+            "InvalidLegalChatRequestError", payload["error_code"],
+        )
+        self.assertIsNone(payload["t2_retrieval_complete"])
+        self.assertIsNone(payload["t4_generation_start"])
+        self.assertIsNone(payload["t6_first_fastapi_delta"])
+        self.assertIsNone(payload["t8_done"])
+
+    def test_post_generation_failure_emits_post_generation_failure_metric(
+        self,
+    ) -> None:
+        answer = (
+            "United Kingdom\n- The minimum notice is one week "
+            "in the stated circumstances [1]."
+        )
+        stream_client = FakeStreamGenerationClient(_delta_events(answer))
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(answer=answer),
+            raise_after=RuntimeError("post-processing failed"),
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=generation_request, x_request_id="metrics-5",
+                        ),
+                    )
+                )
+
+        payload = self._single_stream_metric(log_context)
+
+        self.assertEqual("post_generation_failure", payload["outcome"])
+        self.assertEqual("RuntimeError", payload["error_code"])
+        self.assertIsNone(payload["t8_done"])
+
+
+class NamedEarlyResponseRouteTests(unittest.TestCase):
+    """
+    GATE S4B item 4: E/F/G/H named early-response scenarios, each
+    driven through the REAL resolve_legal_chat_response dispatch
+    (_real_orchestration_pipeline) rather than a generic deterministic
+    stand-in - proving /chat/stream's early-finalized NDJSON shape
+    (start -> delta(full answer) -> metadata -> done) for the actual
+    production code paths that produce it, not just a hand-built
+    LegalChatResponse.
+    """
+
+    # -- E: clarification -----------------------------------------------
+
+    def test_clarification_unsupported_request_streams_as_early_finalized(
+        self,
+    ) -> None:
+        """
+        Mirrors test_chat.py's ChatMetricsTests.
+        test_tax_question_records_unsupported_request_clarification -
+        a real out-of-scope question (not employment law at all) makes
+        RequestUnderstanding return status="unsupported", which
+        resolve_legal_chat_response returns as a canned clarification
+        BEFORE ever calling legal_answer_generation_fn or search.
+        """
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="unsupported", clarification_reason="unsupported_request",
+            )
+        )
+        pipeline = _real_orchestration_pipeline(
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=understanding_client,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=LegalChatRequest(
+                            question=(
+                                "What are the corporate income tax "
+                                "rules in Spain?"
+                            ),
+                            country_codes=["ES"],
+                        ),
+                        x_request_id="clarify-1",
+                    )
+                )
+            )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
+        self.assertEqual(
+            CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER, records[1]["text"],
+        )
+        metadata = records[2]
+        self.assertFalse(metadata["grounded"])
+        self.assertIsNone(metadata["model"])
+        self.assertEqual(0, metadata["retrieval_total"])
+        self.assertEqual([], metadata["sources"])
+
+    # -- F: contact-only --------------------------------------------------
+
+    def test_contact_only_response_streams_with_contacts_intact_in_metadata(
+        self,
+    ) -> None:
+        """
+        A pure contact-intent question ("who do I contact...") resolves
+        via resolve_legal_chat_response's early-exit contact branch
+        (chat.py ~1661-1720), which never calls legal_answer_generation_fn.
+        Proves structured contacts (LegalChatContact, built from a fake
+        in-memory ContactState - never real ContactState sidecar files)
+        survive intact all the way through NDJSON metadata.
+        """
+
+        def fake_contact_search(
+            country_codes: list[str], client=None,
+        ) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query="", total=1, limit=20, offset=0, took_ms=1,
+                hits=[_build_contact_hit(country_code="PE", country="Peru")],
+            )
+
+        fake_settings = SimpleNamespace(
+            document_source_dir=Path("/fake/source/dir"),
+        )
+        fake_state = ContactState(
+            document_id="document-pe",
+            country_code="PE",
+            contacts=(
+                ContactRecord(
+                    contact_id="contact-pe-1",
+                    member_firm="Test Firm",
+                    contact_person="Jane Doe",
+                    email="jane@test-firm.example",
+                    phone="+51 111 222 333",
+                    address="Lima, Peru",
+                    website="https://test-firm.example",
+                ),
+            ),
+        )
+
+        def fake_read_contact_state(source_directory, document_id):
+            self.assertEqual("document-pe", document_id)
+            return fake_state
+
+        pipeline = _real_orchestration_pipeline(
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=_FailingUnderstandingClient(),
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=fake_contact_search,
+        ), mock.patch(
+            "app.routers.chat.get_settings", return_value=fake_settings,
+        ), mock.patch(
+            "app.services.chat_contact_cards.read_contact_state",
+            side_effect=fake_read_contact_state,
+        ):
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=LegalChatRequest(
+                            question=(
+                                "Give me the contact details for an "
+                                "employment lawyer in Peru."
+                            ),
+                        ),
+                        x_request_id="contact-1",
+                    )
+                )
+            )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
+        self.assertIn("Test Firm", records[1]["text"])
+
+        metadata = records[2]
+        self.assertTrue(metadata["grounded"])
+        self.assertEqual(1, len(metadata["contacts"]))
+        contact = metadata["contacts"][0]
+        self.assertEqual("contact-pe-1", contact["contact_id"])
+        self.assertEqual("PE", contact["country_code"])
+        self.assertEqual("Test Firm", contact["member_firm"])
+        self.assertEqual("Jane Doe", contact["contact_person"])
+        self.assertEqual("jane@test-firm.example", contact["email"])
+        self.assertEqual("+51 111 222 333", contact["phone"])
+
+    # -- G: assistant-help / conversation-meta ----------------------------
+
+    def test_assistant_help_response_streams_as_early_finalized(self) -> None:
+        """
+        Mirrors test_chat.py's AssistantHelpRouteTests.test_capabilities -
+        a deterministic (regex-based, non-LLM) meta question about the
+        assistant itself. NoCallUnderstandingClient/NoCallGenerationClient/
+        _unexpected_search each raise if ever invoked - proving
+        RequestUnderstanding, generation, and search are all genuinely
+        skipped, not merely unmocked.
+        """
+
+        pipeline = _real_orchestration_pipeline(
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=NoCallUnderstandingClient(),
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=LegalChatRequest(question="What can you do?"),
+                        x_request_id="help-1",
+                    )
+                )
+            )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
+        self.assertTrue(records[1]["text"])
+
+        metadata = records[2]
+        self.assertFalse(metadata["grounded"])
+        self.assertIsNone(metadata["model"])
+        self.assertEqual(0, metadata["retrieval_total"])
+        self.assertEqual([], metadata["sources"])
+
+    # -- H: insufficient-evidence / fallback ------------------------------
+
+    def test_unavailable_country_fallback_streams_as_early_finalized(
+        self,
+    ) -> None:
+        """
+        Mirrors test_chat.py's ThreeAxisCountryAvailabilityContractTests.
+        test_registered_and_allowed_but_not_indexed_is_a_controlled_fallback -
+        France is a real, registered, admin-allowed country that the
+        fake catalog (_NOT_YET_INDEXED_CODES) deliberately excludes from
+        its indexed set, so this hits the hard early "recognized but
+        unavailable" return (chat.py ~2797-2853) - legal_answer_
+        generation_fn is never referenced, and _unexpected_search proves
+        OpenSearch is never touched either.
+        """
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="clarification", clarification_reason="missing_country",
+            )
+        )
+        pipeline = _real_orchestration_pipeline(
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            search_function=_unexpected_search,
+            generation_client=None,
+            understanding_client=understanding_client,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=LegalChatRequest(
+                            question="What are the overtime rules in France?",
+                        ),
+                        x_request_id="fallback-1",
+                    )
+                )
+            )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
+        self.assertIn("France", records[1]["text"])
+
+        metadata = records[2]
+        self.assertFalse(metadata["grounded"])
+        self.assertIsNone(metadata["model"])
+        self.assertEqual(0, metadata["retrieval_total"])
+        self.assertEqual([], metadata["sources"])
+
+
+class ComparisonRouteTests(unittest.TestCase):
+    """
+    GATE S4B item 5: I/J/K real N-country comparison route tests, plus
+    the current stable-code maximum (10, via max_sources's Pydantic
+    le=10 ceiling) vs the product-documented default (6) - reported,
+    never "fixed", as PRE_EXISTING_PRODUCT_CONSTRAINT_DRIFT.
+    """
+
+    def _assert_clean_comparison_stream(
+        self, records: list[dict], *, codes: list[str], answer: str,
+    ) -> None:
+        types = [r["type"] for r in records]
+        self.assertEqual("start", types[0])
+        self.assertIn("delta", types)
+        self.assertEqual("metadata", types[-2])
+        self.assertEqual("done", types[-1])
+        self.assertNotIn("discard", types)
+
+        deltas = "".join(r["text"] for r, t in zip(records, types) if t == "delta")
+        self.assertEqual(answer, deltas)
+
+        metadata = records[-2]
+        self.assertTrue(metadata["grounded"])
+        self.assertEqual(
+            sorted(codes),
+            sorted(source["country_code"] for source in metadata["sources"]),
+        )
+
+    def test_two_country_comparison(self) -> None:
+        codes = ["GB", "ES"]
+        names = {"GB": "United Kingdom", "ES": "Spain"}
+        request, pipeline, stream_client, answer = _make_comparison_fixture(
+            codes, names, max_sources=6,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(request=request, x_request_id="compare-2"),
+                )
+            )
+        self._assert_clean_comparison_stream(records, codes=codes, answer=answer)
+
+    def test_three_country_comparison(self) -> None:
+        codes = ["GB", "ES", "IT"]
+        names = {"GB": "United Kingdom", "ES": "Spain", "IT": "Italy"}
+        request, pipeline, stream_client, answer = _make_comparison_fixture(
+            codes, names, max_sources=6,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(request=request, x_request_id="compare-3"),
+                )
+            )
+        self._assert_clean_comparison_stream(records, codes=codes, answer=answer)
+
+    def test_six_country_comparison_at_the_default_max_sources_boundary(
+        self,
+    ) -> None:
+        """max_sources defaults to 6 (LegalChatRequest.max_sources,
+        Field(default=6, ge=1, le=10)), and the ONLY live country-count
+        budget check is `max_sources < len(country_codes)` (strict) -
+        so exactly 6 countries is the product-documented, no-override
+        boundary."""
+
+        codes = ["GB", "ES", "IT", "CZ", "SE", "CH"]
+        names = {
+            "GB": "United Kingdom", "ES": "Spain", "IT": "Italy",
+            "CZ": "Czech Republic", "SE": "Sweden", "CH": "Switzerland",
+        }
+        request, pipeline, stream_client, answer = _make_comparison_fixture(
+            codes, names, max_sources=6,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(request=request, x_request_id="compare-6"),
+                )
+            )
+        self._assert_clean_comparison_stream(records, codes=codes, answer=answer)
+
+    def test_current_stable_code_maximum_is_ten_not_six(self) -> None:
+        """
+        PRE_EXISTING_PRODUCT_CONSTRAINT_DRIFT (reported, not fixed, per
+        this mission's standing instruction): the product-documented
+        comparison maximum is 6 countries, but the actual stable-code
+        ceiling is 10 - LegalChatRequest.max_sources' Pydantic le=10 is
+        the ONLY hard limit found anywhere in chat.py/rag_answer.py/
+        request_understanding.py (country_codes itself has no
+        max_length/model_validator constraint at all), and the
+        comparison_source_budget check is `max_sources < country_count`
+        (strict), so max_sources=10 with exactly 10 country_codes is
+        genuinely reachable through the real dispatch/streaming path -
+        proven end to end here, not merely inferred from reading the
+        Pydantic Field() definition.
+        """
+
+        codes = ["GB", "ES", "IT", "CZ", "SE", "CH", "PL", "PT", "NL", "BE"]
+        names = {
+            "GB": "United Kingdom", "ES": "Spain", "IT": "Italy",
+            "CZ": "Czech Republic", "SE": "Sweden", "CH": "Switzerland",
+            "PL": "Poland", "PT": "Portugal", "NL": "Netherlands",
+            "BE": "Belgium",
+        }
+        request, pipeline, stream_client, answer = _make_comparison_fixture(
+            codes, names, max_sources=10,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(request=request, x_request_id="compare-10"),
+                )
+            )
+        self._assert_clean_comparison_stream(records, codes=codes, answer=answer)
+
+    def test_eleven_countries_exceeds_even_the_current_maximum(self) -> None:
+        """
+        max_sources cannot exceed 10 (Pydantic le=10) - so 11
+        countries can never be paired with a large-enough max_sources,
+        and hits the real comparison_source_budget check.
+
+        GATE S4B finding: unlike /chat (where legal_chat()'s except
+        block wraps resolve_legal_chat_response entirely and can
+        return a friendly 200 no matter when this exception fires),
+        comparison_source_budget can ONLY be raised from inside
+        generation (_retrieve_search_hits, shared by answer_legal_
+        question and stream_answer_legal_question) - so for
+        /chat/stream it is architecturally always raised AFTER the
+        bridge has already signaled "generation starting", i.e. after
+        the response is already committed to 200+NDJSON. This module
+        special-cases it (see _drain_stream_events) to still stream
+        the SAME friendly text /chat would return, as a genuine
+        successful completion (replacement -> metadata -> done, no
+        prior delta since the failure is detected before any token was
+        ever generated) rather than a generic in-band error - the
+        closest possible parity with /chat given that constraint.
+        """
+
+        codes = [
+            "GB", "ES", "IT", "CZ", "SE", "CH",
+            "PL", "PT", "NL", "BE", "IE",
+        ]
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "comparison",
+                        country_codes=codes,
+                        legal_topics=["Working Conditions"],
+                    )
+                ],
+            )
+        )
+        pipeline = _real_orchestration_pipeline(
+            catalog_provider=_catalog_provider,
+            document_topic_provider=_document_topic_provider,
+            search_function=_unexpected_search,
+            generation_client=None,
+            understanding_client=understanding_client,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3:
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=LegalChatRequest(
+                                question="Compare these countries.",
+                                country_codes=codes,
+                                max_sources=10,
+                            ),
+                            x_request_id="compare-11",
+                        )
+                    )
+                )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "replacement", "metadata", "done"], types)
+        self.assertIn("11 countries", records[1]["text"])
+        self.assertFalse(records[2]["grounded"])
+
+        metric_payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(metric_payloads))
+        self.assertEqual("stream_completed", metric_payloads[0]["outcome"])
 
 
 class EventLoopNonBlockingTests(unittest.TestCase):

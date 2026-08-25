@@ -165,6 +165,111 @@ def _error_record(
 
 
 # =============================================================================
+# Structured stream metrics (GATE S4B) - exactly one terminal
+# "chat_stream_performance" log line per /chat/stream request,
+# ADDITIVE to (never replacing) the existing "legal_chat_performance"
+# line resolve_legal_chat_response() already emits internally on every
+# path, streaming or not. Never logs the question, the answer,
+# sources, or any credential - only counts/timings/classification
+# labels, matching chat_metrics.py's own existing privacy convention.
+# =============================================================================
+
+
+def _elapsed_ms(started_at: float, event_at: float | None) -> float | None:
+    if event_at is None:
+        return None
+
+    return round((event_at - started_at) * 1000, 2)
+
+
+def _stream_metric_payload(
+    *,
+    request_id: str,
+    t0: float,
+    outcome: str,
+    error_code: str | None = None,
+    timings: StreamAnswerTimings | None = None,
+    metrics: Any = None,
+    first_fastapi_delta_at: float | None = None,
+    done_at: float | None = None,
+) -> dict[str, Any]:
+    """
+    Builds the one "chat_stream_performance" log payload for a single
+    /chat/stream request.
+
+    `timings` is the StreamAnswerTimings instance threaded into
+    stream_answer_legal_question() (rag_answer.py, S3) - populated
+    only once real generation actually ran. `metrics` is the SAME
+    LegalChatMetrics instance _execute_resolved_plan hands to
+    legal_answer_generation_fn (captured by this module's own bridge
+    below), reused here ONLY for its already-existing
+    repair_triggered/repair_success fields, so this event's repair
+    classification is defined identically to /chat's own
+    "legal_chat_performance" line - never a second, divergent
+    definition of "repair succeeded".
+
+    t1_understanding_complete and t3_rerank_complete are always null:
+    neither is observable from this module without adding a new
+    timing hook inside resolve_legal_chat_response's own internal
+    dispatch (t1), or splitting _retrieve_search_hits's combined
+    retrieval+rerank timestamp (t3) - both would touch the stable,
+    unmodified /chat pipeline this gate is explicitly forbidden from
+    refactoring. Never fabricated; reported as null instead. T7 is
+    browser-only and is never computed here.
+    """
+
+    repair_triggered = bool(getattr(metrics, "repair_triggered", False))
+
+    return {
+        "event": "chat_stream_performance",
+        "request_id": request_id,
+        "outcome": outcome,
+        "error_code": error_code,
+        "repair_triggered": repair_triggered,
+        "repair_success": (
+            bool(getattr(metrics, "repair_success", False))
+            if repair_triggered
+            else None
+        ),
+        "t0_request_received": 0.0,
+        "t1_understanding_complete": None,
+        "t2_retrieval_complete": _elapsed_ms(
+            t0,
+            timings.retrieval_and_rerank_complete if timings else None,
+        ),
+        "t3_rerank_complete": None,
+        "t4_generation_start": _elapsed_ms(
+            t0, timings.generation_start if timings else None,
+        ),
+        "t5_first_provider_delta": _elapsed_ms(
+            t0, timings.first_provider_delta if timings else None,
+        ),
+        "t6_first_fastapi_delta": _elapsed_ms(t0, first_fastapi_delta_at),
+        "t8_done": _elapsed_ms(t0, done_at),
+        "validation_start": _elapsed_ms(
+            t0, timings.validation_start if timings else None,
+        ),
+        "validation_end": _elapsed_ms(
+            t0, timings.validation_end if timings else None,
+        ),
+        "repair_start": _elapsed_ms(
+            t0, timings.repair_start if timings else None,
+        ),
+        "repair_end": _elapsed_ms(
+            t0, timings.repair_end if timings else None,
+        ),
+        "total_ms": _elapsed_ms(t0, perf_counter()),
+    }
+
+
+def _log_stream_metric(payload: dict[str, Any]) -> None:
+    logger.info(
+        "%s",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+# =============================================================================
 # Internal StreamAnswerEvent -> NDJSON mapping (mission section 11).
 # The RAG service (rag_answer.py) never sees any of this.
 # =============================================================================
@@ -275,19 +380,33 @@ async def _drain_stream_events(
     event_queue: asyncio.Queue,
     pipeline_task: asyncio.Task[LegalChatResponse],
     request_id: str,
+    request: LegalChatRequest,
     timings: StreamAnswerTimings,
     sent_text_holder: list[str],
+    metrics_holder: list[Any],
+    t0: float,
 ) -> AsyncIterator[bytes]:
     """
     Runs ONLY once "generation starting" has already been observed -
     HTTP 200 + StreamingResponse is already committed by the time this
     generator's body executes. Any failure from here on becomes an
-    in-band `error` record, never a changed HTTP status.
+    in-band `error` record, never a changed HTTP status - EXCEPT
+    InvalidLegalChatRequestError(code="comparison_source_budget")
+    (GATE S4B item 5/6 finding), which gets special-cased below: see
+    that branch's own comment for why.
+
+    `metrics_holder` and `t0` (GATE S4B) exist solely to build the one
+    terminal "chat_stream_performance" log line - see
+    _stream_metric_payload. metrics_holder[0] is set by the bridge
+    (_bridge, below) to the SAME LegalChatMetrics instance
+    _execute_resolved_plan already passes it, before this generator
+    ever sees its first event.
     """
 
     yield _serialize_ndjson_record(_start_record(request_id))
 
     stream_failed = False
+    first_fastapi_delta_at: float | None = None
 
     try:
         while True:
@@ -300,11 +419,15 @@ async def _drain_stream_events(
 
             if item.type is StreamAnswerEventType.ANSWER_DELTA:
                 sent_text_holder[0] += item.delta_text or ""
+                if first_fastapi_delta_at is None:
+                    first_fastapi_delta_at = perf_counter()
                 yield _serialize_ndjson_record(_map_stream_answer_event(item))
                 continue
 
             if item.type is StreamAnswerEventType.REPLACEMENT:
                 sent_text_holder[0] = item.replacement_text or ""
+                if first_fastapi_delta_at is None:
+                    first_fastapi_delta_at = perf_counter()
                 yield _serialize_ndjson_record(_map_stream_answer_event(item))
                 continue
 
@@ -346,21 +469,106 @@ async def _drain_stream_events(
             await pipeline_task
         except Exception:
             pass
+
+        _log_stream_metric(
+            _stream_metric_payload(
+                request_id=request_id,
+                t0=t0,
+                outcome="stream_error",
+                error_code="stream_generation_failed",
+                timings=timings,
+                metrics=metrics_holder[0],
+                first_fastapi_delta_at=first_fastapi_delta_at,
+            )
+        )
         return
 
     try:
         response = await pipeline_task
+    except InvalidLegalChatRequestError as error:
+        if error.code != "comparison_source_budget":
+            raise
+
+        # GATE S4B finding: comparison_source_budget can ONLY ever be
+        # raised from _retrieve_search_hits (rag_answer.py), reached
+        # exclusively through legal_answer_generation_fn - i.e. always
+        # from INSIDE generation, for both answer_legal_question and
+        # stream_answer_legal_question alike. For /chat/stream that
+        # means it is raised strictly AFTER the bridge has already
+        # signaled "generation starting", so it is architecturally
+        # impossible for this exception to ever surface as a
+        # PRE_STREAM_ERROR here (unlike /chat, where legal_chat()'s
+        # except block wraps the entire call and can still return a
+        # friendly 200 no matter when inside the pipeline it fires).
+        # Rather than let this fall through to the generic
+        # post_generation_failure error, build the SAME friendly
+        # response /chat itself would return and stream it as a
+        # genuine successful completion - the closest possible parity
+        # with /chat's own behavior given the HTTP status already
+        # committed to 200 the instant generation started.
+        response = _build_comparison_source_budget_response(
+            request=request, error=error,
+        )
+
+        if response.answer != sent_text_holder[0]:
+            yield _serialize_ndjson_record(
+                _replacement_record(response.answer)
+            )
+
+        if timings.finalization is None:
+            timings.finalization = perf_counter()
+
+        yield _serialize_ndjson_record(_metadata_record(response))
+        done_at = perf_counter()
+        yield _serialize_ndjson_record(_done_record(request_id))
+
+        _log_stream_metric(
+            _stream_metric_payload(
+                request_id=request_id,
+                t0=t0,
+                outcome="stream_completed",
+                timings=timings,
+                metrics=metrics_holder[0],
+                first_fastapi_delta_at=first_fastapi_delta_at,
+                done_at=done_at,
+            )
+        )
+        return
     except Exception as error:
         logger.exception(
             "chat_stream pipeline failed after generation had "
             "already started streaming (request_id=%s)",
             request_id,
         )
+
+        # Generation itself succeeded and validated cleanly (FINALIZED
+        # already fired, or this branch would never be reached), but
+        # the surrounding pipeline then failed before ever returning a
+        # LegalChatResponse - so nothing streamed so far was ever
+        # actually finalized. Whatever provisional/final text the
+        # client already has is therefore no longer trustworthy;
+        # DISCARD it before the terminal error, same as any other
+        # failure that follows partial content (mission section 11).
+        if sent_text_holder[0]:
+            yield _serialize_ndjson_record(_discard_record())
+
         yield _serialize_ndjson_record(
             _error_record(
                 code="post_generation_failure",
                 message="The response could not be finalized.",
                 retryable=False,
+            )
+        )
+
+        _log_stream_metric(
+            _stream_metric_payload(
+                request_id=request_id,
+                t0=t0,
+                outcome="post_generation_failure",
+                error_code=type(error).__name__,
+                timings=timings,
+                metrics=metrics_holder[0],
+                first_fastapi_delta_at=first_fastapi_delta_at,
             )
         )
         return
@@ -377,11 +585,24 @@ async def _drain_stream_events(
         timings.finalization = perf_counter()
 
     yield _serialize_ndjson_record(_metadata_record(response))
+    done_at = perf_counter()
     yield _serialize_ndjson_record(_done_record(request_id))
+
+    _log_stream_metric(
+        _stream_metric_payload(
+            request_id=request_id,
+            t0=t0,
+            outcome="stream_completed",
+            timings=timings,
+            metrics=metrics_holder[0],
+            first_fastapi_delta_at=first_fastapi_delta_at,
+            done_at=done_at,
+        )
+    )
 
 
 async def _early_finalized_stream(
-    response: LegalChatResponse, request_id: str,
+    response: LegalChatResponse, request_id: str, t0: float,
 ) -> AsyncIterator[bytes]:
     """
     Mission section 12/4: a request that resolves WITHOUT ever needing
@@ -391,15 +612,34 @@ async def _early_finalized_stream(
     reaches the browser as one complete, immediately-visible answer -
     never silently reduced to metadata-only. No fabricated token
     delay.
+
+    `t0` (GATE S4B) is this request's start time, used only to build
+    the terminal "chat_stream_performance" log line - no generation
+    ever ran on this path, so `timings`/`metrics` stay unset (repair
+    never applies here, and t2/t4/t5/validation/repair are correctly
+    null rather than fabricated).
     """
 
     yield _serialize_ndjson_record(_start_record(request_id))
 
+    first_fastapi_delta_at: float | None = None
     if response.answer:
+        first_fastapi_delta_at = perf_counter()
         yield _serialize_ndjson_record(_delta_record(response.answer))
 
     yield _serialize_ndjson_record(_metadata_record(response))
+    done_at = perf_counter()
     yield _serialize_ndjson_record(_done_record(request_id))
+
+    _log_stream_metric(
+        _stream_metric_payload(
+            request_id=request_id,
+            t0=t0,
+            outcome="stream_completed",
+            first_fastapi_delta_at=first_fastapi_delta_at,
+            done_at=done_at,
+        )
+    )
 
 
 def _streaming_response_headers(request_id: str) -> dict[str, str]:
@@ -418,6 +658,7 @@ async def legal_chat_stream(
     """NDJSON streaming counterpart to POST /api/v1/chat - see module
     docstring for the full architecture."""
 
+    t0 = perf_counter()
     settings = get_settings()
     request_id = x_request_id.strip() if x_request_id else str(uuid4())
 
@@ -430,6 +671,14 @@ async def legal_chat_stream(
     try:
         stream_client = get_openai_answer_stream_client()
     except OpenAIConfigurationError as error:
+        _log_stream_metric(
+            _stream_metric_payload(
+                request_id=request_id,
+                t0=t0,
+                outcome="pre_stream_failure",
+                error_code=type(error).__name__,
+            )
+        )
         raise HTTPException(
             status_code=503,
             detail="The answer generation service is not configured.",
@@ -439,6 +688,7 @@ async def legal_chat_stream(
     timings = StreamAnswerTimings()
     loop = asyncio.get_running_loop()
     event_queue: asyncio.Queue = asyncio.Queue()
+    metrics_holder: list[Any] = [None]
 
     def _emit_threadsafe(item: object) -> None:
         loop.call_soon_threadsafe(event_queue.put_nowait, item)
@@ -470,6 +720,12 @@ async def legal_chat_stream(
         event_queue for _drain_stream_events to consume.
         """
 
+        # GATE S4B: capture the SAME LegalChatMetrics instance
+        # _execute_resolved_plan passes every legal_answer_generation_fn
+        # (streaming or not), so the terminal stream metric's
+        # repair_triggered/repair_success reuse /chat's own existing
+        # definition of "repair succeeded" rather than a second one.
+        metrics_holder[0] = metrics
         _emit_threadsafe(_GENERATION_STARTING)
 
         async def _consume() -> LegalChatResponse:
@@ -551,16 +807,24 @@ async def legal_chat_stream(
             )
 
             if isinstance(mapped, HTTPException):
+                _log_stream_metric(
+                    _stream_metric_payload(
+                        request_id=request_id,
+                        t0=t0,
+                        outcome="pre_stream_failure",
+                        error_code=type(error).__name__,
+                    )
+                )
                 raise mapped from error
 
             return StreamingResponse(
-                _early_finalized_stream(mapped, request_id),
+                _early_finalized_stream(mapped, request_id, t0),
                 media_type=NDJSON_MEDIA_TYPE,
                 headers=_streaming_response_headers(request_id),
             )
 
         return StreamingResponse(
-            _early_finalized_stream(response, request_id),
+            _early_finalized_stream(response, request_id, t0),
             media_type=NDJSON_MEDIA_TYPE,
             headers=_streaming_response_headers(request_id),
         )
@@ -573,8 +837,11 @@ async def legal_chat_stream(
             event_queue=event_queue,
             pipeline_task=pipeline_task,
             request_id=request_id,
+            request=request,
             timings=timings,
             sent_text_holder=sent_text_holder,
+            metrics_holder=metrics_holder,
+            t0=t0,
         ),
         media_type=NDJSON_MEDIA_TYPE,
         headers=_streaming_response_headers(request_id),
