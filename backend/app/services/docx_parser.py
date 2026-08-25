@@ -2052,13 +2052,17 @@ def _looks_like_plain_contact_person(
     ) >= 2
 
 
-def _extract_plain_paragraph_contacts(
-    file_path: Path,
-) -> list[ExtractedContact]:
+def _iter_plain_paragraph_contact_blocks(
+    document,
+) -> Iterator[tuple[int, int, ExtractedContact]]:
     """
-    Conservative fallback for organically-uploaded DOCX files whose
-    member-firm contact is stored in ordinary body paragraphs rather
-    than Word text boxes.
+    Shared core for _extract_plain_paragraph_contacts (text extraction)
+    and find_plain_paragraph_contact_block_bounds
+    (contact_document_area.py's canonicalizer, which needs to know
+    exactly which body paragraphs to remove and where to insert the
+    canonical table in their place - a document whose legacy member-
+    firm contact lives in ordinary body paragraphs, like France's, has
+    no floating shape for the existing carrier-removal logic to find).
 
     This is intentionally NOT a general scan for every email, phone,
     URL, or firm name in the document.
@@ -2073,6 +2077,121 @@ def _extract_plain_paragraph_contacts(
     That high-confidence shape prevents ordinary legal references,
     government URLs, project-level POCs, and a bare authoring-firm
     name from becoming contact records.
+
+    Yields (first_paragraph_index, last_paragraph_index,
+    ExtractedContact) per detected block, in document order -
+    first_paragraph_index is the person-line paragraph's own index
+    into document.paragraphs, last_paragraph_index is the phone line's
+    index if one was found, else the last email line's index.
+    """
+
+    indexed_lines = [
+        (original_index, normalized)
+        for original_index, paragraph in enumerate(document.paragraphs)
+        if (normalized := _normalize_text(paragraph.text))
+    ]
+    lines = [text for _, text in indexed_lines]
+
+    seen: set[tuple[str | None, str | None, str | None]] = set()
+
+    index = 0
+
+    while index < len(lines):
+        emails = _extract_standalone_contact_emails(lines[index])
+
+        if not emails:
+            index += 1
+            continue
+
+        first_email_index = index
+        all_emails = list(emails)
+
+        index += 1
+
+        while index < len(lines):
+            additional = _extract_standalone_contact_emails(lines[index])
+
+            if not additional:
+                break
+
+            all_emails.extend(additional)
+
+            index += 1
+
+        last_email_index = index - 1
+
+        if first_email_index < 2:
+            continue
+
+        role_line = lines[first_email_index - 1]
+        person_line = lines[first_email_index - 2]
+
+        role_and_firm = _plain_contact_role_and_firm(role_line)
+
+        if role_and_firm is None:
+            continue
+
+        if not _looks_like_plain_contact_person(person_line):
+            continue
+
+        # Explicit defence against project-level/global POC regions.
+        nearby_start = max(0, first_email_index - 4)
+
+        nearby = " ".join(
+            lines[nearby_start:first_email_index + 1]
+        ).casefold()
+
+        if "l&e global poc" in nearby or "l & e global poc" in nearby:
+            continue
+
+        _, member_firm = role_and_firm
+
+        phone = None
+        phone_index: int | None = None
+
+        if index < len(lines):
+            phone = _extract_standalone_contact_phone(lines[index])
+
+            if phone is not None:
+                phone_index = index
+
+        contact = ExtractedContact(
+            member_firm=member_firm,
+            contact_person=person_line,
+            email=", ".join(all_emails),
+            phone=phone,
+            address=None,
+            website=None,
+        )
+
+        key = (
+            contact.member_firm,
+            contact.contact_person,
+            contact.email,
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        first_paragraph_index = indexed_lines[first_email_index - 2][0]
+        last_line_index = (
+            phone_index if phone_index is not None else last_email_index
+        )
+        last_paragraph_index = indexed_lines[last_line_index][0]
+
+        yield first_paragraph_index, last_paragraph_index, contact
+
+
+def _extract_plain_paragraph_contacts(
+    file_path: Path,
+) -> list[ExtractedContact]:
+    """
+    Conservative fallback for organically-uploaded DOCX files whose
+    member-firm contact is stored in ordinary body paragraphs rather
+    than Word text boxes - see _iter_plain_paragraph_contact_blocks for
+    the detection rules.
 
     Existing text-box contacts never reach this function:
     extract_contacts_from_docx() returns those first.
@@ -2092,153 +2211,177 @@ def _extract_plain_paragraph_contacts(
         # parsing/error boundary.
         return []
 
-    lines = [
-        normalized
-        for paragraph in document.paragraphs
-        if (
-            normalized := _normalize_text(
-                paragraph.text
-            )
-        )
+    return [
+        contact
+        for _, _, contact in _iter_plain_paragraph_contact_blocks(document)
     ]
 
-    contacts: list[
-        ExtractedContact
-    ] = []
 
-    seen: set[
-        tuple[
-            str | None,
-            str | None,
-            str | None,
-        ]
-    ] = set()
+def find_plain_paragraph_contact_block_bounds(
+    document,
+) -> tuple[int, int] | None:
+    """
+    The (first_paragraph_index, last_paragraph_index) body-paragraph
+    bounds of the FIRST plain-paragraph legacy contact block this
+    document's own organic content contains (see
+    _iter_plain_paragraph_contact_blocks) - both inclusive, indexing
+    into document.paragraphs. None if this document has no such block
+    at all (e.g. its legacy contact area is a floating shape instead,
+    or it has no legacy contact area at all).
+    """
 
-    index = 0
+    for first_index, last_index, _ in _iter_plain_paragraph_contact_blocks(
+        document
+    ):
+        return (first_index, last_index)
 
-    while index < len(lines):
-        emails = (
-            _extract_standalone_contact_emails(
-                lines[index]
-            )
+    return None
+
+
+_PERSON_SPLIT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\s*,\s*|\s+and\s+", re.IGNORECASE
+)
+
+
+def split_combined_legacy_contact(
+    contact: ExtractedContact,
+) -> list[ExtractedContact] | None:
+    """
+    Split a legacy contact whose contact_person names multiple people
+    ("Caroline Scherrmann and Florence Bacquet") into one
+    ExtractedContact per person, mapped 1:1 in source order onto that
+    same contact's own comma-joined email addresses - ONLY when doing
+    so is unambiguous: the number of name segments must exactly equal
+    the number of email addresses (at least two of each), and every
+    resulting name segment must itself independently look like a real
+    person's name. member_firm/phone/address/website are copied to
+    every split contact unchanged - this only ever separates the
+    person/email pairing, never the shared firm-side fields.
+
+    Returns None (never guesses) whenever contact_person or email is
+    missing, the counts do not match, or any name segment fails the
+    person-name check - a firm name that happens to contain "and"
+    (e.g. "Smith and Jones LLP") is never at risk here regardless,
+    since only contact_person is ever split, never member_firm. In
+    every None case the caller must keep the original combined
+    representation rather than fabricate an incorrect split.
+    """
+
+    if not contact.contact_person or not contact.email:
+        return None
+
+    name_segments = [
+        segment.strip()
+        for segment in _PERSON_SPLIT_PATTERN.split(contact.contact_person)
+        if segment.strip()
+    ]
+
+    email_segments = [
+        segment.strip()
+        for segment in contact.email.split(",")
+        if segment.strip()
+    ]
+
+    if len(name_segments) < 2 or len(name_segments) != len(email_segments):
+        return None
+
+    if not all(
+        _looks_like_plain_contact_person(name) for name in name_segments
+    ):
+        return None
+
+    if not all(
+        _EMAIL_PATTERN.fullmatch(email) for email in email_segments
+    ):
+        return None
+
+    return [
+        ExtractedContact(
+            member_firm=contact.member_firm,
+            contact_person=name,
+            email=email,
+            phone=contact.phone,
+            address=contact.address,
+            website=contact.website,
         )
-
-        if not emails:
-            index += 1
-            continue
-
-        first_email_index = index
-        all_emails = list(
-            emails
-        )
-
-        index += 1
-
-        while index < len(lines):
-            additional = (
-                _extract_standalone_contact_emails(
-                    lines[index]
-                )
-            )
-
-            if not additional:
-                break
-
-            all_emails.extend(
-                additional
-            )
-
-            index += 1
-
-        if first_email_index < 2:
-            continue
-
-        role_line = lines[
-            first_email_index - 1
-        ]
-
-        person_line = lines[
-            first_email_index - 2
-        ]
-
-        role_and_firm = (
-            _plain_contact_role_and_firm(
-                role_line
-            )
-        )
-
-        if role_and_firm is None:
-            continue
-
-        if not _looks_like_plain_contact_person(
-            person_line
-        ):
-            continue
-
-        # Explicit defence against project-level/global POC regions.
-        nearby_start = max(
-            0,
-            first_email_index - 4,
-        )
-
-        nearby = " ".join(
-            lines[
-                nearby_start:
-                first_email_index + 1
-            ]
-        ).casefold()
-
-        if (
-            "l&e global poc" in nearby
-            or "l & e global poc" in nearby
-        ):
-            continue
-
-        _, member_firm = (
-            role_and_firm
-        )
-
-        phone = None
-
-        if index < len(lines):
-            phone = (
-                _extract_standalone_contact_phone(
-                    lines[index]
-                )
-            )
-
-        contact = ExtractedContact(
-            member_firm=member_firm,
-            contact_person=person_line,
-            email=", ".join(
-                all_emails
-            ),
-            phone=phone,
-            address=None,
-            website=None,
-        )
-
-        key = (
-            contact.member_firm,
-            contact.contact_person,
-            contact.email,
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(
-            key
-        )
-
-        contacts.append(
-            contact
-        )
-
-    return contacts
+        for name, email in zip(name_segments, email_segments)
+    ]
 
 
 CONTACT_TABLE_HIDDEN_MARKER: Final[str] = "LE-GLOBAL-CONTACT-TABLE-V1"
+
+# One hidden tag per left-cell field, written as its own zero-size
+# hidden run immediately before that field's own visible run, in the
+# SAME paragraph (mission "FERMER LE CRUD CONTACTS AVANT STREAMING").
+#
+# The canonical table is a format WE OWN - both the writer
+# (contact_document_area.py's _fill_text_cell) and this reader - so its
+# own round-trip has no reason to depend on content heuristics at all.
+# Before this, member_firm/address/phone/website were told apart by
+# which line SCORED strongest for phone-shapedness/URL-shapedness
+# (_classify_canonical_firm_lines below): correct for every real
+# corpus document tested, but not deterministic in the general case -
+# a contact whose address happens to contain a stronger phone-shaped
+# substring than its own actual phone value (confirmed directly: an
+# adversarial add/edit round-trip for Brazil/Romania/Singapore-shaped
+# data swapped address and phone, because the address's embedded
+# "+55 115 086 5000" outscored the dedicated phone line "04038-904")
+# could still be misclassified. A canonical table WE write can instead
+# just say what each line is, unambiguously, and never need to guess.
+#
+# Legacy heuristic parsing (organically-authored documents this system
+# never wrote) is entirely unaffected - the tags below are only ever
+# looked for INSIDE a table already identified by
+# CONTACT_TABLE_HIDDEN_MARKER, never in ordinary body paragraphs or
+# floating text boxes. A canonical table already written by an earlier
+# version of this code (before these tags existed) has none of them -
+# _extract_canonical_table_contacts falls back to the same content-
+# based classification for that row, so an already-canonicalized real
+# document is never broken by this change.
+_FIELD_TAG_MEMBER_FIRM: Final[str] = "LE-GLOBAL-FIELD-FIRM-V1:"
+_FIELD_TAG_ADDRESS: Final[str] = "LE-GLOBAL-FIELD-ADDRESS-V1:"
+_FIELD_TAG_PHONE: Final[str] = "LE-GLOBAL-FIELD-PHONE-V1:"
+_FIELD_TAG_WEBSITE: Final[str] = "LE-GLOBAL-FIELD-WEBSITE-V1:"
+
+_FIELD_TAGS_BY_NAME: Final[dict[str, str]] = {
+    "member_firm": _FIELD_TAG_MEMBER_FIRM,
+    "address": _FIELD_TAG_ADDRESS,
+    "phone": _FIELD_TAG_PHONE,
+    "website": _FIELD_TAG_WEBSITE,
+}
+_FIELD_NAMES_BY_TAG: Final[dict[str, str]] = {
+    tag: name for name, tag in _FIELD_TAGS_BY_NAME.items()
+}
+
+
+def _extract_tagged_canonical_fields(
+    firm_lines: Sequence[str],
+) -> dict[str, str] | None:
+    """
+    Deterministically recover member_firm/address/phone/website from
+    one canonical row's left-cell lines when EVERY line carries one of
+    the hidden field tags above (a table written by the current
+    writer). Returns None - never a partial result - the instant any
+    line lacks a recognized tag, so the caller falls back to content-
+    based classification for that row as a whole (an older canonical
+    table, written before these tags existed).
+    """
+
+    fields: dict[str, str] = {}
+
+    for line in firm_lines:
+        matched_tag = next(
+            (tag for tag in _FIELD_NAMES_BY_TAG if line.startswith(tag)),
+            None,
+        )
+
+        if matched_tag is None:
+            return None
+
+        field_name = _FIELD_NAMES_BY_TAG[matched_tag]
+        fields[field_name] = _normalize_text(line[len(matched_tag):])
+
+    return fields
 
 
 def _score_phone_candidate(line: str) -> tuple[int, int, int, int]:
@@ -2433,22 +2576,44 @@ def _extract_canonical_table_contacts(
         if not firm_lines and not person_lines:
             continue
 
-        member_firm, phone, website, address_line_indices = (
-            _classify_canonical_firm_lines(firm_lines)
-        )
+        tagged_fields = _extract_tagged_canonical_fields(firm_lines)
 
-        address_lines: list[str] = []
+        if tagged_fields is not None:
+            # Every line in this row carries its own hidden field tag
+            # (written by the current code) - no content heuristic
+            # needed or consulted at all, so a value that happens to
+            # look like a different field (a postal code that looks
+            # phone-shaped, a phone number embedded in an address) can
+            # never be misclassified.
+            member_firm = tagged_fields.get("member_firm")
+            phone = tagged_fields.get("phone")
+            website = tagged_fields.get("website")
+            address_lines = (
+                [tagged_fields["address"]] if "address" in tagged_fields else []
+            )
+        else:
+            # No tags at all - a canonical table written before this
+            # mechanism existed (an already-canonicalized real
+            # document, e.g. from a live Admin action predating this
+            # fix). Fall back to the same content-based classification
+            # this reader has always used, so that table keeps reading
+            # exactly as it did before.
+            member_firm, phone, website, address_line_indices = (
+                _classify_canonical_firm_lines(firm_lines)
+            )
 
-        for index in address_line_indices:
-            line = firm_lines[index]
+            address_lines = []
 
-            if (
-                normalized_country is not None
-                and line.casefold() == normalized_country
-            ):
-                continue
+            for index in address_line_indices:
+                line = firm_lines[index]
 
-            address_lines.append(line)
+                if (
+                    normalized_country is not None
+                    and line.casefold() == normalized_country
+                ):
+                    continue
+
+                address_lines.append(line)
 
         emails: list[str] = []
         name_lines: list[str] = []

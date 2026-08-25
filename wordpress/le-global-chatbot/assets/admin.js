@@ -3046,8 +3046,15 @@
             );
         }
 
-        function isAddFieldsFilled(fields, inputs) {
-            return inputs.every(([, input]) => input.value.trim() !== "");
+        function hasAtLeastOneFieldFilled(fields, inputs) {
+            // Every field is individually optional (member_firm,
+            // contact_person, email, phone, address, website) - a
+            // real member-firm contact can genuinely have some of
+            // them empty (e.g. France's own contact has always had
+            // address/website empty). The only requirement, matching
+            // the backend's own AdminContactWriteRequest validator, is
+            // that at least one field carries a value.
+            return inputs.some(([, input]) => input.value.trim() !== "");
         }
 
         function isEditDirty() {
@@ -3087,7 +3094,7 @@
                 !saving
                 && viewSubState === "edit-one"
                 && editBaseline !== null
-                && isAddFieldsFilled(null, editFields)
+                && hasAtLeastOneFieldFilled(null, editFields)
                 && isEditDirty()
             );
 
@@ -3098,7 +3105,7 @@
             const ready = (
                 !adding
                 && countrySelect.value !== ""
-                && isAddFieldsFilled(null, addFields)
+                && hasAtLeastOneFieldFilled(null, addFields)
             );
 
             addSubmitButton.disabled = !ready;

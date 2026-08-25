@@ -109,6 +109,7 @@ from app.services.document_source_resolver import (
 from app.services.docx_parser import (
     ExtractedContact,
     extract_contacts_from_docx,
+    split_combined_legacy_contact,
 )
 
 
@@ -895,12 +896,12 @@ def add_contact(
 
         new_record = ContactRecord(
             contact_id=new_contact_id(),
-            member_firm=fields.member_firm.strip(),
-            contact_person=fields.contact_person.strip(),
-            email=fields.email.strip(),
-            phone=fields.phone.strip(),
-            address=fields.address.strip(),
-            website=fields.website.strip(),
+            member_firm=fields.member_firm.strip() or None,
+            contact_person=fields.contact_person.strip() or None,
+            email=fields.email.strip() or None,
+            phone=fields.phone.strip() or None,
+            address=fields.address.strip() or None,
+            website=fields.website.strip() or None,
         )
 
         new_contacts = previous_contacts + (new_record,)
@@ -1014,12 +1015,12 @@ def update_contact(
 
         updated_record = ContactRecord(
             contact_id=validated_contact_id,
-            member_firm=fields.member_firm.strip(),
-            contact_person=fields.contact_person.strip(),
-            email=fields.email.strip(),
-            phone=fields.phone.strip(),
-            address=fields.address.strip(),
-            website=fields.website.strip(),
+            member_firm=fields.member_firm.strip() or None,
+            contact_person=fields.contact_person.strip() or None,
+            email=fields.email.strip() or None,
+            phone=fields.phone.strip() or None,
+            address=fields.address.strip() or None,
+            website=fields.website.strip() or None,
             photo_filename=current_contacts[position].photo_filename,
             photo_content_type=(
                 current_contacts[position].photo_content_type
@@ -1598,9 +1599,26 @@ def bootstrap_legacy_contacts(
             country=summary.country,
         )
 
+        # A legacy contact whose contact_person names multiple people
+        # (e.g. France's own "Caroline Scherrmann and Florence
+        # Bacquet", sharing one comma-joined email string) becomes one
+        # Admin-managed ContactRecord per person - each with their own
+        # stable id, assigned here and never again (bootstrap never
+        # revisits a document once it has structured state - see the
+        # skip check above) - only when the person/email split is
+        # unambiguous. Never split when it is not: see
+        # split_combined_legacy_contact's own docstring.
+        expanded_contacts: list[ExtractedContact] = []
+
+        for contact in parsed_contacts:
+            split_contacts = split_combined_legacy_contact(contact)
+            expanded_contacts.extend(
+                split_contacts if split_contacts is not None else [contact]
+            )
+
         new_contacts = tuple(
             _extracted_contact_to_record(contact)
-            for contact in parsed_contacts
+            for contact in expanded_contacts
         )
 
         if new_contacts:

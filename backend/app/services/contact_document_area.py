@@ -109,7 +109,7 @@ from zipfile import ZipFile
 from docx import Document as WordDocument
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_LINE_SPACING
-from docx.image.image import Image as DocxImage
+from docx.image.image import BaseImageHeader, Image as DocxImage
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Emu, Pt
@@ -128,12 +128,110 @@ from app.services.docx_parser import (
     CONTACT_TABLE_HIDDEN_MARKER,
     ExtractedContact,
     extract_contacts_from_docx,
+    find_plain_paragraph_contact_block_bounds,
+    _FIELD_TAG_ADDRESS,
+    _FIELD_TAG_MEMBER_FIRM,
+    _FIELD_TAG_PHONE,
+    _FIELD_TAG_WEBSITE,
 )
 
 
 class ContactAreaError(RuntimeError):
     """Raised when the persisted canonical contact table cannot be
     safely rebuilt."""
+
+
+class _WebpImageHeader(BaseImageHeader):
+    """
+    WebP dimension parser, registered into python-docx's own image
+    factory below.
+
+    python-docx 1.2.0 ships header parsers for JPEG/PNG/GIF/TIFF/BMP
+    only (confirmed directly: docx.image has no webp submodule at
+    all) - yet this codebase already accepts and advertises
+    image/webp contact photos (admin_contact_photos.py's own
+    "Only JPEG, PNG and WebP images are accepted", contact_photo_
+    store.py's own .webp extension mapping). Without this, EVERY
+    mutation embedding a real WebP photo (Add+Photo, Edit+Photo,
+    Replace Photo) fails with a raw UnrecognizedImageError wrapped as
+    ContactAreaError - reproduced directly with a real, valid,
+    Pillow-equivalent minimal WebP image - because both DocxImage.
+    from_blob (used here to compute proportional height) AND Run.
+    add_picture's own internal embedding (used to actually write the
+    image part) route through the exact same docx.image.SIGNATURES-
+    driven factory.
+
+    This environment deliberately has no general-purpose image
+    library (see this module's own resolve_untracked_contact_photo
+    docstring on the crop-rectangle refusal), so rather than adding
+    one just to decode WebP, this parses the three documented WebP
+    sub-formats (simple lossy VP8, lossless VP8L, extended VP8X)
+    directly from the RIFF container - a small, fully-specified byte
+    layout, unlike a general still-image codec such an addition would
+    otherwise have to also cover.
+    """
+
+    @classmethod
+    def from_stream(cls, stream):
+        stream.seek(0)
+        data = stream.read()
+        px_width, px_height = cls._read_dimensions(data)
+        return cls(px_width, px_height, 96, 96)
+
+    @classmethod
+    def _read_dimensions(cls, data: bytes) -> tuple[int, int]:
+        from docx.image.exceptions import UnrecognizedImageError
+
+        chunk_fourcc = data[12:16]
+
+        if chunk_fourcc == b"VP8X":
+            width = int.from_bytes(data[24:27], "little") + 1
+            height = int.from_bytes(data[27:30], "little") + 1
+            return width, height
+
+        if chunk_fourcc == b"VP8L":
+            packed = int.from_bytes(data[21:25], "little")
+            width = (packed & 0x3FFF) + 1
+            height = ((packed >> 14) & 0x3FFF) + 1
+            return width, height
+
+        if chunk_fourcc == b"VP8 ":
+            width = int.from_bytes(data[26:28], "little") & 0x3FFF
+            height = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return width, height
+
+        raise UnrecognizedImageError
+
+    @property
+    def content_type(self) -> str:
+        return "image/webp"
+
+    @property
+    def default_ext(self) -> str:
+        return "webp"
+
+
+def _register_webp_image_header() -> None:
+    """Idempotent: safe to import this module more than once (tests,
+    reloads) without registering duplicate signatures. SIGNATURES is a
+    module-level tuple constant (not a list), and
+    _ImageHeaderFactory re-imports it fresh on every call - so
+    reassigning the module attribute here (rather than mutating in
+    place, which a tuple does not support) is picked up by every
+    subsequent DocxImage.from_blob/add_picture call, including ones
+    already inside python-docx's own call stack."""
+
+    import docx.image as _docx_image_module
+
+    entry = (_WebpImageHeader, 8, b"WEBP")
+
+    if entry not in _docx_image_module.SIGNATURES:
+        _docx_image_module.SIGNATURES = (
+            _docx_image_module.SIGNATURES + (entry,)
+        )
+
+
+_register_webp_image_header()
 
 
 _NSMAP = {
@@ -145,7 +243,8 @@ _NSMAP = {
 }
 _R_EMBED_ATTR = f'{{{_NSMAP["r"]}}}embed'
 
-_SRC_RECT_PATTERN = re.compile(r"<a:srcRect\b")
+_SRC_RECT_PATTERN = re.compile(r"<a:srcRect\b([^>]*)/?>")
+_SRC_RECT_OFFSET_PATTERN = re.compile(r'\b(?:l|t|r|b)="(-?\d+)"')
 
 # The right (photo) column as a fraction of the table's own usable
 # width - a percentage, never a fixed EMU width, so the table always
@@ -322,6 +421,126 @@ def _remove_legacy_carrier_and_get_anchor(
     return None
 
 
+def _remove_plain_paragraph_legacy_contact_block_and_get_anchor(
+    document,
+) -> tuple[bool, object | None]:
+    """
+    France-style legacy contact area: a member-firm contact stored in
+    ordinary body paragraphs (person/persons, role+firm, email(s),
+    optional phone) rather than a floating shape - see docx_parser.
+    find_plain_paragraph_contact_block_bounds. Removes exactly those
+    paragraphs and returns (True, anchor_element) where anchor_element
+    is the paragraph immediately preceding the block (None if the
+    block was the very first paragraph(s) in the body - the caller's
+    own existing "None means insert at body start" convention already
+    handles that correctly), so the new canonical table lands at the
+    EXACT same logical position the legacy block occupied.
+
+    Returns (False, None) when this document has no such block at all
+    - the caller must NOT then fall back to a generic default anchor
+    without first checking this: a document whose legacy contact area
+    genuinely exists here must never end up with its canonical table
+    inserted elsewhere while these paragraphs are silently left both
+    unremoved AND undetected.
+    """
+
+    bounds = find_plain_paragraph_contact_block_bounds(document)
+
+    if bounds is None:
+        return False, None
+
+    first_index, last_index = bounds
+    body_paragraphs = document.element.body.findall("w:p", _NSMAP)
+
+    anchor_element = (
+        body_paragraphs[first_index - 1] if first_index > 0 else None
+    )
+
+    for paragraph_element in body_paragraphs[first_index:last_index + 1]:
+        paragraph_element.getparent().remove(paragraph_element)
+
+    return True, anchor_element
+
+
+# --- Single-contact-zone invariant ---------------------------------------
+#
+# rebuild_canonical_contact_table already removes whichever ONE contact
+# area currently exists (a prior canonical table, a legacy floating-
+# shape carrier, or a legacy plain-paragraph block) before inserting the
+# fresh table - so two areas can only ever coexist in the output if one
+# of those three detectors fails to recognize a real legacy area that is
+# still there (each detector's own heuristics were reverse-engineered
+# from specific real documents - e.g. the floating-shape carrier's own
+# docstring cites the AU baseline - and a different country's original
+# template is not guaranteed to match every one of those signals).
+#
+# Rather than chase every possible legacy layout variant with more
+# per-country heuristics, this re-runs all three detectors against the
+# JUST-BUILT output itself: if any of them still finds something to
+# remove, a second contact area survived alongside the new table, and
+# the whole mutation is refused before anything is persisted - the same
+# fail-closed discipline this module already applies to an unreproducible
+# photo crop. This is what turns "two contact areas silently coexist"
+# (the historical Argentina/Canada incidents) into a loud, safe error
+# for ANY country's legacy shape, not only the ones already inspected.
+
+
+def _count_canonical_tables(document) -> int:
+    return sum(
+        1
+        for table in document.tables
+        if table.rows
+        and CONTACT_TABLE_HIDDEN_MARKER in table.rows[0].cells[0].text
+    )
+
+
+def _assert_single_contact_zone(
+    new_bytes: bytes,
+    *,
+    expected_table_count: int,
+    legacy_photo_relationship_ids: set[str],
+) -> None:
+    """Refuse to persist new_bytes if it contains more than one contact
+    area - the freshly built canonical table PLUS any leftover legacy
+    carrier a detector failed to remove."""
+
+    scratch_document = WordDocument(BytesIO(new_bytes))
+
+    actual_table_count = _count_canonical_tables(scratch_document)
+
+    if actual_table_count != expected_table_count:
+        raise ContactAreaError(
+            f"Expected exactly {expected_table_count} canonical contact "
+            f"table(s) after rebuilding, found {actual_table_count} - "
+            "no change was saved."
+        )
+
+    leftover_floating_carrier = _remove_legacy_carrier_and_get_anchor(
+        scratch_document,
+        legacy_photo_relationship_ids=legacy_photo_relationship_ids,
+    )
+
+    if leftover_floating_carrier is not None:
+        raise ContactAreaError(
+            "A legacy floating-shape contact area still exists alongside "
+            "the new canonical contact table - refusing to save a "
+            "document with two contact areas."
+        )
+
+    leftover_plain_block_found, _ = (
+        _remove_plain_paragraph_legacy_contact_block_and_get_anchor(
+            scratch_document
+        )
+    )
+
+    if leftover_plain_block_found:
+        raise ContactAreaError(
+            "A legacy plain-paragraph contact area still exists alongside "
+            "the new canonical contact table - refusing to save a "
+            "document with two contact areas."
+        )
+
+
 # --- Canonical table detection/removal ----------------------------------
 
 
@@ -400,6 +619,21 @@ def _new_cell_paragraph(cell, *, used_first: bool):
     return paragraph
 
 
+def _add_tagged_run(paragraph, tag: str, value: str):
+    """A hidden, zero-size run carrying `tag` immediately before the
+    real, visible run carrying `value`, both in the SAME paragraph -
+    invisible in any rendering (same technique as the table's own
+    hidden marker), and what lets _extract_canonical_table_contacts
+    read this exact field back deterministically, by tag, rather than
+    by guessing from the value's own shape. Returns the visible run
+    (the caller may still want to style it, e.g. bold)."""
+
+    tag_run = paragraph.add_run(tag)
+    tag_run.font.hidden = True
+    tag_run.font.size = Pt(1)
+    return paragraph.add_run(value)
+
+
 def _fill_text_cell(
     cell, contact: ExtractedContact, *, hidden_marker: str | None
 ) -> None:
@@ -423,17 +657,22 @@ def _fill_text_cell(
     if contact.member_firm:
         paragraph = _next_paragraph()
         paragraph.paragraph_format.space_after = Pt(9)
-        firm_run = paragraph.add_run(contact.member_firm)
+        firm_run = _add_tagged_run(
+            paragraph, _FIELD_TAG_MEMBER_FIRM, contact.member_firm
+        )
         firm_run.bold = True
 
-    for value in (contact.address, contact.phone):
+    for value, tag in (
+        (contact.address, _FIELD_TAG_ADDRESS),
+        (contact.phone, _FIELD_TAG_PHONE),
+    ):
         if value:
             paragraph = _next_paragraph()
             paragraph.paragraph_format.space_after = Pt(2)
-            paragraph.add_run(value)
+            _add_tagged_run(paragraph, tag, value)
 
     if contact.website:
-        _next_paragraph().add_run(contact.website)
+        _add_tagged_run(_next_paragraph(), _FIELD_TAG_WEBSITE, contact.website)
 
 
 def _fill_photo_and_person_cell(
@@ -589,12 +828,34 @@ def _default_insertion_anchor(document):
 
 
 def _has_crop_rectangle(document_xml: str, relationship_id: str) -> bool:
+    """
+    Return whether a photo's own source shape specifies a REAL, visible
+    crop - not merely the presence of an <a:srcRect> element, which Word
+    can (and does) emit as an all-zero/no-op placeholder even when the
+    image was never actually cropped: OOXML defines each of its l/t/r/b
+    offset attributes as 0 when absent, and a bare <a:srcRect/> with no
+    attributes at all is exactly that - a declared-but-empty crop that
+    clips nothing. Real Indonesia corpus content carries exactly this
+    bare <a:srcRect/> on its own contact portrait (confirmed directly),
+    which the previous presence-only check refused to embed even though
+    nothing about the image is actually cropped - a false positive that
+    would block any Contact CRUD mutation needing to preserve that
+    photo. Only a genuinely non-zero l/t/r/b offset is refused.
+    """
+
     span = _run_span_for_relationship(document_xml, relationship_id)
 
     if span is None:
         return False
 
-    return bool(_SRC_RECT_PATTERN.search(document_xml[span[0]:span[1]]))
+    match = _SRC_RECT_PATTERN.search(document_xml[span[0]:span[1]])
+
+    if match is None:
+        return False
+
+    offsets = _SRC_RECT_OFFSET_PATTERN.findall(match.group(1))
+
+    return any(int(offset) != 0 for offset in offsets)
 
 
 def resolve_untracked_contact_photo(
@@ -719,7 +980,16 @@ def rebuild_canonical_contact_table(
         )
 
         if anchor_element is None:
-            anchor_element = _default_insertion_anchor(document)
+            plain_block_found, plain_anchor_element = (
+                _remove_plain_paragraph_legacy_contact_block_and_get_anchor(
+                    document
+                )
+            )
+
+            if plain_block_found:
+                anchor_element = plain_anchor_element
+            else:
+                anchor_element = _default_insertion_anchor(document)
 
     if contacts:
         table = _build_canonical_table(
@@ -734,6 +1004,12 @@ def rebuild_canonical_contact_table(
     output = BytesIO()
     document.save(output)
     new_bytes = output.getvalue()
+
+    _assert_single_contact_zone(
+        new_bytes,
+        expected_table_count=1 if contacts else 0,
+        legacy_photo_relationship_ids=legacy_photo_relationship_ids,
+    )
 
     _validate_canonical_table(
         new_bytes,

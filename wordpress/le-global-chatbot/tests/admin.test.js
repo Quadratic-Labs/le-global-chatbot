@@ -5182,7 +5182,7 @@ describe("contacts panel", () => {
 
     // --- Add: required fields, submit, duplicates, errors --------------
 
-    test("Add submit stays disabled until a country is selected and all six fields are filled", async () => {
+    test("Add submit stays disabled until a country is selected and at least one field is filled", async () => {
         queueFetchResponses([ONE_CONTACT_RESPONSE]);
 
         assert.equal(dom.addSubmitButton.disabled, true);
@@ -5192,13 +5192,24 @@ describe("contacts panel", () => {
 
         assert.equal(dom.addSubmitButton.disabled, true, "still empty");
 
+        // Every field is individually optional - filling in just ONE
+        // is already enough (matching the backend's own cross-field
+        // "at least one field" rule), not "all six".
         setField(dom.addMemberFirmInput, "Acme Legal SARL");
-        setField(dom.addContactPersonInput, "Jane Doe");
-        setField(dom.addEmailInput, "jane@example.test");
-        setField(dom.addPhoneInput, "+33 1 23 45 67 89");
-        setField(dom.addAddressInput, "1 Rue de Paris");
 
-        assert.equal(dom.addSubmitButton.disabled, true, "website is still blank");
+        assert.equal(
+            dom.addSubmitButton.disabled,
+            false,
+            "one filled field is enough - the other five stay optional"
+        );
+
+        setField(dom.addMemberFirmInput, "");
+
+        assert.equal(
+            dom.addSubmitButton.disabled,
+            true,
+            "wholly blank again"
+        );
 
         setField(dom.addWebsiteInput, "https://example.test");
 
@@ -5455,7 +5466,7 @@ describe("contacts panel", () => {
         assert.equal(dom.editMemberFirmInput.disabled, false, "fields must become editable");
     });
 
-    test("Save stays disabled until all six fields are filled and at least one differs from the loaded baseline", async () => {
+    test("Save stays disabled until dirty and at least one field is still filled", async () => {
         queueFetchResponses([ONE_CONTACT_RESPONSE]);
 
         await selectCountry("doc_fr");
@@ -5463,13 +5474,30 @@ describe("contacts panel", () => {
 
         assert.equal(dom.saveButton.disabled, true, "unchanged baseline - nothing to save yet");
 
-        setField(dom.editMemberFirmInput, "");
-        assert.equal(dom.saveButton.disabled, true, "a blank field must keep Save disabled even though it is now 'dirty'");
-
         setField(dom.editMemberFirmInput, "Acme Legal SARL (renamed)");
-        assert.equal(dom.saveButton.disabled, false, "all six filled and one differs from the baseline");
+        assert.equal(dom.saveButton.disabled, false, "dirty, and still has a filled field");
 
-        setField(dom.editMemberFirmInput, "Acme Legal SARL");
+        // Clearing every field makes the contact wholly blank - a
+        // single blank field is legitimately optional and must NOT
+        // block Save on its own, but ALL SIX blank must.
+        setField(dom.editMemberFirmInput, "");
+        setField(dom.editContactPersonInput, "");
+        setField(dom.editEmailInput, "");
+        setField(dom.editPhoneInput, "");
+        setField(dom.editAddressInput, "");
+        setField(dom.editWebsiteInput, "");
+        assert.equal(
+            dom.saveButton.disabled,
+            true,
+            "wholly blank contact must keep Save disabled"
+        );
+
+        setField(dom.editMemberFirmInput, CONTACT_1.member_firm);
+        setField(dom.editContactPersonInput, CONTACT_1.contact_person);
+        setField(dom.editEmailInput, CONTACT_1.email);
+        setField(dom.editPhoneInput, CONTACT_1.phone);
+        setField(dom.editAddressInput, CONTACT_1.address);
+        setField(dom.editWebsiteInput, CONTACT_1.website);
         assert.equal(dom.saveButton.disabled, true, "back to the baseline - nothing dirty");
     });
 
@@ -5631,7 +5659,7 @@ describe("contacts panel", () => {
         assert.equal(dom.messageEl.className.includes("is-success"), true);
     });
 
-    test("a legacy contact with blank fields is viewable/editable without throwing; Save stays disabled while any field is blank", async () => {
+    test("a legacy contact with blank fields is viewable/editable without throwing; Save enables once dirty with at least one field still filled", async () => {
         queueFetchResponses([LEGACY_CONTACT_RESPONSE]);
 
         await selectCountry("doc_legacy");
@@ -5647,17 +5675,38 @@ describe("contacts panel", () => {
         assert.equal(
             dom.saveButton.disabled,
             true,
-            "blank fields must keep Save disabled even though nothing has changed yet"
+            "unchanged baseline - nothing to save yet"
         );
 
+        // Filling in just ONE previously-blank field is already
+        // enough - the other blank fields (and member_firm/
+        // contact_person's own already-filled values) are not a
+        // reason to block Save.
         setField(dom.editEmailInput, "old@example.test");
-        assert.equal(dom.saveButton.disabled, true, "phone/address/website are still blank");
+        assert.equal(
+            dom.saveButton.disabled,
+            false,
+            "dirty, and member_firm/contact_person are still filled"
+        );
+
+        // Clearing every field, including the two that started
+        // non-blank, makes the contact wholly blank - Save must go
+        // back to disabled.
+        setField(dom.editEmailInput, "");
+        setField(dom.editMemberFirmInput, "");
+        setField(dom.editContactPersonInput, "");
+        assert.equal(
+            dom.saveButton.disabled,
+            true,
+            "wholly blank contact must keep Save disabled"
+        );
 
         setField(dom.editPhoneInput, "1");
-        setField(dom.editAddressInput, "a");
-        setField(dom.editWebsiteInput, "https://legacy.example");
-
-        assert.equal(dom.saveButton.disabled, false, "all six are now filled and dirty relative to baseline");
+        assert.equal(
+            dom.saveButton.disabled,
+            false,
+            "phone alone is enough once filled"
+        );
     });
 
     test("Cancel while editing restores the fields to the loaded baseline, not to empty, and stays in edit-one mode", async () => {

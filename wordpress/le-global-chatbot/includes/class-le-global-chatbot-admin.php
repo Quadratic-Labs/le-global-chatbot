@@ -3336,10 +3336,11 @@ final class LE_Global_Chatbot_Admin
     }
 
     /**
-     * Mission "ORDER 8G-B2" - Add one new contact. All six real
-     * business fields are required (the backend is the final
-     * authority - this is only a friendlier, earlier client-side
-     * rejection of the same rule); duplicates of an existing contact's
+     * Mission "ORDER 8G-B2" - Add one new contact. Every one of the
+     * six real business fields is individually optional (the backend
+     * is the final authority: it rejects only a submission where
+     * every field is blank, never a single missing field - see
+     * AdminContactWriteRequest); duplicates of an existing contact's
      * exact field values are explicitly allowed, never rejected here.
      * Every field is unslashed only, never sanitize_text_field()'d,
      * for the same reason handle_update_section leaves section content
@@ -3869,8 +3870,9 @@ final class LE_Global_Chatbot_Admin
      * sanitize_text_field(), which would also collapse internal
      * whitespace/strip characters a legitimate firm name, address, or
      * phone number may legitimately contain) - the backend itself
-     * enforces "all six required, non-empty after trimming"; this is
-     * only a plain, honest relay of whatever the Admin typed.
+     * enforces only that at least one of the six is non-empty after
+     * trimming, never that every individual field is; this is only a
+     * plain, honest relay of whatever the Admin typed.
      */
     private static function read_contact_fields_for_json(): array
     {
