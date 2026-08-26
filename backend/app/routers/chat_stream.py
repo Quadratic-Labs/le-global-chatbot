@@ -485,14 +485,12 @@ async def _drain_stream_events(
 
     try:
         response = await pipeline_task
-    except InvalidLegalChatRequestError as error:
-        if error.code != "comparison_source_budget":
-            raise
-
-        # GATE S4B finding: comparison_source_budget can ONLY ever be
-        # raised from _retrieve_search_hits (rag_answer.py), reached
-        # exclusively through legal_answer_generation_fn - i.e. always
-        # from INSIDE generation, for both answer_legal_question and
+    except Exception as error:
+        # GATE S4B finding: comparison_source_budget
+        # (InvalidLegalChatRequestError) can ONLY ever be raised from
+        # _retrieve_search_hits (rag_answer.py), reached exclusively
+        # through legal_answer_generation_fn - i.e. always from INSIDE
+        # generation, for both answer_legal_question and
         # stream_answer_legal_question alike. For /chat/stream that
         # means it is raised strictly AFTER the bridge has already
         # signaled "generation starting", so it is architecturally
@@ -500,41 +498,48 @@ async def _drain_stream_events(
         # PRE_STREAM_ERROR here (unlike /chat, where legal_chat()'s
         # except block wraps the entire call and can still return a
         # friendly 200 no matter when inside the pipeline it fires).
-        # Rather than let this fall through to the generic
-        # post_generation_failure error, build the SAME friendly
-        # response /chat itself would return and stream it as a
-        # genuine successful completion - the closest possible parity
-        # with /chat's own behavior given the HTTP status already
-        # committed to 200 the instant generation started.
-        response = _build_comparison_source_budget_response(
-            request=request, error=error,
-        )
-
-        if response.answer != sent_text_holder[0]:
-            yield _serialize_ndjson_record(
-                _replacement_record(response.answer)
+        # Special-case it to stream the SAME friendly response /chat
+        # itself would return, as a genuine successful completion -
+        # the closest possible parity with /chat given the HTTP status
+        # already committed to 200 the instant generation started.
+        # Checked by isinstance+code (never a bare re-raise here) so a
+        # class of exception this module doesn't fully recognize can
+        # never escape this already-active generator uncaught - it
+        # falls through to the generic, always-safe handling below
+        # instead, same as ever other unexpected exception.
+        if (
+            isinstance(error, InvalidLegalChatRequestError)
+            and error.code == "comparison_source_budget"
+        ):
+            response = _build_comparison_source_budget_response(
+                request=request, error=error,
             )
 
-        if timings.finalization is None:
-            timings.finalization = perf_counter()
+            if response.answer != sent_text_holder[0]:
+                yield _serialize_ndjson_record(
+                    _replacement_record(response.answer)
+                )
 
-        yield _serialize_ndjson_record(_metadata_record(response))
-        done_at = perf_counter()
-        yield _serialize_ndjson_record(_done_record(request_id))
+            if timings.finalization is None:
+                timings.finalization = perf_counter()
 
-        _log_stream_metric(
-            _stream_metric_payload(
-                request_id=request_id,
-                t0=t0,
-                outcome="stream_completed",
-                timings=timings,
-                metrics=metrics_holder[0],
-                first_fastapi_delta_at=first_fastapi_delta_at,
-                done_at=done_at,
+            yield _serialize_ndjson_record(_metadata_record(response))
+            done_at = perf_counter()
+            yield _serialize_ndjson_record(_done_record(request_id))
+
+            _log_stream_metric(
+                _stream_metric_payload(
+                    request_id=request_id,
+                    t0=t0,
+                    outcome="stream_completed",
+                    timings=timings,
+                    metrics=metrics_holder[0],
+                    first_fastapi_delta_at=first_fastapi_delta_at,
+                    done_at=done_at,
+                )
             )
-        )
-        return
-    except Exception as error:
+            return
+
         logger.exception(
             "chat_stream pipeline failed after generation had "
             "already started streaming (request_id=%s)",
