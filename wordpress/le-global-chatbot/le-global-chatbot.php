@@ -35,48 +35,76 @@ final class LE_Global_Chatbot_Plugin
         '/' . self::REST_NAMESPACE . '/chat/stream'
     );
 
-    // GATE S6B: derived from the STREAMING backend's own effective
-    // timeout hierarchy - NOT from /chat's unrelated 75s
-    // (non-streaming, a completely different client/timeout axis).
+    // GATE S7-LITE: the smallest possible switch for exposing
+    // /chat/stream to the browser widget - one wp-config.php-style
+    // constant, matching LE_GLOBAL_CHATBOT_API_URL/_API_KEY's own
+    // defined()-or-default convention (see get_backend_configuration()
+    // below). Undefined - the default - means OFF: render_shortcode()
+    // still advertises the /chat/stream URL (so it is never a secret),
+    // but chatbot.js will not use it until this constant is defined
+    // truthy. Deliberately not a general feature-flag framework - no
+    // options table row, no admin UI, no per-request evaluation.
+    private const STREAMING_ENABLED_CONSTANT = (
+        'LE_GLOBAL_CHATBOT_STREAMING_ENABLED'
+    );
+
+    // GATE S6C: the S6B derivation (200s) covered only retrieval +
+    // the streamed answer + repair - it omitted request understanding,
+    // which runs BEFORE any byte streams and so also counts against
+    // this route's total request/response window. Full stage-by-stage
+    // trace (backend source, not assumption):
     //
-    // OpenAIResponsesStreamClient (backend/app/clients/
-    // openai_responses_stream.py) is constructed by
-    // get_openai_answer_stream_client() with ONLY api_key/model/
-    // reasoning_effort/max_output_tokens - none of its 5 timeout
-    // constructor parameters are ever overridden, so the EFFECTIVE
-    // runtime values are always its class defaults, and
-    // OPENAI_TIMEOUT_SECONDS (env-configurable) has NO effect on them
-    // at all (grep-confirmed: that setting is read only by the
-    // separate, non-streaming OpenAIResponsesClient):
-    //   connect=10s, read(idle-between-chunks)=30s, write=10s,
-    //   pool=10s - httpx.Timeout axes, all short/connection-shaped.
-    //   total_stream_timeout_seconds=120s - a SEPARATE, self-enforced
-    //   wall-clock ceiling on the WHOLE first-pass stream (checked
-    //   per-chunk against time.monotonic(), yielding a normal
-    //   in-band ERROR StreamEvent if exceeded - never an exception).
+    //   UNDERSTANDING: request_understanding.py's understand_request()
+    //   makes "at most two network attempts (a single retry, only for
+    //   a transient failure)", no backoff sleep between them, each via
+    //   get_openai_understanding_client() -> the same OPENAI_TIMEOUT_
+    //   SECONDS-bounded (60s default) sync client every OpenAI call in
+    //   this codebase shares (_get_configured_openai_client() - one
+    //   shared timeout, no per-flavor override). Worst case: 2x60=120s.
     //
-    // The full WordPress-to-backend HTTP request/response this route
-    // proxies can ALSO include, within that same request/response
-    // window: real OpenSearch retrieval before streaming starts
-    // (opensearch-py's own un-overridden per-call default is 10s -
-    // budgeted here at ~20s for a realistic, not worst-case-
-    // pathological, multi-call retrieval phase) and, if the streamed
-    // answer needs repair, exactly one additional sync OpenAI call
-    // bounded by OPENAI_TIMEOUT_SECONDS (60s default - backend/app/
-    // clients/openai_responses.py's own urlopen() timeout).
-    // Legitimate worst case: 20 + 120 + 60 = 200s - the number this
-    // route's own ceilings must safely exceed, not the bare 120s
-    // figure alone, since WordPress's cURL call spans the ENTIRE
-    // request/response window, not just the streaming sub-phase.
+    //   RETRIEVAL: one _retrieve_search_hits() call per action_spec,
+    //   one OpenSearch call per country within it (opensearch-py's own
+    //   un-overridden default: 10s/call, no application-level retry).
+    //   action_specs/actions has no max_length in the Pydantic model -
+    //   not hard-bounded - but OPENAI_UNDERSTANDING_MAX_OUTPUT_TOKENS's
+    //   own docstring records real-API verification up to "mixed
+    //   3-action" requests as the realistic/tested envelope. Budgeted
+    //   at ~30s for that many calls at healthy-cluster (not
+    //   all-timing-out) latency, consistent with S6B's own reasoning.
+    //
+    //   RERANK: RERANK_ENABLED defaults to false (infra/compose.yml) -
+    //   0s in the CURRENT runtime. If ever enabled, rerank shares
+    //   retrieval's own call-count profile (one call per retrieval
+    //   call) via the same OPENAI_TIMEOUT_SECONDS-bounded sync client -
+    //   budgeted at ~30s for the same reasoning as retrieval, since
+    //   this route's ceiling must not need re-deriving the moment
+    //   reranking is turned on.
+    //
+    //   STREAM: OpenAIResponsesStreamClient's own self-enforced
+    //   total_stream_timeout_seconds=120s (class default, never
+    //   overridden by get_openai_answer_stream_client() - confirmed
+    //   OPENAI_TIMEOUT_SECONDS has zero effect on this axis).
+    //
+    //   REPAIR: at most one repair attempt (stream_answer_legal_
+    //   question's own generation_attempts=2 ceiling - a single
+    //   asyncio.to_thread() call, no loop), via the same 60s-bounded
+    //   sync client, no retry. Worst case: 60s.
+    //
+    // CURRENT_RUNTIME_MAX  = 120 + 30 + 0  + 120 + 60 = 330s
+    // SUPPORTED_CONFIG_MAX = 120 + 30 + 30 + 120 + 60 = 360s (rerank on)
+    //
+    // This route's own ceilings are sized against SUPPORTED_CONFIG_MAX
+    // (360s), not the current-runtime figure, so enabling rerank later
+    // never silently reopens this same gap.
     private const STREAM_CONNECT_TIMEOUT_SECONDS = 10;
 
-    private const STREAM_TOTAL_TIMEOUT_SECONDS = 215;
+    private const STREAM_TOTAL_TIMEOUT_SECONDS = 400;
 
     // A few seconds of headroom over STREAM_TOTAL_TIMEOUT_SECONDS -
     // this route must never be cut short by PHP's own execution
     // ceiling before the backend's own (longer) stream timeout has a
     // chance to fire and be relayed to the client normally.
-    private const STREAM_PHP_EXECUTION_TIME_SECONDS = 225;
+    private const STREAM_PHP_EXECUTION_TIME_SECONDS = 420;
 
     // Only these backend response headers are ever relayed to the
     // client for the streaming route - never a blind passthrough.
@@ -397,6 +425,18 @@ final class LE_Global_Chatbot_Plugin
             data-chat-endpoint="<?php
                 echo esc_url(
                     $rest_base . '/chat'
+                );
+            ?>"
+            data-chat-stream-endpoint="<?php
+                echo esc_url(
+                    $rest_base . '/chat/stream'
+                );
+            ?>"
+            data-chat-streaming-enabled="<?php
+                echo esc_attr(
+                    self::is_chat_streaming_enabled()
+                        ? '1'
+                        : '0'
                 );
             ?>"
             <?php if ($is_floating) : ?>
@@ -1615,6 +1655,21 @@ final class LE_Global_Chatbot_Plugin
         exit;
     }
 
+
+    /**
+     * GATE S7-LITE: the one boolean render_shortcode() exposes as
+     * data-chat-streaming-enabled. Defined-and-truthy is the only way
+     * to turn this on; anything else (undefined, "", "0", false) is
+     * OFF, matching the mission's "default MUST remain OFF" rule
+     * without needing a truthiness table.
+     */
+    private static function is_chat_streaming_enabled(): bool
+    {
+        return (
+            defined(self::STREAMING_ENABLED_CONSTANT)
+            && (bool) constant(self::STREAMING_ENABLED_CONSTANT)
+        );
+    }
 
     private static function get_backend_configuration()
     {

@@ -79,6 +79,21 @@ from app.routers.chat import resolve_legal_chat_response
 NDJSON_PROTOCOL_VERSION: Final[int] = 1
 NDJSON_MEDIA_TYPE: Final[str] = "application/x-ndjson; charset=utf-8"
 
+# GATE S6D: a single whole-request deadline for /chat/stream only -
+# /chat is untouched. No individual OpenAI/OpenSearch timeout is
+# changed by this; this is purely an OUTER ceiling on the full
+# understanding -> retrieval -> rerank -> generation -> validation ->
+# repair sequence, none of which previously had one shared bound.
+# Matches GATE S6C's own SUPPORTED_CONFIG_MAX derivation (120s
+# understanding + 30s retrieval + 30s rerank-if-enabled + 120s stream
+# + 60s repair = 360s), kept strictly below the WordPress proxy's own
+# cURL total (400s) and PHP execution (420s) ceilings so this backend
+# deadline is always what fires first for a genuinely stuck request -
+# WordPress's own ceilings remain the outer safety net only for a
+# request that somehow ignores this deadline entirely (e.g. a true
+# hang inside a call this deadline can't interrupt mid-flight).
+STREAM_REQUEST_DEADLINE_SECONDS: Final[float] = 360.0
+
 logger = logging.getLogger("app.routers.chat_stream")
 
 
@@ -375,6 +390,24 @@ _GENERATION_STARTING: Final[object] = object()
 _PIPELINE_DONE: Final[object] = object()
 
 
+async def _get_with_deadline(
+    event_queue: asyncio.Queue, deadline_at: float,
+):
+    """
+    GATE S6D: the ONE place this module waits on event_queue with the
+    whole-request deadline applied - used both by the eager pre-stream
+    race and by _drain_stream_events's own drain loop, so "the
+    deadline expired" is detected identically (and cancels the same
+    way) regardless of which phase the request was in when it fired.
+    Raises asyncio.TimeoutError when the deadline passes with nothing
+    new on the queue - callers decide what that means for THEIR phase
+    (a pre-stream HTTP error vs. an in-band NDJSON error).
+    """
+
+    remaining = max(0.0, deadline_at - perf_counter())
+    return await asyncio.wait_for(event_queue.get(), timeout=remaining)
+
+
 async def _drain_stream_events(
     *,
     event_queue: asyncio.Queue,
@@ -385,6 +418,7 @@ async def _drain_stream_events(
     sent_text_holder: list[str],
     metrics_holder: list[Any],
     t0: float,
+    deadline_at: float,
 ) -> AsyncIterator[bytes]:
     """
     Runs ONLY once "generation starting" has already been observed -
@@ -410,7 +444,47 @@ async def _drain_stream_events(
 
     try:
         while True:
-            item = await event_queue.get()
+            try:
+                item = await _get_with_deadline(event_queue, deadline_at)
+            except asyncio.TimeoutError:
+                # GATE S6D: the whole-request deadline fired mid-
+                # stream. Whatever provisional text the client already
+                # has is no longer trustworthy (the request as a whole
+                # never finished), so DISCARD it first - same
+                # invalidate-before-terminal-error rule as every other
+                # failure that follows partial content.
+                if sent_text_holder[0]:
+                    yield _serialize_ndjson_record(_discard_record())
+
+                yield _serialize_ndjson_record(
+                    _error_record(
+                        code="stream_request_timeout",
+                        message=(
+                            "The legal assistant did not finish "
+                            "responding in time."
+                        ),
+                        retryable=True,
+                    )
+                )
+
+                pipeline_task.cancel()
+                try:
+                    await pipeline_task
+                except (Exception, asyncio.CancelledError):
+                    pass
+
+                _log_stream_metric(
+                    _stream_metric_payload(
+                        request_id=request_id,
+                        t0=t0,
+                        outcome="stream_error",
+                        error_code="stream_request_timeout",
+                        timings=timings,
+                        metrics=metrics_holder[0],
+                        first_fastapi_delta_at=first_fastapi_delta_at,
+                    )
+                )
+                return
 
             if item is _PIPELINE_DONE:
                 break
@@ -664,6 +738,7 @@ async def legal_chat_stream(
     docstring for the full architecture."""
 
     t0 = perf_counter()
+    deadline_at = t0 + STREAM_REQUEST_DEADLINE_SECONDS
     settings = get_settings()
     request_id = x_request_id.strip() if x_request_id else str(uuid4())
 
@@ -800,8 +875,33 @@ async def legal_chat_stream(
     # Eagerly wait for the FIRST signal - "generation is starting" or
     # "the whole pipeline is already done" - BEFORE constructing
     # StreamingResponse, so a pre-generation failure preserves today's
-    # exact HTTP status (mission section 7/8).
-    first_signal = await event_queue.get()
+    # exact HTTP status (mission section 7/8). GATE S6D: also races
+    # against the whole-request deadline - if it fires before either
+    # real signal arrives, this is still squarely a PRE-STREAM failure
+    # (no StreamingResponse constructed yet), so it gets a normal HTTP
+    # status rather than an in-band NDJSON error.
+    try:
+        first_signal = await _get_with_deadline(event_queue, deadline_at)
+    except asyncio.TimeoutError:
+        pipeline_task.cancel()
+        try:
+            await pipeline_task
+        except (Exception, asyncio.CancelledError):
+            pass
+
+        _log_stream_metric(
+            _stream_metric_payload(
+                request_id=request_id,
+                t0=t0,
+                outcome="pre_stream_failure",
+                error_code="stream_request_timeout",
+            )
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="The legal assistant did not respond in time.",
+            headers={"X-Request-ID": request_id},
+        ) from None
 
     if first_signal is _PIPELINE_DONE:
         try:
@@ -847,6 +947,7 @@ async def legal_chat_stream(
             sent_text_holder=sent_text_holder,
             metrics_holder=metrics_holder,
             t0=t0,
+            deadline_at=deadline_at,
         ),
         media_type=NDJSON_MEDIA_TYPE,
         headers=_streaming_response_headers(request_id),

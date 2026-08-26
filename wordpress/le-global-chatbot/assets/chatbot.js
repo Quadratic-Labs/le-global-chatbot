@@ -40,6 +40,13 @@
     // and discarded rather than misread.
     const CONVERSATION_STORAGE_VERSION = 2;
 
+    // GATE S7-LITE: the only /chat/stream NDJSON protocol version this
+    // client understands - matches the backend's own
+    // NDJSON_PROTOCOL_VERSION (chat_stream.py). A start record naming
+    // any other version is rejected as a protocol error rather than
+    // parsed optimistically.
+    const STREAM_PROTOCOL_VERSION = 1;
+
     /**
      * Build the history payload sent alongside a new question, from
      * this widget's own turns array - a pure function of its input so
@@ -542,6 +549,34 @@
             widget.dataset.contactPhotoEndpoint || ""
         );
 
+        // GATE S7-LITE: same server-generated data-attribute mechanism
+        // as chatEndpoint/configEndpoint above - never hard-coded, and
+        // still always same-origin WordPress, never the backend
+        // directly. chatStreamingEnabled defaults OFF whenever the
+        // attribute is absent or not exactly "1" (an older cached
+        // shortcode render, or the PHP-side constant left undefined).
+        const chatStreamEndpoint = (
+            widget.dataset.chatStreamEndpoint || ""
+        );
+
+        const chatStreamingEnabled = (
+            widget.dataset.chatStreamingEnabled === "1"
+        );
+
+        // Fixed for this widget's entire lifetime (browser capability
+        // and the server-provided flag/endpoint never change at
+        // runtime) - captured once here, then closure-captured by
+        // every submitChatRequest() call including its own
+        // conversation_state retry, so a request that ever dispatches
+        // through /chat/stream can structurally never fall through to
+        // /chat instead (mission section 5's no-double-request rule).
+        const chatTransport = resolveChatTransport(
+            {
+                chatStreamingEnabled,
+                chatStreamEndpoint,
+            }
+        );
+
         const form = widget.querySelector(
             ".le-global-chatbot__composer"
         );
@@ -779,7 +814,7 @@
 
                 refreshLoadingState();
 
-                async function submitChatRequest(
+                function sendChatRequest(
                     includeConversationState
                 ) {
                     const requestBody = {
@@ -798,53 +833,64 @@
                         );
                     }
 
-                    try {
-                        return await requestJson(
+                    const requestInit = {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                        },
+                        credentials: "same-origin",
+                        signal: controller.signal,
+                        body: JSON.stringify(
+                            requestBody
+                        ),
+                    };
+
+                    // chatTransport is fixed for this whole submit -
+                    // see its own definition above for why a retry
+                    // below can never cross from stream to json.
+                    return chatTransport === "stream"
+                        ? requestStream(
+                            chatStreamEndpoint,
+                            requestInit
+                        )
+                        : requestJson(
                             chatEndpoint,
-                            {
-                                method: "POST",
-                                headers: {
-                                    "Content-Type":
-                                        "application/json",
-                                },
-                                credentials: "same-origin",
-                                signal: controller.signal,
-                                body: JSON.stringify(
-                                    requestBody
-                                ),
-                            }
+                            requestInit
                         );
-                    } catch (error) {
-                        // Recover from a conversation_state the
-                        // backend rejected (RECTIFICATIF §D): drop
-                        // only conversationState, keep every
-                        // persisted message, and retry this exact
-                        // question exactly once without it - never
-                        // a second copy of the user's question, never
-                        // a retry loop.
-                        if (
-                            includeConversationState
-                            && isConversationStateValidationError(
-                                error
-                            )
-                        ) {
-                            conversationState = null;
+                }
 
-                            saveConversation(
-                                turns.filter(
-                                    (existingTurn) => (
-                                        existingTurn.id !== turn.id
-                                    )
-                                ),
-                                maxHistoryMessages,
-                                null
-                            );
+                function submitChatRequest(
+                    includeConversationState
+                ) {
+                    return performChatTransportRequest(
+                        {
+                            send: sendChatRequest,
+                            includeConversationState,
+                            onConversationStateRejected: () => {
+                                // Recover from a conversation_state
+                                // the backend rejected (RECTIFICATIF
+                                // §D): drop only conversationState,
+                                // keep every persisted message - the
+                                // retry itself (exactly once, same
+                                // transport, never a second copy of
+                                // the user's question) is
+                                // performChatTransportRequest's own
+                                // job.
+                                conversationState = null;
 
-                            return submitChatRequest(false);
+                                saveConversation(
+                                    turns.filter(
+                                        (existingTurn) => (
+                                            existingTurn.id
+                                            !== turn.id
+                                        )
+                                    ),
+                                    maxHistoryMessages,
+                                    null
+                                );
+                            },
                         }
-
-                        throw error;
-                    }
+                    );
                 }
 
                 try {
@@ -1889,6 +1935,526 @@
         );
     }
 
+    // =====================================================================
+    // GATE S7-LITE: /chat/stream consumption - fetch + ReadableStream +
+    // TextDecoder, a robust NDJSON parser, protocol v1 state validation,
+    // and reconstruction of an object shaped exactly like /chat's own
+    // JSON response, so the EXISTING renderer (buildAssistantBubble and
+    // everything upstream of it) never needs to know which endpoint a
+    // turn's answer came from. No progressive UI here - deltas/
+    // validating/discard/replacement only update internal state; the
+    // caller sees one complete result once (and only once) `done`
+    // arrives, exactly like a resolved requestJson() call.
+    // =====================================================================
+
+    /**
+     * True only when this browser can plausibly support requestStream()
+     * - fetch, a real ReadableStream body, and TextDecoder. Takes an
+     * optional capability source purely so tests can simulate an
+     * unsupported browser without touching real globals; production
+     * code always calls this with no argument.
+     */
+    function isStreamResponseSupported(capabilitySource) {
+        const source = (
+            capabilitySource
+            || (
+                typeof globalThis !== "undefined"
+                    ? globalThis
+                    : {}
+            )
+        );
+
+        return Boolean(
+            source
+            && typeof source.fetch === "function"
+            && typeof source.ReadableStream === "function"
+            && typeof source.TextDecoder === "function"
+        );
+    }
+
+    /**
+     * The ONE place that decides /chat vs /chat/stream for a widget -
+     * called once per widget (mission section 3/5): OFF by default,
+     * and never chosen at all unless this browser can actually support
+     * it. Never re-evaluated mid-request, so a retry can never migrate
+     * from one transport to the other.
+     */
+    function resolveChatTransport(
+        {
+            chatStreamingEnabled,
+            chatStreamEndpoint,
+            capabilitySource,
+        }
+    ) {
+        if (
+            !chatStreamingEnabled
+            || !chatStreamEndpoint
+        ) {
+            return "json";
+        }
+
+        return isStreamResponseSupported(capabilitySource)
+            ? "stream"
+            : "json";
+    }
+
+    /**
+     * The retry-on-invalid-conversation_state wrapper shared by /chat
+     * and /chat/stream alike (RECTIFICATIF §D) - `send` already has
+     * its transport fixed by the caller (see chatTransport in
+     * initializeWidget), so this never has an opinion about which
+     * endpoint is used; it only ever calls `send` again, never a
+     * different function. That is what makes "no automatic retry
+     * against /chat after a stream request has been sent" (mission
+     * section 5) hold structurally rather than by convention: there is
+     * no second `send` implementation for this to accidentally reach
+     * for.
+     */
+    async function performChatTransportRequest(
+        {
+            send,
+            includeConversationState,
+            onConversationStateRejected,
+        }
+    ) {
+        try {
+            return await send(
+                includeConversationState
+            );
+        } catch (error) {
+            if (
+                includeConversationState
+                && isConversationStateValidationError(
+                    error
+                )
+            ) {
+                onConversationStateRejected();
+
+                return performChatTransportRequest(
+                    {
+                        send,
+                        includeConversationState: false,
+                        onConversationStateRejected,
+                    }
+                );
+            }
+
+            throw error;
+        }
+    }
+
+    /**
+     * Incrementally decodes arbitrary byte chunks into complete
+     * newline-terminated NDJSON records. Network chunk boundaries are
+     * arbitrary - a chunk may end mid-multibyte-character or mid-JSON-
+     * object - so this buffers raw text (never raw bytes are handed to
+     * JSON.parse) and only ever yields complete lines. A raw newline
+     * byte can only ever be a record separator: JSON string values
+     * with an embedded newline always carry it escaped ("\n", two
+     * characters), never a literal 0x0A, so this never mis-splits a
+     * record's own text.
+     */
+    function createNdjsonLineParser() {
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        function push(chunk) {
+            buffer += decoder.decode(
+                chunk,
+                { stream: true }
+            );
+
+            const records = [];
+            let newlineIndex = buffer.indexOf("\n");
+
+            while (newlineIndex !== -1) {
+                const rawLine = buffer.slice(
+                    0,
+                    newlineIndex
+                );
+
+                buffer = buffer.slice(
+                    newlineIndex + 1
+                );
+
+                if (rawLine.length > 0) {
+                    records.push(
+                        parseNdjsonLine(rawLine)
+                    );
+                }
+
+                newlineIndex = buffer.indexOf("\n");
+            }
+
+            return records;
+        }
+
+        /**
+         * Call once at end-of-stream. Flushes any pending decoder
+         * state and rejects a non-empty, newline-less remainder - a
+         * truncated record is never silently accepted as complete.
+         */
+        function flush() {
+            buffer += decoder.decode();
+
+            const hadTrailingContent = (
+                buffer.trim().length > 0
+            );
+
+            buffer = "";
+
+            if (hadTrailingContent) {
+                throw createStreamProtocolError(
+                    "truncated_stream",
+                    "The response stream ended with an "
+                    + "incomplete record."
+                );
+            }
+        }
+
+        return { push, flush };
+    }
+
+    function parseNdjsonLine(rawLine) {
+        try {
+            return JSON.parse(rawLine);
+        } catch {
+            throw createStreamProtocolError(
+                "malformed_record",
+                "The response stream contained a "
+                + "malformed record."
+            );
+        }
+    }
+
+    function createStreamProtocolError(code, message) {
+        const error = new Error(message);
+        error.code = code;
+        return error;
+    }
+
+    function createStreamReconstructionState() {
+        return {
+            started: false,
+            terminal: null,
+            answerText: "",
+            metadata: null,
+            errorCode: null,
+            errorMessage: null,
+            errorRetryable: false,
+        };
+    }
+
+    /**
+     * Validates and applies one already-JSON-parsed NDJSON record to
+     * the running reconstruction state (mission sections 7/8). Mutates
+     * and returns the same state object. Throws a StreamProtocolError-
+     * shaped Error (a plain Error with a .code) for any sequence this
+     * client does not recognize as valid protocol v1 - never silently
+     * ignored.
+     *
+     * `replacement` is accepted any time after `start` and before a
+     * terminal event, WITH or WITHOUT a preceding `discard`: besides
+     * the discard/replacement repair pair, the backend also emits a
+     * bare replacement to reconcile the streamed text with the final
+     * assembled answer whenever generation is followed by appended
+     * content it could not have streamed in advance (an unavailable-
+     * countries note, or an ungrounded-answer contact fallback - see
+     * chat_stream.py's own post-generation reconciliation branch).
+     * Requiring a prior discard in every case would reject that
+     * legitimate, routine success response as a protocol error.
+     */
+    function applyStreamProtocolEvent(state, record) {
+        if (
+            !record
+            || typeof record !== "object"
+            || Array.isArray(record)
+        ) {
+            throw createStreamProtocolError(
+                "invalid_record",
+                "The response stream contained an "
+                + "invalid record."
+            );
+        }
+
+        if (state.terminal) {
+            throw createStreamProtocolError(
+                "event_after_terminal",
+                "The response stream continued after it "
+                + "had already ended."
+            );
+        }
+
+        const type = record.type;
+
+        if (!state.started) {
+            if (type !== "start") {
+                throw createStreamProtocolError(
+                    "missing_start",
+                    "The response stream did not begin "
+                    + "with a start event."
+                );
+            }
+
+            if (
+                record.protocol_version
+                !== STREAM_PROTOCOL_VERSION
+            ) {
+                throw createStreamProtocolError(
+                    "unsupported_protocol_version",
+                    "The response stream used an "
+                    + "unsupported protocol version."
+                );
+            }
+
+            state.started = true;
+            return state;
+        }
+
+        if (type === "start") {
+            throw createStreamProtocolError(
+                "duplicate_start",
+                "The response stream sent more than one "
+                + "start event."
+            );
+        }
+
+        if (type === "delta") {
+            if (typeof record.text !== "string") {
+                throw createStreamProtocolError(
+                    "invalid_delta",
+                    "The response stream sent a malformed "
+                    + "delta event."
+                );
+            }
+
+            state.answerText += record.text;
+            return state;
+        }
+
+        if (type === "validating") {
+            return state;
+        }
+
+        if (type === "discard") {
+            state.answerText = "";
+            return state;
+        }
+
+        if (type === "replacement") {
+            if (typeof record.text !== "string") {
+                throw createStreamProtocolError(
+                    "invalid_replacement",
+                    "The response stream sent a malformed "
+                    + "replacement event."
+                );
+            }
+
+            state.answerText = record.text;
+            return state;
+        }
+
+        if (type === "metadata") {
+            state.metadata = record;
+            return state;
+        }
+
+        if (type === "done") {
+            if (!state.metadata) {
+                throw createStreamProtocolError(
+                    "missing_metadata",
+                    "The response stream reached done "
+                    + "without metadata."
+                );
+            }
+
+            state.terminal = "done";
+            return state;
+        }
+
+        if (type === "error") {
+            state.terminal = "error";
+            state.errorCode = record.code || null;
+            state.errorMessage = (
+                typeof record.message === "string"
+                    ? record.message
+                    : (
+                        "The legal assistant could not "
+                        + "process the request."
+                    )
+            );
+            state.errorRetryable = Boolean(
+                record.retryable
+            );
+            return state;
+        }
+
+        throw createStreamProtocolError(
+            "unknown_event_type",
+            "The response stream contained an "
+            + "unrecognized event."
+        );
+    }
+
+    /** Mirrors requestJson()'s own thrown-Error shape/philosophy. */
+    function buildStreamTerminalError(state) {
+        const error = new Error(
+            state.errorMessage
+            || "The legal assistant could not process "
+            + "the request."
+        );
+
+        error.code = state.errorCode;
+        error.retryable = state.errorRetryable;
+        return error;
+    }
+
+    /**
+     * Builds an object shaped exactly like /chat's own LegalChatResponse
+     * JSON (mission section 9) from a state that reached `done` -
+     * answer from the accumulated delta/replacement text, everything
+     * else from the one `metadata` record (itself every LegalChatResponse
+     * field except answer - see chat_stream.py's _metadata_record).
+     */
+    function buildReconstructedChatResponse(state) {
+        const metadata = state.metadata || {};
+
+        return {
+            question: metadata.question,
+            answer: state.answerText,
+            grounded: Boolean(metadata.grounded),
+            model: (
+                metadata.model !== undefined
+                    ? metadata.model
+                    : null
+            ),
+            retrieval_total: (
+                Number.isInteger(metadata.retrieval_total)
+                    ? metadata.retrieval_total
+                    : 0
+            ),
+            sources: (
+                Array.isArray(metadata.sources)
+                    ? metadata.sources
+                    : []
+            ),
+            contacts: (
+                Array.isArray(metadata.contacts)
+                    ? metadata.contacts
+                    : []
+            ),
+            conversation_state: (
+                metadata.conversation_state !== undefined
+                    ? metadata.conversation_state
+                    : null
+            ),
+        };
+    }
+
+    /**
+     * Consumes one /chat/stream response end to end and returns an
+     * object shaped exactly like requestJson(chatEndpoint, ...) would -
+     * so a caller can await either interchangeably. A pre-NDJSON HTTP
+     * failure (401/422/429/502/503 - mission section 11) throws with
+     * the SAME .statusCode/.payload shape requestJson() uses, so
+     * isConversationStateValidationError() and the existing error UI
+     * both work unchanged. Any failure once the NDJSON body has begun -
+     * a malformed/truncated record, a protocol violation, an in-band
+     * `error` record, or the request being aborted - throws a plain
+     * Error with no .statusCode, so it is never mistaken for that one
+     * retryable pre-stream case (see performChatTransportRequest).
+     */
+    async function requestStream(url, options) {
+        const response = await fetch(
+            url,
+            options
+        );
+
+        const contentType = (
+            response.headers.get("content-type") || ""
+        );
+
+        const isNdjson = contentType.includes(
+            "application/x-ndjson"
+        );
+
+        if (!response.ok || !isNdjson) {
+            let payload = null;
+
+            try {
+                payload = await response.json();
+            } catch {
+                payload = null;
+            }
+
+            const error = new Error(
+                getErrorMessage(
+                    payload,
+                    response.status
+                )
+            );
+
+            error.statusCode = response.status;
+            error.payload = payload;
+            throw error;
+        }
+
+        if (
+            !response.body
+            || typeof response.body.getReader !== "function"
+        ) {
+            throw new Error(
+                "The legal assistant could not process "
+                + "the request."
+            );
+        }
+
+        const reader = response.body.getReader();
+        const parser = createNdjsonLineParser();
+        let state = createStreamReconstructionState();
+
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+
+                if (done) {
+                    parser.flush();
+                    break;
+                }
+
+                const records = parser.push(value);
+
+                for (const record of records) {
+                    state = applyStreamProtocolEvent(
+                        state,
+                        record
+                    );
+                }
+            }
+        } catch (error) {
+            try {
+                await reader.cancel();
+            } catch {
+                // Best-effort only - the stream is already
+                // being abandoned over the original error.
+            }
+
+            throw error;
+        }
+
+        if (state.terminal === "error") {
+            throw buildStreamTerminalError(state);
+        }
+
+        if (state.terminal !== "done") {
+            throw new Error(
+                "The response stream ended unexpectedly."
+            );
+        }
+
+        return buildReconstructedChatResponse(state);
+    }
+
     // Test-only hook: absent in the browser (module is never defined
     // there), so this changes nothing about how the widget itself
     // loads or runs. Exposes only the pure, DOM-free functions the
@@ -1905,6 +2471,16 @@
             clearStoredConversation,
             rebuildTurnsFromMessages,
             isConversationStateValidationError,
+            STREAM_PROTOCOL_VERSION,
+            isStreamResponseSupported,
+            resolveChatTransport,
+            performChatTransportRequest,
+            createNdjsonLineParser,
+            createStreamReconstructionState,
+            applyStreamProtocolEvent,
+            buildStreamTerminalError,
+            buildReconstructedChatResponse,
+            requestStream,
         };
     }
 })();

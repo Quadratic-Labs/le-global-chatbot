@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1285,6 +1286,157 @@ class StreamMetricsTests(unittest.TestCase):
         self.assertEqual("post_generation_failure", payload["outcome"])
         self.assertEqual("RuntimeError", payload["error_code"])
         self.assertIsNone(payload["t8_done"])
+
+
+class _HangingPipeline:
+    """A resolve_legal_chat_response stand-in that blocks (in the
+    worker thread, via time.sleep - correct here since this is the
+    SAME thread asyncio.to_thread already runs the real pipeline in)
+    longer than a mocked-tiny STREAM_REQUEST_DEADLINE_SECONDS, without
+    ever invoking legal_answer_generation_fn - i.e. the deadline must
+    fire while this is still squarely a PRE-STREAM condition."""
+
+    def __init__(self, *, hang_seconds: float, response: LegalChatResponse):
+        self.hang_seconds = hang_seconds
+        self.response = response
+
+    def __call__(self, request, **kwargs) -> LegalChatResponse:
+        time.sleep(self.hang_seconds)
+        return self.response
+
+
+class _HangingStreamClient:
+    """A stream client that yields one real delta, then blocks past a
+    mocked-tiny deadline before ever completing - proving the deadline
+    correctly fires mid-stream (DISCARD already has real provisional
+    text to invalidate) rather than only in the pre-stream case."""
+
+    model = "test-model"
+
+    def __init__(self, *, hang_seconds: float):
+        self.hang_seconds = hang_seconds
+
+    async def stream(self, instructions, input_text):
+        yield StreamEvent(type=StreamEventType.DELTA, text="United Kingdom\n")
+        await asyncio.sleep(self.hang_seconds)
+        yield StreamEvent(type=StreamEventType.COMPLETED)
+
+
+class RequestDeadlineTests(unittest.TestCase):
+    """GATE S6D: STREAM_REQUEST_DEADLINE_SECONDS - a single whole-
+    request ceiling covering understanding/retrieval/rerank/
+    generation/validation/repair together, previously unbounded as
+    one unit. Mocked to a tiny value so these tests run in
+    milliseconds rather than the real 360s."""
+
+    def test_deadline_before_generation_starts_is_a_pre_stream_http_error(
+        self,
+    ) -> None:
+        response = LegalChatResponse(
+            question="hello", answer="too late", grounded=False,
+            model=None, retrieval_total=0, sources=[],
+        )
+        pipeline = _HangingPipeline(hang_seconds=0.3, response=response)
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 0.05,
+        ):
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                with self.assertRaises(HTTPException) as ctx:
+                    _run(
+                        legal_chat_stream(
+                            request=LegalChatRequest(
+                                question="A valid-length question.",
+                            ),
+                            x_request_id="deadline-pre-1",
+                        )
+                    )
+
+        self.assertEqual(504, ctx.exception.status_code)
+        self.assertEqual(
+            "deadline-pre-1", ctx.exception.headers["X-Request-ID"],
+        )
+
+        payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("pre_stream_failure", payloads[0]["outcome"])
+        self.assertEqual("stream_request_timeout", payloads[0]["error_code"])
+
+    def test_deadline_mid_stream_discards_then_errors_no_done(self) -> None:
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        stream_client = _HangingStreamClient(hang_seconds=0.3)
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 0.05,
+        ):
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=generation_request, x_request_id="deadline-mid-1",
+                        ),
+                    )
+                )
+
+        types = [r["type"] for r in records]
+        self.assertEqual("start", types[0])
+        self.assertIn("delta", types)
+        self.assertIn("discard", types)
+        self.assertEqual(types[-1], "error")
+        self.assertEqual("stream_request_timeout", records[-1]["code"])
+        self.assertNotIn("metadata", types)
+        self.assertNotIn("done", types)
+
+        payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("stream_error", payloads[0]["outcome"])
+        self.assertEqual("stream_request_timeout", payloads[0]["error_code"])
+
+    def test_deadline_never_fires_for_a_request_within_budget(self) -> None:
+        """Regression guard: a normal, fast request must be completely
+        unaffected by the deadline mechanism - proven by using the
+        SAME tiny mocked deadline but a pipeline that finishes well
+        within it."""
+
+        response = LegalChatResponse(
+            question="hello", answer="in time", grounded=False,
+            model=None, retrieval_total=0, sources=[],
+        )
+        pipeline = _DeterministicPipeline(response)
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 5.0,
+        ):
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=LegalChatRequest(question="hello"),
+                        x_request_id="deadline-unaffected-1",
+                    ),
+                )
+            )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
 
 
 class NamedEarlyResponseRouteTests(unittest.TestCase):
