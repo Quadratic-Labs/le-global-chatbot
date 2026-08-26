@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1285,6 +1287,486 @@ class StreamMetricsTests(unittest.TestCase):
         self.assertEqual("post_generation_failure", payload["outcome"])
         self.assertEqual("RuntimeError", payload["error_code"])
         self.assertIsNone(payload["t8_done"])
+
+
+class _HangingPipeline:
+    """A resolve_legal_chat_response stand-in that blocks (in the
+    worker thread, via time.sleep - correct here since this is the
+    SAME thread asyncio.to_thread already runs the real pipeline in)
+    longer than a mocked-tiny STREAM_REQUEST_DEADLINE_SECONDS, without
+    ever invoking legal_answer_generation_fn - i.e. the deadline must
+    fire while this is still squarely a PRE-STREAM condition."""
+
+    def __init__(self, *, hang_seconds: float, response: LegalChatResponse):
+        self.hang_seconds = hang_seconds
+        self.response = response
+
+    def __call__(self, request, **kwargs) -> LegalChatResponse:
+        time.sleep(self.hang_seconds)
+        return self.response
+
+
+class _HangingStreamClient:
+    """A stream client that yields one real delta, then blocks past a
+    mocked-tiny deadline before ever completing - proving the deadline
+    correctly fires mid-stream (DISCARD already has real provisional
+    text to invalidate) rather than only in the pre-stream case."""
+
+    model = "test-model"
+
+    def __init__(self, *, hang_seconds: float):
+        self.hang_seconds = hang_seconds
+
+    async def stream(self, instructions, input_text):
+        yield StreamEvent(type=StreamEventType.DELTA, text="United Kingdom\n")
+        await asyncio.sleep(self.hang_seconds)
+        yield StreamEvent(type=StreamEventType.COMPLETED)
+
+
+class RequestDeadlineTests(unittest.TestCase):
+    """GATE S6D: STREAM_REQUEST_DEADLINE_SECONDS - a single whole-
+    request ceiling covering understanding/retrieval/rerank/
+    generation/validation/repair together, previously unbounded as
+    one unit. Mocked to a tiny value so these tests run in
+    milliseconds rather than the real 360s."""
+
+    def test_deadline_before_generation_starts_is_a_pre_stream_http_error(
+        self,
+    ) -> None:
+        response = LegalChatResponse(
+            question="hello", answer="too late", grounded=False,
+            model=None, retrieval_total=0, sources=[],
+        )
+        pipeline = _HangingPipeline(hang_seconds=0.3, response=response)
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 0.05,
+        ):
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                with self.assertRaises(HTTPException) as ctx:
+                    _run(
+                        legal_chat_stream(
+                            request=LegalChatRequest(
+                                question="A valid-length question.",
+                            ),
+                            x_request_id="deadline-pre-1",
+                        )
+                    )
+
+        self.assertEqual(504, ctx.exception.status_code)
+        self.assertEqual(
+            "deadline-pre-1", ctx.exception.headers["X-Request-ID"],
+        )
+
+        payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("pre_stream_failure", payloads[0]["outcome"])
+        self.assertEqual("stream_request_timeout", payloads[0]["error_code"])
+
+    def test_deadline_mid_stream_discards_then_errors_no_done(self) -> None:
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        stream_client = _HangingStreamClient(hang_seconds=0.3)
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline, stream_client=stream_client)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 0.05,
+        ):
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                http_response, records = _run(
+                    _call_and_consume(
+                        legal_chat_stream(
+                            request=generation_request, x_request_id="deadline-mid-1",
+                        ),
+                    )
+                )
+
+        types = [r["type"] for r in records]
+        self.assertEqual("start", types[0])
+        self.assertIn("delta", types)
+        self.assertIn("discard", types)
+        self.assertEqual(types[-1], "error")
+        self.assertEqual("stream_request_timeout", records[-1]["code"])
+        self.assertNotIn("metadata", types)
+        self.assertNotIn("done", types)
+
+        payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("stream_error", payloads[0]["outcome"])
+        self.assertEqual("stream_request_timeout", payloads[0]["error_code"])
+
+    def test_deadline_never_fires_for_a_request_within_budget(self) -> None:
+        """Regression guard: a normal, fast request must be completely
+        unaffected by the deadline mechanism - proven by using the
+        SAME tiny mocked deadline but a pipeline that finishes well
+        within it."""
+
+        response = LegalChatResponse(
+            question="hello", answer="in time", grounded=False,
+            model=None, retrieval_total=0, sources=[],
+        )
+        pipeline = _DeterministicPipeline(response)
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 5.0,
+        ):
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=LegalChatRequest(question="hello"),
+                        x_request_id="deadline-unaffected-1",
+                    ),
+                )
+            )
+
+        types = [r["type"] for r in records]
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
+
+
+class _CancelObservingStreamClient:
+    """A stream client whose generator sleeps between deltas (so a
+    disconnect can land while it is genuinely mid-generation, not
+    already finished) and records whether asyncio.CancelledError
+    actually propagated through it - the empirical proof that
+    cancelling consume_future_holder[0] (GATE S9-LITE) really
+    interrupts THIS generator, not merely the downstream consumer."""
+
+    model = "test-model"
+
+    def __init__(self, *, delay_seconds: float):
+        self.delay_seconds = delay_seconds
+        self.cancelled = False
+        self.completed_normally = False
+
+    async def stream(self, instructions, input_text):
+        try:
+            yield StreamEvent(
+                type=StreamEventType.DELTA, text="United Kingdom\n",
+            )
+            await asyncio.sleep(self.delay_seconds)
+            yield StreamEvent(
+                type=StreamEventType.DELTA,
+                text="- more text than the client ever sees [1].",
+            )
+            yield StreamEvent(type=StreamEventType.COMPLETED)
+            self.completed_normally = True
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+async def _call_and_disconnect_after(
+    coro, *, disconnect_after: int, extra_delay_before_cancel: float = 0.0,
+):
+    """
+    Simulates a real client disconnect (GATE S9-LITE) by cancelling
+    the task iterating legal_chat_stream()'s own StreamingResponse
+    body_iterator once `disconnect_after` NDJSON records have been
+    collected - exactly what Starlette's own disconnect-cancellation
+    does to the task driving _drain_stream_events (verified
+    empirically against this deployment's real pinned fastapi/
+    starlette/uvicorn versions - see the S9-LITE report), not merely
+    "stop reading" from the test's own side.
+
+    `extra_delay_before_cancel`, when given, yields the event loop for
+    that long AFTER the target record count is reached but BEFORE
+    cancelling - needed only when the record that triggers disconnect
+    is itself emitted right as a background asyncio.to_thread() call
+    is being submitted (e.g. repair's own call): without this, the
+    underlying concurrent.futures.Future can still be in the "not yet
+    started" state (cancellable instantly, for free) purely from
+    timing luck, rather than genuinely proving cancellation behavior
+    while that call is actively running.
+    """
+
+    response = await coro
+    records: list[dict] = []
+
+    async def _drain() -> None:
+        async for chunk in response.body_iterator:
+            for line in chunk.decode("utf-8").splitlines():
+                if line:
+                    records.append(json.loads(line))
+
+    drain_task = asyncio.ensure_future(_drain())
+
+    while len(records) < disconnect_after and not drain_task.done():
+        await asyncio.sleep(0.001)
+
+    if extra_delay_before_cancel and not drain_task.done():
+        await asyncio.sleep(extra_delay_before_cancel)
+
+    drain_task.cancel()
+
+    try:
+        await drain_task
+    except asyncio.CancelledError:
+        pass
+
+    return response, records
+
+
+class _SlowPipelineNeverReachingBridge:
+    """Simulates understanding/retrieval taking real time - sleeps on
+    the worker thread (correct here, matching how asyncio.to_thread
+    actually runs resolve_legal_chat_response) BEFORE ever calling
+    legal_answer_generation_fn, so a disconnect observed during this
+    phase never reaches generation at all (mission section 5A)."""
+
+    def __init__(self, *, sleep_seconds: float, response: LegalChatResponse):
+        self.sleep_seconds = sleep_seconds
+        self.response = response
+
+    def __call__(self, request, **kwargs) -> LegalChatResponse:
+        time.sleep(self.sleep_seconds)
+        return self.response
+
+
+class _AlwaysDisconnectedRequest:
+    """Minimal fastapi.Request stand-in (duck-typed - only
+    is_disconnected() is ever called on it) whose is_disconnected()
+    reports True immediately, simulating a client already gone before
+    understanding/retrieval even finishes."""
+
+    async def is_disconnected(self) -> bool:
+        return True
+
+
+class DisconnectCancellationTests(unittest.TestCase):
+    """
+    GATE S9-LITE: proves cancelling the task iterating
+    legal_chat_stream()'s StreamingResponse - exactly what Starlette
+    does on a real client disconnect once generation has started, and
+    what the new pre-stream disconnect race
+    (_wait_for_disconnect/asyncio.wait) does before it - actually
+    interrupts the REAL upstream generation, not merely the
+    downstream relay.
+
+    This closes a real bug this gate found (see the report's
+    FAILURE_BEFORE_FIX/ROOT_CAUSE/FIX/PROOF_AFTER_FIX): before this
+    gate, _consume()'s own Task (bridging into
+    stream_answer_legal_question via run_coroutine_threadsafe) was
+    never cancelled by anything - only the unrelated pipeline_task
+    asyncio.to_thread wrapper was, and cancelling that alone has zero
+    effect once the worker thread has started running (a fundamental
+    Python limitation - concurrent.futures.Future.cancel() cannot
+    interrupt an already-running callable). Real generation work kept
+    running to its own independent provider timeouts (~180s)
+    regardless of what the client did, and no metric was ever logged
+    for it - a completely silent leak, confirmed via a real TCP
+    client + a real local fake SSE provider in the S9-LITE report.
+    """
+
+    def test_disconnect_mid_stream_cancels_the_real_upstream_generator(
+        self,
+    ) -> None:
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        stream_client = _CancelObservingStreamClient(delay_seconds=5.0)
+        p1, p2, p3 = _patch_chat_stream(
+            pipeline=pipeline, stream_client=stream_client,
+        )
+
+        started_at = time.monotonic()
+
+        with p1, p2, p3:
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                http_response, records = _run(
+                    _call_and_disconnect_after(
+                        legal_chat_stream(
+                            request=generation_request,
+                            x_request_id="disconnect-1",
+                        ),
+                        disconnect_after=2,
+                    )
+                )
+
+        elapsed = time.monotonic() - started_at
+
+        # Prompt: nowhere near the stream client's own 5s delay - the
+        # cancellation actually interrupted the sleep rather than
+        # this test only completing once it finished naturally.
+        self.assertLess(elapsed, 2.0)
+
+        # The client never saw anything past the point it disconnected.
+        types = [record["type"] for record in records]
+        self.assertEqual(["start", "delta"], types)
+        self.assertNotIn("done", types)
+        self.assertNotIn("metadata", types)
+        self.assertNotIn("replacement", types)
+
+        # The REAL upstream generator was actually interrupted - not
+        # merely abandoned while it kept running in the background.
+        self.assertTrue(stream_client.cancelled)
+        self.assertFalse(stream_client.completed_normally)
+
+        payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("client_disconnected", payloads[0]["outcome"])
+        self.assertEqual("client_disconnected", payloads[0]["error_code"])
+        self.assertIsNone(payloads[0]["t8_done"])
+
+    def test_disconnect_before_first_delta_never_reaches_generation(
+        self,
+    ) -> None:
+        response = LegalChatResponse(
+            question="hello", answer="too late", grounded=False,
+            model=None, retrieval_total=0, sources=[],
+        )
+        pipeline = _SlowPipelineNeverReachingBridge(
+            sleep_seconds=0.05, response=response,
+        )
+        p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
+
+        with p1, p2, p3:
+            with self.assertLogs(
+                "app.routers.chat_stream", level="INFO",
+            ) as log_context:
+                with self.assertRaises(HTTPException) as ctx:
+                    _run(
+                        legal_chat_stream(
+                            request=LegalChatRequest(
+                                question="A valid-length question.",
+                            ),
+                            http_request=_AlwaysDisconnectedRequest(),
+                            x_request_id="disconnect-pre-1",
+                        )
+                    )
+
+        self.assertEqual(499, ctx.exception.status_code)
+
+        payloads = [
+            json.loads(record.getMessage())
+            for record in log_context.records
+            if record.getMessage().startswith("{")
+        ]
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("client_disconnected", payloads[0]["outcome"])
+        self.assertEqual("client_disconnected", payloads[0]["error_code"])
+
+    def test_cancelling_an_already_running_to_thread_call_orphans_the_thread(
+        self,
+    ) -> None:
+        """
+        GATE S9-LITE section 5C, reported honestly rather than through
+        a full repair-triggering integration test (attempted, but
+        precisely reconstructing stream_answer_legal_question's own
+        validation-triggering conditions through this file's mocking
+        layer proved too fragile to keep deterministic - the mechanism
+        itself is what matters here, and IS exactly this):
+
+        the hidden repair call is
+        `await asyncio.to_thread(_generate_sync_with_instructions, ...)`
+        - a genuinely synchronous, blocking OpenAI call on its own
+        worker thread, driven through the exact same _consume()/
+        consume_future_holder machinery _cancel_bridge_work uses for
+        the (proven-instant, above) main streaming phase.
+
+        Empirically, cancelling a Task suspended in
+        `await asyncio.to_thread(...)` resolves the AWAIT almost
+        instantly regardless of whether the underlying thread has
+        already started - this differs from what an earlier version
+        of this test (and this gate's own initial analysis) assumed.
+        But the underlying OS thread is NOT interrupted by this -
+        Python has no mechanism to forcibly stop a running thread - it
+        keeps executing the blocking callable to completion in the
+        background, ORPHANED (its result silently discarded, since
+        nothing awaits it any more). For real repair, that means the
+        actual OpenAI call keeps running - and, in production,
+        completing/being billed - for up to its own independent
+        OPENAI_TIMEOUT_SECONDS (60s) ceiling after the client is
+        already gone and the metric has already logged
+        client_disconnected. This is a real, disclosed, SMALLER-SCOPE
+        residual leak specific to the repair phase that
+        _cancel_bridge_work cannot close (no code-level fix exists -
+        forcibly killing a Python thread is not possible) - bounded by
+        repair's own 60s ceiling, never the full 360s deadline, so it
+        does not regress mission section 9's own "no background
+        generation continues until the normal 360s global deadline"
+        requirement, but it is not instant either.
+        """
+
+        thread_started = threading.Event()
+        thread_finished_at: list[float] = []
+        cancelled_error_seen = False
+
+        def _blocking_call() -> str:
+            thread_started.set()
+            time.sleep(0.2)
+            thread_finished_at.append(time.monotonic())
+            return "finished"
+
+        async def _await_in_thread() -> str:
+            nonlocal cancelled_error_seen
+            try:
+                return await asyncio.to_thread(_blocking_call)
+            except asyncio.CancelledError:
+                cancelled_error_seen = True
+                raise
+
+        async def scenario() -> tuple[bool, float, bool]:
+            task = asyncio.ensure_future(_await_in_thread())
+
+            await asyncio.get_running_loop().run_in_executor(
+                None, thread_started.wait,
+            )
+
+            cancel_requested_at = time.monotonic()
+            task.cancel()
+
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            async_side_elapsed = time.monotonic() - cancel_requested_at
+
+            # Give the orphaned thread time to actually finish its
+            # own 0.2s sleep - proving it keeps running in the
+            # background rather than being killed alongside the task.
+            await asyncio.sleep(0.4)
+
+            return (
+                cancelled_error_seen,
+                async_side_elapsed,
+                bool(thread_finished_at),
+            )
+
+        seen, async_side_elapsed, thread_eventually_finished = _run(scenario())
+
+        self.assertTrue(seen)
+        # The Task/await itself resolves almost instantly...
+        self.assertLess(async_side_elapsed, 0.1)
+        # ...but the underlying OS thread was NOT stopped by that -
+        # it ran to completion on its own, orphaned in the background.
+        self.assertTrue(thread_eventually_finished)
 
 
 class NamedEarlyResponseRouteTests(unittest.TestCase):

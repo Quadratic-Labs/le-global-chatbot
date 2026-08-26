@@ -8,10 +8,15 @@
 // tail adds a test-only `module.exports` hook (skipped entirely in a
 // real browser, where `module` is never defined) that exposes only
 // the pure, DOM-free functions this file exercises. The DOM-wired
-// widget internals (initializeWidget's own event handlers, the
-// exactly-once submitChatRequest retry) are not reachable this way
-// and are instead covered by `node --check` plus direct source
-// review - see the mission report for that scoping decision.
+// widget internals (initializeWidget's own event handlers - reading
+// widget.dataset, constructing sendChatRequest/submitChatRequest, the
+// requestInFlight/AbortController plumbing) are not reachable this
+// way and are instead covered by `node --check` plus direct source
+// review - see the mission report for that scoping decision. The
+// exactly-once retry-on-invalid-conversation_state rule itself is
+// NOT in that untested category: GATE S7-LITE extracted it into
+// performChatTransportRequest(), which IS exercised directly - see
+// chatbot-stream.test.js.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

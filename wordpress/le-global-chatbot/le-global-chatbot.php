@@ -35,6 +35,19 @@ final class LE_Global_Chatbot_Plugin
         '/' . self::REST_NAMESPACE . '/chat/stream'
     );
 
+    // GATE S7-LITE: the smallest possible switch for exposing
+    // /chat/stream to the browser widget - one wp-config.php-style
+    // constant, matching LE_GLOBAL_CHATBOT_API_URL/_API_KEY's own
+    // defined()-or-default convention (see get_backend_configuration()
+    // below). Undefined - the default - means OFF: render_shortcode()
+    // still advertises the /chat/stream URL (so it is never a secret),
+    // but chatbot.js will not use it until this constant is defined
+    // truthy. Deliberately not a general feature-flag framework - no
+    // options table row, no admin UI, no per-request evaluation.
+    private const STREAMING_ENABLED_CONSTANT = (
+        'LE_GLOBAL_CHATBOT_STREAMING_ENABLED'
+    );
+
     // GATE S6C: the S6B derivation (200s) covered only retrieval +
     // the streamed answer + repair - it omitted request understanding,
     // which runs BEFORE any byte streams and so also counts against
@@ -412,6 +425,18 @@ final class LE_Global_Chatbot_Plugin
             data-chat-endpoint="<?php
                 echo esc_url(
                     $rest_base . '/chat'
+                );
+            ?>"
+            data-chat-stream-endpoint="<?php
+                echo esc_url(
+                    $rest_base . '/chat/stream'
+                );
+            ?>"
+            data-chat-streaming-enabled="<?php
+                echo esc_attr(
+                    self::is_chat_streaming_enabled()
+                        ? '1'
+                        : '0'
                 );
             ?>"
             <?php if ($is_floating) : ?>
@@ -1351,6 +1376,34 @@ final class LE_Global_Chatbot_Plugin
                             flush();
                         }
 
+                        // GATE S9-LITE: connection_aborted() only ever
+                        // becomes true once a write has actually
+                        // FAILED at the OS level - it does not
+                        // proactively poll the socket, so checking
+                        // only BEFORE the next chunk (as this code did
+                        // before this gate) can never notice a failure
+                        // that happened on THIS chunk's own write until
+                        // a further chunk arrives. Checking again
+                        // immediately after closes that specific gap.
+                        // It is NOT a complete fix, and is disclosed as
+                        // such in the S9-LITE report: real testing
+                        // against a real Apache mod_php + real TCP
+                        // client found that small, infrequent NDJSON
+                        // chunks can be absorbed into the OS socket
+                        // send buffer without the kernel attempting
+                        // real transmission (and so without any write
+                        // ever actually failing) for a materially long
+                        // time after the browser has already gone -
+                        // this is a genuine platform characteristic of
+                        // connection_aborted()'s write-failure-based
+                        // detection, not fixable from application code
+                        // alone. WordPress's own outer ceilings
+                        // (CURLOPT_TIMEOUT/set_time_limit) remain the
+                        // bound of last resort when this happens.
+                        if (connection_aborted()) {
+                            return -1;
+                        }
+
                         return strlen($chunk);
                     }
                 ),
@@ -1630,6 +1683,21 @@ final class LE_Global_Chatbot_Plugin
         exit;
     }
 
+
+    /**
+     * GATE S7-LITE: the one boolean render_shortcode() exposes as
+     * data-chat-streaming-enabled. Defined-and-truthy is the only way
+     * to turn this on; anything else (undefined, "", "0", false) is
+     * OFF, matching the mission's "default MUST remain OFF" rule
+     * without needing a truthiness table.
+     */
+    private static function is_chat_streaming_enabled(): bool
+    {
+        return (
+            defined(self::STREAMING_ENABLED_CONSTANT)
+            && (bool) constant(self::STREAMING_ENABLED_CONSTANT)
+        );
+    }
 
     private static function get_backend_configuration()
     {
