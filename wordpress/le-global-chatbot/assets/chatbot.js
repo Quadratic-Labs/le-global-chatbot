@@ -47,6 +47,14 @@
     // parsed optimistically.
     const STREAM_PROTOCOL_VERSION = 1;
 
+    // GATE S8-LITE: neutral, transient labels shown in the streaming
+    // assistant bubble - deliberately never "unsafe"/"hallucinated"/
+    // "invalid"/"repaired", matching the mission's own tone
+    // requirement. Both disappear the moment the turn settles (the
+    // bubble itself is replaced by the existing final-render path).
+    const STREAM_VALIDATING_STATUS_TEXT = "Validating answer…";
+    const STREAM_FINALIZING_STATUS_TEXT = "Finalizing answer…";
+
     /**
      * Build the history payload sent alongside a new question, from
      * this widget's own turns array - a pure function of its input so
@@ -534,6 +542,274 @@
         };
     }
 
+    // =====================================================================
+    // GATE S8-LITE: progressive rendering for the /chat/stream path.
+    // Only ever wired up when chatTransport === "stream" - the non-
+    // streaming path never calls any of this, so it cannot regress the
+    // existing renderer. Everything below is DOM-manipulation-only
+    // (never renderMessageList(), never innerHTML) so the existing
+    // final-render logic remains the single source of truth for the
+    // settled turn.
+    // =====================================================================
+
+    /**
+     * Locates the pending assistant bubble for the turn most recently
+     * appended to messageListElement - always the last child right
+     * after the initial renderMessageList() call for a freshly pushed
+     * turn (turns are only ever appended at the end - see the
+     * mission's own turns.push()/turns.shift() comment).
+     */
+    function findPendingBubbleElement(messageListElement) {
+        const lastTurnElement = messageListElement
+            ? messageListElement.lastElementChild
+            : null;
+
+        if (!lastTurnElement) {
+            return null;
+        }
+
+        return lastTurnElement.querySelector(
+            ".le-global-chatbot__message--pending"
+        );
+    }
+
+    function defaultScheduleStreamWork(callback) {
+        if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(callback);
+            return;
+        }
+
+        setTimeout(callback, 0);
+    }
+
+    /**
+     * Drives ONE assistant bubble through an entire /chat/stream
+     * response (mission sections 3-7, 10-12, 14). Every dependency is
+     * injected explicitly (documentRef/scheduleWork default to the
+     * real browser globals, capabilitySource-style) so this is fully
+     * testable without a real DOM.
+     *
+     * Deltas/replacements are coalesced into at most one DOM write per
+     * animation frame (section 14) - `latestAnswerText` is the single
+     * source of truth a scheduled flush reads from, so an out-of-order
+     * or superseded flush is always a harmless, idempotent no-op.
+     * discard/error clear the provisional answer and update the
+     * status line SYNCHRONOUSLY, never coalesced - "no longer valid"
+     * must never wait a frame.
+     *
+     * `error` is the one event type that branches on whether the
+     * bubble was ever activated (section 10): before any visible
+     * delta, it is a complete no-op - the original pending "Searching
+     * ..." state is left untouched, exactly like the existing normal
+     * chat error experience, since the settle-time rebuild supplies
+     * the real friendly error bubble a moment later. Once at least one
+     * delta/validating/discard/replacement already activated the
+     * bubble, `error` clears the provisional answer unconditionally -
+     * a deliberate defensive addition beyond the literal spec
+     * (disclosed in the S8-LITE report), since the backend's own mid-
+     * generation ERROR event does not always send a discard first.
+     *
+     * `metadata`/`done`/`start` are intentionally not handled here at
+     * all (section 8) - final metadata/sources/contacts/conversation
+     * state are applied exclusively by the EXISTING final-render path
+     * once the caller's own await settles, never duplicated here.
+     */
+    function createStreamingBubbleController(
+        {
+            bubbleElement,
+            conversationElement,
+            isStale,
+            documentRef,
+            scheduleWork,
+        }
+    ) {
+        const doc = (
+            documentRef
+            || (typeof document !== "undefined" ? document : null)
+        );
+
+        const schedule = scheduleWork || defaultScheduleStreamWork;
+
+        let answerElement = null;
+        let statusElement = null;
+        let latestAnswerText = "";
+        let flushScheduled = false;
+
+        function ensureActivated() {
+            if (
+                answerElement
+                || !bubbleElement
+                || !doc
+            ) {
+                return;
+            }
+
+            bubbleElement.classList.remove(
+                "le-global-chatbot__message--pending"
+            );
+            bubbleElement.textContent = "";
+
+            answerElement = doc.createElement("div");
+            answerElement.className = (
+                "le-global-chatbot__answer"
+            );
+            bubbleElement.appendChild(answerElement);
+
+            statusElement = doc.createElement("p");
+            statusElement.className = (
+                "le-global-chatbot__stream-status "
+                + "le-global-chatbot__message--pending"
+            );
+            statusElement.hidden = true;
+            bubbleElement.appendChild(statusElement);
+        }
+
+        function isNearBottom() {
+            if (!conversationElement) {
+                return false;
+            }
+
+            const slackPixels = 48;
+
+            return (
+                conversationElement.scrollHeight
+                - conversationElement.scrollTop
+                - conversationElement.clientHeight
+            ) <= slackPixels;
+        }
+
+        function scheduleFlush() {
+            if (flushScheduled) {
+                return;
+            }
+
+            flushScheduled = true;
+
+            schedule(() => {
+                flushScheduled = false;
+
+                if (isStale() || !answerElement) {
+                    return;
+                }
+
+                const wasNearBottom = isNearBottom();
+
+                answerElement.textContent = latestAnswerText;
+
+                if (wasNearBottom && conversationElement) {
+                    conversationElement.scrollTop = (
+                        conversationElement.scrollHeight
+                    );
+                }
+            });
+        }
+
+        function setStatus(text) {
+            ensureActivated();
+
+            if (!statusElement) {
+                return;
+            }
+
+            if (text) {
+                statusElement.textContent = text;
+                statusElement.hidden = false;
+            } else {
+                statusElement.textContent = "";
+                statusElement.hidden = true;
+            }
+        }
+
+        function clearProvisionalAnswer(statusText) {
+            ensureActivated();
+            latestAnswerText = "";
+
+            if (answerElement) {
+                answerElement.textContent = "";
+            }
+
+            setStatus(statusText);
+        }
+
+        return {
+            handleEvent(record) {
+                if (!record || isStale()) {
+                    return;
+                }
+
+                if (record.type === "delta") {
+                    ensureActivated();
+
+                    latestAnswerText += (
+                        typeof record.text === "string"
+                            ? record.text
+                            : ""
+                    );
+
+                    setStatus(null);
+                    scheduleFlush();
+                    return;
+                }
+
+                if (record.type === "validating") {
+                    setStatus(STREAM_VALIDATING_STATUS_TEXT);
+                    return;
+                }
+
+                if (record.type === "discard") {
+                    clearProvisionalAnswer(
+                        STREAM_FINALIZING_STATUS_TEXT
+                    );
+                    return;
+                }
+
+                if (record.type === "replacement") {
+                    ensureActivated();
+
+                    latestAnswerText = (
+                        typeof record.text === "string"
+                            ? record.text
+                            : ""
+                    );
+
+                    setStatus(null);
+                    scheduleFlush();
+                    return;
+                }
+
+                if (record.type === "error") {
+                    // Section 10: "before any visible delta, keep the
+                    // existing normal chat error experience" - if this
+                    // bubble was never activated (answerElement is
+                    // still null - no delta/validating/discard/
+                    // replacement ever touched it), leave the original
+                    // pending "Searching..." state completely alone.
+                    // The existing settle path shows the real error
+                    // bubble once the promise rejects; there is
+                    // nothing here to correct.
+                    if (!answerElement) {
+                        return;
+                    }
+
+                    // Provisional text WAS already visible. Defensive,
+                    // beyond the literal spec (disclosed in the
+                    // S8-LITE report): the backend does not always
+                    // send discard before an in-band error (its own
+                    // mid-generation ERROR path never does), so this
+                    // clears provisional text unconditionally rather
+                    // than assuming discard already ran.
+                    clearProvisionalAnswer(
+                        STREAM_FINALIZING_STATUS_TEXT
+                    );
+                    return;
+                }
+
+                // start/metadata/done: no bubble action (section 8) -
+                // the existing final-render path owns all of that.
+            },
+        };
+    }
+
     const widgets = document.querySelectorAll(
         ".le-global-chatbot"
     );
@@ -649,6 +925,16 @@
         // the browser actually manages to cancel it in time.
         let activeChatController = null;
         let conversationGeneration = 0;
+
+        // GATE S9B: the request_id of whichever /chat/stream request
+        // is currently active, learned only from that request's own
+        // `start` NDJSON record (see handleStreamProtocolEvent) - null
+        // until then, and reset to null once a turn settles or a new
+        // one begins, so a stale id can never be sent for the wrong
+        // request. Used only for the explicit best-effort cancel(...)
+        // call in startNewConversation() - never invented, never
+        // reused across requests.
+        let activeStreamRequestId = null;
 
         /**
          * Conversation turns, oldest first. At most
@@ -798,12 +1084,61 @@
                 const requestGeneration = conversationGeneration;
                 const controller = new AbortController();
                 activeChatController = controller;
+                activeStreamRequestId = null;
 
                 function isStaleRequest() {
                     return (
                         requestGeneration !== conversationGeneration
                         || activeChatController !== controller
                     );
+                }
+
+                // GATE S8-LITE: only ever created for the streaming
+                // transport - the non-streaming path (chatTransport
+                // === "json") never touches any of this, so it cannot
+                // regress the existing renderer. isStaleRequest is
+                // reused as-is so an aborted/superseded request stops
+                // updating the bubble exactly like every other stale-
+                // request guard in this file.
+                const streamingBubbleController = (
+                    chatTransport === "stream"
+                        ? createStreamingBubbleController(
+                            {
+                                bubbleElement: (
+                                    findPendingBubbleElement(
+                                        messageListElement
+                                    )
+                                ),
+                                conversationElement,
+                                isStale: isStaleRequest,
+                            }
+                        )
+                        : null
+                );
+
+                function handleStreamProtocolEvent(record) {
+                    // GATE S9B: the ONLY place a request_id ever
+                    // becomes known - the `start` record is the sole
+                    // place the backend reveals one. Guarded by
+                    // isStaleRequest() so a late/stray event from an
+                    // already-superseded request (e.g. one that lost
+                    // the race against a fresh "New conversation")
+                    // can never overwrite the CURRENT request's own
+                    // tracked id with a stale one.
+                    if (
+                        record
+                        && record.type === "start"
+                        && typeof record.request_id === "string"
+                        && !isStaleRequest()
+                    ) {
+                        activeStreamRequestId = record.request_id;
+                    }
+
+                    if (streamingBubbleController) {
+                        streamingBubbleController.handleEvent(
+                            record
+                        );
+                    }
                 }
 
                 requestInFlight = true;
@@ -851,7 +1186,8 @@
                     return chatTransport === "stream"
                         ? requestStream(
                             chatStreamEndpoint,
-                            requestInit
+                            requestInit,
+                            handleStreamProtocolEvent
                         )
                         : requestJson(
                             chatEndpoint,
@@ -951,6 +1287,7 @@
                     if (!isStaleRequest()) {
                         requestInFlight = false;
                         activeChatController = null;
+                        activeStreamRequestId = null;
 
                         conversationElement.setAttribute(
                             "aria-busy",
@@ -1183,6 +1520,21 @@
                 activeChatController.abort();
             }
 
+            // GATE S9B: best-effort explicit cancel, IN ADDITION TO
+            // (never instead of) the abort() above - fired, never
+            // awaited, so the UI reset below happens immediately
+            // regardless of how/whether it resolves. Only ever sent
+            // when a request_id is already known (learned from that
+            // stream's own `start` record) - if cancellation happens
+            // before that, there is nothing to name, and none is
+            // invented (mission section 3's own explicit rule).
+            if (chatTransport === "stream" && activeStreamRequestId) {
+                cancelActiveStream(
+                    chatStreamEndpoint, activeStreamRequestId
+                );
+            }
+
+            activeStreamRequestId = null;
             activeChatController = null;
             requestInFlight = false;
 
@@ -2363,8 +2715,15 @@
      * `error` record, or the request being aborted - throws a plain
      * Error with no .statusCode, so it is never mistaken for that one
      * retryable pre-stream case (see performChatTransportRequest).
+     *
+     * `onProtocolEvent(record)` (GATE S8-LITE), when given, is called
+     * once per record immediately after it is validated/applied -
+     * live, in-order access for a caller that wants to progressively
+     * update UI (see createStreamingBubbleController) without this
+     * function's own return-value contract changing at all. Omitting
+     * it (every GATE S7-LITE caller/test) is fully unchanged.
      */
-    async function requestStream(url, options) {
+    async function requestStream(url, options, onProtocolEvent) {
         const response = await fetch(
             url,
             options
@@ -2429,6 +2788,10 @@
                         state,
                         record
                     );
+
+                    if (typeof onProtocolEvent === "function") {
+                        onProtocolEvent(record);
+                    }
                 }
             }
         } catch (error) {
@@ -2453,6 +2816,46 @@
         }
 
         return buildReconstructedChatResponse(state);
+    }
+
+    /**
+     * GATE S9B: explicit cancellation - independent of passive
+     * connection_aborted()-based disconnect detection (found
+     * unreliable under real Apache/mod_php - see the S9-LITE report).
+     * Best-effort ONLY: fired, never awaited by callers (the UI resets
+     * immediately regardless - see startNewConversation()), and never
+     * retried - a failed/lost cancel just means the backend's own
+     * existing safety nets (the 360s global deadline) bound the
+     * abandoned work instead, exactly as before this function existed.
+     * Never sent unless a real request_id is already known (learned
+     * from that stream's own `start` record) - no identifier is ever
+     * invented here.
+     */
+    function cancelActiveStream(chatStreamEndpoint, requestId) {
+        if (!chatStreamEndpoint || !requestId) {
+            return;
+        }
+
+        try {
+            fetch(
+                chatStreamEndpoint + "/cancel",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    credentials: "same-origin",
+                    body: JSON.stringify(
+                        { request_id: requestId }
+                    ),
+                }
+            ).catch(() => {
+                // Best-effort only - see this function's own docstring.
+            });
+        } catch {
+            // A small number of environments can throw synchronously
+            // here rather than rejecting - equally harmless to ignore.
+        }
     }
 
     // Test-only hook: absent in the browser (module is never defined
@@ -2481,6 +2884,11 @@
             buildStreamTerminalError,
             buildReconstructedChatResponse,
             requestStream,
+            STREAM_VALIDATING_STATUS_TEXT,
+            STREAM_FINALIZING_STATUS_TEXT,
+            findPendingBubbleElement,
+            createStreamingBubbleController,
+            cancelActiveStream,
         };
     }
 })();
