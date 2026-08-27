@@ -31,6 +31,13 @@ final class LE_Global_Chatbot_Plugin
         '/api/v1/chat/stream'
     );
 
+    // GATE S9B: explicit cancellation, independent of passive
+    // connection_aborted()-based disconnect detection (found
+    // unreliable under real Apache/mod_php - see the S9-LITE report).
+    private const BACKEND_CHAT_STREAM_CANCEL_PATH = (
+        '/api/v1/chat/stream/cancel'
+    );
+
     private const STREAM_ROUTE = (
         '/' . self::REST_NAMESPACE . '/chat/stream'
     );
@@ -239,6 +246,28 @@ final class LE_Global_Chatbot_Plugin
                     '__return_true'
                 ),
                 'args' => self::chat_route_args(),
+            ]
+        );
+
+        // GATE S9B.
+        register_rest_route(
+            self::REST_NAMESPACE,
+            '/chat/stream/cancel',
+            [
+                'methods' => WP_REST_Server::CREATABLE,
+                'callback' => [
+                    self::class,
+                    'cancel_chat_stream',
+                ],
+                'permission_callback' => (
+                    '__return_true'
+                ),
+                'args' => [
+                    'request_id' => [
+                        'required' => true,
+                        'type' => 'string',
+                    ],
+                ],
             ]
         );
     }
@@ -642,6 +671,41 @@ final class LE_Global_Chatbot_Plugin
                 $payload,
                 $request_id
             )
+        );
+    }
+
+    /**
+     * GATE S9B: explicit cancellation - the normal (non-streaming)
+     * proxy mechanism, never the raw cURL relay stream_backend_
+     * response() uses for /chat/stream itself: this response is one
+     * small JSON object, not a stream. request_id comes from the
+     * request BODY here (unlike submit_chat_question_stream's own
+     * X-Request-ID HEADER usage) because it names an EXISTING, already
+     * in-flight stream the client learned from that stream's own
+     * `start` NDJSON record - it is not this request's own identity.
+     */
+    public static function cancel_chat_stream(
+        WP_REST_Request $request
+    ) {
+        $request_id = self::sanitize_request_id(
+            $request->get_param('request_id')
+        );
+
+        if ($request_id === null) {
+            return new WP_Error(
+                'le_global_chatbot_invalid_request_id',
+                'A valid request_id is required.',
+                [
+                    'status' => 422,
+                ]
+            );
+        }
+
+        return self::proxy_backend_request(
+            'POST',
+            self::BACKEND_CHAT_STREAM_CANCEL_PATH,
+            ['request_id' => $request_id],
+            10
         );
     }
 

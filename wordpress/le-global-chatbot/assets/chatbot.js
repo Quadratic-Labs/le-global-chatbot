@@ -926,6 +926,16 @@
         let activeChatController = null;
         let conversationGeneration = 0;
 
+        // GATE S9B: the request_id of whichever /chat/stream request
+        // is currently active, learned only from that request's own
+        // `start` NDJSON record (see handleStreamProtocolEvent) - null
+        // until then, and reset to null once a turn settles or a new
+        // one begins, so a stale id can never be sent for the wrong
+        // request. Used only for the explicit best-effort cancel(...)
+        // call in startNewConversation() - never invented, never
+        // reused across requests.
+        let activeStreamRequestId = null;
+
         /**
          * Conversation turns, oldest first. At most
          * floor(maxHistoryMessages / 2) are ever kept - adding one
@@ -1074,6 +1084,7 @@
                 const requestGeneration = conversationGeneration;
                 const controller = new AbortController();
                 activeChatController = controller;
+                activeStreamRequestId = null;
 
                 function isStaleRequest() {
                     return (
@@ -1106,6 +1117,23 @@
                 );
 
                 function handleStreamProtocolEvent(record) {
+                    // GATE S9B: the ONLY place a request_id ever
+                    // becomes known - the `start` record is the sole
+                    // place the backend reveals one. Guarded by
+                    // isStaleRequest() so a late/stray event from an
+                    // already-superseded request (e.g. one that lost
+                    // the race against a fresh "New conversation")
+                    // can never overwrite the CURRENT request's own
+                    // tracked id with a stale one.
+                    if (
+                        record
+                        && record.type === "start"
+                        && typeof record.request_id === "string"
+                        && !isStaleRequest()
+                    ) {
+                        activeStreamRequestId = record.request_id;
+                    }
+
                     if (streamingBubbleController) {
                         streamingBubbleController.handleEvent(
                             record
@@ -1259,6 +1287,7 @@
                     if (!isStaleRequest()) {
                         requestInFlight = false;
                         activeChatController = null;
+                        activeStreamRequestId = null;
 
                         conversationElement.setAttribute(
                             "aria-busy",
@@ -1491,6 +1520,21 @@
                 activeChatController.abort();
             }
 
+            // GATE S9B: best-effort explicit cancel, IN ADDITION TO
+            // (never instead of) the abort() above - fired, never
+            // awaited, so the UI reset below happens immediately
+            // regardless of how/whether it resolves. Only ever sent
+            // when a request_id is already known (learned from that
+            // stream's own `start` record) - if cancellation happens
+            // before that, there is nothing to name, and none is
+            // invented (mission section 3's own explicit rule).
+            if (chatTransport === "stream" && activeStreamRequestId) {
+                cancelActiveStream(
+                    chatStreamEndpoint, activeStreamRequestId
+                );
+            }
+
+            activeStreamRequestId = null;
             activeChatController = null;
             requestInFlight = false;
 
@@ -2774,6 +2818,46 @@
         return buildReconstructedChatResponse(state);
     }
 
+    /**
+     * GATE S9B: explicit cancellation - independent of passive
+     * connection_aborted()-based disconnect detection (found
+     * unreliable under real Apache/mod_php - see the S9-LITE report).
+     * Best-effort ONLY: fired, never awaited by callers (the UI resets
+     * immediately regardless - see startNewConversation()), and never
+     * retried - a failed/lost cancel just means the backend's own
+     * existing safety nets (the 360s global deadline) bound the
+     * abandoned work instead, exactly as before this function existed.
+     * Never sent unless a real request_id is already known (learned
+     * from that stream's own `start` record) - no identifier is ever
+     * invented here.
+     */
+    function cancelActiveStream(chatStreamEndpoint, requestId) {
+        if (!chatStreamEndpoint || !requestId) {
+            return;
+        }
+
+        try {
+            fetch(
+                chatStreamEndpoint + "/cancel",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    credentials: "same-origin",
+                    body: JSON.stringify(
+                        { request_id: requestId }
+                    ),
+                }
+            ).catch(() => {
+                // Best-effort only - see this function's own docstring.
+            });
+        } catch {
+            // A small number of environments can throw synchronously
+            // here rather than rejecting - equally harmless to ignore.
+        }
+    }
+
     // Test-only hook: absent in the browser (module is never defined
     // there), so this changes nothing about how the widget itself
     // loads or runs. Exposes only the pure, DOM-free functions the
@@ -2804,6 +2888,7 @@
             STREAM_FINALIZING_STATUS_TEXT,
             findPendingBubbleElement,
             createStreamingBubbleController,
+            cancelActiveStream,
         };
     }
 })();

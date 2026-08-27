@@ -54,6 +54,7 @@ from uuid import uuid4
 
 from fastapi import Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.clients.openai_responses import OpenAIConfigurationError
 from app.clients.openai_responses_stream import get_openai_answer_stream_client
@@ -440,6 +441,62 @@ def _cancel_bridge_work(
     pipeline_task.cancel()
 
 
+# =============================================================================
+# GATE S9B: explicit cancellation by request_id - independent of the
+# passive browser-disconnect detection GATE S9-LITE found unreliable
+# under real Apache/mod_php (small/infrequent NDJSON chunks can sit in
+# the OS send buffer without the kernel ever attempting a real write,
+# so connection_aborted() may never observe a failure at all). This is
+# a plain, process-local, in-memory dict - no Redis/database, no
+# prompts/answers ever stored, nothing persisted across a process
+# restart. Registered only once real streaming has actually begun (see
+# _drain_stream_events) - a pre-stream request has no request_id the
+# client could ever have learned yet (the NDJSON `start` record is the
+# only place one is ever revealed), so there is nothing meaningful to
+# register or cancel before that point.
+# =============================================================================
+
+_ACTIVE_STREAMS: dict[
+    str, tuple[asyncio.Task, list[concurrent.futures.Future | None]]
+] = {}
+
+
+def _register_active_stream(
+    request_id: str,
+    pipeline_task: asyncio.Task,
+    consume_future_holder: list[concurrent.futures.Future | None],
+) -> None:
+    _ACTIVE_STREAMS[request_id] = (pipeline_task, consume_future_holder)
+
+
+def _deregister_active_stream(request_id: str) -> None:
+    """Idempotent - safe to call more than once, and safe for a
+    request_id that was never registered (e.g. a pre-stream request)."""
+
+    _ACTIVE_STREAMS.pop(request_id, None)
+
+
+def cancel_active_stream(request_id: str) -> bool:
+    """
+    The one function POST /chat/stream/cancel calls. Returns True if
+    `request_id` named a currently-active stream (cancellation was
+    requested - not a guarantee it has finished yet, just that
+    _cancel_bridge_work was invoked for it), False for any unknown or
+    already-finished request_id - always safe, never raises, and
+    cancelling one request_id can never affect any other (each maps to
+    its own independent pipeline_task/consume_future_holder pair).
+    """
+
+    entry = _ACTIVE_STREAMS.get(request_id)
+
+    if entry is None:
+        return False
+
+    pipeline_task, consume_future_holder = entry
+    _cancel_bridge_work(pipeline_task, consume_future_holder)
+    return True
+
+
 async def _wait_for_disconnect(
     request: Request | None,
     poll_interval: float = _DISCONNECT_POLL_INTERVAL_SECONDS,
@@ -525,6 +582,12 @@ async def _drain_stream_events(
 
     yield _serialize_ndjson_record(_start_record(request_id))
 
+    # GATE S9B: only from this point on does the client have any way
+    # to have learned request_id (it is revealed exclusively in the
+    # start record above) - registering any earlier would let a
+    # cancel request name an id nobody could legitimately know yet.
+    _register_active_stream(request_id, pipeline_task, consume_future_holder)
+
     stream_failed = False
     first_fastapi_delta_at: float | None = None
 
@@ -570,6 +633,7 @@ async def _drain_stream_events(
                         first_fastapi_delta_at=first_fastapi_delta_at,
                     )
                 )
+                _deregister_active_stream(request_id)
                 return
 
             if item is _PIPELINE_DONE:
@@ -645,6 +709,7 @@ async def _drain_stream_events(
                 first_fastapi_delta_at=first_fastapi_delta_at,
             )
         )
+        _deregister_active_stream(request_id)
         raise
     finally:
         pass
@@ -670,10 +735,49 @@ async def _drain_stream_events(
                 first_fastapi_delta_at=first_fastapi_delta_at,
             )
         )
+        _deregister_active_stream(request_id)
         return
 
     try:
         response = await pipeline_task
+    except asyncio.CancelledError:
+        # GATE S9B: explicit cancellation via POST /chat/stream/cancel
+        # arrived while this generator was still waiting on
+        # event_queue (NOT this generator's own task being cancelled -
+        # that is the separate except asyncio.CancelledError above,
+        # around the while loop, which only fires on a real client
+        # disconnect). _PIPELINE_DONE still arrived normally (_run_
+        # pipeline's own finally always emits it, cancelled or not),
+        # but pipeline_task itself now carries the CancelledError that
+        # cancelling consume_future_holder[0] produced. The client is
+        # very likely still connected here (it asked to cancel, it did
+        # not vanish) - same invalidate-before-terminal-error rule as
+        # every other failure that follows partial content, so it
+        # still gets a normal in-band error record, never silence.
+        if sent_text_holder[0]:
+            yield _serialize_ndjson_record(_discard_record())
+
+        yield _serialize_ndjson_record(
+            _error_record(
+                code="stream_cancelled",
+                message="The request was cancelled.",
+                retryable=False,
+            )
+        )
+
+        _log_stream_metric(
+            _stream_metric_payload(
+                request_id=request_id,
+                t0=t0,
+                outcome="stream_cancelled",
+                error_code="explicit_cancel",
+                timings=timings,
+                metrics=metrics_holder[0],
+                first_fastapi_delta_at=first_fastapi_delta_at,
+            )
+        )
+        _deregister_active_stream(request_id)
+        return
     except Exception as error:
         # GATE S4B finding: comparison_source_budget
         # (InvalidLegalChatRequestError) can ONLY ever be raised from
@@ -727,6 +831,7 @@ async def _drain_stream_events(
                     done_at=done_at,
                 )
             )
+            _deregister_active_stream(request_id)
             return
 
         logger.exception(
@@ -765,6 +870,7 @@ async def _drain_stream_events(
                 first_fastapi_delta_at=first_fastapi_delta_at,
             )
         )
+        _deregister_active_stream(request_id)
         return
 
     # _execute_resolved_plan can append text AFTER the streamed RAG
@@ -793,6 +899,7 @@ async def _drain_stream_events(
             done_at=done_at,
         )
     )
+    _deregister_active_stream(request_id)
 
 
 async def _early_finalized_stream(
@@ -1181,3 +1288,36 @@ async def legal_chat_stream(
         media_type=NDJSON_MEDIA_TYPE,
         headers=_streaming_response_headers(request_id),
     )
+
+
+class CancelChatStreamRequest(BaseModel):
+    """
+    GATE S9B: the ONLY field this endpoint accepts - the request_id a
+    client learned from a /chat/stream response's own `start` record.
+    No prompts/answers/other request content is ever accepted or
+    stored here.
+    """
+
+    request_id: str = Field(min_length=1, max_length=200)
+
+    class Config:
+        extra = "forbid"
+
+
+@router.post("/chat/stream/cancel")
+async def cancel_chat_stream(
+    payload: CancelChatStreamRequest,
+) -> dict[str, bool]:
+    """
+    GATE S9B: explicit cancellation, independent of the passive
+    browser-disconnect detection GATE S9-LITE found unreliable under
+    real Apache/mod_php. Protected by the same ApiProtectionMiddleware
+    as every other /api/v1 route (path-prefix based - no route-
+    specific change needed there). Always returns 200 with
+    {"cancelled": bool} - an unknown/already-finished request_id is a
+    normal, safe outcome (cancelled: false), never an error status;
+    there is nothing here for a client to distinguish "already done"
+    from "never existed" for, and no reason to let it.
+    """
+
+    return {"cancelled": cancel_active_stream(payload.request_id)}

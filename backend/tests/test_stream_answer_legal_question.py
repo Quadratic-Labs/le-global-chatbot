@@ -159,20 +159,6 @@ def _assert_valid_event_sequence(
                     "no ANSWER_DELTA may occur after VALIDATING",
                 )
 
-    replacement_indices = [
-        index for index, event in enumerate(events)
-        if event.type is StreamAnswerEventType.REPLACEMENT
-    ]
-    discard_indices = [
-        index for index, event in enumerate(events)
-        if event.type is StreamAnswerEventType.DISCARD
-    ]
-
-    for replacement_index in replacement_indices:
-        test_case.assertTrue(
-            any(d < replacement_index for d in discard_indices),
-            "REPLACEMENT must be preceded by a DISCARD",
-        )
 
 
 class StreamAnswerLegalQuestionTests(unittest.TestCase):
@@ -324,12 +310,11 @@ class StreamAnswerLegalQuestionTests(unittest.TestCase):
     def test_repair_degraded_answer_reverts_to_first_via_replacement(
         self,
     ) -> None:
-        """The existing, unmodified three-way repair outcome logic:
-        when repair makes things WORSE (still has a hard error) but
-        the FIRST answer had none, the first answer wins - and since it
-        was DISCARDed like any repair-triggering case, it must be
-        RE-ANNOUNCED via REPLACEMENT, not silently kept from the
-        provisional draft."""
+        """When a soft-only repair degrades an otherwise legally
+        valid initial answer, the first answer wins. Because the
+        initial answer had no hard error, it remains visible during
+        repair and the winning text is finalized through REPLACEMENT
+        without a preceding DISCARD."""
 
         # A soft-error-only initial answer (structure) whose "repair"
         # instead introduces a hard error (unknown citation) - the
@@ -361,6 +346,16 @@ class StreamAnswerLegalQuestionTests(unittest.TestCase):
         )
 
         _assert_valid_event_sequence(self, events)
+
+        types = [event.type for event in events]
+        self.assertNotIn(
+            StreamAnswerEventType.DISCARD,
+            types,
+        )
+        self.assertIn(
+            StreamAnswerEventType.REPLACEMENT,
+            types,
+        )
 
         finalized = events[-1]
         self.assertEqual(StreamAnswerEventType.FINALIZED, finalized.type)

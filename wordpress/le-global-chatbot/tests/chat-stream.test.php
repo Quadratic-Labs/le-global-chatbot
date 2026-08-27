@@ -84,6 +84,11 @@ final class WP_REST_Request
         return $this->jsonParams;
     }
 
+    public function get_param(string $key): mixed
+    {
+        return $this->jsonParams[$key] ?? null;
+    }
+
     public function set_header(string $name, string $value): void
     {
         $this->headers[strtolower($name)] = $value;
@@ -181,6 +186,36 @@ function untrailingslashit(string $value): string
 function esc_url_raw(string $value): string
 {
     return $value;
+}
+
+// GATE S9B: captures every wp_remote_request() call so a test can
+// assert exactly what URL/body cancel_chat_stream() (via
+// proxy_backend_request()) sent, and returns a scripted response -
+// never a real network call.
+$GLOBALS['s9b_wp_remote_request_calls'] = [];
+$GLOBALS['s9b_wp_remote_request_response'] = [
+    'response' => ['code' => 200],
+    'body' => '{"cancelled":true}',
+];
+
+function wp_remote_request(string $url, array $args = [])
+{
+    $GLOBALS['s9b_wp_remote_request_calls'][] = [
+        'url' => $url,
+        'args' => $args,
+    ];
+
+    return $GLOBALS['s9b_wp_remote_request_response'];
+}
+
+function wp_remote_retrieve_response_code($response): int
+{
+    return (int) ($response['response']['code'] ?? 0);
+}
+
+function wp_remote_retrieve_body($response): string
+{
+    return (string) ($response['body'] ?? '');
 }
 
 function status_header(int $code): void
@@ -519,6 +554,94 @@ check(
         'sanitize_request_id',
         [str_repeat('a', 200)]
     ) === null,
+    $failures
+);
+
+// --- cancel_chat_stream() (GATE S9B) -------------------------------------
+
+$GLOBALS['s9b_wp_remote_request_calls'] = [];
+
+$invalidCancelRequest = new WP_REST_Request(
+    ['request_id' => "evil\r\nX-Injected: yes"],
+    '/le-global-chatbot/v1/chat/stream/cancel'
+);
+
+$invalidCancelResult = LE_Global_Chatbot_Plugin::cancel_chat_stream(
+    $invalidCancelRequest
+);
+
+check(
+    'cancel_chat_stream rejects an invalid request_id as a WP_Error, '
+    . 'never proxying to the backend',
+    is_wp_error($invalidCancelResult)
+        && ($invalidCancelResult->get_error_data()['status'] ?? null) === 422
+        && count($GLOBALS['s9b_wp_remote_request_calls']) === 0,
+    $failures
+);
+
+$missingCancelRequest = new WP_REST_Request(
+    [],
+    '/le-global-chatbot/v1/chat/stream/cancel'
+);
+
+check(
+    'cancel_chat_stream rejects a missing request_id as a WP_Error',
+    is_wp_error(
+        LE_Global_Chatbot_Plugin::cancel_chat_stream($missingCancelRequest)
+    ),
+    $failures
+);
+
+$GLOBALS['s9b_wp_remote_request_calls'] = [];
+$GLOBALS['s9b_wp_remote_request_response'] = [
+    'response' => ['code' => 200],
+    'body' => '{"cancelled":true}',
+];
+
+$validCancelRequest = new WP_REST_Request(
+    ['request_id' => 'abc123-def456'],
+    '/le-global-chatbot/v1/chat/stream/cancel'
+);
+
+$validCancelResult = LE_Global_Chatbot_Plugin::cancel_chat_stream(
+    $validCancelRequest
+);
+
+check(
+    'cancel_chat_stream proxies exactly one call to the backend '
+    . 'cancel path',
+    count($GLOBALS['s9b_wp_remote_request_calls']) === 1
+        && str_ends_with(
+            $GLOBALS['s9b_wp_remote_request_calls'][0]['url'],
+            '/api/v1/chat/stream/cancel'
+        ),
+    $failures
+);
+
+check(
+    'cancel_chat_stream forwards the sanitized request_id as the '
+    . 'JSON body, never the raw/unsanitized header form',
+    ($GLOBALS['s9b_wp_remote_request_calls'][0]['args']['body'] ?? null)
+        === wp_json_encode(['request_id' => 'abc123-def456']),
+    $failures
+);
+
+check(
+    'cancel_chat_stream attaches the server-side API key, never '
+    . 'exposing it to the caller',
+    (
+        $GLOBALS['s9b_wp_remote_request_calls'][0]['args']['headers']['X-API-Key']
+        ?? null
+    ) === LE_GLOBAL_CHATBOT_API_KEY,
+    $failures
+);
+
+check(
+    'cancel_chat_stream returns the backend JSON response unchanged, '
+    . 'as a normal (non-streaming) WP_REST_Response',
+    $validCancelResult instanceof WP_REST_Response
+        && $validCancelResult->get_data() === ['cancelled' => true]
+        && $validCancelResult->get_status() === 200,
     $failures
 );
 

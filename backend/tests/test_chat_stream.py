@@ -52,6 +52,7 @@ from app.routers.chat_stream import (
     _map_stream_answer_event,
     _metadata_record,
     _serialize_ndjson_record,
+    cancel_active_stream,
     legal_chat_stream,
 )
 from app.routers.chat import (
@@ -1767,6 +1768,271 @@ class DisconnectCancellationTests(unittest.TestCase):
         # ...but the underlying OS thread was NOT stopped by that -
         # it ran to completion on its own, orphaned in the background.
         self.assertTrue(thread_eventually_finished)
+
+
+class ActiveStreamRegistryTests(unittest.TestCase):
+    """
+    GATE S9B: _ACTIVE_STREAMS (request_id -> (pipeline_task,
+    consume_future_holder)) - registered only once real streaming has
+    begun (see _drain_stream_events's own comment on why), removed on
+    every exit path. setUp/tearDown assert the registry is empty
+    before AND after every test in this class - a stray leftover
+    entry from one test polluting the next would otherwise be a
+    silent, hard-to-diagnose source of flakiness.
+    """
+
+    def setUp(self) -> None:
+        self.assertEqual(
+            {}, chat_stream_module._ACTIVE_STREAMS,
+            "a previous test leaked a registry entry",
+        )
+
+    def tearDown(self) -> None:
+        self.assertEqual(
+            {}, chat_stream_module._ACTIVE_STREAMS,
+            "this test leaked a registry entry",
+        )
+
+    def test_normal_completion_removes_the_entry(self) -> None:
+        answer = (
+            "United Kingdom\n- The minimum notice is one week "
+            "in the stated circumstances [1]."
+        )
+        stream_client = FakeStreamGenerationClient(_delta_events(answer))
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(answer=answer),
+        )
+        p1, p2, p3 = _patch_chat_stream(
+            pipeline=pipeline, stream_client=stream_client,
+        )
+
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=generation_request, x_request_id="registry-done-1",
+                    ),
+                )
+            )
+
+        self.assertEqual("done", records[-1]["type"])
+        self.assertNotIn("registry-done-1", chat_stream_module._ACTIVE_STREAMS)
+
+    def test_in_band_error_removes_the_entry(self) -> None:
+        stream_client = FakeStreamGenerationClient(
+            [StreamEvent(
+                type=StreamEventType.ERROR, error_message="down", retryable=True,
+            )]
+        )
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+            raise_after=RagAnswerError("Streaming generation failed."),
+        )
+        p1, p2, p3 = _patch_chat_stream(
+            pipeline=pipeline, stream_client=stream_client,
+        )
+
+        with p1, p2, p3:
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=generation_request, x_request_id="registry-error-1",
+                    ),
+                )
+            )
+
+        self.assertEqual(["start", "error"], [r["type"] for r in records])
+        self.assertNotIn(
+            "registry-error-1", chat_stream_module._ACTIVE_STREAMS,
+        )
+
+    def test_timeout_removes_the_entry(self) -> None:
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        stream_client = _HangingStreamClient(hang_seconds=0.3)
+        p1, p2, p3 = _patch_chat_stream(
+            pipeline=pipeline, stream_client=stream_client,
+        )
+
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat_stream.STREAM_REQUEST_DEADLINE_SECONDS", 0.05,
+        ):
+            http_response, records = _run(
+                _call_and_consume(
+                    legal_chat_stream(
+                        request=generation_request, x_request_id="registry-timeout-1",
+                    ),
+                )
+            )
+
+        self.assertEqual("error", records[-1]["type"])
+        self.assertNotIn(
+            "registry-timeout-1", chat_stream_module._ACTIVE_STREAMS,
+        )
+
+    def test_explicit_cancel_removes_the_entry(self) -> None:
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        stream_client = _CancelObservingStreamClient(delay_seconds=5.0)
+        p1, p2, p3 = _patch_chat_stream(
+            pipeline=pipeline, stream_client=stream_client,
+        )
+
+        async def scenario():
+            with p1, p2, p3:
+                response = await legal_chat_stream(
+                    request=generation_request, x_request_id="registry-cancel-1",
+                )
+
+                records: list[dict] = []
+
+                async def _drain() -> None:
+                    async for chunk in response.body_iterator:
+                        for line in chunk.decode("utf-8").splitlines():
+                            if line:
+                                records.append(json.loads(line))
+
+                drain_task = asyncio.ensure_future(_drain())
+
+                while "registry-cancel-1" not in chat_stream_module._ACTIVE_STREAMS:
+                    await asyncio.sleep(0.001)
+
+                was_registered = (
+                    "registry-cancel-1" in chat_stream_module._ACTIVE_STREAMS
+                )
+                cancelled = cancel_active_stream("registry-cancel-1")
+
+                await drain_task
+
+                return was_registered, cancelled, records
+
+        was_registered, cancelled, records = _run(scenario())
+
+        self.assertTrue(was_registered)
+        self.assertTrue(cancelled)
+        types = [record["type"] for record in records]
+        self.assertNotIn("done", types)
+        self.assertNotIn("metadata", types)
+        self.assertNotIn("replacement", types)
+        self.assertEqual("error", types[-1])
+        self.assertEqual("stream_cancelled", records[-1]["code"])
+        self.assertNotIn(
+            "registry-cancel-1", chat_stream_module._ACTIVE_STREAMS,
+        )
+
+    def test_unknown_request_id_is_safe(self) -> None:
+        self.assertFalse(cancel_active_stream("no-such-request-id"))
+        self.assertFalse(cancel_active_stream(""))
+
+    def test_two_active_streams_cancelling_one_does_not_affect_the_other(
+        self,
+    ) -> None:
+        generation_request = LegalChatRequest(
+            question="What notice period applies?", country_codes=["GB"],
+        )
+        pipeline = _GeneratingPipeline(
+            generation_request=generation_request,
+            search_function=_make_search_function(hits=[_build_hit()]),
+            generation_client=FakeGenerationClient(),
+        )
+        stream_client_a = _CancelObservingStreamClient(delay_seconds=5.0)
+        stream_client_b = _CancelObservingStreamClient(delay_seconds=0.05)
+
+        async def scenario():
+            with (
+                mock.patch(
+                    "app.routers.chat_stream.get_settings",
+                    return_value=_fake_settings(),
+                ),
+                mock.patch(
+                    "app.routers.chat_stream.resolve_legal_chat_response",
+                    side_effect=pipeline,
+                ),
+                mock.patch(
+                    "app.routers.chat_stream.get_openai_answer_stream_client",
+                    side_effect=[stream_client_a, stream_client_b],
+                ),
+            ):
+                # Sequential legal_chat_stream() calls - each one's own
+                # eager pre-stream await (including its own
+                # get_openai_answer_stream_client() call) fully
+                # completes before the next starts, so the side_effect
+                # list above deterministically assigns stream_client_a
+                # to "isolation-a" and stream_client_b to "isolation-b"
+                # regardless of how their STREAMING later interleaves.
+                response_a = await legal_chat_stream(
+                    request=generation_request, x_request_id="isolation-a",
+                )
+                response_b = await legal_chat_stream(
+                    request=generation_request, x_request_id="isolation-b",
+                )
+
+            records_a: list[dict] = []
+            records_b: list[dict] = []
+
+            async def _drain(response, records) -> None:
+                async for chunk in response.body_iterator:
+                    for line in chunk.decode("utf-8").splitlines():
+                        if line:
+                            records.append(json.loads(line))
+
+            task_a = asyncio.ensure_future(_drain(response_a, records_a))
+            task_b = asyncio.ensure_future(_drain(response_b, records_b))
+
+            while (
+                "isolation-a" not in chat_stream_module._ACTIVE_STREAMS
+                or "isolation-b" not in chat_stream_module._ACTIVE_STREAMS
+            ):
+                await asyncio.sleep(0.001)
+
+            both_registered = True
+
+            cancelled = cancel_active_stream("isolation-a")
+
+            await task_a
+            await task_b
+
+            return both_registered, cancelled, records_a, records_b
+
+        both_registered, cancelled, records_a, records_b = _run(scenario())
+
+        self.assertTrue(both_registered)
+        self.assertTrue(cancelled)
+
+        types_a = [record["type"] for record in records_a]
+        self.assertNotIn("done", types_a)
+        self.assertEqual("stream_cancelled", records_a[-1]["code"])
+        self.assertTrue(stream_client_a.cancelled)
+
+        types_b = [record["type"] for record in records_b]
+        self.assertEqual("done", types_b[-1])
+        self.assertFalse(stream_client_b.cancelled)
+        self.assertTrue(stream_client_b.completed_normally)
+
+        self.assertNotIn("isolation-a", chat_stream_module._ACTIVE_STREAMS)
+        self.assertNotIn("isolation-b", chat_stream_module._ACTIVE_STREAMS)
 
 
 class NamedEarlyResponseRouteTests(unittest.TestCase):
