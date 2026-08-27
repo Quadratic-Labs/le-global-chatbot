@@ -5313,7 +5313,15 @@ async def stream_answer_legal_question(
     if should_repair:
         repair_triggered = True
 
-        yield StreamAnswerEvent(type=StreamAnswerEventType.DISCARD)
+        # Hard grounding/quality failures invalidate the provisional
+        # answer immediately. Soft-only repair triggers (currently
+        # structure / subject_drift) do not: the first answer has no
+        # hard error, so keep it visible while the repair runs and
+        # atomically replace it once the winning final text is ready.
+        if first_hard_errors:
+            yield StreamAnswerEvent(
+                type=StreamAnswerEventType.DISCARD
+            )
 
         if timings is not None:
             timings.repair_start = perf_counter()
