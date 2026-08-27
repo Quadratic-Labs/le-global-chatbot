@@ -2729,7 +2729,7 @@ describe("conflict review panel", () => {
 // --- Documents table rendering (AJAX-refresh integration) -----------
 //
 // Mission "ORDER 8B", sections 22-30 - exercised through the same
-// refresh path a real upload/reindex/delete triggers, asserting on
+// refresh path a real upload triggers, asserting on
 // the rendered HTML string (this harness has no real DOM parser, so
 // assertions are deliberately scoped to precise substrings/regexes
 // rather than full markup structure - the Chromium E2E suite is the
@@ -2865,7 +2865,7 @@ describe("documents table rendering", () => {
         assert.equal(html.includes(formatLastUpdated(iso)), true);
     });
 
-    test("Reindex is presented only as 'Refresh chatbot data', never the word 'Reindex' as visible text", async () => {
+    test("the refreshed table omits Year/Refresh/Delete and exposes only Download for a document", async () => {
         await mockRefresh(
             [
                 {
@@ -2873,9 +2873,11 @@ describe("documents table rendering", () => {
                     country: "Belgium",
                     country_code: "BE",
                     source_filename: "Belgium.docx",
+                    reference_year: 2026,
                     status: "indexed",
                     source_file_present: true,
                     updated_at: "2026-08-01T00:00:00.000Z",
+                    download_url: "https://example.test/download",
                     reindex_nonce: "n1",
                     delete_nonce: "n2",
                 },
@@ -2885,8 +2887,13 @@ describe("documents table rendering", () => {
 
         const html = dom.fakeDocumentsContainer.innerHTML;
 
-        assert.match(html, />Refresh chatbot data</);
+        assert.match(html, />Download<\/a>/);
+        assert.equal(html.includes("<th scope=\"col\">Year</th>"), false);
+        assert.equal(html.includes(">2026<"), false);
+        assert.equal(html.includes("Refresh chatbot data"), false);
+        assert.equal(html.includes("Delete document"), false);
         assert.equal(html.includes(">Reindex<"), false);
+        assert.equal(html.includes("le-global-chatbot-admin__menu"), false);
     });
 
     test("a country conflict collapses into one Action required row with a Review button, never per-record raw rows", async () => {
@@ -2945,8 +2952,8 @@ describe("documents table rendering", () => {
         );
         assert.equal(
             (html.match(/data-reindex-form/g) || []).length,
-            1,
-            "only France's real Refresh form should render; Italy has no per-record actions at all"
+            0,
+            "Refresh must not render for either regular or conflicted rows"
         );
         assert.equal(
             (html.match(/data-review-country-code="IT"/g) || []).length,

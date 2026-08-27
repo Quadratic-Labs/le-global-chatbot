@@ -255,10 +255,9 @@ function wp_verify_nonce(string $nonce, $action = -1): bool
 }
 
 /**
- * render_document_row() (invoked in full, below, to verify the
- * rendered Download link) also renders sibling reindex/delete forms
- * that call wp_nonce_field() directly - a minimal, real-shaped hidden
- * input is enough; no test here inspects its contents.
+ * Other admin rendering paths call wp_nonce_field() directly. A
+ * minimal, real-shaped hidden input is enough for this framework-free
+ * rendering harness; no test here inspects its contents.
  */
 function wp_nonce_field(
     $action = -1,
@@ -1056,10 +1055,53 @@ function invoke_render_document_row(
     return ob_get_clean();
 }
 
+function invoke_render_documents_table_body(array $documents): string
+{
+    $reflection = new ReflectionClass('LE_Global_Chatbot_Admin');
+    $method = $reflection->getMethod('render_documents_table_body');
+    $method->setAccessible(true);
+
+    ob_start();
+    $method->invoke(null, $documents, null, []);
+
+    return ob_get_clean();
+}
+
 check(
     'a real HTML parser (ext-dom) is available to verify the rendered download link',
     class_exists('DOMDocument'),
     true
+);
+
+$table_html = invoke_render_documents_table_body([
+    [
+        'document_id' => $REALISTIC_DOCUMENT_IDS[0],
+        'country' => 'Australia',
+        'country_code' => 'AU',
+        'source_filename' => 'AU.docx',
+        'reference_year' => 2026,
+        'source_file_present' => true,
+        'status' => 'indexed',
+    ],
+]);
+
+$table_dom = new DOMDocument();
+libxml_use_internal_errors(true);
+$table_dom->loadHTML(
+    '<!DOCTYPE html><html><body>' . $table_html . '</body></html>'
+);
+libxml_clear_errors();
+
+$header_labels = [];
+
+foreach ($table_dom->getElementsByTagName('th') as $header) {
+    $header_labels[] = trim($header->textContent);
+}
+
+check(
+    'the Documents table has no Year column and preserves the remaining headers',
+    $header_labels,
+    ['Country', 'Document', 'Status', 'Last updated', 'Actions']
 );
 
 foreach ($REALISTIC_DOCUMENT_IDS as $document_id) {
@@ -1095,6 +1137,29 @@ foreach ($REALISTIC_DOCUMENT_IDS as $document_id) {
         "the rendered row has a Download link with an href ({$document_id})",
         $download_href !== null,
         true
+    );
+    check(
+        "the rendered row contains exactly five cells and no Year value ({$document_id})",
+        $document_dom->getElementsByTagName('td')->length,
+        5
+    );
+    check(
+        "the rendered row does not expose Refresh ({$document_id})",
+        str_contains($row_html, 'Refresh chatbot data'),
+        false
+    );
+    check(
+        "the rendered row does not expose Delete ({$document_id})",
+        str_contains($row_html, 'Delete document'),
+        false
+    );
+    check(
+        "the rendered row keeps reference_year out of visible text ({$document_id})",
+        str_contains(
+            preg_replace('/\s+/', ' ', strip_tags($row_html)),
+            '2026'
+        ),
+        false
     );
 
     // DOMDocument::getAttribute() already returns the attribute value
@@ -1189,6 +1254,72 @@ check(
 // warns against).
 $admin_php_source = file_get_contents(
     __DIR__ . '/../includes/class-le-global-chatbot-admin.php'
+);
+$render_page_method = new ReflectionMethod(
+    'LE_Global_Chatbot_Admin',
+    'render_page'
+);
+$admin_php_lines = file(
+    __DIR__ . '/../includes/class-le-global-chatbot-admin.php'
+);
+$render_page_source = implode(
+    '',
+    array_slice(
+        $admin_php_lines,
+        $render_page_method->getStartLine() - 1,
+        $render_page_method->getEndLine()
+            - $render_page_method->getStartLine()
+            + 1
+    )
+);
+$render_upload_method = new ReflectionMethod(
+    'LE_Global_Chatbot_Admin',
+    'render_upload_panel'
+);
+$render_upload_source = implode(
+    '',
+    array_slice(
+        $admin_php_lines,
+        $render_upload_method->getStartLine() - 1,
+        $render_upload_method->getEndLine()
+            - $render_upload_method->getStartLine()
+            + 1
+    )
+);
+$render_upload_visible_text = preg_replace(
+    '/\s+/',
+    ' ',
+    strip_tags($render_upload_source)
+);
+$warning_text = 'Important: Upload one document per country. Uploading a new document replaces the existing document for that country, including all employment-law content currently used by the chatbot for that country.';
+
+check(
+    'the upload panel renders the exact required warning text',
+    str_contains($render_upload_visible_text, $warning_text),
+    true
+);
+check(
+    'the warning is inside Upload after its description and before the dropzone',
+    !str_contains($render_page_source, $warning_text)
+        && strpos($render_upload_source, 'Maximum file size: 25 MB each.')
+            < strpos($render_upload_source, '<strong>Important:</strong>')
+        && strpos($render_upload_source, '<strong>Important:</strong>')
+            < strpos($render_upload_source, 'le-global-chatbot-admin__dropzone'),
+    true
+);
+check(
+    'Overview is rendered once between Contacts and Documents',
+    substr_count($render_page_source, 'self::render_overview_panel(') === 1
+        && strpos($render_page_source, 'render_contacts_panel')
+            < strpos($render_page_source, 'render_overview_panel')
+        && strpos($render_page_source, 'render_overview_panel')
+            < strpos($render_page_source, 'render_documents_panel'),
+    true
+);
+check(
+    'the Documents count element remains in the admin renderer',
+    str_contains($admin_php_source, 'id="le-global-document-count"'),
+    true
 );
 $admin_php_code_only = '';
 

@@ -324,7 +324,7 @@ final class LE_Global_Chatbot_Admin
                     </p>
 
                     <h1>
-                        Document management
+                        Document Management
                     </h1>
 
                     <p class="le-global-chatbot-admin__description">
@@ -351,18 +351,18 @@ final class LE_Global_Chatbot_Admin
             ?>
 
             <?php
-            self::render_documents_panel(
-                $documents,
-                $catalog_error,
-                $conflicted_country_codes
-            );
-            ?>
-
-            <?php
             self::render_overview_panel(
                 $total_documents,
                 $total_countries,
                 $countries_requiring_action_count
+            );
+            ?>
+
+            <?php
+            self::render_documents_panel(
+                $documents,
+                $catalog_error,
+                $conflicted_country_codes
             );
             ?>
         </div>
@@ -393,6 +393,24 @@ final class LE_Global_Chatbot_Admin
                         Maximum file size: 25 MB each.
                     </p>
                 </div>
+            </div>
+
+            <div
+                class="le-global-chatbot-admin__information-callout"
+                role="note"
+            >
+                <span
+                    class="dashicons dashicons-info-outline"
+                    aria-hidden="true"
+                ></span>
+
+                <p>
+                    <strong>Important:</strong> Upload one document per
+                    country. Uploading a new document replaces the
+                    existing document for that country, including all
+                    employment-law content currently used by the
+                    chatbot for that country.
+                </p>
             </div>
 
             <form
@@ -1302,7 +1320,9 @@ final class LE_Global_Chatbot_Admin
         array $conflicted_country_codes
     ): void {
         ?>
-        <section class="le-global-chatbot-admin__panel">
+        <section
+            class="le-global-chatbot-admin__panel le-global-chatbot-admin__panel--documents"
+        >
             <div class="le-global-chatbot-admin__panel-header">
                 <div>
                     <h2>
@@ -1414,7 +1434,6 @@ final class LE_Global_Chatbot_Admin
                     <tr>
                         <th scope="col">Country</th>
                         <th scope="col">Document</th>
-                        <th scope="col">Year</th>
                         <th scope="col">Status</th>
                         <th scope="col">Last updated</th>
                         <th scope="col">Actions</th>
@@ -1538,7 +1557,7 @@ final class LE_Global_Chatbot_Admin
                 <?php endif; ?>
             </td>
 
-            <td colspan="3">
+            <td colspan="2">
                 <span
                     class="le-global-chatbot-admin__status is-warning"
                     title="More than one document record is linked to this country."
@@ -1591,10 +1610,6 @@ final class LE_Global_Chatbot_Admin
             ? (string) $document['source_filename']
             : '';
 
-        $reference_year = isset($document['reference_year'])
-            ? (int) $document['reference_year']
-            : 0;
-
         $source_present = !empty($document['source_file_present']);
 
         $has_country_conflict = (
@@ -1645,14 +1660,6 @@ final class LE_Global_Chatbot_Admin
             </td>
 
             <td>
-                <?php
-                echo $reference_year > 0
-                    ? esc_html((string) $reference_year)
-                    : '—';
-                ?>
-            </td>
-
-            <td>
                 <?php self::render_status_badge($display_status); ?>
             </td>
 
@@ -1667,11 +1674,8 @@ final class LE_Global_Chatbot_Admin
             <td>
                 <?php
                 self::render_document_actions(
-                    $document,
                     $document_id,
-                    $source_filename,
-                    $source_present,
-                    $has_country_conflict
+                    $source_present
                 );
                 ?>
             </td>
@@ -1703,23 +1707,14 @@ final class LE_Global_Chatbot_Admin
     }
 
     /**
-     * ORDER 8B, section 28 - Download stays its own, always-visible
-     * primary action; Refresh chatbot data (internally: Reindex) and
-     * the visually-destructive Delete move into one "⋯" menu, so the
-     * row never presents three same-weight buttons. A country in
-     * conflict can still be downloaded when its own source resolves
-     * unambiguously, but never refreshed/edited - see section 26.
+     * Download is the document table's only visitor-facing action.
+     * Reindex/delete endpoints and service logic remain available;
+     * they are intentionally absent from this simplified UI.
      */
     private static function render_document_actions(
-        array $document,
         string $document_id,
-        string $source_filename,
-        bool $source_present,
-        bool $has_country_conflict
+        bool $source_present
     ): void {
-        $country = isset($document['country'])
-            ? (string) $document['country']
-            : '';
         ?>
         <div class="le-global-chatbot-admin__actions">
             <?php if ($source_present) : ?>
@@ -1743,129 +1738,6 @@ final class LE_Global_Chatbot_Admin
                     Download
                 </button>
             <?php endif; ?>
-
-            <div class="le-global-chatbot-admin__menu">
-                <button
-                    type="button"
-                    class="button le-global-chatbot-admin__menu-toggle"
-                    aria-haspopup="true"
-                    aria-expanded="false"
-                    aria-label="<?php
-                        echo esc_attr(
-                            'More actions for '
-                            . $source_filename
-                        );
-                    ?>"
-                >
-                    &hellip;
-                </button>
-
-                <div
-                    class="le-global-chatbot-admin__menu-list"
-                    role="menu"
-                    hidden
-                >
-                    <?php if ($source_present && !$has_country_conflict) : ?>
-                        <form
-                            method="post"
-                            action="<?php
-                                echo esc_url(
-                                    admin_url('admin-post.php')
-                                );
-                            ?>"
-                            data-reindex-form
-                        >
-                            <input
-                                type="hidden"
-                                name="action"
-                                value="<?php
-                                    echo esc_attr(self::REINDEX_ACTION);
-                                ?>"
-                            >
-
-                            <input
-                                type="hidden"
-                                name="document_id"
-                                value="<?php echo esc_attr($document_id); ?>"
-                            >
-
-                            <?php
-                            wp_nonce_field(
-                                self::REINDEX_ACTION . ':' . $document_id
-                            );
-                            ?>
-
-                            <button
-                                type="submit"
-                                class="le-global-chatbot-admin__menu-item"
-                                role="menuitem"
-                            >
-                                Refresh chatbot data
-                            </button>
-                        </form>
-                    <?php else : ?>
-                        <button
-                            type="button"
-                            class="le-global-chatbot-admin__menu-item"
-                            role="menuitem"
-                            disabled
-                            title="<?php
-                                echo esc_attr(
-                                    $has_country_conflict
-                                        ? 'This country has conflicting document records.'
-                                        : 'The source document is unavailable.'
-                                );
-                            ?>"
-                        >
-                            Refresh chatbot data
-                        </button>
-                    <?php endif; ?>
-
-                    <div class="le-global-chatbot-admin__menu-separator"></div>
-
-                    <form
-                        method="post"
-                        action="<?php
-                            echo esc_url(admin_url('admin-post.php'));
-                        ?>"
-                        data-confirm-delete
-                        data-document-name="<?php
-                            echo esc_attr($source_filename);
-                        ?>"
-                        data-country-name="<?php
-                            echo esc_attr($country);
-                        ?>"
-                    >
-                        <input
-                            type="hidden"
-                            name="action"
-                            value="<?php
-                                echo esc_attr(self::DELETE_ACTION);
-                            ?>"
-                        >
-
-                        <input
-                            type="hidden"
-                            name="document_id"
-                            value="<?php echo esc_attr($document_id); ?>"
-                        >
-
-                        <?php
-                        wp_nonce_field(
-                            self::DELETE_ACTION . ':' . $document_id
-                        );
-                        ?>
-
-                        <button
-                            type="submit"
-                            class="le-global-chatbot-admin__menu-item is-destructive"
-                            role="menuitem"
-                        >
-                            Delete document
-                        </button>
-                    </form>
-                </div>
-            </div>
         </div>
         <?php
     }
@@ -1882,7 +1754,9 @@ final class LE_Global_Chatbot_Admin
         int $countries_requiring_action_count
     ): void {
         ?>
-        <section class="le-global-chatbot-admin__panel">
+        <section
+            class="le-global-chatbot-admin__panel le-global-chatbot-admin__panel--overview"
+        >
             <div class="le-global-chatbot-admin__panel-header">
                 <div>
                     <h2>Overview</h2>

@@ -309,6 +309,31 @@ test("progressive rendering: multiple deltas append into the SAME bubble - never
     );
 });
 
+test("progressive rendering: a numeric citation split across deltas is never visible", () => {
+    const bubble = createPendingBubble();
+    const controller = createController({ bubbleElement: bubble });
+
+    controller.handleEvent(
+        { type: "delta", text: "An employer must provide notice [" }
+    );
+
+    const answerElement = bubble.querySelector(
+        ".le-global-chatbot__answer"
+    );
+
+    assert.equal(
+        answerElement.textContent,
+        "An employer must provide notice"
+    );
+
+    controller.handleEvent({ type: "delta", text: "12]." });
+
+    assert.equal(
+        answerElement.textContent,
+        "An employer must provide notice."
+    );
+});
+
 // =====================================================================
 // 3. validating shows transient state
 // =====================================================================
@@ -431,7 +456,7 @@ test("progressive rendering: repair sequence (discard then replacement) shows on
     );
     controller.handleEvent({ type: "discard" });
     controller.handleEvent(
-        { type: "replacement", text: "Corrected, validated answer." }
+        { type: "replacement", text: "Corrected, validated answer [12]." }
     );
 
     const answerElement = bubble.querySelector(
@@ -462,7 +487,7 @@ test("progressive rendering: a bare replacement (no preceding discard) still ato
     controller.handleEvent(
         {
             type: "replacement",
-            text: "Streamed answer. Note: no data for CH.",
+            text: "Streamed answer [2]. Note: no data for CH.",
         }
     );
 
@@ -477,10 +502,10 @@ test("progressive rendering: a bare replacement (no preceding discard) still ato
 });
 
 // =====================================================================
-// 8. metadata/sources appear only at finalization
+// 8. metadata/sources remain internal and never alter the bubble
 // =====================================================================
 
-test("progressive rendering: metadata never touches the bubble - sources are applied only by the existing final-render path, never duplicated here", () => {
+test("progressive rendering: metadata never touches the bubble or exposes visitor-facing sources", () => {
     const bubble = createPendingBubble();
     const controller = createController({ bubbleElement: bubble });
 
@@ -509,6 +534,12 @@ test("progressive rendering: metadata never touches the bubble - sources are app
             ".le-global-chatbot__sources-section"
         ),
         null
+    );
+    assert.equal(
+        bubble.querySelector(
+            ".le-global-chatbot__answer"
+        ).textContent,
+        "Answer."
     );
 });
 

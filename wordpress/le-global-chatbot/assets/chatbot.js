@@ -16,6 +16,14 @@
         /\[(\d+(?:\s*,\s*\d+)*)\]/g
     );
 
+    const DISPLAY_CITATION_MARKER_PATTERN = (
+        /[ \t]*\[\d+(?:\s*,\s*\d+)*\]/g
+    );
+
+    const TRAILING_PARTIAL_CITATION_PATTERN = (
+        /[ \t]*\[\s*(?:\d+\s*(?:,\s*\d*\s*)*)?$/
+    );
+
     const HISTORY_QUESTION_MAX_CHARACTERS = 2000;
     const HISTORY_ANSWER_MAX_CHARACTERS = 3000;
 
@@ -583,6 +591,29 @@
     }
 
     /**
+     * Remove only numeric citation groups from visitor-visible text.
+     * The raw answer remains untouched in conversation/stream state.
+     * While streaming, suppress a trailing partial group as well so a
+     * marker split across delta chunks never flashes in the bubble.
+     */
+    function answerTextForDisplay(answer, { streaming = false } = {}) {
+        let visibleText = typeof answer === "string" ? answer : "";
+
+        visibleText = visibleText
+            .replace(DISPLAY_CITATION_MARKER_PATTERN, "")
+            .replace(/[ \t]+([,.;:!?])/g, "$1");
+
+        if (streaming) {
+            visibleText = visibleText.replace(
+                TRAILING_PARTIAL_CITATION_PATTERN,
+                ""
+            );
+        }
+
+        return visibleText;
+    }
+
+    /**
      * Drives ONE assistant bubble through an entire /chat/stream
      * response (mission sections 3-7, 10-12, 14). Every dependency is
      * injected explicitly (documentRef/scheduleWork default to the
@@ -694,7 +725,10 @@
 
                 const wasNearBottom = isNearBottom();
 
-                answerElement.textContent = latestAnswerText;
+                answerElement.textContent = answerTextForDisplay(
+                    latestAnswerText,
+                    { streaming: true }
+                );
 
                 if (wasNearBottom && conversationElement) {
                     conversationElement.scrollTop = (
@@ -1685,7 +1719,9 @@
                 "le-global-chatbot__answer"
             );
 
-            answerElement.textContent = turn.answer || "";
+            answerElement.textContent = answerTextForDisplay(
+                turn.answer || ""
+            );
 
             const contacts = normalizePublicContacts(
                 turn.contacts
@@ -1722,14 +1758,6 @@
             if (contacts.length > 0) {
                 assistantBubble.appendChild(
                     buildContactCardsSection(contacts)
-                );
-            }
-
-            if (sources.length > 0 && !contactOnly) {
-                assistantBubble.appendChild(
-                    buildSourcesSection(
-                        sources
-                    )
                 );
             }
 
@@ -1874,95 +1902,6 @@
             });
 
             return section;
-        }
-
-        function buildSourcesSection(sources) {
-            const sourcesSection = document.createElement(
-                "section"
-            );
-
-            sourcesSection.className = (
-                "le-global-chatbot__sources-section"
-            );
-
-            const sourcesTitle = document.createElement(
-                "h4"
-            );
-
-            sourcesTitle.className = (
-                "le-global-chatbot__sources-title"
-            );
-
-            sourcesTitle.textContent = "Sources";
-            sourcesSection.appendChild(
-                sourcesTitle
-            );
-
-            const sourcesList = document.createElement(
-                "ol"
-            );
-
-            sourcesList.className = (
-                "le-global-chatbot__sources"
-            );
-
-            sources.forEach((source) => {
-                const item = document.createElement(
-                    "li"
-                );
-
-                item.className = (
-                    "le-global-chatbot__source"
-                );
-
-                const title = document.createElement(
-                    "strong"
-                );
-
-                title.textContent = [
-                    `[${source.citation}]`,
-                    source.country,
-                    source.section,
-                ]
-                    .filter(Boolean)
-                    .join(" — ");
-
-                const metadata = document.createElement(
-                    "span"
-                );
-
-                metadata.className = (
-                    "le-global-chatbot__source-metadata"
-                );
-
-                metadata.textContent = [
-                    source.subsection,
-                    source.source_filename,
-                    source.reference_year,
-                ]
-                    .filter(Boolean)
-                    .join(" · ");
-
-                item.appendChild(
-                    title
-                );
-
-                if (metadata.textContent) {
-                    item.appendChild(
-                        metadata
-                    );
-                }
-
-                sourcesList.appendChild(
-                    item
-                );
-            });
-
-            sourcesSection.appendChild(
-                sourcesList
-            );
-
-            return sourcesSection;
         }
 
         function scrollConversationToBottom() {
@@ -2888,6 +2827,7 @@
             STREAM_FINALIZING_STATUS_TEXT,
             findPendingBubbleElement,
             createStreamingBubbleController,
+            answerTextForDisplay,
             cancelActiveStream,
         };
     }

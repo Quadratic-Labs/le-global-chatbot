@@ -45,6 +45,32 @@
     font-size: 1rem;
 }
 
+.le-global-chatbot-admin__information-callout {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    max-width: 960px;
+    margin: 0 0 1.5rem;
+    padding: 1rem 1.15rem;
+    border: 1px solid #b6d4fe;
+    border-left: 4px solid #0d6efd;
+    border-radius: 6px;
+    background: #eaf3ff;
+    color: #17324d;
+}
+
+.le-global-chatbot-admin__information-callout .dashicons {
+    flex: 0 0 auto;
+    margin-top: 0.1rem;
+    color: #0d6efd;
+}
+
+.le-global-chatbot-admin__information-callout p {
+    margin: 0;
+    font-size: 0.95rem;
+    line-height: 1.55;
+}
+
 .le-global-chatbot-admin__summary {
     display: grid;
     grid-template-columns: repeat(
@@ -75,6 +101,32 @@
     color: #17324d;
     font-size: 2rem;
     line-height: 1;
+}
+
+.le-global-chatbot-admin__panel--overview {
+    margin: 1rem 0;
+    padding: 0.85rem 1rem 1rem;
+}
+
+.le-global-chatbot-admin__panel--overview .le-global-chatbot-admin__panel-header {
+    margin-bottom: 0.65rem;
+}
+
+.le-global-chatbot-admin__panel--overview .le-global-chatbot-admin__summary {
+    gap: 0.75rem;
+}
+
+.le-global-chatbot-admin__panel--overview .le-global-chatbot-admin__summary-card {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.7rem 0.9rem;
+}
+
+.le-global-chatbot-admin__panel--overview .le-global-chatbot-admin__summary-card strong {
+    margin-top: 0;
+    font-size: 1.5rem;
 }
 
 .le-global-chatbot-admin__panel {
@@ -428,11 +480,34 @@
 
 /* --- Documents toolbar (search + status filter) --------------------- */
 
+.le-global-chatbot-admin__panel--documents {
+    margin: 1rem 0;
+    padding: 1rem 1.25rem 1.25rem;
+}
+
+.le-global-chatbot-admin__panel--documents .le-global-chatbot-admin__panel-header {
+    margin-bottom: 0.75rem;
+}
+
+.le-global-chatbot-admin__panel--documents .le-global-chatbot-admin__panel-header p {
+    margin-top: 0.3rem;
+}
+
 .le-global-chatbot-admin__toolbar {
     display: flex;
     flex-wrap: wrap;
     gap: 1rem;
     margin-bottom: 1.25rem;
+}
+
+.le-global-chatbot-admin__panel--documents .le-global-chatbot-admin__toolbar {
+    align-items: flex-end;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.le-global-chatbot-admin__panel--documents .le-global-chatbot-admin__toolbar-field label {
+    margin-bottom: 0.25rem;
 }
 
 .le-global-chatbot-admin__toolbar-field label {
@@ -453,6 +528,12 @@
 .le-global-chatbot-admin__table th,
 .le-global-chatbot-admin__table td {
     vertical-align: middle;
+}
+
+.le-global-chatbot-admin__panel--documents .le-global-chatbot-admin__table th,
+.le-global-chatbot-admin__panel--documents .le-global-chatbot-admin__table td {
+    padding-top: 0.4rem;
+    padding-bottom: 0.4rem;
 }
 
 .le-global-chatbot-admin__table tr[hidden] {
