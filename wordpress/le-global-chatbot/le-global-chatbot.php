@@ -480,9 +480,6 @@ final class LE_Global_Chatbot_Plugin
         >
             <header class="le-global-chatbot__panel-header">
                 <div class="le-global-chatbot__panel-heading">
-                    <p class="le-global-chatbot__eyebrow">
-                        L&amp;E Global
-                    </p>
 
                     <h2
                         class="le-global-chatbot__title"

@@ -8,9 +8,10 @@ PHP = (R / "le-global-chatbot.php").read_text()
 class TestContactCards(unittest.TestCase):
     def test_answer_stays_safe(self):
         self.assertIn(
-            'answerElement.textContent = turn.answer || "";',
+            "answerElement.textContent = answerTextForDisplay(",
             JS,
         )
+        self.assertNotIn("answerElement.innerHTML", JS)
 
     def test_contacts_enter_turn(self):
         self.assertIn(

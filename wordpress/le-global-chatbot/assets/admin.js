@@ -1450,7 +1450,6 @@
             + "<thead><tr>"
             + "<th scope=\"col\">Country</th>"
             + "<th scope=\"col\">Document</th>"
-            + "<th scope=\"col\">Year</th>"
             + "<th scope=\"col\">Status</th>"
             + "<th scope=\"col\">Last updated</th>"
             + "<th scope=\"col\">Actions</th>"
@@ -1548,10 +1547,9 @@
             + '<td><span class="le-global-chatbot-admin__filename" '
             + `data-document-id="${escapeHtml(item.document_id || "")}">`
             + `${escapeHtml(filename)}</span></td>`
-            + `<td>${item.reference_year ? escapeHtml(item.reference_year) : "—"}</td>`
             + `<td>${statusBadgeHtml(displayStatus)}</td>`
             + `<td>${escapeHtml(formatLastUpdated(item.updated_at))}</td>`
-            + `<td>${rowActionsHtml(item, hasConflict)}</td>`
+            + `<td>${rowActionsHtml(item)}</td>`
             + "</tr>"
         );
     }
@@ -1576,7 +1574,7 @@
                     : ""
             )
             + "</td>"
-            + '<td colspan="3">'
+            + '<td colspan="2">'
             + statusBadgeHtml({
                 label: "Action required",
                 icon: "⚠",
@@ -1607,100 +1605,21 @@
         );
     }
 
-    function rowActionsHtml(item, hasConflict) {
-        const parts = [];
-
+    function rowActionsHtml(item) {
         if (item.download_url) {
-            parts.push(
-                `<a class="button" href="${escapeHtml(item.download_url)}">Download</a>`
-            );
-        } else {
-            parts.push(
-                '<button type="button" class="button" disabled '
-                + 'title="No unambiguous source document is available to download.">'
-                + "Download</button>"
+            return (
+                '<div class="le-global-chatbot-admin__actions">'
+                + `<a class="button" href="${escapeHtml(item.download_url)}">Download</a>`
+                + "</div>"
             );
         }
-
-        let refreshItem;
-
-        if (adminFormConfig && item.reindex_nonce && !hasConflict) {
-            refreshItem = actionFormHtml({
-                action: adminFormConfig.reindexAction,
-                nonce: item.reindex_nonce,
-                documentId: item.document_id,
-                buttonClass: "le-global-chatbot-admin__menu-item",
-                buttonLabel: "Refresh chatbot data",
-                markerAttribute: "data-reindex-form",
-                buttonAttributes: 'role="menuitem"',
-            });
-        } else {
-            const title = hasConflict
-                ? "This country has conflicting document records."
-                : "The source document is unavailable.";
-
-            refreshItem = (
-                '<button type="button" class="le-global-chatbot-admin__menu-item" '
-                + `role="menuitem" disabled title="${escapeHtml(title)}">`
-                + "Refresh chatbot data</button>"
-            );
-        }
-
-        let deleteItem = "";
-
-        if (adminFormConfig && item.delete_nonce) {
-            deleteItem = actionFormHtml({
-                action: adminFormConfig.deleteAction,
-                nonce: item.delete_nonce,
-                documentId: item.document_id,
-                buttonClass: "le-global-chatbot-admin__menu-item is-destructive",
-                buttonLabel: "Delete document",
-                markerAttribute: "data-confirm-delete",
-                formAttributes: (
-                    `data-document-name="${escapeHtml(item.source_filename || "")}" `
-                    + `data-country-name="${escapeHtml(item.country || "")}"`
-                ),
-                buttonAttributes: 'role="menuitem"',
-            });
-        }
-
-        parts.push(
-            '<div class="le-global-chatbot-admin__menu">'
-            + '<button type="button" class="button le-global-chatbot-admin__menu-toggle" '
-            + 'aria-haspopup="true" aria-expanded="false" '
-            + `aria-label="${escapeHtml("More actions for " + (item.source_filename || ""))}">`
-            + "&hellip;</button>"
-            + '<div class="le-global-chatbot-admin__menu-list" role="menu" hidden>'
-            + refreshItem
-            + '<div class="le-global-chatbot-admin__menu-separator"></div>'
-            + deleteItem
-            + "</div></div>"
-        );
 
         return (
             '<div class="le-global-chatbot-admin__actions">'
-            + parts.join("")
+            + '<button type="button" class="button" disabled '
+            + 'title="No unambiguous source document is available to download.">'
+            + "Download</button>"
             + "</div>"
-        );
-    }
-
-    function actionFormHtml({
-        action,
-        nonce,
-        documentId,
-        buttonClass,
-        buttonLabel,
-        markerAttribute,
-        formAttributes = "",
-        buttonAttributes = "",
-    }) {
-        return (
-            `<form method="post" action="${escapeHtml(adminFormConfig.adminPostUrl || "")}" ${markerAttribute} ${formAttributes}>`
-            + `<input type="hidden" name="action" value="${escapeHtml(action)}">`
-            + `<input type="hidden" name="document_id" value="${escapeHtml(documentId)}">`
-            + `<input type="hidden" name="_wpnonce" value="${escapeHtml(nonce)}">`
-            + `<button type="submit" class="${buttonClass}" ${buttonAttributes}>${escapeHtml(buttonLabel)}</button>`
-            + "</form>"
         );
     }
 

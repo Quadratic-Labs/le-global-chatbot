@@ -1,6 +1,6 @@
 .le-global-chatbot {
-    --le-global-primary: #17324d;
-    --le-global-primary-hover: #244b6f;
+    --le-global-primary: #0d6efd;
+    --le-global-primary-hover: #0b5ed7;
     --le-global-border: #d8dee5;
     --le-global-background: #ffffff;
     --le-global-muted: #5d6874;
@@ -206,35 +206,9 @@
     color: var(--le-global-error);
 }
 
-.le-global-chatbot__sources-title {
-    margin-top: 0;
-}
-
 .le-global-chatbot__answer {
     white-space: pre-wrap;
     line-height: 1.7;
-}
-
-.le-global-chatbot__sources-section {
-    margin-top: 1rem;
-}
-
-.le-global-chatbot__sources {
-    display: grid;
-    gap: 0.8rem;
-    padding-left: 1.4rem;
-}
-
-.le-global-chatbot__source {
-    padding-left: 0.25rem;
-    line-height: 1.45;
-}
-
-.le-global-chatbot__source-metadata {
-    display: block;
-    margin-top: 0.25rem;
-    color: var(--le-global-muted);
-    font-size: 0.86rem;
 }
 
 .le-global-chatbot__disclaimer {
@@ -258,6 +232,9 @@
 }
 
 .le-global-chatbot-floating {
+    --le-global-primary: #0d6efd;
+    --le-global-primary-hover: #0b5ed7;
+
     position: fixed;
     right: 24px;
     bottom: 24px;
@@ -275,14 +252,14 @@
     padding: 0;
     border: 0;
     border-radius: 50%;
-    background: var(--le-global-primary, #17324d);
+    background: var(--le-global-primary, #0d6efd);
     color: #fff;
     cursor: pointer;
-    box-shadow: 0 10px 30px rgba(23, 50, 77, 0.35);
+    box-shadow: 0 10px 30px rgba(13, 110, 253, 0.35);
 }
 
 .le-global-chatbot-floating__launcher:hover {
-    background: var(--le-global-primary-hover, #244b6f);
+    background: var(--le-global-primary-hover, #0b5ed7);
 }
 
 .le-global-chatbot-floating__launcher svg {
@@ -291,8 +268,8 @@
 
 .le-global-chatbot-floating--open .le-global-chatbot-floating__launcher {
     box-shadow:
-        0 0 0 4px rgba(23, 50, 77, 0.18),
-        0 10px 30px rgba(23, 50, 77, 0.35);
+        0 0 0 4px rgba(13, 110, 253, 0.18),
+        0 10px 30px rgba(13, 110, 253, 0.35);
 }
 
 .le-global-chatbot.le-global-chatbot--floating {
@@ -361,15 +338,6 @@
 .le-global-chatbot--floating .le-global-chatbot__submit {
     font-size: 14px;
     padding: 0.55rem 1.1rem;
-}
-
-.le-global-chatbot--floating .le-global-chatbot__sources-title {
-    font-size: 13px;
-}
-
-.le-global-chatbot--floating .le-global-chatbot__source,
-.le-global-chatbot--floating .le-global-chatbot__source-metadata {
-    font-size: 12.5px;
 }
 
 .le-global-chatbot--floating .le-global-chatbot__disclaimer {
@@ -649,3 +617,169 @@
         font-size: 13px;
     }
 }
+
+/* === L&E GLOBAL CLIENT TYPOGRAPHY START === */
+
+/*
+ * L&E Global website typography.
+ * Reference body style:
+ * Inter / 1rem / 300 / 2rem / #200e32
+ */
+.le-global-chatbot,
+.le-global-chatbot--floating {
+    font-family: Inter, sans-serif;
+    color: #200e32;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/*
+ * Main conversational content uses the same body typography
+ * as leglobal.law.
+ */
+.le-global-chatbot__message,
+.le-global-chatbot__question,
+.le-global-chatbot__contact-body,
+.le-global-chatbot__contact-firm,
+.le-global-chatbot__contact-address,
+.le-global-chatbot__contact-website,
+.le-global-chatbot--floating .le-global-chatbot__message,
+.le-global-chatbot--floating .le-global-chatbot__question {
+    font-family: Inter, sans-serif;
+    font-size: 1rem;
+    font-weight: 300;
+    line-height: 2rem;
+}
+
+/*
+ * Native controls do not reliably inherit typography.
+ */
+.le-global-chatbot button,
+.le-global-chatbot input,
+.le-global-chatbot textarea,
+.le-global-chatbot select,
+.le-global-chatbot--floating button,
+.le-global-chatbot--floating input,
+.le-global-chatbot--floating textarea,
+.le-global-chatbot--floating select {
+    font-family: Inter, sans-serif;
+    font-size: 1rem;
+}
+
+/*
+ * Override the compact floating-widget sizes for textual controls.
+ * Keep their existing weight/layout/colour behaviour.
+ */
+.le-global-chatbot--floating .le-global-chatbot__submit,
+.le-global-chatbot--floating .le-global-chatbot__new-conversation {
+    font-family: Inter, sans-serif;
+    font-size: 1rem;
+}
+
+/*
+ * Contact names keep their existing emphasis but use the client
+ * body font size.
+ */
+.le-global-chatbot__contact-name {
+    font-family: Inter, sans-serif;
+    font-size: 1rem;
+}
+
+/* === L&E GLOBAL CLIENT TYPOGRAPHY END === */
+
+/* === L&E GLOBAL FINAL BUTTON COLORS START === */
+
+/* Send */
+.le-global-chatbot--floating .le-global-chatbot__submit {
+    background-color: #0d6efd;
+    border-color: #0d6efd;
+}
+
+.le-global-chatbot--floating .le-global-chatbot__submit:hover {
+    background-color: #000a21 !important;
+    border-color: #000a21 !important;
+}
+
+/* New conversation */
+.le-global-chatbot__new-conversation {
+    background-color: #eb7a5c;
+    border-color: #eb7a5c;
+    color: #ffffff;
+}
+
+.le-global-chatbot__new-conversation:hover {
+    background-color: #d9684f;
+    border-color: #d9684f;
+    color: #ffffff;
+}
+
+/* Close X */
+.le-global-chatbot-floating__close {
+    background-color: #eb7a5c;
+    border-color: #eb7a5c;
+    color: #ffffff;
+}
+
+.le-global-chatbot-floating__close:hover {
+    background-color: #d9684f;
+    border-color: #d9684f;
+    color: #ffffff;
+}
+
+/* === L&E GLOBAL FINAL BUTTON COLORS END === */
+
+/* === L&E GLOBAL LAUNCHER COLORS START === */
+
+.le-global-chatbot-floating__launcher {
+    background-color: #0d6efd !important;
+}
+
+.le-global-chatbot-floating__launcher:hover {
+    background-color: #000a21 !important;
+}
+
+/* === L&E GLOBAL LAUNCHER COLORS END === */
+
+/* === L&E GLOBAL SIMPLE BUTTON HOVER START === */
+
+.le-global-chatbot button,
+.le-global-chatbot-floating button {
+    transition:
+        box-shadow 0.18s ease,
+        transform 0.18s ease;
+}
+
+.le-global-chatbot button:hover:not(:disabled),
+.le-global-chatbot-floating button:hover:not(:disabled) {
+    box-shadow: 0 3px 8px rgba(0, 0, 0, 0.14);
+    transform: translateY(-1px);
+}
+
+.le-global-chatbot button:active:not(:disabled),
+.le-global-chatbot-floating button:active:not(:disabled) {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+    transform: translateY(0);
+}
+
+/* === L&E GLOBAL SIMPLE BUTTON HOVER END === */
+
+/* === L&E GLOBAL SIMPLE HOVER EFFECT START === */
+
+.le-global-chatbot__submit,
+.le-global-chatbot__new-conversation,
+.le-global-chatbot-floating__close,
+.le-global-chatbot-floating__launcher {
+    transition:
+        background-color 0.15s ease,
+        border-color 0.15s ease,
+        box-shadow 0.15s ease;
+}
+
+.le-global-chatbot__submit:hover,
+.le-global-chatbot__new-conversation:hover,
+.le-global-chatbot-floating__close:hover,
+.le-global-chatbot-floating__launcher:hover {
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.18);
+}
+
+/* === L&E GLOBAL SIMPLE HOVER EFFECT END === */

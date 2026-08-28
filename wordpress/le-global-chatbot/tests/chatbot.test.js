@@ -30,6 +30,13 @@ const CHATBOT_JS_PATH = path.join(
     "chatbot.js"
 );
 
+const CHATBOT_CSS_PATH = path.join(
+    __dirname,
+    "..",
+    "assets",
+    "chatbot.css"
+);
+
 function createFakeSessionStorage() {
     const store = new Map();
 
@@ -361,4 +368,70 @@ test("the widget never touches localStorage, cookies, or IndexedDB", () => {
     assert.equal(/\blocalStorage\s*\./.test(source), false);
     assert.equal(/\bdocument\.cookie\b/.test(source), false);
     assert.equal(/\bindexedDB\s*\./.test(source), false);
+});
+
+test("visitor display removes only numeric citation groups and preserves the raw answer", () => {
+    const rawAnswer = (
+        "Notice is required [1]. Grouped support [2, 12]! "
+        + "Keep [Article 1] and [2024 Act]."
+    );
+
+    assert.equal(
+        chatbot.answerTextForDisplay(rawAnswer),
+        "Notice is required. Grouped support! Keep [Article 1] and [2024 Act]."
+    );
+    assert.equal(
+        rawAnswer,
+        "Notice is required [1]. Grouped support [2, 12]! Keep [Article 1] and [2024 Act]."
+    );
+});
+
+test("visitor display suppresses only a trailing partial citation while streaming", () => {
+    assert.equal(
+        chatbot.answerTextForDisplay(
+            "An employer must provide notice [12",
+            { streaming: true }
+        ),
+        "An employer must provide notice"
+    );
+    assert.equal(
+        chatbot.answerTextForDisplay("An employer must provide notice [12"),
+        "An employer must provide notice [12"
+    );
+});
+
+test("the production chatbot has no visitor-facing Sources renderer or styles", () => {
+    const script = fs.readFileSync(CHATBOT_JS_PATH, "utf8");
+    const stylesheet = fs.readFileSync(CHATBOT_CSS_PATH, "utf8");
+
+    assert.equal(script.includes("buildSourcesSection"), false);
+    assert.equal(
+        script.includes("le-global-chatbot__sources-section"),
+        false
+    );
+    assert.equal(
+        stylesheet.includes("le-global-chatbot__sources-section"),
+        false
+    );
+});
+
+test("the chatbot and floating launcher primary color is exactly #0d6efd", () => {
+    const stylesheet = fs.readFileSync(CHATBOT_CSS_PATH, "utf8");
+    const chatbotRule = stylesheet.match(
+        /\.le-global-chatbot\s*\{([^}]*)\}/
+    );
+    const floatingRule = stylesheet.match(
+        /\.le-global-chatbot-floating\s*\{([^}]*)\}/
+    );
+
+    assert.ok(chatbotRule);
+    assert.ok(floatingRule);
+    assert.match(
+        chatbotRule[1],
+        /--le-global-primary:\s*#0d6efd;/
+    );
+    assert.match(
+        floatingRule[1],
+        /--le-global-primary:\s*#0d6efd;/
+    );
 });
