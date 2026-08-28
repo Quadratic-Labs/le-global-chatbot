@@ -1488,7 +1488,7 @@
 
         (documents || []).forEach((document) => {
             const code = (document && document.country_code) || "";
-            const key = code === "" ? ` no-code-${groups.length}` : code;
+            const key = code === "" ? `no-code-${groups.length}` : code;
 
             if (!indexByCode.has(key)) {
                 indexByCode.set(key, groups.length);

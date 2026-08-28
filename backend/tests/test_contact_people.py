@@ -20,7 +20,9 @@ from app.services.docx_parser import (
 )
 
 
-SOURCE_ROOT = Path("/data/documents/source")
+from tests.corpus_paths import resolve_source_root
+
+SOURCE_ROOT = resolve_source_root()
 
 
 def _photo(name: str) -> ContactPhotoCandidate:

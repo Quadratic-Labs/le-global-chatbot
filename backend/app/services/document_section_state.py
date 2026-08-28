@@ -58,17 +58,6 @@ def section_id_for_legal_topic(legal_topic: str) -> str:
     return slug
 
 
-_SECTION_ID_TO_LEGAL_TOPIC: Final[dict[str, str]] = {
-    section_id_for_legal_topic(topic): topic for topic in LEGAL_TOPICS
-}
-
-
-def legal_topic_for_section_id(section_id: str) -> str | None:
-    """Reverse lookup - None when section_id is not a real topic slug."""
-
-    return _SECTION_ID_TO_LEGAL_TOPIC.get(section_id.strip().lower())
-
-
 @dataclass(frozen=True, slots=True)
 class SectionEdit:
     """One persisted, currently-effective edited section."""

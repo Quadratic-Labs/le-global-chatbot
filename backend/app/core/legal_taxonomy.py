@@ -82,6 +82,10 @@ _TRAILING_DECORATION_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\s*[|¦=]+\s*$"
 )
 
+_TRAILING_ANNOTATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\s*\([^()]*\)\s*$"
+)
+
 
 def _normalize_text(value: str) -> str:
     """Normalize whitespace and punctuation used in source labels."""
@@ -113,7 +117,30 @@ def _clean_label(value: str) -> str:
         )
     )
 
-    return without_trailing_decoration.strip()
+    without_trailing_annotation = (
+        _strip_trailing_annotation(
+            without_trailing_decoration
+        )
+    )
+
+    return without_trailing_annotation.strip()
+
+
+def _strip_trailing_annotation(value: str) -> str:
+    """
+    Drop one harmless trailing "(...)" editorial annotation (for
+    example " (NEW SECTION)") so a canonical heading carrying it is
+    still recognized. Never applied if it would erase the entire
+    label - only a heading whose non-parenthetical text stands on its
+    own is affected.
+    """
+
+    stripped = _TRAILING_ANNOTATION_PATTERN.sub(
+        "",
+        value,
+    )
+
+    return stripped if stripped.strip() else value
 
 
 def _with_the_variant(

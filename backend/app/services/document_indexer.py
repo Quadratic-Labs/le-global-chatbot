@@ -49,18 +49,6 @@ class DocumentIndexingResult:
     indexed_chunks: int
     stale_chunks_deleted: int
 
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable representation."""
-
-        return {
-            "index_alias": self.index_alias,
-            "document_id": self.document_id,
-            "source_filename": self.source_filename,
-            "requested_chunks": self.requested_chunks,
-            "indexed_chunks": self.indexed_chunks,
-            "stale_chunks_deleted": self.stale_chunks_deleted,
-        }
-
 
 def _validate_chunks(
     chunks: Sequence[DocumentChunk],

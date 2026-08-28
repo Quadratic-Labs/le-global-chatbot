@@ -3,10 +3,9 @@ Tests for the additive OpenAI Responses API streaming client (GATE S2,
 chat-streaming initiative).
 
 OpenAIResponsesClient (openai_responses.py) is a completely separate
-class, untouched by anything here - see
-test_openai_responses.py::ExistingClientRegressionTests below, which
-re-runs a representative slice of its own suite unmodified to prove
-this file's additions have zero effect on it.
+class, untouched by anything here - see test_openai_responses.py,
+which the full backend suite already discovers and runs independently
+to prove this file's additions have zero effect on it.
 
 Testing philosophy (established directly, empirically, before writing
 this file - see commit message / GATE S2 report for the raw
@@ -709,34 +708,6 @@ class OpenAIResponsesStreamClientTests(unittest.TestCase):
                 model="gpt-5-mini",
                 read_timeout_seconds=0,
             )
-
-
-class ExistingClientRegressionTests(unittest.TestCase):
-    """
-    GATE S2's own explicit requirement: prove OpenAIResponsesClient
-    (openai_responses.py) is unaffected. Rather than re-implementing
-    that suite here (risking silent drift from the real one), this
-    imports and runs it directly, in-process, as part of this file's
-    own suite - so `python -m unittest tests.test_openai_responses_stream`
-    and the full-suite run both exercise it.
-    """
-
-    def test_existing_openai_responses_suite_still_passes(self) -> None:
-        import io
-        import unittest as _unittest
-
-        from tests import test_openai_responses as _existing_module
-
-        loader = _unittest.TestLoader()
-        suite = loader.loadTestsFromModule(_existing_module)
-        runner = _unittest.TextTestRunner(verbosity=0, stream=io.StringIO())
-        result = runner.run(suite)
-
-        self.assertTrue(
-            result.wasSuccessful(),
-            f"existing OpenAIResponsesClient suite regressed: "
-            f"{len(result.failures)} failures, {len(result.errors)} errors",
-        )
 
 
 if __name__ == "__main__":

@@ -44,6 +44,77 @@ class LegalTaxonomyTests(unittest.TestCase):
             "Restrictive Covenants",
         )
 
+    def test_recognizes_plain_canonical_topic(
+        self,
+    ) -> None:
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="Pay Equity Laws",
+            ),
+            "Pay Equity Laws",
+        )
+
+    def test_recognizes_canonical_topic_with_trailing_annotation(
+        self,
+    ) -> None:
+        """
+        GATE 0B.4 / PT_PAY_EQUITY_FINDING: a contributor's harmless
+        "(NEW SECTION)" editorial annotation must not hide an
+        otherwise-canonical heading from taxonomy matching.
+        """
+
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="PAY EQUITY LAWS (NEW SECTION)",
+            ),
+            "Pay Equity Laws",
+        )
+
+    def test_recognizes_numbered_canonical_topic_with_trailing_annotation(
+        self,
+    ) -> None:
+        """The exact heading text found in the current PT source."""
+
+        self.assertEqual(
+            get_canonical_legal_topic(
+                section="VI. PAY EQUITY LAWS (NEW SECTION)",
+            ),
+            "Pay Equity Laws",
+        )
+
+    def test_trailing_annotation_never_creates_a_false_match(
+        self,
+    ) -> None:
+        """
+        An unrelated custom heading that happens to carry a
+        parenthetical remark must remain unrecognized - stripping the
+        annotation must never turn non-canonical text into a false
+        canonical match.
+        """
+
+        self.assertIsNone(
+            get_canonical_legal_topic(
+                section=(
+                    "V060 Temporary Validation Section "
+                    "(Draft)"
+                ),
+            )
+        )
+
+    def test_trailing_annotation_stripping_never_blanks_the_label(
+        self,
+    ) -> None:
+        """A label that is nothing but a parenthetical must be left
+        alone rather than reduced to an empty, always-matching
+        string."""
+
+        self.assertEqual(
+            normalize_topic(
+                section="(New Section)",
+            ),
+            "(New Section)",
+        )
+
     def test_recognizes_australian_topic_variant(
         self,
     ) -> None:

@@ -83,7 +83,6 @@ from app.services.document_warnings import (
     TopicCoverageWarning,
     evaluate_topic_coverage,
 )
-from app.services.opensearch_index import LEGAL_DOCUMENTS_ALIAS
 
 
 def _sorted_admin_allowed_countries() -> list[dict[str, str]]:

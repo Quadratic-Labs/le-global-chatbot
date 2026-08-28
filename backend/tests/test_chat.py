@@ -7017,11 +7017,6 @@ class AssistantHistoryBoundingTests(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class LastMileChatHardeningR3Tests(unittest.TestCase):
     """Last-mile regressions found during the real client canary."""
 
@@ -7176,3 +7171,7 @@ class LastMileChatHardeningR3Tests(unittest.TestCase):
             "specify the country",
             response.answer,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

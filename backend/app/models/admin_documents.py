@@ -65,16 +65,6 @@ class AdminDocumentStatsResponse(BaseModel):
         extra = "forbid"
 
 
-class AdminAllowedCountryOption(BaseModel):
-    """One country selectable for a manual upload decision."""
-
-    code: str
-    name: str
-
-    class Config:
-        extra = "forbid"
-
-
 class AdminCountryConflictCandidate(BaseModel):
     """
     One safe, business-facing candidate document in a country conflict

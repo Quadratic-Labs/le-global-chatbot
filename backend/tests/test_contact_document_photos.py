@@ -32,7 +32,9 @@ from app.services.contact_photos import extract_contact_photo_candidates
 from app.services.docx_parser import CONTACT_TABLE_HIDDEN_MARKER
 
 
-SOURCE_ROOT = Path("/data/documents/source")
+from tests.corpus_paths import resolve_source_root
+
+SOURCE_ROOT = resolve_source_root()
 
 _VALID_JPEG = bytes.fromhex(
     "ffd8ffe000104a46494600010100000100010000ffd9"

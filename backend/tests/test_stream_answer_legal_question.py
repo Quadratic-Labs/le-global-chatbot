@@ -3,8 +3,8 @@ Tests for stream_answer_legal_question() (chat-streaming initiative,
 GATE S3).
 
 answer_legal_question() and its own test suite (test_rag_answer.py)
-are completely unaffected - see ExistingRagAnswerRegressionTests at
-the bottom of this file, which re-runs that suite in-process.
+are completely unaffected - the full backend suite already discovers
+and runs test_rag_answer.py independently to prove it.
 
 Fixtures (_build_hit, _build_metrics, FakeGenerationClient, and the
 exact initial/repaired answer text pairs used below) are taken
@@ -843,28 +843,6 @@ class StreamAnswerLegalQuestionTests(unittest.TestCase):
         self.assertIsNotNone(timings.repair_end)
         self.assertLessEqual(timings.repair_start, timings.repair_end)
         self.assertLessEqual(timings.repair_end, timings.finalization)
-
-
-class ExistingRagAnswerRegressionTests(unittest.TestCase):
-    """GATE S3's own explicit requirement: prove answer_legal_question()
-    is unaffected - imports and runs its real, existing suite."""
-
-    def test_existing_rag_answer_suite_still_passes(self) -> None:
-        import io
-        import unittest as _unittest
-
-        from tests import test_rag_answer as _existing_module
-
-        loader = _unittest.TestLoader()
-        suite = loader.loadTestsFromModule(_existing_module)
-        runner = _unittest.TextTestRunner(verbosity=0, stream=io.StringIO())
-        result = runner.run(suite)
-
-        self.assertTrue(
-            result.wasSuccessful(),
-            f"existing answer_legal_question suite regressed: "
-            f"{len(result.failures)} failures, {len(result.errors)} errors",
-        )
 
 
 if __name__ == "__main__":

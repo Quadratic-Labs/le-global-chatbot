@@ -609,21 +609,6 @@ def get_canonical_subsection(
     )
 
 
-def is_known_subsection(
-    parent_topic: str | None,
-    subsection: str,
-) -> bool:
-    """Return whether a subsection is approved for its parent topic."""
-
-    return (
-        get_canonical_subsection(
-            parent_topic=parent_topic,
-            subsection=subsection,
-        )
-        is not None
-    )
-
-
 # Some source documents embed a heading whose content belongs to a
 # different legal topic than the section it is physically placed in
 # (for example, Australia presents "Notice of Termination and

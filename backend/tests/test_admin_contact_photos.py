@@ -39,7 +39,9 @@ from app.services.contact_state import (
 )
 
 
-SOURCE_ROOT = Path("/data/documents/source")
+from tests.corpus_paths import resolve_source_root
+
+SOURCE_ROOT = resolve_source_root()
 
 def _make_valid_jpeg(width: int = 183, height: int = 234) -> bytes:
     """
