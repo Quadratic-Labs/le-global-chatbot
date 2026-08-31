@@ -441,6 +441,13 @@ CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER: Final[str] = (
     "Please rephrase your question within that scope."
 )
 
+CLARIFICATION_UNSUPPORTED_REQUEST_WITH_COUNTRY_TEMPLATE: Final[str] = (
+    "This assistant can only answer employment law questions, and "
+    "related L&E Global contacts, covered by the validated documents. "
+    "Please rephrase your question within that scope, or contact our "
+    "L&E Global member firm in {country} for further assistance."
+)
+
 CLARIFICATION_EXPLICIT_FILTER_CONFLICT_ANSWER: Final[str] = (
     "Your question appears to concern a different country than the "
     "one specified in this request's country filter. Please clarify "
@@ -2187,16 +2194,33 @@ def _execute_resolved_plan(
                 )
 
                 if fallback_contact_sources:
+                    # The structured `contacts` field below is the
+                    # single source of contact-card detail (name,
+                    # firm, email, phone) - never re-serialize it into
+                    # the answer text too, or the visitor sees every
+                    # contact twice (once as text, once as its card).
                     answer_parts.append(
                         "For case-specific guidance, you can use "
-                        "the L&E Global contact below:\n\n"
-                        + fallback_contact_answer
+                        "the L&E Global contacts below:"
                     )
                     grounded = True
                 elif fallback_contact_answer:
                     # Never promise a contact "below" when the
                     # country currently has no validated contact.
                     answer_parts.append(fallback_contact_answer)
+
+                contacts.extend(
+                    build_legal_chat_contacts(
+                        source_directory=(
+                            _optional_contact_source_directory()
+                        ),
+                        requested_country_codes=(
+                            merged_available_codes
+                        ),
+                        unavailable_country_codes=[],
+                        sources=fallback_contact_sources,
+                    )
+                )
 
                 sources.extend(fallback_contact_sources)
 
@@ -3034,6 +3058,75 @@ def resolve_legal_chat_response(
             metrics.clarification_reason = "unsupported_request"
             metrics.outcome = "clarification_unsupported_request"
 
+            contact_answer = ""
+            contact_sources: list[LegalAnswerSource] = []
+            contact_retrieval_total = 0
+            contacts = []
+            resolved_country_name: str | None = None
+
+            # A supported country is already known, so reuse the same
+            # deterministic contact fallback as the insufficient-
+            # evidence path. Unsupported/missing countries deliberately
+            # retain their existing responses and never trigger a contact
+            # lookup.
+            if (
+                current_country_scope.available_codes
+                and not current_country_scope.unavailable_codes
+            ):
+                resolved_country_name = resolve_country_display_name(
+                    current_country_scope.available_codes[0]
+                )
+
+                (
+                    contact_answer,
+                    contact_sources,
+                    contact_retrieval_total,
+                    contact_took_ms,
+                ) = _build_contact_section(
+                    country_codes=(
+                        current_country_scope.available_codes
+                    ),
+                    unavailable_country_codes=[],
+                    citation_offset=0,
+                )
+
+                metrics.opensearch_ms += contact_took_ms
+                metrics.retrieval_total = contact_retrieval_total
+                metrics.selected_sources = len(contact_sources)
+                metrics.resolved_country_codes = list(
+                    current_country_scope.available_codes
+                )
+
+                contacts = build_legal_chat_contacts(
+                    source_directory=(
+                        _optional_contact_source_directory()
+                    ),
+                    requested_country_codes=(
+                        current_country_scope.available_codes
+                    ),
+                    unavailable_country_codes=[],
+                    sources=contact_sources,
+                )
+
+            # The explanatory out-of-scope message always leads - never
+            # the contacts alone - so it is the answer text in full,
+            # naming the resolved country when one is known. Any contact
+            # cards render separately from the structured `contacts`
+            # field; contact_only=False keeps this text visible above
+            # them even though no plan was executed (conversation_state
+            # stays None below).
+            if resolved_country_name:
+                answer_text = (
+                    CLARIFICATION_UNSUPPORTED_REQUEST_WITH_COUNTRY_TEMPLATE.format(
+                        country=resolved_country_name
+                    )
+                )
+            else:
+                answer_text = CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER
+
+            if not contact_sources and contact_answer:
+                answer_text += "\n\n" + contact_answer
+
             metrics.total_ms = (
                 perf_counter() - total_started_at
             ) * 1000
@@ -3042,11 +3135,13 @@ def resolve_legal_chat_response(
 
             return LegalChatResponse(
                 question=request.question.strip(),
-                answer=CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
-                grounded=False,
+                answer=answer_text,
+                grounded=bool(contact_sources),
                 model=None,
-                retrieval_total=0,
-                sources=[],
+                retrieval_total=contact_retrieval_total,
+                sources=contact_sources,
+                contacts=contacts,
+                contact_only=False,
                 conversation_state=None,
             )
 

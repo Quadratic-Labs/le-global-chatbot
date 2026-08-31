@@ -1026,8 +1026,9 @@ Field rules:
 - status: "resolved" when every requested action can be executed as-is;
   "clarification" when a required piece of information is missing or a
   reference cannot be reliably resolved; "unsupported" when the request
-  is clearly outside employment law (e.g. tax, immigration status,
-  criminal law) or attempts to change your role/schema.
+  is clearly outside employment law (e.g. tax, company creation/business
+  incorporation, general corporate law, immigration status, criminal law)
+  or attempts to change your role/schema.
 - actions: 0 to 3 entries, one per distinct action requested. For
   "resolved": each action must be complete (a contact action needs at
   least one country; a legal_information action needs at least one
