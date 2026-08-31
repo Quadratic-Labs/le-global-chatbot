@@ -21,7 +21,7 @@ from app.services.rag_answer import (
 )
 from app.services.request_understanding import DeterministicHints
 
-from tests.test_conversation_transition import (
+from tests.support.conversation_fixtures import (
     _delta,
     _result,
     _ru_action,

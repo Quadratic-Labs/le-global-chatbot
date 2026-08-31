@@ -17,7 +17,7 @@ from app.services.request_understanding import (
     UNDERSTANDING_INSTRUCTIONS,
 )
 
-from tests.test_conversation_transition import (
+from tests.support.conversation_fixtures import (
     _action_state,
     _delta,
     _hints,

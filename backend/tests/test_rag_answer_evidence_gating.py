@@ -17,7 +17,6 @@ import unittest
 from app.models.chat import LegalChatRequest
 from app.models.conversation_state import ConversationSearchConcept
 from app.models.search import LegalSearchHit, LegalSearchResponse
-from app.services.chat_metrics import LegalChatMetrics
 from app.services.rag_answer import (
     EXCLUDED_COUNTRY_HEADING_INSTRUCTION_TEMPLATE,
     INSUFFICIENT_EVIDENCE_ANSWER_TEMPLATE,
@@ -31,6 +30,7 @@ from app.services.rag_answer import (
     _validate_no_subject_drift,
     answer_legal_question,
 )
+from tests.support.rag_fixtures import _build_metrics
 
 
 def _build_hit(
@@ -61,15 +61,6 @@ def _build_hit(
         ),
         source_format="docx",
         reference_year=2026,
-    )
-
-
-def _build_metrics(request_id: str) -> LegalChatMetrics:
-    return LegalChatMetrics(
-        request_id=request_id,
-        question_characters=10,
-        max_sources=6,
-        rerank_enabled=False,
     )
 
 

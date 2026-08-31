@@ -63,16 +63,16 @@ from app.routers.chat import (
 from app.models.search import LegalSearchResponse
 from app.services.contact_state import ContactRecord, ContactState
 
-from tests.test_rag_answer import (
+from tests.support.rag_fixtures import (
     FakeGenerationClient,
     _build_hit,
     _make_search_function,
 )
-from tests.test_stream_answer_legal_question import (
+from tests.support.stream_fixtures import (
     FakeStreamGenerationClient,
     _RepairOnlyClient,
 )
-from tests.test_chat import (
+from tests.support.chat_fixtures import (
     FakeGenerationClient as ChatFakeGenerationClient,
     FakeUnderstandingClient,
     NoCallGenerationClient,

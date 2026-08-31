@@ -27,14 +27,14 @@ from app.services.rag_answer import (
     stream_answer_legal_question,
 )
 
-from tests.test_rag_answer import _build_metrics
+from tests.support.rag_fixtures import _build_metrics
 from tests.test_rag_answer_evidence_gating import (
     _build_hit,
     _make_country_scoped_search_function,
     _make_search_function,
     _remote_work_concept,
 )
-from tests.test_stream_answer_legal_question import (
+from tests.support.stream_fixtures import (
     FakeStreamGenerationClient,
     _RepairOnlyClient,
     _delta_events,

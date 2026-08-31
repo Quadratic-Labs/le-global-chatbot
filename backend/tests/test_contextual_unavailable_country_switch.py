@@ -7,7 +7,7 @@ from app.services.conversation_transition import (
     apply_conversation_transition,
 )
 
-from tests.test_conversation_transition import (
+from tests.support.conversation_fixtures import (
     _action_state,
     _delta,
     _hints,
