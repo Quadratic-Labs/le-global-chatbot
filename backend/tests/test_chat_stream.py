@@ -38,7 +38,7 @@ from fastapi import HTTPException, Response
 
 from app.clients.openai_responses import OpenAIConfigurationError
 from app.clients.openai_responses_stream import StreamEvent, StreamEventType
-from app.models.chat import LegalChatRequest, LegalChatResponse
+from app.models.chat import LegalChatContact, LegalChatRequest, LegalChatResponse
 from app.services.conversation_transition import ConversationTransitionError
 from app.services.country_detection import CountryDetectionError
 from app.services.rag_answer import (
@@ -56,7 +56,7 @@ from app.routers.chat_stream import (
     legal_chat_stream,
 )
 from app.routers.chat import (
-    CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
+    CLARIFICATION_UNSUPPORTED_REQUEST_WITH_COUNTRY_TEMPLATE,
     legal_chat as real_legal_chat,
     resolve_legal_chat_response as real_resolve_legal_chat_response,
 )
@@ -80,6 +80,7 @@ from tests.test_chat import (
     _FailingUnderstandingClient,
     _build_contact_hit,
     _catalog_provider,
+    _catalog_provider_with_france,
     _document_topic_provider,
     _understanding_action,
     _understanding_result,
@@ -102,6 +103,7 @@ def _fake_settings() -> SimpleNamespace:
         rerank_pool_multiplier=1,
         rag_max_context_characters=12000,
         rag_max_source_characters=6000,
+        document_source_dir=Path("/fake/source/dir"),
     )
 
 
@@ -2073,7 +2075,22 @@ class NamedEarlyResponseRouteTests(unittest.TestCase):
             understanding_client=understanding_client,
         )
         p1, p2, p3 = _patch_chat_stream(pipeline=pipeline)
-        with p1, p2, p3:
+        with p1, p2, p3, mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            return_value=LegalSearchResponse(
+                query="",
+                total=1,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_contact_hit(
+                        country_code="ES",
+                        country="Spain",
+                    )
+                ],
+            ),
+        ):
             http_response, records = _run(
                 _call_and_consume(
                     legal_chat_stream(
@@ -2092,13 +2109,18 @@ class NamedEarlyResponseRouteTests(unittest.TestCase):
         types = [r["type"] for r in records]
         self.assertEqual(["start", "delta", "metadata", "done"], types)
         self.assertEqual(
-            CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER, records[1]["text"],
+            CLARIFICATION_UNSUPPORTED_REQUEST_WITH_COUNTRY_TEMPLATE.format(
+                country="Spain"
+            ),
+            records[1]["text"],
         )
         metadata = records[2]
-        self.assertFalse(metadata["grounded"])
+        self.assertTrue(metadata["grounded"])
         self.assertIsNone(metadata["model"])
-        self.assertEqual(0, metadata["retrieval_total"])
-        self.assertEqual([], metadata["sources"])
+        self.assertEqual(1, metadata["retrieval_total"])
+        self.assertEqual(1, len(metadata["sources"]))
+        self.assertEqual("ES", metadata["sources"][0]["country_code"])
+        self.assertFalse(metadata["contact_only"])
 
     # -- F: contact-only --------------------------------------------------
 
@@ -2810,15 +2832,6 @@ class StableVsStreamEquivalenceTests(unittest.TestCase):
                 )
             )
 
-        stable = _run_real_chat_route(
-            request,
-            catalog_provider=_catalog_provider,
-            document_topic_provider=_document_topic_provider,
-            search_function=_unexpected_search,
-            generation_client=NoCallGenerationClient(),
-            understanding_client=make_understanding_client(),
-        )
-
         pipeline = _real_orchestration_pipeline(
             catalog_provider=_catalog_provider,
             document_topic_provider=_document_topic_provider,
@@ -2826,9 +2839,35 @@ class StableVsStreamEquivalenceTests(unittest.TestCase):
             generation_client=NoCallGenerationClient(),
             understanding_client=make_understanding_client(),
         )
-        reconstructed = self._stream_reconstructed(
-            request, pipeline=pipeline, x_request_id="eq-clarify",
-        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            return_value=LegalSearchResponse(
+                query="",
+                total=1,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_contact_hit(
+                        country_code="ES",
+                        country="Spain",
+                    )
+                ],
+            ),
+        ):
+            stable = _run_real_chat_route(
+                request,
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=make_understanding_client(),
+            )
+
+            reconstructed = self._stream_reconstructed(
+                request, pipeline=pipeline, x_request_id="eq-clarify",
+            )
 
         self._assert_equivalent(stable, reconstructed)
 
@@ -2941,6 +2980,107 @@ class StableVsStreamEquivalenceTests(unittest.TestCase):
         )
 
         self._assert_equivalent(stable, reconstructed)
+
+    def test_insufficient_evidence_fallback_contacts_not_duplicated(
+        self,
+    ) -> None:
+        """
+        The insufficient-evidence contact fallback appends a lead-in
+        sentence plus structured `contacts` - never the raw contact
+        text a second time - and the stream-reconstructed response
+        must match the stable one exactly, including that omission.
+        """
+
+        request = LegalChatRequest(
+            question="Can employees work remotely in France?"
+        )
+
+        def make_understanding_client():
+            return FakeUnderstandingClient(
+                payload=_understanding_result(
+                    actions=[
+                        _understanding_action(
+                            "legal_information",
+                            country_codes=["FR"],
+                            legal_topics=["Working Conditions"],
+                            subject_text="remote work",
+                            search_concepts=[
+                                {"terms": ["remote work", "telework"]}
+                            ],
+                            subject_specificity="specific",
+                            evidence_mode="direct_topic",
+                        )
+                    ],
+                )
+            )
+
+        def unrelated_legal_search(req) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=req.query, total=1, limit=req.limit, offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country_code="FR", country="France",
+                        content="Standard working hours are 9am to 5pm.",
+                    )
+                ],
+            )
+
+        def fake_contact_search(country_codes, client=None):
+            return LegalSearchResponse(
+                query="", total=1, limit=20, offset=0, took_ms=1,
+                hits=[_build_contact_hit(country_code="FR", country="France")],
+            )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=fake_contact_search,
+        ), mock.patch(
+            "app.routers.chat.build_legal_chat_contacts",
+            return_value=[
+                LegalChatContact(
+                    contact_id="contact-france",
+                    country_code="FR",
+                    member_firm="Test Firm",
+                    contact_person="France Contact",
+                    email="contact@test-firm.example",
+                )
+            ],
+        ):
+            stable = _run_real_chat_route(
+                request,
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=unrelated_legal_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=make_understanding_client(),
+            )
+
+            pipeline = _real_orchestration_pipeline(
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=unrelated_legal_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=make_understanding_client(),
+            )
+            reconstructed = self._stream_reconstructed(
+                request, pipeline=pipeline, x_request_id="eq-fallback-contacts",
+            )
+
+        self._assert_equivalent(stable, reconstructed)
+
+        for response in (stable, reconstructed):
+            self.assertIn(
+                "L&E Global contacts below", response.answer,
+            )
+            self.assertNotIn("Test Firm", response.answer)
+            self.assertNotIn(
+                "contact@test-firm.example", response.answer,
+            )
+            self.assertEqual(
+                ["FR"],
+                [c.country_code for c in response.contacts],
+            )
 
     def test_assistant_help_meta(self) -> None:
         request = LegalChatRequest(question="What can you do?")

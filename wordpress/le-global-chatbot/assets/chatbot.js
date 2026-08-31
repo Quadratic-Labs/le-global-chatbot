@@ -27,6 +27,11 @@
     const HISTORY_QUESTION_MAX_CHARACTERS = 2000;
     const HISTORY_ANSWER_MAX_CHARACTERS = 3000;
 
+    // Matches the textarea's CSS max-height. getComputedStyle() is
+    // preferred at runtime so this remains only a safe fallback when
+    // styles cannot be read (for example, in a minimal test DOM).
+    const QUESTION_INPUT_MAX_HEIGHT_PX = 160;
+
     // Scaled proportionally with DEFAULT_MAX_HISTORY_MESSAGES
     // (previously 10000 for 6 messages), matching the backend's own
     // HISTORY_TOTAL_MAX_CHARACTERS exactly - the per-message limits
@@ -41,12 +46,87 @@
         "le_global_chatbot_conversation_v1"
     );
 
-    // Version 2 adds conversationState (structured routing context
-    // for the next turn) and a per-message hasDisclaimer flag
-    // alongside the existing messages array - a version 1 payload
-    // (messages only) is detected by normalizeStoredConversation()
-    // and discarded rather than misread.
+    // Version 2 carries conversationState (structured routing context
+    // for the next turn) plus per-message rendering metadata alongside
+    // the existing messages array. contactOnly is optional within this
+    // version so already-stored v2 conversations retain the legacy
+    // source-based display behavior. A version 1 payload (messages only)
+    // is detected by normalizeStoredConversation() and discarded rather
+    // than misread.
     const CONVERSATION_STORAGE_VERSION = 2;
+
+    /**
+     * Resize the existing question textarea to its content, up to the
+     * CSS maximum. Measuring from zero avoids retaining a previous
+     * multi-line height after text is removed. The two border widths
+     * are added because scrollHeight includes padding but not borders,
+     * while this widget uses border-box sizing.
+     */
+    function autoResizeQuestionInput(
+        questionInput,
+        readComputedStyle
+    ) {
+        if (!questionInput || !questionInput.style) {
+            return;
+        }
+
+        const styleReader = (
+            readComputedStyle
+            || (
+                typeof window !== "undefined"
+                && typeof window.getComputedStyle === "function"
+                    ? window.getComputedStyle.bind(window)
+                    : null
+            )
+        );
+
+        questionInput.style.height = "0px";
+        questionInput.style.overflowY = "hidden";
+
+        const computedStyle = styleReader
+            ? styleReader(questionInput)
+            : null;
+
+        const pixelValue = (propertyName) => {
+            if (!computedStyle) {
+                return 0;
+            }
+
+            const parsed = Number.parseFloat(
+                computedStyle[propertyName]
+            );
+
+            return Number.isFinite(parsed) ? parsed : 0;
+        };
+
+        const configuredMaximum = pixelValue("maxHeight");
+        const maximumHeight = configuredMaximum > 0
+            ? configuredMaximum
+            : QUESTION_INPUT_MAX_HEIGHT_PX;
+
+        const borderHeight = (
+            pixelValue("borderTopWidth")
+            + pixelValue("borderBottomWidth")
+        );
+
+        const contentHeight = Math.max(
+            0,
+            Number(questionInput.scrollHeight) || 0
+        );
+
+        const requiredHeight = contentHeight + borderHeight;
+        const nextHeight = Math.min(
+            requiredHeight,
+            maximumHeight
+        );
+
+        questionInput.style.height = `${nextHeight}px`;
+        questionInput.style.overflowY = (
+            requiredHeight > maximumHeight
+                ? "auto"
+                : "hidden"
+        );
+    }
 
     // GATE S7-LITE: the only /chat/stream NDJSON protocol version this
     // client understands - matches the backend's own
@@ -204,6 +284,84 @@
             });
     }
 
+    function hasOnlyContactSources(rawSources) {
+        return (
+            Array.isArray(rawSources)
+            && rawSources.length > 0
+            && rawSources.every((source) => (
+                source
+                && typeof source === "object"
+                && String(
+                    source.subsection
+                    || source.section
+                    || ""
+                )
+                    .trim()
+                    .toLowerCase() === "contact"
+            ))
+        );
+    }
+
+    /**
+     * Decide whether a settled response is a pure contact lookup whose
+     * duplicate text answer should be replaced by cards.
+     *
+     * Contact sources alone are not sufficient: a missing-evidence legal
+     * answer can append deterministic contact sources after retrieval has
+     * produced no citeable legal source. Its structured conversation state
+     * still names the real comparison/legal action, so that answer must stay
+     * visible above the cards. Older/direct deterministic responses without
+     * conversation state retain the established source-based behavior -
+     * unless the backend sends an explicit contact_only override (e.g. an
+     * out-of-scope explanation, which also lacks conversation state but is
+     * never a duplicate of the contact cards).
+     */
+    function isContactOnlyResponse(response) {
+        if (response && typeof response.contact_only === "boolean") {
+            return response.contact_only;
+        }
+
+        if (
+            !response
+            || normalizePublicContacts(response.contacts).length === 0
+            || !hasOnlyContactSources(response.sources)
+        ) {
+            return false;
+        }
+
+        const state = response.conversation_state;
+        const actions = (
+            state
+            && typeof state === "object"
+            && !Array.isArray(state)
+            && Array.isArray(state.actions)
+                ? state.actions
+                : null
+        );
+
+        if (!actions || actions.length === 0) {
+            return true;
+        }
+
+        return actions.every((action) => (
+            action
+            && typeof action === "object"
+            && action.type === "contact"
+        ));
+    }
+
+    function isContactOnlyTurn(turn) {
+        if (turn && typeof turn.contactOnly === "boolean") {
+            return turn.contactOnly;
+        }
+
+        return Boolean(
+            turn
+            && normalizePublicContacts(turn.contacts).length > 0
+            && hasOnlyContactSources(turn.sources)
+        );
+    }
+
     function normalizeStoredConversationState(rawConversationState) {
         if (
             !rawConversationState
@@ -284,6 +442,10 @@
                 message.hasDisclaimer = Boolean(
                     entry.hasDisclaimer
                 );
+
+                if (typeof entry.contactOnly === "boolean") {
+                    message.contactOnly = entry.contactOnly;
+                }
             }
 
             normalizedMessages.push(message);
@@ -452,6 +614,7 @@
                         hasDisclaimer: Boolean(
                             turn.hasDisclaimer
                         ),
+                        contactOnly: isContactOnlyTurn(turn),
                     }
                 );
             });
@@ -536,6 +699,9 @@
                     ),
                     hasDisclaimer: Boolean(
                         assistantMessage.hasDisclaimer
+                    ),
+                    contactOnly: isContactOnlyTurn(
+                        assistantMessage
                     ),
                     errorMessage: null,
                 }
@@ -1024,8 +1190,14 @@
                 characterCount.textContent = String(
                     questionInput.value.length
                 );
+
+                autoResizeQuestionInput(questionInput);
             }
         );
+
+        // Start at the same compact one-line height used after every
+        // reset. Shift+Enter and wrapped text grow it from here.
+        autoResizeQuestionInput(questionInput);
 
         questionInput.addEventListener(
             "keydown",
@@ -1088,6 +1260,7 @@
                     answer: null,
                     sources: [],
                     contacts: [],
+                    contactOnly: false,
                     errorMessage: null,
                 };
 
@@ -1110,6 +1283,7 @@
 
                 questionInput.value = "";
                 characterCount.textContent = "0";
+                autoResizeQuestionInput(questionInput);
                 questionInput.focus();
 
                 renderMessageList();
@@ -1291,6 +1465,9 @@
                     turn.answer = renumbered.answer;
                     turn.sources = renumbered.sources;
                     turn.contacts = normalizePublicContacts(response.contacts);
+                    turn.contactOnly = isContactOnlyResponse(
+                        response
+                    );
                     // Routing state may survive a clarification.
                     // Grounding is the authoritative disclaimer signal.
                     turn.hasDisclaimer = Boolean(
@@ -1589,6 +1766,7 @@
 
             questionInput.value = "";
             characterCount.textContent = "0";
+            autoResizeQuestionInput(questionInput);
             questionInput.focus();
         }
 
@@ -1727,23 +1905,7 @@
                 turn.contacts
             );
 
-            const sources = Array.isArray(turn.sources)
-                ? turn.sources
-                : [];
-
-            const contactOnly = (
-                contacts.length > 0
-                && sources.length > 0
-                && sources.every((source) => (
-                    String(
-                        source.subsection
-                        || source.section
-                        || ""
-                    )
-                        .trim()
-                        .toLowerCase() === "contact"
-                ))
-            );
+            const contactOnly = isContactOnlyTurn(turn);
 
             if (contactOnly) {
                 assistantBubble.classList.add(
@@ -2634,6 +2796,13 @@
                     ? metadata.contacts
                     : []
             ),
+            // isContactOnlyResponse()'s explicit override only fires
+            // when this is a real boolean - carrying it through
+            // unchanged (including a JSON null from an unset backend
+            // value) preserves that contract for a streamed response
+            // exactly as for a non-streamed one, where it survives
+            // untouched as part of the raw parsed JSON already.
+            contact_only: metadata.contact_only,
             conversation_state: (
                 metadata.conversation_state !== undefined
                     ? metadata.conversation_state
@@ -2829,6 +2998,10 @@
             createStreamingBubbleController,
             answerTextForDisplay,
             cancelActiveStream,
+            isContactOnlyResponse,
+            isContactOnlyTurn,
+            autoResizeQuestionInput,
+            QUESTION_INPUT_MAX_HEIGHT_PX,
         };
     }
 })();

@@ -290,6 +290,14 @@ class LegalChatResponse(BaseModel):
         default_factory=list
     )
 
+    # Explicit override for the client's contact-only card rendering
+    # heuristic (which otherwise infers "contact only" from an absent
+    # conversation_state). False marks a response whose answer text is
+    # substantive and must stay visible above any contact cards - e.g.
+    # the out-of-scope explanation - even though no plan was executed.
+    # None leaves the client's existing heuristic untouched.
+    contact_only: bool | None = None
+
     conversation_state: ConversationState | None = None
 
     class Config:

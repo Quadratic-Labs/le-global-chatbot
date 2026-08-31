@@ -37,7 +37,7 @@ from app.routers.chat import (
     CLARIFICATION_LEGAL_MISSING_COUNTRY_ANSWER,
     CLARIFICATION_MISSING_COMPARISON_COUNTRIES_ANSWER,
     CLARIFICATION_MISSING_COMPARISON_TOPIC_ANSWER,
-    CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
+    CLARIFICATION_UNSUPPORTED_REQUEST_WITH_COUNTRY_TEMPLATE,
     CONTACT_CLARIFICATION_ANSWER,
     resolve_legal_chat_response,
 )
@@ -864,21 +864,44 @@ class ClarificationWordingTests(unittest.TestCase):
             )
         )
 
-        response = resolve_legal_chat_response(
-            request=LegalChatRequest(
-                question="Tell me about taxes in Peru."
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            return_value=LegalSearchResponse(
+                query="",
+                total=1,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_contact_hit(
+                        country_code="PE",
+                        country="Peru",
+                    )
+                ],
             ),
-            catalog_provider=_catalog_provider,
-            document_topic_provider=_document_topic_provider,
-            search_function=_fail_if_called,
-            understanding_client=understanding_client,
-        )
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="Tell me about taxes in Peru."
+                ),
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_fail_if_called,
+                understanding_client=understanding_client,
+            )
 
         self.assertEqual(
-            response.answer, CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER
+            CLARIFICATION_UNSUPPORTED_REQUEST_WITH_COUNTRY_TEMPLATE.format(
+                country="Peru"
+            ),
+            response.answer,
         )
-        self.assertFalse(response.grounded)
-        self.assertEqual(response.retrieval_total, 0)
+        self.assertEqual(
+            ["PE"], [item.country_code for item in response.sources]
+        )
+        self.assertTrue(response.grounded)
+        self.assertFalse(response.contact_only)
+        self.assertEqual(response.retrieval_total, 1)
 
 
 class ExplicitFilterConflictTests(unittest.TestCase):

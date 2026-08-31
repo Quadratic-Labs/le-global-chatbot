@@ -26,6 +26,7 @@ from app.models.catalog import (
     LegalCatalogResponse,
 )
 from app.models.chat import (
+    LegalChatContact,
     LegalChatHistoryMessage,
     LegalChatRequest,
 )
@@ -111,6 +112,40 @@ def _catalog_provider() -> LegalCatalogResponse:
     return _build_catalog()
 
 
+def _catalog_provider_with_france() -> LegalCatalogResponse:
+    """Return the test catalog with France explicitly supported."""
+
+    return LegalCatalogResponse(
+        countries=[
+            *_build_catalog().countries,
+            LegalCatalogCountry(
+                country_code="FR",
+                country="France",
+                chunk_count=29,
+            ),
+        ],
+        legal_topics=[],
+        subsections=[],
+    )
+
+
+def _catalog_provider_with_germany() -> LegalCatalogResponse:
+    """Return the test catalog with Germany explicitly supported."""
+
+    return LegalCatalogResponse(
+        countries=[
+            *_build_catalog().countries,
+            LegalCatalogCountry(
+                country_code="DE",
+                country="Germany",
+                chunk_count=29,
+            ),
+        ],
+        legal_topics=[],
+        subsections=[],
+    )
+
+
 def _build_hit(
     *,
     country_code: str,
@@ -183,6 +218,22 @@ def _unexpected_search(
     raise AssertionError(
         "OpenSearch must not be called "
         "for an unsupported request."
+    )
+
+
+def _empty_contact_search(
+    country_codes: list[str],
+    client: Any = None,
+) -> LegalSearchResponse:
+    """Return a deterministic no-contact result for fallback tests."""
+
+    return LegalSearchResponse(
+        query="",
+        total=0,
+        limit=20,
+        offset=0,
+        took_ms=0,
+        hits=[],
     )
 
 
@@ -516,7 +567,7 @@ class ChatScopeTests(unittest.TestCase):
             response.answer,
         )
 
-    def test_tax_question_returns_fallback_without_search(
+    def test_tax_question_returns_fallback_without_legal_search(
         self,
     ) -> None:
         # Tax is clearly outside employment law - a well-behaved model
@@ -529,21 +580,25 @@ class ChatScopeTests(unittest.TestCase):
             )
         )
 
-        response = resolve_legal_chat_response(
-            request=LegalChatRequest(
-                question=(
-                    "What are the corporate income "
-                    "tax rules in Spain?"
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=_empty_contact_search,
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question=(
+                        "What are the corporate income "
+                        "tax rules in Spain?"
+                    ),
+                    country_codes=[
+                        "ES",
+                    ],
                 ),
-                country_codes=[
-                    "ES",
-                ],
-            ),
-            catalog_provider=_catalog_provider,
-            document_topic_provider=_document_topic_provider,
-            search_function=_unexpected_search,
-            understanding_client=understanding_client,
-        )
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                understanding_client=understanding_client,
+            )
 
         self.assertFalse(
             response.grounded
@@ -554,7 +609,7 @@ class ChatScopeTests(unittest.TestCase):
             [],
         )
 
-    def test_vat_question_returns_fallback_without_search(
+    def test_vat_question_returns_fallback_without_legal_search(
         self,
     ) -> None:
         understanding_client = FakeUnderstandingClient(
@@ -564,18 +619,22 @@ class ChatScopeTests(unittest.TestCase):
             )
         )
 
-        response = resolve_legal_chat_response(
-            request=LegalChatRequest(
-                question="What is the VAT rate in Italy?",
-                country_codes=[
-                    "IT",
-                ],
-            ),
-            catalog_provider=_catalog_provider,
-            document_topic_provider=_document_topic_provider,
-            search_function=_unexpected_search,
-            understanding_client=understanding_client,
-        )
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=_empty_contact_search,
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="What is the VAT rate in Italy?",
+                    country_codes=[
+                        "IT",
+                    ],
+                ),
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                understanding_client=understanding_client,
+            )
 
         self.assertFalse(
             response.grounded
@@ -586,7 +645,7 @@ class ChatScopeTests(unittest.TestCase):
             [],
         )
 
-    def test_patents_question_returns_fallback_without_search(
+    def test_patents_question_returns_fallback_without_legal_search(
         self,
     ) -> None:
         understanding_client = FakeUnderstandingClient(
@@ -596,21 +655,25 @@ class ChatScopeTests(unittest.TestCase):
             )
         )
 
-        response = resolve_legal_chat_response(
-            request=LegalChatRequest(
-                question=(
-                    "What about patents and inventions "
-                    "for employees in Spain?"
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=_empty_contact_search,
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question=(
+                        "What about patents and inventions "
+                        "for employees in Spain?"
+                    ),
+                    country_codes=[
+                        "ES",
+                    ],
                 ),
-                country_codes=[
-                    "ES",
-                ],
-            ),
-            catalog_provider=_catalog_provider,
-            document_topic_provider=_document_topic_provider,
-            search_function=_unexpected_search,
-            understanding_client=understanding_client,
-        )
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                understanding_client=understanding_client,
+            )
 
         self.assertFalse(
             response.grounded
@@ -1352,9 +1415,9 @@ class ChatMetricsTests(unittest.TestCase):
         # Tax is outside employment law entirely - no canonical topic
         # matches, so this now goes through the semantic-understanding
         # "unsupported" status (mocked here) rather than the old,
-        # generic documentary-insufficiency message. OpenSearch must
-        # still never be called: a clarification is returned, not a
-        # search result.
+        # generic documentary-insufficiency message. Legal retrieval
+        # must still never be called; only the deterministic contact
+        # lookup is allowed.
         understanding_client = FakeUnderstandingClient(
             payload=_understanding_result(
                 status="unsupported",
@@ -1362,7 +1425,10 @@ class ChatMetricsTests(unittest.TestCase):
             )
         )
 
-        with self.assertLogs(
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=_empty_contact_search,
+        ), self.assertLogs(
             self.LOGGER_NAME,
             level="INFO",
         ) as log_context:
@@ -1830,6 +1896,382 @@ class NoCallGenerationClient:
             "OpenAI must not be called for a "
             "deterministic contact response."
         )
+
+
+class CountryContactFallbackRegressionTests(unittest.TestCase):
+    """Focused contract for supported-country fallback contacts."""
+
+    @staticmethod
+    def _france_contact_search(
+        country_codes: list[str],
+        client: Any = None,
+    ) -> LegalSearchResponse:
+        if [code.upper() for code in country_codes] != ["FR"]:
+            raise AssertionError(
+                "Only the resolved France contact may be searched."
+            )
+
+        return LegalSearchResponse(
+            query="",
+            total=1,
+            limit=20,
+            offset=0,
+            took_ms=1,
+            hits=[
+                _build_contact_hit(
+                    country_code="FR",
+                    country="France",
+                )
+            ],
+        )
+
+    @staticmethod
+    def _france_contact_card() -> LegalChatContact:
+        return LegalChatContact(
+            contact_id="contact-france",
+            country_code="FR",
+            member_firm="Test Firm",
+            contact_person="France Contact",
+            email="contact@test-firm.example",
+        )
+
+    def test_a_supported_france_out_of_scope_returns_contact(
+        self,
+    ) -> None:
+        from app.services.request_understanding import (
+            UNDERSTANDING_INSTRUCTIONS,
+        )
+
+        self.assertIn(
+            "company creation/business",
+            UNDERSTANDING_INSTRUCTIONS,
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="unsupported",
+                clarification_reason="unsupported_request",
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=self._france_contact_search,
+        ), mock.patch(
+            "app.routers.chat.build_legal_chat_contacts",
+            return_value=[self._france_contact_card()],
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="In France, how can I create my company?"
+                ),
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=understanding_client,
+            )
+
+        self.assertEqual(
+            "This assistant can only answer employment law questions, "
+            "and related L&E Global contacts, covered by the validated "
+            "documents. Please rephrase your question within that "
+            "scope, or contact our L&E Global member firm in France "
+            "for further assistance.",
+            response.answer,
+        )
+        self.assertNotIn("Test Firm", response.answer)
+        self.assertNotIn("incorporat", response.answer.casefold())
+        self.assertNotIn("register", response.answer.casefold())
+        self.assertTrue(response.grounded)
+        self.assertFalse(response.contact_only)
+        self.assertEqual(1, len(response.sources))
+        self.assertEqual(["FR"], [item.country_code for item in response.contacts])
+
+    def test_a2_supported_germany_out_of_scope_returns_contact(
+        self,
+    ) -> None:
+        def germany_contact_search(
+            country_codes: list[str],
+            client: Any = None,
+        ) -> LegalSearchResponse:
+            if [code.upper() for code in country_codes] != ["DE"]:
+                raise AssertionError(
+                    "Only the resolved Germany contact may be searched."
+                )
+
+            return LegalSearchResponse(
+                query="",
+                total=1,
+                limit=20,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_contact_hit(
+                        country_code="DE",
+                        country="Germany",
+                    )
+                ],
+            )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="unsupported",
+                clarification_reason="unsupported_request",
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=germany_contact_search,
+        ), mock.patch(
+            "app.routers.chat.build_legal_chat_contacts",
+            return_value=[
+                LegalChatContact(
+                    contact_id="contact-germany",
+                    country_code="DE",
+                    member_firm="Test Firm",
+                    contact_person="Germany Contact",
+                    email="contact@test-firm.example",
+                )
+            ],
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="In Germany, how can I incorporate a company?"
+                ),
+                catalog_provider=_catalog_provider_with_germany,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=understanding_client,
+            )
+
+        self.assertEqual(
+            "This assistant can only answer employment law questions, "
+            "and related L&E Global contacts, covered by the validated "
+            "documents. Please rephrase your question within that "
+            "scope, or contact our L&E Global member firm in Germany "
+            "for further assistance.",
+            response.answer,
+        )
+        self.assertNotIn("incorporat", response.answer.casefold())
+        self.assertTrue(response.grounded)
+        self.assertFalse(response.contact_only)
+        self.assertEqual(1, len(response.sources))
+        self.assertEqual(["DE"], [item.country_code for item in response.contacts])
+
+    def test_b_normal_france_legal_answer_is_unchanged(
+        self,
+    ) -> None:
+        legal_answer = (
+            "France\n"
+            "- Employers must follow the validated termination rules "
+            "described in the source. [1]"
+        )
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["FR"],
+                        legal_topics=[
+                            "Termination of Employment Contracts"
+                        ],
+                    )
+                ],
+                current_message_delta=_current_message_delta(
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["FR"],
+                    explicit_legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                ),
+            )
+        )
+
+        def legal_search(request: Any) -> LegalSearchResponse:
+            hit = _build_hit(
+                country_code="FR",
+                country="France",
+                content=(
+                    "Employers must follow the validated termination "
+                    "rules described in the source."
+                ),
+            ).model_copy(
+                update={
+                    "legal_topic": (
+                        "Termination of Employment Contracts"
+                    ),
+                    "section": (
+                        "Termination of Employment Contracts"
+                    ),
+                }
+            )
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[hit],
+            )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=AssertionError(
+                "A grounded legal answer must not force contacts."
+            ),
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question=(
+                        "What are the main termination rules in France?"
+                    )
+                ),
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=legal_search,
+                generation_client=FakeGenerationClient(legal_answer),
+                understanding_client=understanding_client,
+            )
+
+        self.assertEqual(legal_answer, response.answer)
+        self.assertTrue(response.grounded)
+        self.assertEqual([], response.contacts)
+
+    def test_c_recognized_unsupported_country_is_unchanged(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="clarification",
+                clarification_reason="missing_country",
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+        ) as contact_search:
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question=(
+                        "What are the main termination rules in France?"
+                    )
+                ),
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                understanding_client=understanding_client,
+            )
+
+        contact_search.assert_not_called()
+        self.assertFalse(response.grounded)
+        self.assertEqual([], response.contacts)
+        self.assertIn("not currently covered", response.answer)
+
+    def test_d_question_without_country_still_clarifies(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="clarification",
+                clarification_reason="missing_country",
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+        ) as contact_search:
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="What are the main termination rules?"
+                ),
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                understanding_client=understanding_client,
+            )
+
+        contact_search.assert_not_called()
+        self.assertFalse(response.grounded)
+        self.assertEqual([], response.contacts)
+        self.assertEqual(
+            "Which country would you like information about?",
+            response.answer,
+        )
+
+    def test_e_insufficient_evidence_keeps_contact_fallback(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["FR"],
+                        legal_topics=["Working Conditions"],
+                        subject_text="remote work",
+                        search_concepts=[
+                            {"terms": ["remote work", "telework"]}
+                        ],
+                        subject_specificity="specific",
+                        evidence_mode="direct_topic",
+                    )
+                ],
+                current_message_delta=_current_message_delta(
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["FR"],
+                    explicit_legal_topics=["Working Conditions"],
+                    explicit_subject_text="remote work",
+                ),
+            )
+        )
+
+        def unrelated_legal_search(request: Any) -> LegalSearchResponse:
+            return LegalSearchResponse(
+                query=request.query,
+                total=1,
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=[
+                    _build_hit(
+                        country_code="FR",
+                        country="France",
+                        content="Standard working hours are 9am to 5pm.",
+                    )
+                ],
+            )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+            side_effect=self._france_contact_search,
+        ), mock.patch(
+            "app.routers.chat.build_legal_chat_contacts",
+            return_value=[self._france_contact_card()],
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="Can employees work remotely in France?"
+                ),
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=unrelated_legal_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=understanding_client,
+            )
+
+        self.assertIn(
+            "cannot reliably determine remote work for France",
+            response.answer,
+        )
+        self.assertIn("L&E Global contacts below", response.answer)
+        self.assertNotIn("Test Firm", response.answer)
+        self.assertNotIn("contact@test-firm.example", response.answer)
+        self.assertEqual(["FR"], [item.country_code for item in response.contacts])
+        self.assertEqual(1, len(response.sources))
 
 
 class LegalChatRouteTransitionErrorTests(unittest.TestCase):

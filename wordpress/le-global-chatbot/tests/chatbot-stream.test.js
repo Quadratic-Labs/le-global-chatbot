@@ -401,6 +401,62 @@ test("requestStream reconstruction: contacts are preserved from metadata", async
     assert.deepEqual(response.contacts, contacts);
 });
 
+test("requestStream reconstruction: contact_only survives from metadata and keeps an out-of-scope explanation visible", async () => {
+    const contacts = [
+        {
+            contact_id: "contact-france",
+            country_code: "FR",
+            member_firm: "Flichy Grangé Avocats",
+            contact_person: "Caroline Scherrmann",
+            email: "scherrmann@flichy.com",
+        },
+    ];
+
+    const explanation = (
+        "This assistant can only answer employment law "
+        + "questions, and related L&E Global contacts, covered "
+        + "by the validated documents. Please rephrase your "
+        + "question within that scope, or contact our L&E "
+        + "Global member firm in France for further assistance."
+    );
+
+    const records = [
+        { type: "start", protocol_version: 1, request_id: "r-oos" },
+        { type: "delta", text: explanation },
+        {
+            type: "metadata",
+            question: "In France, how can I create my company?",
+            grounded: true,
+            model: null,
+            retrieval_total: 1,
+            sources: [
+                { country_code: "FR", subsection: "Contact" },
+            ],
+            contacts,
+            contact_only: false,
+            conversation_state: null,
+        },
+        { type: "done", request_id: "r-oos" },
+    ];
+
+    installFakeStreamFetch(bytesFromLines(ndjsonLines(records)));
+
+    const response = await chatbot.requestStream(
+        "https://example.test/chat/stream",
+        {}
+    );
+
+    // Before this fix, buildReconstructedChatResponse() silently
+    // dropped contact_only, so isContactOnlyResponse() fell back to
+    // its legacy no-conversation-state heuristic and hid this exact
+    // explanatory answer behind the contact cards in a real streamed
+    // browser session (the default transport) - even though the same
+    // response worked correctly over plain /chat.
+    assert.equal(response.contact_only, false);
+    assert.equal(response.answer, explanation);
+    assert.equal(chatbot.isContactOnlyResponse(response), false);
+});
+
 test("requestStream reconstruction: conversation_state is preserved from metadata", async () => {
     const conversationState = {
         version: 1,
