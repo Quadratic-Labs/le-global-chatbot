@@ -9,7 +9,7 @@ from fastapi import (
 from app.models.frontend import (
     FrontendConfigResponse,
 )
-from app.services.frontend_config import (
+from app.services.legal_catalog import (
     FrontendConfigError,
     get_frontend_config,
 )

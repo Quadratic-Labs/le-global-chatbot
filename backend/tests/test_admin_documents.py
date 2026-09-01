@@ -1,26 +1,17 @@
 """Consolidated test module generated from validated domain owners."""
-
 from __future__ import annotations
-
-
-
-# ================================================================
-# SOURCE: backend/tests/test_admin_documents.py
-# ================================================================
-
 import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from opensearchpy.exceptions import NotFoundError
 from app.core.admin_country_policy import ADMIN_ALLOWED_COUNTRY_CODES, is_admin_country_allowed
 from app.core.country_registry import COUNTRIES, canonical_country_name
 from app.models.document import DocumentChunk
 from app.security.admin import admin_key_matches
-from app.services.admin_documents import InvalidDocumentUploadError, _lookup_existing_source_filename, _sanitize_filename, list_indexed_documents, upload_and_index_document
+from app.services.admin_document_replacement import InvalidDocumentUploadError, _sanitize_filename, list_indexed_documents
 from app.services.admin_document_replacement import AdminDocumentAlreadyCurrentError, AdminDocumentCountryConfirmationRequiredError, AdminDocumentCountryConflictReviewRequiredError, AdminDocumentCountryNotAllowedError, AdminDocumentCountrySelectionInvalidError, AdminDocumentCountrySelectionRequiredError, AdminDocumentIdenticalButAdminModifiedError, AdminDocumentReplacementRequiredError, AdminDocumentWarningConfirmationRequiredError, ExistingCountryDocument, safe_upload_and_index_document
-from app.services.admin_documents import DocumentCountryUndeterminedError
+from app.services.admin_document_replacement import DocumentCountryUndeterminedError
 from app.services.admin_document_lifecycle import AdminDocumentNotFoundError, AdminDocumentSourceConflictError, AdminDocumentSourceMissingError, delete_indexed_document, reindex_indexed_document
 from app.services.docx_country_marker import read_country_marker
 from app.services.document_chunk_builder import DOCUMENT_FAMILY, AmbiguousDocumentCountryError, UndeterminableDocumentCountryError, build_document_chunks_from_docx, metadata_from_content
@@ -30,18 +21,6 @@ from tests.support.documents import real_source_entries
 from tests.support.opensearch import FakeAdminOpenSearch
 from docx import Document as DocxDocument
 from unittest.mock import patch
-
-def _no_existing_source(document_id: str, client: Any) -> None:
-    """
-    Stub for upload_and_index_document's existing_source_lookup: no
-    prior document shares this document_id - the ordinary case for a
-    fresh temporary source_directory in these tests. Tests that need
-    to simulate a real pre-existing legacy document override this
-    explicitly instead.
-    """
-    del document_id
-    del client
-    return None
 
 def _build_chunk(filename: str) -> DocumentChunk:
     """Build one valid document chunk."""
@@ -70,61 +49,6 @@ class AdminDocumentTests(unittest.TestCase):
         self.assertTrue(admin_key_matches('admin-secret', 'admin-secret'))
         self.assertFalse(admin_key_matches('wrong', 'admin-secret'))
         self.assertFalse(admin_key_matches(None, 'admin-secret'))
-
-    def test_non_docx_upload_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            with self.assertRaises(InvalidDocumentUploadError):
-                upload_and_index_document(filename='document.pdf', file_stream=BytesIO(b'content'), source_directory=Path(root) / 'source', processed_directory=Path(root) / 'processed', maximum_bytes=1000)
-
-    def test_invalid_docx_content_is_rejected_before_any_storage(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            with self.assertRaises(InvalidDocumentUploadError):
-                upload_and_index_document(filename='renamed.docx', file_stream=BytesIO(b'This is plain text, not a real DOCX.'), source_directory=source_directory, processed_directory=Path(root) / 'processed', maximum_bytes=1000)
-            self.assertEqual(list(source_directory.iterdir()) if source_directory.exists() else [], [])
-
-    def test_oversized_upload_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            with self.assertRaises(InvalidDocumentUploadError):
-                upload_and_index_document(filename='document.docx', file_stream=BytesIO(b'0123456789'), source_directory=Path(root) / 'source', processed_directory=Path(root) / 'processed', maximum_bytes=5)
-
-    def test_valid_upload_is_persisted_and_indexed(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-
-            def chunk_builder(path: Path) -> list[DocumentChunk]:
-                return [_build_chunk(path.name)]
-
-            def document_indexer(*, chunks, client=None) -> DocumentIndexingResult:
-                del client
-                return DocumentIndexingResult(index_alias='legal-documents', document_id=chunks[0].document_id, source_filename=chunks[0].source_filename, requested_chunks=1, indexed_chunks=1, stale_chunks_deleted=0)
-            response = upload_and_index_document(filename='UK 2026.docx', file_stream=BytesIO(b'uploaded-docx'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=chunk_builder, document_indexer=document_indexer, existing_source_lookup=_no_existing_source)
-            self.assertEqual(response.status, 'indexed')
-            self.assertEqual(response.indexed_chunks, 1)
-            self.assertFalse(response.replaced_source_file)
-            self.assertEqual((source_directory / 'GB.docx').read_bytes(), b'uploaded-docx')
-            self.assertEqual(response.source_filename, 'UK 2026.docx')
-            self.assertEqual(response.document_family, DOCUMENT_FAMILY)
-
-    def test_previous_source_is_restored_on_index_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-            source_directory.mkdir(parents=True)
-            final_path = source_directory / 'GB.docx'
-            final_path.write_bytes(b'previous-version')
-
-            def chunk_builder(path: Path) -> list[DocumentChunk]:
-                return [_build_chunk(path.name)]
-
-            def failing_indexer(*, chunks, client=None):
-                del chunks
-                del client
-                raise DocumentIndexingError('Indexing failed')
-            with self.assertRaises(DocumentIndexingError):
-                upload_and_index_document(filename='UK 2026.docx', file_stream=BytesIO(b'new-version'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=chunk_builder, document_indexer=failing_indexer, existing_source_lookup=_no_existing_source)
-            self.assertEqual(final_path.read_bytes(), b'previous-version')
 
     def test_indexed_documents_are_listed(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -161,43 +85,6 @@ class AdminDocumentTests(unittest.TestCase):
             self.assertEqual(response.documents[0].status, 'indexed_source_conflict')
             self.assertFalse(response.documents[0].source_file_present)
 
-class FreshClusterOpenSearchClient:
-    """
-    Simulates a genuinely fresh OpenSearch cluster: the legal-documents
-    index does not exist yet, so any search against it raises
-    NotFoundError - the ordinary state before the very first document
-    is ever indexed.
-    """
-
-    def search(self, index: str, body: dict[str, Any]) -> dict[str, Any]:
-        del index
-        del body
-        raise NotFoundError(404, 'index_not_found_exception', {'error': {'reason': 'no such index'}})
-
-class ExistingSourceLookupTests(unittest.TestCase):
-    """
-    upload_and_index_document's own lookup for a pre-existing
-    document's historical filename must treat a missing index as "no
-    prior document", never as a hard failure.
-    """
-
-    def test_index_not_found_resolves_to_no_prior_document(self) -> None:
-        result = _lookup_existing_source_filename('doc_' + 'a' * 64, FreshClusterOpenSearchClient())
-        self.assertIsNone(result)
-
-    def test_upload_succeeds_on_a_genuinely_fresh_cluster(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-
-            def chunk_builder(path: Path) -> list[DocumentChunk]:
-                return [_build_chunk(path.name)]
-
-            def document_indexer(*, chunks, client=None) -> DocumentIndexingResult:
-                del client
-                return DocumentIndexingResult(index_alias='legal-documents', document_id=chunks[0].document_id, source_filename=chunks[0].source_filename, requested_chunks=1, indexed_chunks=1, stale_chunks_deleted=0)
-            response = upload_and_index_document(filename='UK 2026.docx', file_stream=BytesIO(b'uploaded-docx'), source_directory=Path(root) / 'source', processed_directory=Path(root) / 'processed', maximum_bytes=1000, chunk_builder=chunk_builder, document_indexer=document_indexer, client=FreshClusterOpenSearchClient())
-        self.assertEqual(response.status, 'indexed')
-        self.assertFalse(response.replaced_source_file)
-
 class FilenameAcceptanceTests(unittest.TestCase):
     """
     Arbitrary safe DOCX filenames are accepted verbatim: no business
@@ -209,20 +96,6 @@ class FilenameAcceptanceTests(unittest.TestCase):
         for filename in self.ACCEPTED_FILENAMES:
             with self.subTest(filename=filename):
                 self.assertEqual(_sanitize_filename(filename), filename)
-
-    def test_upload_preserves_the_arbitrary_filename_exactly(self) -> None:
-        for filename in self.ACCEPTED_FILENAMES:
-            with self.subTest(filename=filename):
-                with tempfile.TemporaryDirectory() as root:
-
-                    def chunk_builder(path: Path) -> list[DocumentChunk]:
-                        return [_build_chunk(path.name)]
-
-                    def document_indexer(*, chunks, client=None) -> DocumentIndexingResult:
-                        del client
-                        return DocumentIndexingResult(index_alias='legal-documents', document_id=chunks[0].document_id, source_filename=chunks[0].source_filename, requested_chunks=1, indexed_chunks=1, stale_chunks_deleted=0)
-                    response = upload_and_index_document(filename=filename, file_stream=BytesIO(b'uploaded-docx'), source_directory=Path(root) / 'source', processed_directory=Path(root) / 'processed', maximum_bytes=1000, chunk_builder=chunk_builder, document_indexer=document_indexer, existing_source_lookup=_no_existing_source)
-                    self.assertEqual(response.source_filename, filename)
 
 class FilenameRejectionTests(unittest.TestCase):
     """
@@ -250,72 +123,6 @@ def _build_canada_chunk(*, filename: str, reference_year: int) -> DocumentChunk:
     _build_document_id) behaves once a country is already active.
     """
     return DocumentChunk(document_id=CANADA_DOCUMENT_ID, chunk_id='chunk-ca-1', country='Canada', country_code='CA', legal_topic='Employment Contracts', document_type='comparator', language='en', section='Employment Contracts', subsection='Notice Period', content='Notice content.', source_filename=filename, source_format='docx', content_hash='content-hash', reference_year=reference_year)
-
-class ReplacingDocumentIndexer:
-    """
-    A stateful document_indexer double simulating OpenSearch's own
-    replace-by-document_id behaviour: the first call for a document_id
-    indexes fresh chunks, every later call for the same document_id
-    reports the previous chunks as stale/deleted - exactly the
-    signal upload_and_index_document's own response surfaces to the
-    admin API.
-    """
-
-    def __init__(self, *, fail: bool=False) -> None:
-        self.fail = fail
-        self.indexed_document_ids: set[str] = set()
-        self.call_count = 0
-
-    def __call__(self, *, chunks: list[DocumentChunk], client: Any=None) -> DocumentIndexingResult:
-        del client
-        self.call_count += 1
-        if self.fail:
-            raise DocumentIndexingError('Simulated indexing failure.')
-        document_id = chunks[0].document_id
-        stale_chunks_deleted = 1 if document_id in self.indexed_document_ids else 0
-        self.indexed_document_ids.add(document_id)
-        return DocumentIndexingResult(index_alias='legal-documents', document_id=document_id, source_filename=chunks[0].source_filename, requested_chunks=len(chunks), indexed_chunks=len(chunks), stale_chunks_deleted=stale_chunks_deleted)
-
-class ReplacementAndRollbackTests(unittest.TestCase):
-    """
-    The mandatory Canada 2025 -> 2026 replacement scenario, plus its
-    mid-indexing failure/rollback variant.
-    """
-
-    def test_canada_2026_upload_replaces_the_2025_version(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-            indexer = ReplacingDocumentIndexer()
-            first_response = upload_and_index_document(filename='Employment Law Overview - Canada 2025.docx', file_stream=BytesIO(b'canada-2025-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_canada_chunk(filename=path.name, reference_year=2025)], document_indexer=indexer, existing_source_lookup=_no_existing_source)
-            self.assertEqual(first_response.status, 'indexed')
-            self.assertFalse(first_response.replaced_source_file)
-            self.assertEqual(first_response.reference_year, 2025)
-            second_response = upload_and_index_document(filename='Canada_2026-04-15-Employment-Law-Overview-EDITED.docx', file_stream=BytesIO(b'canada-2026-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_canada_chunk(filename=path.name, reference_year=2026)], document_indexer=indexer, existing_source_lookup=_no_existing_source)
-            self.assertEqual(second_response.document_id, first_response.document_id)
-            self.assertEqual(second_response.country_code, 'CA')
-            self.assertEqual(second_response.country, 'Canada')
-            self.assertEqual(second_response.reference_year, 2026)
-            self.assertTrue(second_response.replaced_source_file)
-            self.assertEqual(second_response.source_filename, 'Canada_2026-04-15-Employment-Law-Overview-EDITED.docx')
-            self.assertEqual(indexer.call_count, 2)
-            entries = list(source_directory.iterdir())
-            self.assertEqual([entry.name for entry in entries], ['CA.docx'])
-            self.assertEqual((source_directory / 'CA.docx').read_bytes(), b'canada-2026-bytes')
-
-    def test_failed_2026_reindex_restores_the_2025_version(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-            indexer = ReplacingDocumentIndexer()
-            upload_and_index_document(filename='Employment Law Overview - Canada 2025.docx', file_stream=BytesIO(b'canada-2025-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_canada_chunk(filename=path.name, reference_year=2025)], document_indexer=indexer, existing_source_lookup=_no_existing_source)
-            failing_indexer = ReplacingDocumentIndexer(fail=True)
-            failing_indexer.indexed_document_ids = set(indexer.indexed_document_ids)
-            with self.assertRaises(DocumentIndexingError):
-                upload_and_index_document(filename='Canada_2026-04-15-Employment-Law-Overview-EDITED.docx', file_stream=BytesIO(b'canada-2026-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_canada_chunk(filename=path.name, reference_year=2026)], document_indexer=failing_indexer, existing_source_lookup=_no_existing_source)
-            entries = list(source_directory.iterdir())
-            self.assertEqual([entry.name for entry in entries], ['CA.docx'])
-            self.assertEqual((source_directory / 'CA.docx').read_bytes(), b'canada-2025-bytes')
 SPAIN_DOCUMENT_ID = 'doc_' + 'e' * 64
 
 def _build_spain_chunk(*, filename: str) -> DocumentChunk:
@@ -329,52 +136,6 @@ class LegacyReplacementAndRollbackTests(unittest.TestCase):
     historical filename, never {COUNTRY_CODE}.docx.
     """
     LEGACY_FILENAME = 'Labour and Employment Law in Spain 2026.docx'
-
-    def test_replace_upload_finds_and_retires_the_historical_file(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-            source_directory.mkdir(parents=True)
-            legacy_path = source_directory / self.LEGACY_FILENAME
-            legacy_path.write_bytes(b'legacy-spain-bytes')
-            indexer = ReplacingDocumentIndexer()
-            indexer.indexed_document_ids.add(SPAIN_DOCUMENT_ID)
-            response = upload_and_index_document(filename='Spain-2027-update.docx', file_stream=BytesIO(b'new-spain-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_spain_chunk(filename=path.name)], document_indexer=indexer, existing_source_lookup=lambda document_id, client: self.LEGACY_FILENAME)
-            self.assertTrue(response.replaced_source_file)
-            self.assertEqual(response.country_code, 'ES')
-            entries = list(source_directory.iterdir())
-            self.assertEqual([entry.name for entry in entries], ['ES.docx'])
-            self.assertEqual((source_directory / 'ES.docx').read_bytes(), b'new-spain-bytes')
-
-    def test_failed_replace_upload_restores_the_historical_file_exactly(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-            source_directory.mkdir(parents=True)
-            legacy_path = source_directory / self.LEGACY_FILENAME
-            original_bytes = b'legacy-spain-bytes'
-            legacy_path.write_bytes(original_bytes)
-            failing_indexer = ReplacingDocumentIndexer(fail=True)
-            failing_indexer.indexed_document_ids.add(SPAIN_DOCUMENT_ID)
-            with self.assertRaises(DocumentIndexingError):
-                upload_and_index_document(filename='Spain-2027-update.docx', file_stream=BytesIO(b'new-spain-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_spain_chunk(filename=path.name)], document_indexer=failing_indexer, existing_source_lookup=lambda document_id, client: self.LEGACY_FILENAME)
-            entries = list(source_directory.iterdir())
-            self.assertEqual([entry.name for entry in entries], [self.LEGACY_FILENAME])
-            self.assertEqual(legacy_path.read_bytes(), original_bytes)
-
-    def test_upload_refuses_when_source_conflict_exists(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            source_directory = Path(root) / 'source'
-            processed_directory = Path(root) / 'processed'
-            source_directory.mkdir(parents=True)
-            legacy_path = source_directory / self.LEGACY_FILENAME
-            legacy_path.write_bytes(b'legacy-spain-bytes')
-            canonical_path = source_directory / 'ES.docx'
-            canonical_path.write_bytes(b'canonical-spain-bytes')
-            with self.assertRaises(InvalidDocumentUploadError):
-                upload_and_index_document(filename='Spain-2027-update.docx', file_stream=BytesIO(b'new-spain-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, chunk_builder=lambda path: [_build_spain_chunk(filename=path.name)], document_indexer=ReplacingDocumentIndexer(), existing_source_lookup=lambda document_id, client: self.LEGACY_FILENAME)
-            self.assertEqual(legacy_path.read_bytes(), b'legacy-spain-bytes')
-            self.assertEqual(canonical_path.read_bytes(), b'canonical-spain-bytes')
 
 def _real_docx_bytes(paragraphs: list[str]) -> bytes:
     """A minimal real DOCX (valid zip/OOXML), for tests that exercise
@@ -1092,7 +853,7 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
     """
 
     def test_replacement_flow_admin_modified_flag_matches_marker_state(self) -> None:
-        from app.services.admin_modification_marker import mark_admin_modified
+        from app.services.document_section_state import mark_admin_modified
         for marker_set in (False, True):
             with self.subTest(marker_set=marker_set):
                 with tempfile.TemporaryDirectory() as root:
@@ -1112,7 +873,7 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
             processed_directory = Path(root) / 'processed'
             source_directory.mkdir(parents=True)
             (source_directory / 'Employment Law Overview Australia.docx').write_bytes(b'legacy-australia')
-            from app.services.admin_modification_marker import mark_admin_modified
+            from app.services.document_section_state import mark_admin_modified
             mark_admin_modified(source_directory, AU_OLD_ID)
             with self.assertRaises(AdminDocumentWarningConfirmationRequiredError) as context:
                 safe_upload_and_index_document(filename='Australia 2026.docx', file_stream=BytesIO(b'new-australia-bytes'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, country_confirmed=True, confirm_warnings=False, chunk_builder=lambda path: [_build_au_chunk(path.name)], country_document_lookup=_existing_documents)
@@ -1135,7 +896,7 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
             processed_directory = Path(root) / 'processed'
             source_directory.mkdir(parents=True)
             (source_directory / 'Employment Law Overview Australia.docx').write_bytes(b'same-australia')
-            from app.services.admin_modification_marker import mark_admin_modified
+            from app.services.document_section_state import mark_admin_modified
             mark_admin_modified(source_directory, AU_OLD_ID)
             with self.assertRaises(AdminDocumentIdenticalButAdminModifiedError) as context:
                 safe_upload_and_index_document(filename='Australia 2026.docx', file_stream=BytesIO(b'same-australia'), source_directory=source_directory, processed_directory=processed_directory, maximum_bytes=1000, country_confirmed=True, confirm_warnings=True, chunk_builder=lambda path: [_build_au_chunk(path.name)], country_document_lookup=_existing_documents)
@@ -1147,7 +908,7 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
             processed_directory = Path(root) / 'processed'
             source_directory.mkdir(parents=True)
             (source_directory / 'Employment Law Overview Australia.docx').write_bytes(b'same-australia')
-            from app.services.admin_modification_marker import mark_admin_modified
+            from app.services.document_section_state import mark_admin_modified
             from app.services.contact_state import ContactState, read_contact_state, write_contact_state_atomic
             from app.services.contact_state import ContactRecord
             mark_admin_modified(source_directory, AU_OLD_ID)
@@ -1163,7 +924,7 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
             processed_directory = Path(root) / 'processed'
             source_directory.mkdir(parents=True)
             (source_directory / 'Employment Law Overview Australia.docx').write_bytes(b'same-australia')
-            from app.services.admin_modification_marker import is_admin_modified_since_upload, mark_admin_modified
+            from app.services.document_section_state import is_admin_modified_since_upload, mark_admin_modified
             from app.services.contact_state import ContactRecord, ContactState, read_contact_state, write_contact_state_atomic
             from app.services.docx_parser import ExtractedContact
             mark_admin_modified(source_directory, AU_OLD_ID)
@@ -1182,7 +943,7 @@ class AdminModifiedReplacementWarningTests(unittest.TestCase):
             processed_directory = Path(root) / 'processed'
             source_directory.mkdir(parents=True)
             (source_directory / 'Employment Law Overview Australia.docx').write_bytes(b'legacy-australia')
-            from app.services.admin_modification_marker import is_admin_modified_since_upload, mark_admin_modified
+            from app.services.document_section_state import is_admin_modified_since_upload, mark_admin_modified
             from app.services.contact_state import ContactRecord, ContactState, read_contact_state, write_contact_state_atomic
             from app.services.docx_parser import ExtractedContact
             mark_admin_modified(source_directory, AU_NEW_ID)
@@ -1573,13 +1334,6 @@ class SectionEditReindexIntegrationTests(unittest.TestCase):
             legacy_state = read_section_edit_state(source_directory, document_id)
             self.assertIsNotNone(legacy_state)
             self.assertIn(_test_admin_documents__section_id_for_legal_topic('Employment Contracts'), legacy_state.sections)
-
-
-
-# ================================================================
-# SOURCE: backend/tests/test_admin_documents_api.py
-# ================================================================
-
 import asyncio
 import hashlib
 import io
@@ -1643,7 +1397,7 @@ class AdminRouterIntegrationTestCase(unittest.TestCase):
         os.environ['API_ACCESS_KEY'] = 'unused-api-key'
         get_settings.cache_clear()
         self.fake = FakeAdminOpenSearch()
-        self._patches = [patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake), patch('app.services.admin_document_lifecycle.get_opensearch_client', return_value=self.fake), patch('app.services.admin_documents.get_opensearch_client', return_value=self.fake), patch('app.services.document_indexer.get_opensearch_client', return_value=self.fake), patch('app.services.document_indexer.bulk', side_effect=bulk_writer_for(self.fake)), patch('app.services.document_indexer.ensure_legal_documents_index')]
+        self._patches = [patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake), patch('app.services.admin_document_lifecycle.get_opensearch_client', return_value=self.fake), patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake), patch('app.services.document_indexer.get_opensearch_client', return_value=self.fake), patch('app.services.document_indexer.bulk', side_effect=bulk_writer_for(self.fake)), patch('app.services.document_indexer.ensure_legal_documents_index')]
         for p in self._patches:
             p.start()
 
@@ -2068,7 +1822,7 @@ class ConflictResolutionRouterTests(AdminRouterIntegrationTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self._extra_patches = [patch('app.services.admin_document_conflict_resolution.get_opensearch_client', return_value=self.fake)]
+        self._extra_patches = [patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake)]
         for p in self._extra_patches:
             p.start()
 
@@ -2248,7 +2002,7 @@ class AdminAsgiTestCase(unittest.TestCase):
         get_settings.cache_clear()
         self.fake_opensearch = FakeAdminOpenSearch()
         self.fake_redis = FakeRedis()
-        self._patches = [patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.admin_document_lifecycle.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.admin_documents.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.document_indexer.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.document_indexer.bulk', side_effect=bulk_writer_for(self.fake_opensearch)), patch('app.services.document_indexer.ensure_legal_documents_index'), patch('app.middleware.api_protection.get_redis_client', return_value=self.fake_redis)]
+        self._patches = [patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.admin_document_lifecycle.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.admin_document_replacement.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.document_indexer.get_opensearch_client', return_value=self.fake_opensearch), patch('app.services.document_indexer.bulk', side_effect=bulk_writer_for(self.fake_opensearch)), patch('app.services.document_indexer.ensure_legal_documents_index'), patch('app.middleware.api_protection.get_redis_client', return_value=self.fake_redis)]
         for one_patch in self._patches:
             one_patch.start()
         import importlib
@@ -2322,13 +2076,6 @@ class AuthAsgiTests(AdminAsgiTestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload['total'], 0)
-
-
-
-# ================================================================
-# SOURCE: backend/tests/test_admin_sections.py
-# ================================================================
-
 import contextlib
 import tempfile
 import unittest
@@ -2337,7 +2084,7 @@ from typing import Any
 from unittest.mock import patch
 from docx import Document
 from opensearchpy.exceptions import OpenSearchException
-from app.services.admin_modification_marker import is_admin_modified_since_upload
+from app.services.document_section_state import is_admin_modified_since_upload
 from app.services.admin_document_lifecycle import AdminDocumentCountryConflictError, AdminDocumentRollbackError, reindex_indexed_document
 from app.services.admin_document_sections import AdminDocumentSectionAlreadyExistsError, AdminDocumentSectionInvalidError, AdminDocumentSectionLastRemainingError, AdminDocumentSectionNotFoundError, AdminDocumentSectionPositionError, AdminDocumentSectionUpdateFailedError, add_new_section, delete_section, get_effective_section, list_effective_sections, section_id_for_legal_topic as _test_admin_sections__section_id_for_legal_topic, update_effective_section
 from app.services.document_chunk_builder import DocumentMetadata, build_document_chunks

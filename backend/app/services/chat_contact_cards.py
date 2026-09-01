@@ -22,7 +22,7 @@ from typing import Iterable
 from urllib.parse import quote
 
 from app.models.chat import LegalChatContact
-from app.services.contact_photo_store import (
+from app.services.contact_state import (
     ContactPhotoStorageError,
     read_contact_photo,
 )

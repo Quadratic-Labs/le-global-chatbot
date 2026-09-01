@@ -1,122 +1,35 @@
-"""
-Admin Contact Management backend foundation (mission "ORDER 8G-B1").
-
-Architecture (see also the "ORDER 8G-B0" audit this mission executes):
-
-    NEW DOCX ACCEPTED
-            |
-    extract_contacts_from_docx()
-            |
-    structured contact state (this module + contact_state.py)
-            |
-    OpenSearch Contact chunk = DERIVED representation
-
-Between accepted DOCX uploads, the structured contact state is
-authoritative: Admin Contact CRUD (list/add/update/delete, below)
-reads and writes it directly, and the OpenSearch Contact chunk is
-synchronized from it immediately, via the ONE shared formatter/builder
-in document_chunk_builder.py (build_contact_chunk_for_contacts) - never
-a second, separately maintained formatting implementation.
-
-Contact edits are never written back into the DOCX's own anchored Word
-text boxes (the "ORDER 8G-B0" audit found no safe existing textbox
-mutation primitive) - a later CONFIRMED new DOCX for the same country
-simply discards this structured state and recreates it fresh from that
-new DOCX (see reseed_contact_state_from_docx and
-reseed_contacts_from_current_docx below); no merge ever happens.
-"""
-
+"""admin_contacts service. Includes former admin_contact_photos responsibilities."""
 from __future__ import annotations
-
 import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
-
 from opensearchpy import OpenSearch
-
 from app.clients.opensearch import get_opensearch_client
-from app.models.admin_contacts import (
-    AdminContactDeleteResponse,
-    AdminContactListResponse,
-    AdminContactResponse,
-    AdminContactSummary,
-    AdminContactWriteRequest,
-)
-from app.services.admin_document_lifecycle import (
-    AdminDocumentLifecycleError,
-    AdminDocumentRollbackError,
-    InvalidAdminDocumentIdError,
-    _ensure_no_country_conflict,
-    _get_document_metadata,
-    _required_string,
-)
-from app.services.admin_document_sections import (
-    _fsync_path,
-    _make_temp_docx_path,
-)
-from app.services.admin_modification_marker import (
-    is_admin_modified_since_upload,
-    mark_admin_modified,
-    reset_admin_modified,
-    write_admin_modified_marker,
-)
-from app.services.contact_document_area import (
-    ContactAreaError,
-    ContactPhotoPayload,
-    rebuild_canonical_contact_table,
-    resolve_untracked_contact_photo,
-)
-from app.services.contact_people import (
-    associate_contact_photos,
-)
-from app.services.contact_photos import (
-    ContactPhotoExtractionError,
-    extract_contact_photo_candidates,
-)
-from app.services.contact_photo_store import (
-    ContactPhotoStorageError,
-    delete_contact_photo,
-    read_contact_photo,
-    write_contact_photo_atomic,
-)
-from app.services.contact_state import (
-    ContactRecord,
-    ContactState,
-    delete_contact_state,
-    new_contact_id,
-    read_contact_state,
-    write_contact_state_atomic,
-)
-from app.services.country_lock import (
-    DEFAULT_LOCK_TIMEOUT_SECONDS,
-    country_lock,
-)
-from app.services.document_chunk_builder import (
-    DocumentMetadata,
-    build_contact_chunk_for_contacts,
-    validate_docx_format,
-)
-from app.services.document_indexer import (
-    replace_document_contact_chunk,
-)
-from app.services.document_source_resolver import (
-    DocumentSourceConflictError,
-    resolve_document_source_path,
-)
-from app.services.docx_parser import (
-    ExtractedContact,
-    extract_contacts_from_docx,
-    split_combined_legacy_contact,
-)
-
-
-DOCUMENT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^doc_[0-9a-f]{64}$"
-)
-
+from app.models.admin_contacts import AdminContactDeleteResponse, AdminContactListResponse, AdminContactResponse, AdminContactSummary, AdminContactWriteRequest
+from app.services.admin_document_lifecycle import AdminDocumentLifecycleError, AdminDocumentRollbackError, InvalidAdminDocumentIdError, _ensure_no_country_conflict, _get_document_metadata, _required_string
+from app.services.admin_document_sections import _fsync_path, _make_temp_docx_path
+from app.services.document_section_state import is_admin_modified_since_upload, mark_admin_modified, reset_admin_modified, write_admin_modified_marker
+from app.services.contact_document_area import ContactAreaError, ContactPhotoPayload, rebuild_canonical_contact_table, resolve_untracked_contact_photo
+from app.services.contact_photos import associate_contact_photos
+from app.services.contact_photos import ContactPhotoExtractionError, extract_contact_photo_candidates
+from app.services.contact_state import ContactPhotoStorageError, delete_contact_photo, read_contact_photo, write_contact_photo_atomic
+from app.services.contact_state import ContactRecord, ContactState, delete_contact_state, new_contact_id, read_contact_state, write_contact_state_atomic
+from app.services.country_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, country_lock
+from app.services.document_chunk_builder import DocumentMetadata, build_contact_chunk_for_contacts, validate_docx_format
+from app.services.document_indexer import replace_document_contact_chunk
+from app.services.document_source_resolver import DocumentSourceConflictError, resolve_document_source_path
+from app.services.docx_parser import ExtractedContact, extract_contacts_from_docx, split_combined_legacy_contact
+from dataclasses import dataclass, replace
+import hashlib
+from app.services.admin_document_lifecycle import AdminDocumentLifecycleError, _get_document_metadata, _required_string
+from app.services.document_section_state import mark_admin_modified
+from app.services.contact_document_area import ContactAreaError, ContactPhotoPayload, rebuild_canonical_contact_table
+from app.services.contact_state import ContactState, ContactStateError, read_contact_state, write_contact_state_atomic
+from app.services.document_chunk_builder import validate_docx_format
+DOCUMENT_ID_PATTERN: Final[re.Pattern[str]] = re.compile('^doc_[0-9a-f]{64}$')
 
 class AdminContactNotFoundError(LookupError):
     """Raised when a specific contact_id is not found in a document's
@@ -125,23 +38,11 @@ class AdminContactNotFoundError(LookupError):
     def __init__(self, *, document_id: str, contact_id: str) -> None:
         self.document_id = document_id
         self.contact_id = contact_id
-
-        super().__init__(
-            f"Contact {contact_id!r} was not found for document "
-            f"{document_id!r}."
-        )
+        super().__init__(f'Contact {contact_id!r} was not found for document {document_id!r}.')
 
     def to_detail(self) -> dict[str, object]:
         """Return a structured HTTP 404 payload."""
-
-        return {
-            "code": "contact_not_found",
-            "message": str(self),
-            "operation": "contact_mutation",
-            "document_id": self.document_id,
-            "contact_id": self.contact_id,
-        }
-
+        return {'code': 'contact_not_found', 'message': str(self), 'operation': 'contact_mutation', 'document_id': self.document_id, 'contact_id': self.contact_id}
 
 class AdminContactMutationFailedError(RuntimeError):
     """
@@ -150,74 +51,36 @@ class AdminContactMutationFailedError(RuntimeError):
     are all intact; nothing was left half-applied.
     """
 
-
 def _get_client(client: OpenSearch | None) -> OpenSearch:
     """Return the supplied or configured OpenSearch client - the same
     inline convention every other admin service module in this
     codebase already uses."""
-
-    return (
-        client
-        if client is not None
-        else get_opensearch_client()
-    )
-
+    return client if client is not None else get_opensearch_client()
 
 def _validate_document_id(document_id: str) -> str:
     """Validate one deterministic document identifier - reuses the
     exact pattern admin_document_lifecycle.py already validates
     against, never a second, independently maintained regex."""
-
     normalized_document_id = document_id.strip()
-
     if not DOCUMENT_ID_PATTERN.fullmatch(normalized_document_id):
-        raise InvalidAdminDocumentIdError(
-            "The document identifier is invalid."
-        )
-
+        raise InvalidAdminDocumentIdError('The document identifier is invalid.')
     return normalized_document_id
 
-
-def _record_to_extracted_contact(
-    record: ContactRecord,
-) -> ExtractedContact:
+def _record_to_extracted_contact(record: ContactRecord) -> ExtractedContact:
     """
     Adapt one persisted ContactRecord to the shape
     build_contact_chunk_content already knows how to render - the
     contact_id itself carries no meaning for the rendered chunk text,
     so it is intentionally dropped here.
     """
+    return ExtractedContact(member_firm=record.member_firm, contact_person=record.contact_person, email=record.email, phone=record.phone, address=record.address, website=record.website)
 
-    return ExtractedContact(
-        member_firm=record.member_firm,
-        contact_person=record.contact_person,
-        email=record.email,
-        phone=record.phone,
-        address=record.address,
-        website=record.website,
-    )
-
-
-def _extracted_contact_to_record(
-    contact: ExtractedContact,
-) -> ContactRecord:
+def _extracted_contact_to_record(contact: ExtractedContact) -> ContactRecord:
     """Adapt one freshly DOCX-parsed ExtractedContact into a persisted
     ContactRecord, assigning it a fresh, stable identifier."""
+    return ContactRecord(contact_id=new_contact_id(), member_firm=contact.member_firm, contact_person=contact.contact_person, email=contact.email, phone=contact.phone, address=contact.address, website=contact.website)
 
-    return ContactRecord(
-        contact_id=new_contact_id(),
-        member_firm=contact.member_firm,
-        contact_person=contact.contact_person,
-        email=contact.email,
-        phone=contact.phone,
-        address=contact.address,
-        website=contact.website,
-    )
-
-
-def _document_metadata_for_chunks(
-    document_metadata: dict[str, Any],
-) -> DocumentMetadata:
+def _document_metadata_for_chunks(document_metadata: dict[str, Any]) -> DocumentMetadata:
     """
     Build the DocumentMetadata needed to render a Contact chunk from
     one document's own indexed metadata - language/source_format are
@@ -227,46 +90,13 @@ def _document_metadata_for_chunks(
     this mirrors that established convention rather than inventing a
     second metadata-fetch path).
     """
+    reference_year = document_metadata.get('reference_year')
+    return DocumentMetadata(country=_required_string(document_metadata, 'country'), country_code=_required_string(document_metadata, 'country_code'), reference_year=int(reference_year) if isinstance(reference_year, int) else None, language='en', source_filename=_required_string(document_metadata, 'source_filename'), source_format='docx')
 
-    reference_year = document_metadata.get("reference_year")
+def _contact_photo_filenames(contacts: tuple[ContactRecord, ...]) -> set[str]:
+    return {record.photo_filename for record in contacts if record.photo_filename is not None}
 
-    return DocumentMetadata(
-        country=_required_string(document_metadata, "country"),
-        country_code=_required_string(
-            document_metadata,
-            "country_code",
-        ),
-        reference_year=(
-            int(reference_year)
-            if isinstance(reference_year, int)
-            else None
-        ),
-        language="en",
-        source_filename=_required_string(
-            document_metadata,
-            "source_filename",
-        ),
-        source_format="docx",
-    )
-
-
-
-def _contact_photo_filenames(
-    contacts: tuple[ContactRecord, ...],
-) -> set[str]:
-    return {
-        record.photo_filename
-        for record in contacts
-        if record.photo_filename is not None
-    }
-
-
-def _build_photo_aware_contact_records(
-    *,
-    source_directory: Path,
-    docx_path: Path,
-    contacts: Sequence[ExtractedContact],
-) -> tuple[ContactRecord, ...]:
+def _build_photo_aware_contact_records(*, source_directory: Path, docx_path: Path, contacts: Sequence[ExtractedContact]) -> tuple[ContactRecord, ...]:
     """
     Build freshly-seeded ContactRecords from one accepted DOCX.
 
@@ -277,115 +107,43 @@ def _build_photo_aware_contact_records(
     If any image write fails, every image already created by THIS seed
     attempt is removed before the original error is propagated.
     """
-
     try:
-        photos = extract_contact_photo_candidates(
-            docx_path,
-        )
+        photos = extract_contact_photo_candidates(docx_path)
     except ContactPhotoExtractionError:
-        # A contact photo is optional. A DOCX already accepted by the
-        # document/contact pipeline must not become unusable solely
-        # because its image package cannot be inspected reliably.
-        # Fail closed to zero photo associations; never guess.
         photos = []
-
-    associated = associate_contact_photos(
-        contacts,
-        photos,
-    )
-
+    associated = associate_contact_photos(contacts, photos)
     records: list[ContactRecord] = []
     created_photo_filenames: list[str] = []
-
     try:
         for contact in associated:
             contact_id = new_contact_id()
-
             photo_filename = None
             photo_content_type = None
             photo_sha256 = None
-
             if contact.photo is not None:
-                stored = write_contact_photo_atomic(
-                    source_directory,
-                    contact_id,
-                    data=contact.photo.data,
-                    content_type=contact.photo.content_type,
-                )
-
-                created_photo_filenames.append(
-                    stored.filename
-                )
-
+                stored = write_contact_photo_atomic(source_directory, contact_id, data=contact.photo.data, content_type=contact.photo.content_type)
+                created_photo_filenames.append(stored.filename)
                 photo_filename = stored.filename
                 photo_content_type = stored.content_type
                 photo_sha256 = stored.sha256
-
-            records.append(
-                ContactRecord(
-                    contact_id=contact_id,
-                    member_firm=contact.member_firm,
-                    contact_person=contact.contact_person,
-                    email=contact.email,
-                    phone=contact.phone,
-                    address=contact.address,
-                    website=contact.website,
-                    photo_filename=photo_filename,
-                    photo_content_type=photo_content_type,
-                    photo_sha256=photo_sha256,
-                )
-            )
-
+            records.append(ContactRecord(contact_id=contact_id, member_firm=contact.member_firm, contact_person=contact.contact_person, email=contact.email, phone=contact.phone, address=contact.address, website=contact.website, photo_filename=photo_filename, photo_content_type=photo_content_type, photo_sha256=photo_sha256))
         return tuple(records)
-
     except Exception as original_error:
         cleanup_error: Exception | None = None
-
-        for filename in reversed(
-            created_photo_filenames
-        ):
+        for filename in reversed(created_photo_filenames):
             try:
-                delete_contact_photo(
-                    source_directory,
-                    filename,
-                )
+                delete_contact_photo(source_directory, filename)
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error
-
         if cleanup_error is not None:
-            raise ContactPhotoStorageError(
-                "Contact photo seeding failed and its photo cleanup "
-                "was itself incomplete."
-            ) from cleanup_error
-
+            raise ContactPhotoStorageError('Contact photo seeding failed and its photo cleanup was itself incomplete.') from cleanup_error
         raise original_error
 
-
-
 def _contact_summary(record: ContactRecord) -> AdminContactSummary:
-    return AdminContactSummary(
-        contact_id=record.contact_id,
-        member_firm=record.member_firm,
-        contact_person=record.contact_person,
-        email=record.email,
-        phone=record.phone,
-        address=record.address,
-        website=record.website,
-        has_photo=record.photo_filename is not None,
-    )
+    return AdminContactSummary(contact_id=record.contact_id, member_firm=record.member_firm, contact_person=record.contact_person, email=record.email, phone=record.phone, address=record.address, website=record.website, has_photo=record.photo_filename is not None)
 
-
-def _apply_contact_state_change(
-    *,
-    document_id: str,
-    country_code: str,
-    source_directory: Path,
-    new_contacts: tuple[ContactRecord, ...],
-    document_metadata: dict[str, Any],
-    client: OpenSearch,
-    reset_marker: bool,
-) -> None:
+def _apply_contact_state_change(*, document_id: str, country_code: str, source_directory: Path, new_contacts: tuple[ContactRecord, ...], document_metadata: dict[str, Any], client: OpenSearch, reset_marker: bool) -> None:
     """
     The one shared transactional core behind every contact-state
     mutation - Add, Update, Delete, and a DOCX-driven reseed (mission
@@ -402,183 +160,51 @@ def _apply_contact_state_change(
     accepted); False marks it True (an ordinary Admin CRUD mutation
     against a document whose accepted DOCX has not changed).
     """
-
-    previous_state = read_contact_state(
-        source_directory,
-        document_id,
-    )
-    previous_marker = is_admin_modified_since_upload(
-        source_directory,
-        document_id,
-    )
-
-    previous_photo_filenames = {
-        record.photo_filename
-        for record in (
-            previous_state.contacts
-            if previous_state is not None
-            else ()
-        )
-        if record.photo_filename is not None
-    }
-
-    new_photo_filenames = {
-        record.photo_filename
-        for record in new_contacts
-        if record.photo_filename is not None
-    }
-
-    # Files referenced only by the candidate state were already
-    # materialized before this transactional state/index commit.
-    # They must disappear again if the transaction rolls back.
-    rollback_photo_filenames = (
-        new_photo_filenames
-        - previous_photo_filenames
-    )
-
-    # Files referenced only by the previous committed state may be
-    # removed, but strictly AFTER state + OpenSearch + marker commit.
-    superseded_photo_filenames = (
-        previous_photo_filenames
-        - new_photo_filenames
-    )
-
+    previous_state = read_contact_state(source_directory, document_id)
+    previous_marker = is_admin_modified_since_upload(source_directory, document_id)
+    previous_photo_filenames = {record.photo_filename for record in (previous_state.contacts if previous_state is not None else ()) if record.photo_filename is not None}
+    new_photo_filenames = {record.photo_filename for record in new_contacts if record.photo_filename is not None}
+    rollback_photo_filenames = new_photo_filenames - previous_photo_filenames
+    superseded_photo_filenames = previous_photo_filenames - new_photo_filenames
     metadata = _document_metadata_for_chunks(document_metadata)
-
-    new_state = ContactState(
-        document_id=document_id,
-        country_code=country_code,
-        contacts=new_contacts,
-    )
-
-    new_contact_chunk = build_contact_chunk_for_contacts(
-        [
-            _record_to_extracted_contact(record)
-            for record in new_contacts
-        ],
-        metadata,
-    )
-
+    new_state = ContactState(document_id=document_id, country_code=country_code, contacts=new_contacts)
+    new_contact_chunk = build_contact_chunk_for_contacts([_record_to_extracted_contact(record) for record in new_contacts], metadata)
     try:
-        write_contact_state_atomic(
-            source_directory,
-            new_state,
-        )
-
-        replace_document_contact_chunk(
-            document_id=document_id,
-            chunk=new_contact_chunk,
-            client=client,
-        )
-
+        write_contact_state_atomic(source_directory, new_state)
+        replace_document_contact_chunk(document_id=document_id, chunk=new_contact_chunk, client=client)
         if reset_marker:
             reset_admin_modified(source_directory, document_id)
         else:
             mark_admin_modified(source_directory, document_id)
-
     except Exception as original_error:
         try:
             if previous_state is not None:
-                write_contact_state_atomic(
-                    source_directory,
-                    previous_state,
-                )
+                write_contact_state_atomic(source_directory, previous_state)
             else:
                 delete_contact_state(source_directory, document_id)
-
-            previous_contact_chunk = build_contact_chunk_for_contacts(
-                [
-                    _record_to_extracted_contact(record)
-                    for record in (
-                        previous_state.contacts
-                        if previous_state is not None
-                        else ()
-                    )
-                ],
-                metadata,
-            )
-
-            replace_document_contact_chunk(
-                document_id=document_id,
-                chunk=previous_contact_chunk,
-                client=client,
-            )
-
-            write_admin_modified_marker(
-                source_directory,
-                document_id,
-                previous_marker,
-            )
-
-            for filename in sorted(
-                rollback_photo_filenames
-            ):
-                delete_contact_photo(
-                    source_directory,
-                    filename,
-                )
-
+            previous_contact_chunk = build_contact_chunk_for_contacts([_record_to_extracted_contact(record) for record in (previous_state.contacts if previous_state is not None else ())], metadata)
+            replace_document_contact_chunk(document_id=document_id, chunk=previous_contact_chunk, client=client)
+            write_admin_modified_marker(source_directory, document_id, previous_marker)
+            for filename in sorted(rollback_photo_filenames):
+                delete_contact_photo(source_directory, filename)
         except Exception as rollback_error:
-            raise AdminDocumentRollbackError(
-                "A contact mutation failed for document "
-                f"{document_id!r}, and its rollback afterwards was "
-                "itself incomplete - manual recovery is required."
-            ) from rollback_error
-
-        raise AdminContactMutationFailedError(
-            "The contact change could not be completed: "
-            f"{original_error}"
-        ) from original_error
-
-    for filename in sorted(
-        superseded_photo_filenames
-    ):
+            raise AdminDocumentRollbackError(f'A contact mutation failed for document {document_id!r}, and its rollback afterwards was itself incomplete - manual recovery is required.') from rollback_error
+        raise AdminContactMutationFailedError(f'The contact change could not be completed: {original_error}') from original_error
+    for filename in sorted(superseded_photo_filenames):
         try:
-            delete_contact_photo(
-                source_directory,
-                filename,
-            )
+            delete_contact_photo(source_directory, filename)
         except ContactPhotoStorageError:
-            # The authoritative state already committed successfully.
-            # A stale unreferenced photo is safer than turning that
-            # successful transaction into a misleading failure.
             pass
 
-
-def _load_country_code_and_metadata(
-    *,
-    document_id: str,
-    client: OpenSearch,
-    operation: str,
-) -> tuple[str, dict[str, Any]]:
+def _load_country_code_and_metadata(*, document_id: str, client: OpenSearch, operation: str) -> tuple[str, dict[str, Any]]:
     """Validate document_id exists and has no unresolved country
     conflict, returning (country_code, full document metadata)."""
+    document_metadata = _get_document_metadata(document_id=document_id, client=client)
+    country_code = _required_string(document_metadata, 'country_code')
+    _ensure_no_country_conflict(country_code=country_code, client=client, operation=operation)
+    return (country_code, document_metadata)
 
-    document_metadata = _get_document_metadata(
-        document_id=document_id,
-        client=client,
-    )
-
-    country_code = _required_string(
-        document_metadata,
-        "country_code",
-    )
-
-    _ensure_no_country_conflict(
-        country_code=country_code,
-        client=client,
-        operation=operation,
-    )
-
-    return country_code, document_metadata
-
-
-def list_contacts(
-    *,
-    document_id: str,
-    source_directory: Path,
-    client: OpenSearch | None = None,
-) -> AdminContactListResponse:
+def list_contacts(*, document_id: str, source_directory: Path, client: OpenSearch | None=None) -> AdminContactListResponse:
     """
     Every contact currently configured for one document, in stable
     order.
@@ -592,77 +218,29 @@ def list_contacts(
     distinction between "no state" and "empty state" matters only to
     the legacy bootstrap facility below, never to this read path.
     """
-
     validated_document_id = _validate_document_id(document_id)
     opensearch_client = _get_client(client)
-
-    document_metadata = _get_document_metadata(
-        document_id=validated_document_id,
-        client=opensearch_client,
-    )
-
-    country_code = _required_string(
-        document_metadata,
-        "country_code",
-    )
-
-    state = read_contact_state(
-        source_directory,
-        validated_document_id,
-    )
-
+    document_metadata = _get_document_metadata(document_id=validated_document_id, client=opensearch_client)
+    country_code = _required_string(document_metadata, 'country_code')
+    state = read_contact_state(source_directory, validated_document_id)
     contacts = state.contacts if state is not None else ()
+    return AdminContactListResponse(document_id=validated_document_id, country_code=country_code, contacts=[_contact_summary(record) for record in contacts])
 
-    return AdminContactListResponse(
-        document_id=validated_document_id,
-        country_code=country_code,
-        contacts=[
-            _contact_summary(record)
-            for record in contacts
-        ],
-    )
-
-
-def _resolve_source_path_for_mutation(
-    *,
-    source_directory: Path,
-    document_metadata: dict[str, Any],
-    country_code: str,
-) -> Path:
+def _resolve_source_path_for_mutation(*, source_directory: Path, document_metadata: dict[str, Any], country_code: str) -> Path:
     """The CURRENT persisted source DOCX for one document, resolved
     the same way admin_contact_photos.py already does for every DOCX
     mutation - a read-only OpenSearch-metadata-derived lookup, never a
     reindex."""
-
-    source_filename = _required_string(
-        document_metadata, "source_filename"
-    )
-
+    source_filename = _required_string(document_metadata, 'source_filename')
     try:
-        resolved = resolve_document_source_path(
-            source_root=source_directory,
-            country_code=country_code,
-            source_filename=source_filename,
-        )
-
+        resolved = resolve_document_source_path(source_root=source_directory, country_code=country_code, source_filename=source_filename)
     except DocumentSourceConflictError as error:
-        raise AdminContactMutationFailedError(
-            "The source DOCX could not be unambiguously resolved."
-        ) from error
-
+        raise AdminContactMutationFailedError('The source DOCX could not be unambiguously resolved.') from error
     if resolved.path is None:
-        raise AdminContactMutationFailedError(
-            "The source DOCX file is missing."
-        )
-
+        raise AdminContactMutationFailedError('The source DOCX file is missing.')
     return resolved.path
 
-
-def _stage_and_commit_source_document(
-    *,
-    source_path: Path,
-    new_document_bytes: bytes,
-) -> None:
+def _stage_and_commit_source_document(*, source_path: Path, new_document_bytes: bytes) -> None:
     """
     Write, fsync, validate, then atomically replace the persisted
     source DOCX - the same staging discipline
@@ -678,32 +256,21 @@ def _stage_and_commit_source_document(
     rollback and the caller's ContactState rollback, leaving a
     committed DOCX mutation with no matching ContactState entry.
     """
-
     temp_path = _make_temp_docx_path(source_path)
-
     try:
         temp_path.write_bytes(new_document_bytes)
         _fsync_path(temp_path)
         validate_docx_format(temp_path)
         os.replace(temp_path, source_path)
-
     except Exception as error:
         temp_path.unlink(missing_ok=True)
-        raise AdminContactMutationFailedError(
-            f"The updated source document could not be saved: {error}"
-        ) from error
-
+        raise AdminContactMutationFailedError(f'The updated source document could not be saved: {error}') from error
     try:
         _fsync_path(source_path.parent)
     except OSError:
         pass
 
-
-def _restore_source_document(
-    *,
-    source_path: Path,
-    original_bytes: bytes,
-) -> None:
+def _restore_source_document(*, source_path: Path, original_bytes: bytes) -> None:
     """
     Restore the source DOCX to its exact pre-mutation bytes after a
     DOCX mutation committed but the following ContactState/index
@@ -712,36 +279,21 @@ def _restore_source_document(
     direct, non-atomic write onto the live source_path), so a crash
     or I/O error mid-restore can never leave source_path truncated.
     """
-
     temp_path = _make_temp_docx_path(source_path)
-
     try:
         temp_path.write_bytes(original_bytes)
         _fsync_path(temp_path)
         validate_docx_format(temp_path)
         os.replace(temp_path, source_path)
-
     except Exception as error:
         temp_path.unlink(missing_ok=True)
-        raise AdminDocumentRollbackError(
-            "A contact mutation failed and the source document could "
-            "not be restored to its original state - manual recovery "
-            "is required."
-        ) from error
-
+        raise AdminDocumentRollbackError('A contact mutation failed and the source document could not be restored to its original state - manual recovery is required.') from error
     try:
         _fsync_path(source_path.parent)
     except OSError:
         pass
 
-
-def _resolve_contact_photo(
-    record: ContactRecord,
-    *,
-    source_directory: Path,
-    source_path: Path,
-    country: str | None,
-) -> ContactPhotoPayload | None:
+def _resolve_contact_photo(record: ContactRecord, *, source_directory: Path, source_path: Path, country: str | None) -> ContactPhotoPayload | None:
     """
     The authoritative photo bytes for one contact about to be written
     into the rebuilt canonical table - the Admin photo store's own
@@ -752,40 +304,18 @@ def _resolve_contact_photo(
     rebuilding the canonical area from ContactState alone never
     silently drops a photo the document still visibly has.
     """
-
     if record.photo_filename is not None:
         try:
-            data = read_contact_photo(
-                source_directory, record.photo_filename
-            )
+            data = read_contact_photo(source_directory, record.photo_filename)
         except ContactPhotoStorageError as error:
-            raise AdminContactMutationFailedError(
-                f"The contact's own stored photo could not be read: "
-                f"{error}"
-            ) from error
-
-        return ContactPhotoPayload(
-            data=data,
-            content_type=record.photo_content_type or "image/jpeg",
-        )
-
+            raise AdminContactMutationFailedError(f"The contact's own stored photo could not be read: {error}") from error
+        return ContactPhotoPayload(data=data, content_type=record.photo_content_type or 'image/jpeg')
     try:
-        return resolve_untracked_contact_photo(
-            source_path,
-            contact_person=record.contact_person,
-            country=country,
-        )
+        return resolve_untracked_contact_photo(source_path, contact_person=record.contact_person, country=country)
     except ContactAreaError as error:
         raise AdminContactMutationFailedError(str(error)) from error
 
-
-def _synchronize_source_document(
-    *,
-    source_directory: Path,
-    document_metadata: dict[str, Any],
-    country_code: str,
-    all_records: tuple[ContactRecord, ...],
-) -> tuple[Path, bytes]:
+def _synchronize_source_document(*, source_directory: Path, document_metadata: dict[str, Any], country_code: str, all_records: tuple[ContactRecord, ...]) -> tuple[Path, bytes]:
     """
     Rebuild the ENTIRE persisted canonical contact area from the
     complete intended contact list - the one mechanism behind every
@@ -799,57 +329,19 @@ def _synchronize_source_document(
     been committed by the time this returns, so the caller can restore
     original_bytes if the following ContactState commit fails.
     """
-
-    source_path = _resolve_source_path_for_mutation(
-        source_directory=source_directory,
-        document_metadata=document_metadata,
-        country_code=country_code,
-    )
-    country = _required_string(document_metadata, "country")
+    source_path = _resolve_source_path_for_mutation(source_directory=source_directory, document_metadata=document_metadata, country_code=country_code)
+    country = _required_string(document_metadata, 'country')
     original_bytes = source_path.read_bytes()
-
-    extracted_contacts = tuple(
-        _record_to_extracted_contact(record) for record in all_records
-    )
-    photos = tuple(
-        _resolve_contact_photo(
-            record,
-            source_directory=source_directory,
-            source_path=source_path,
-            country=country,
-        )
-        for record in all_records
-    )
-
+    extracted_contacts = tuple((_record_to_extracted_contact(record) for record in all_records))
+    photos = tuple((_resolve_contact_photo(record, source_directory=source_directory, source_path=source_path, country=country) for record in all_records))
     try:
-        new_document_bytes = rebuild_canonical_contact_table(
-            source_path,
-            contacts=extracted_contacts,
-            photos=photos,
-            country=country,
-        )
+        new_document_bytes = rebuild_canonical_contact_table(source_path, contacts=extracted_contacts, photos=photos, country=country)
     except ContactAreaError as error:
-        raise AdminContactMutationFailedError(
-            f"The contact area could not be synchronized into the "
-            f"source document: {error}"
-        ) from error
+        raise AdminContactMutationFailedError(f'The contact area could not be synchronized into the source document: {error}') from error
+    _stage_and_commit_source_document(source_path=source_path, new_document_bytes=new_document_bytes)
+    return (source_path, original_bytes)
 
-    _stage_and_commit_source_document(
-        source_path=source_path,
-        new_document_bytes=new_document_bytes,
-    )
-
-    return source_path, original_bytes
-
-
-def add_contact(
-    *,
-    document_id: str,
-    fields: AdminContactWriteRequest,
-    source_directory: Path,
-    client: OpenSearch | None = None,
-    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-) -> AdminContactResponse:
+def add_contact(*, document_id: str, fields: AdminContactWriteRequest, source_directory: Path, client: OpenSearch | None=None, lock_timeout_seconds: float=DEFAULT_LOCK_TIMEOUT_SECONDS) -> AdminContactResponse:
     """
     Append one new contact - duplicates (identical field values to an
     existing contact) are explicitly allowed; the new record always
@@ -864,97 +356,24 @@ def add_contact(
     successful Add Contact never leaves the source DOCX unsynchronized
     with ContactState.
     """
-
     validated_document_id = _validate_document_id(document_id)
     opensearch_client = _get_client(client)
-
-    preliminary_metadata = _get_document_metadata(
-        document_id=validated_document_id,
-        client=opensearch_client,
-    )
-
-    with country_lock(
-        source_directory,
-        _required_string(preliminary_metadata, "country_code"),
-        timeout_seconds=lock_timeout_seconds,
-    ):
-        country_code, document_metadata = _load_country_code_and_metadata(
-            document_id=validated_document_id,
-            client=opensearch_client,
-            operation="contact_add",
-        )
-
-        current_state = read_contact_state(
-            source_directory,
-            validated_document_id,
-        )
-        previous_contacts = (
-            current_state.contacts
-            if current_state is not None
-            else ()
-        )
-
-        new_record = ContactRecord(
-            contact_id=new_contact_id(),
-            member_firm=fields.member_firm.strip() or None,
-            contact_person=fields.contact_person.strip() or None,
-            email=fields.email.strip() or None,
-            phone=fields.phone.strip() or None,
-            address=fields.address.strip() or None,
-            website=fields.website.strip() or None,
-        )
-
+    preliminary_metadata = _get_document_metadata(document_id=validated_document_id, client=opensearch_client)
+    with country_lock(source_directory, _required_string(preliminary_metadata, 'country_code'), timeout_seconds=lock_timeout_seconds):
+        country_code, document_metadata = _load_country_code_and_metadata(document_id=validated_document_id, client=opensearch_client, operation='contact_add')
+        current_state = read_contact_state(source_directory, validated_document_id)
+        previous_contacts = current_state.contacts if current_state is not None else ()
+        new_record = ContactRecord(contact_id=new_contact_id(), member_firm=fields.member_firm.strip() or None, contact_person=fields.contact_person.strip() or None, email=fields.email.strip() or None, phone=fields.phone.strip() or None, address=fields.address.strip() or None, website=fields.website.strip() or None)
         new_contacts = previous_contacts + (new_record,)
-
-        committed_source_path, original_document_bytes = (
-            _synchronize_source_document(
-                source_directory=source_directory,
-                document_metadata=document_metadata,
-                country_code=country_code,
-                all_records=new_contacts,
-            )
-        )
-
+        committed_source_path, original_document_bytes = _synchronize_source_document(source_directory=source_directory, document_metadata=document_metadata, country_code=country_code, all_records=new_contacts)
         try:
-            _apply_contact_state_change(
-                document_id=validated_document_id,
-                country_code=country_code,
-                source_directory=source_directory,
-                new_contacts=new_contacts,
-                document_metadata=document_metadata,
-                client=opensearch_client,
-                reset_marker=False,
-            )
-
+            _apply_contact_state_change(document_id=validated_document_id, country_code=country_code, source_directory=source_directory, new_contacts=new_contacts, document_metadata=document_metadata, client=opensearch_client, reset_marker=False)
         except Exception:
-            _restore_source_document(
-                source_path=committed_source_path,
-                original_bytes=original_document_bytes,
-            )
+            _restore_source_document(source_path=committed_source_path, original_bytes=original_document_bytes)
             raise
+    return AdminContactResponse(document_id=validated_document_id, country_code=country_code, contact_id=new_record.contact_id, member_firm=new_record.member_firm, contact_person=new_record.contact_person, email=new_record.email, phone=new_record.phone, address=new_record.address, website=new_record.website)
 
-    return AdminContactResponse(
-        document_id=validated_document_id,
-        country_code=country_code,
-        contact_id=new_record.contact_id,
-        member_firm=new_record.member_firm,
-        contact_person=new_record.contact_person,
-        email=new_record.email,
-        phone=new_record.phone,
-        address=new_record.address,
-        website=new_record.website,
-    )
-
-
-def update_contact(
-    *,
-    document_id: str,
-    contact_id: str,
-    fields: AdminContactWriteRequest,
-    source_directory: Path,
-    client: OpenSearch | None = None,
-    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-) -> AdminContactResponse:
+def update_contact(*, document_id: str, contact_id: str, fields: AdminContactWriteRequest, source_directory: Path, client: OpenSearch | None=None, lock_timeout_seconds: float=DEFAULT_LOCK_TIMEOUT_SECONDS) -> AdminContactResponse:
     """
     Save new field values for one existing contact - its contact_id
     and its position among the document's contacts are both preserved.
@@ -967,219 +386,55 @@ def update_contact(
     ContactState commit then fails, the DOCX is restored to its exact
     prior bytes before the error propagates.
     """
-
     validated_document_id = _validate_document_id(document_id)
     validated_contact_id = contact_id.strip()
     opensearch_client = _get_client(client)
-
-    preliminary_metadata = _get_document_metadata(
-        document_id=validated_document_id,
-        client=opensearch_client,
-    )
-
-    with country_lock(
-        source_directory,
-        _required_string(preliminary_metadata, "country_code"),
-        timeout_seconds=lock_timeout_seconds,
-    ):
-        country_code, document_metadata = _load_country_code_and_metadata(
-            document_id=validated_document_id,
-            client=opensearch_client,
-            operation="contact_update",
-        )
-
-        current_state = read_contact_state(
-            source_directory,
-            validated_document_id,
-        )
-        current_contacts = (
-            current_state.contacts
-            if current_state is not None
-            else ()
-        )
-
-        position = next(
-            (
-                index
-                for index, record in enumerate(current_contacts)
-                if record.contact_id == validated_contact_id
-            ),
-            None,
-        )
-
+    preliminary_metadata = _get_document_metadata(document_id=validated_document_id, client=opensearch_client)
+    with country_lock(source_directory, _required_string(preliminary_metadata, 'country_code'), timeout_seconds=lock_timeout_seconds):
+        country_code, document_metadata = _load_country_code_and_metadata(document_id=validated_document_id, client=opensearch_client, operation='contact_update')
+        current_state = read_contact_state(source_directory, validated_document_id)
+        current_contacts = current_state.contacts if current_state is not None else ()
+        position = next((index for index, record in enumerate(current_contacts) if record.contact_id == validated_contact_id), None)
         if position is None:
-            raise AdminContactNotFoundError(
-                document_id=validated_document_id,
-                contact_id=validated_contact_id,
-            )
-
-        updated_record = ContactRecord(
-            contact_id=validated_contact_id,
-            member_firm=fields.member_firm.strip() or None,
-            contact_person=fields.contact_person.strip() or None,
-            email=fields.email.strip() or None,
-            phone=fields.phone.strip() or None,
-            address=fields.address.strip() or None,
-            website=fields.website.strip() or None,
-            photo_filename=current_contacts[position].photo_filename,
-            photo_content_type=(
-                current_contacts[position].photo_content_type
-            ),
-            photo_sha256=current_contacts[position].photo_sha256,
-        )
-
-        new_contacts = (
-            current_contacts[:position]
-            + (updated_record,)
-            + current_contacts[position + 1:]
-        )
-
-        committed_source_path, original_document_bytes = (
-            _synchronize_source_document(
-                source_directory=source_directory,
-                document_metadata=document_metadata,
-                country_code=country_code,
-                all_records=new_contacts,
-            )
-        )
-
+            raise AdminContactNotFoundError(document_id=validated_document_id, contact_id=validated_contact_id)
+        updated_record = ContactRecord(contact_id=validated_contact_id, member_firm=fields.member_firm.strip() or None, contact_person=fields.contact_person.strip() or None, email=fields.email.strip() or None, phone=fields.phone.strip() or None, address=fields.address.strip() or None, website=fields.website.strip() or None, photo_filename=current_contacts[position].photo_filename, photo_content_type=current_contacts[position].photo_content_type, photo_sha256=current_contacts[position].photo_sha256)
+        new_contacts = current_contacts[:position] + (updated_record,) + current_contacts[position + 1:]
+        committed_source_path, original_document_bytes = _synchronize_source_document(source_directory=source_directory, document_metadata=document_metadata, country_code=country_code, all_records=new_contacts)
         try:
-            _apply_contact_state_change(
-                document_id=validated_document_id,
-                country_code=country_code,
-                source_directory=source_directory,
-                new_contacts=new_contacts,
-                document_metadata=document_metadata,
-                client=opensearch_client,
-                reset_marker=False,
-            )
-
+            _apply_contact_state_change(document_id=validated_document_id, country_code=country_code, source_directory=source_directory, new_contacts=new_contacts, document_metadata=document_metadata, client=opensearch_client, reset_marker=False)
         except Exception:
-            _restore_source_document(
-                source_path=committed_source_path,
-                original_bytes=original_document_bytes,
-            )
+            _restore_source_document(source_path=committed_source_path, original_bytes=original_document_bytes)
             raise
+    return AdminContactResponse(document_id=validated_document_id, country_code=country_code, contact_id=updated_record.contact_id, member_firm=updated_record.member_firm, contact_person=updated_record.contact_person, email=updated_record.email, phone=updated_record.phone, address=updated_record.address, website=updated_record.website)
 
-    return AdminContactResponse(
-        document_id=validated_document_id,
-        country_code=country_code,
-        contact_id=updated_record.contact_id,
-        member_firm=updated_record.member_firm,
-        contact_person=updated_record.contact_person,
-        email=updated_record.email,
-        phone=updated_record.phone,
-        address=updated_record.address,
-        website=updated_record.website,
-    )
-
-
-def delete_contact(
-    *,
-    document_id: str,
-    contact_id: str,
-    source_directory: Path,
-    client: OpenSearch | None = None,
-    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-) -> AdminContactDeleteResponse:
+def delete_contact(*, document_id: str, contact_id: str, source_directory: Path, client: OpenSearch | None=None, lock_timeout_seconds: float=DEFAULT_LOCK_TIMEOUT_SECONDS) -> AdminContactDeleteResponse:
     """
     Remove exactly one contact by its contact_id - every other
     contact for this document is left completely unchanged, including
     its position. Confirmation is a WordPress/B2 concern; this
     performs the authorized deletion directly.
     """
-
     validated_document_id = _validate_document_id(document_id)
     validated_contact_id = contact_id.strip()
     opensearch_client = _get_client(client)
-
-    preliminary_metadata = _get_document_metadata(
-        document_id=validated_document_id,
-        client=opensearch_client,
-    )
-
-    with country_lock(
-        source_directory,
-        _required_string(preliminary_metadata, "country_code"),
-        timeout_seconds=lock_timeout_seconds,
-    ):
-        country_code, document_metadata = _load_country_code_and_metadata(
-            document_id=validated_document_id,
-            client=opensearch_client,
-            operation="contact_delete",
-        )
-
-        current_state = read_contact_state(
-            source_directory,
-            validated_document_id,
-        )
-        current_contacts = (
-            current_state.contacts
-            if current_state is not None
-            else ()
-        )
-
-        deleted_record = next(
-            (
-                record
-                for record in current_contacts
-                if record.contact_id == validated_contact_id
-            ),
-            None,
-        )
-
+    preliminary_metadata = _get_document_metadata(document_id=validated_document_id, client=opensearch_client)
+    with country_lock(source_directory, _required_string(preliminary_metadata, 'country_code'), timeout_seconds=lock_timeout_seconds):
+        country_code, document_metadata = _load_country_code_and_metadata(document_id=validated_document_id, client=opensearch_client, operation='contact_delete')
+        current_state = read_contact_state(source_directory, validated_document_id)
+        current_contacts = current_state.contacts if current_state is not None else ()
+        deleted_record = next((record for record in current_contacts if record.contact_id == validated_contact_id), None)
         if deleted_record is None:
-            raise AdminContactNotFoundError(
-                document_id=validated_document_id,
-                contact_id=validated_contact_id,
-            )
-
-        new_contacts = tuple(
-            record
-            for record in current_contacts
-            if record.contact_id != validated_contact_id
-        )
-
-        committed_source_path, original_document_bytes = (
-            _synchronize_source_document(
-                source_directory=source_directory,
-                document_metadata=document_metadata,
-                country_code=country_code,
-                all_records=new_contacts,
-            )
-        )
-
+            raise AdminContactNotFoundError(document_id=validated_document_id, contact_id=validated_contact_id)
+        new_contacts = tuple((record for record in current_contacts if record.contact_id != validated_contact_id))
+        committed_source_path, original_document_bytes = _synchronize_source_document(source_directory=source_directory, document_metadata=document_metadata, country_code=country_code, all_records=new_contacts)
         try:
-            _apply_contact_state_change(
-                document_id=validated_document_id,
-                country_code=country_code,
-                source_directory=source_directory,
-                new_contacts=new_contacts,
-                document_metadata=document_metadata,
-                client=opensearch_client,
-                reset_marker=False,
-            )
-
+            _apply_contact_state_change(document_id=validated_document_id, country_code=country_code, source_directory=source_directory, new_contacts=new_contacts, document_metadata=document_metadata, client=opensearch_client, reset_marker=False)
         except Exception:
-            _restore_source_document(
-                source_path=committed_source_path,
-                original_bytes=original_document_bytes,
-            )
+            _restore_source_document(source_path=committed_source_path, original_bytes=original_document_bytes)
             raise
+    return AdminContactDeleteResponse(document_id=validated_document_id, country_code=country_code, contact_id=validated_contact_id)
 
-    return AdminContactDeleteResponse(
-        document_id=validated_document_id,
-        country_code=country_code,
-        contact_id=validated_contact_id,
-    )
-
-
-def _reseed_contacts_from_current_docx_locked(
-    *,
-    validated_document_id: str,
-    source_directory: Path,
-    opensearch_client: OpenSearch,
-) -> AdminContactListResponse:
+def _reseed_contacts_from_current_docx_locked(*, validated_document_id: str, source_directory: Path, opensearch_client: OpenSearch) -> AdminContactListResponse:
     """
     The real reseed-from-current-DOCX logic - always called with the
     country's lock already held by the caller.
@@ -1195,77 +450,21 @@ def _reseed_contacts_from_current_docx_locked(
     already-held lock for the same country would deadlock (observed
     directly while building this integration).
     """
-
-    country_code, document_metadata = _load_country_code_and_metadata(
-        document_id=validated_document_id,
-        client=opensearch_client,
-        operation="contact_reseed",
-    )
-
-    source_filename = _required_string(
-        document_metadata,
-        "source_filename",
-    )
-    country = _required_string(
-        document_metadata,
-        "country",
-    )
-
+    country_code, document_metadata = _load_country_code_and_metadata(document_id=validated_document_id, client=opensearch_client, operation='contact_reseed')
+    source_filename = _required_string(document_metadata, 'source_filename')
+    country = _required_string(document_metadata, 'country')
     try:
-        resolved_source = resolve_document_source_path(
-            source_root=source_directory,
-            country_code=country_code,
-            source_filename=source_filename,
-        )
-
+        resolved_source = resolve_document_source_path(source_root=source_directory, country_code=country_code, source_filename=source_filename)
     except DocumentSourceConflictError as error:
-        raise AdminDocumentLifecycleError(
-            "The source DOCX could not be unambiguously resolved."
-        ) from error
-
+        raise AdminDocumentLifecycleError('The source DOCX could not be unambiguously resolved.') from error
     if resolved_source.path is None:
-        raise AdminDocumentLifecycleError(
-            "The source DOCX file is missing."
-        )
+        raise AdminDocumentLifecycleError('The source DOCX file is missing.')
+    parsed_contacts = extract_contacts_from_docx(resolved_source.path, country=country)
+    new_contacts = _build_photo_aware_contact_records(source_directory=source_directory, docx_path=resolved_source.path, contacts=parsed_contacts)
+    _apply_contact_state_change(document_id=validated_document_id, country_code=country_code, source_directory=source_directory, new_contacts=new_contacts, document_metadata=document_metadata, client=opensearch_client, reset_marker=True)
+    return AdminContactListResponse(document_id=validated_document_id, country_code=country_code, contacts=[_contact_summary(record) for record in new_contacts])
 
-    parsed_contacts = extract_contacts_from_docx(
-        resolved_source.path,
-        country=country,
-    )
-
-    new_contacts = _build_photo_aware_contact_records(
-        source_directory=source_directory,
-        docx_path=resolved_source.path,
-        contacts=parsed_contacts,
-    )
-
-    _apply_contact_state_change(
-        document_id=validated_document_id,
-        country_code=country_code,
-        source_directory=source_directory,
-        new_contacts=new_contacts,
-        document_metadata=document_metadata,
-        client=opensearch_client,
-        reset_marker=True,
-    )
-
-    return AdminContactListResponse(
-        document_id=validated_document_id,
-        country_code=country_code,
-        contacts=[
-            _contact_summary(record)
-            for record in new_contacts
-        ],
-    )
-
-
-def reseed_contacts_from_current_docx(
-    *,
-    document_id: str,
-    source_directory: Path,
-    client: OpenSearch | None = None,
-    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-) -> AdminContactListResponse:
+def reseed_contacts_from_current_docx(*, document_id: str, source_directory: Path, client: OpenSearch | None=None, lock_timeout_seconds: float=DEFAULT_LOCK_TIMEOUT_SECONDS) -> AdminContactListResponse:
     """
     Explicitly discard the current structured contact state (and any
     Admin edits it holds) and reseed it fresh from document_id's
@@ -1287,35 +486,13 @@ def reseed_contacts_from_current_docx(
     _reseed_contacts_from_current_docx_locked directly instead, never
     this function, to avoid a self-deadlock.
     """
-
     validated_document_id = _validate_document_id(document_id)
     opensearch_client = _get_client(client)
+    preliminary_metadata = _get_document_metadata(document_id=validated_document_id, client=opensearch_client)
+    with country_lock(source_directory, _required_string(preliminary_metadata, 'country_code'), timeout_seconds=lock_timeout_seconds):
+        return _reseed_contacts_from_current_docx_locked(validated_document_id=validated_document_id, source_directory=source_directory, opensearch_client=opensearch_client)
 
-    preliminary_metadata = _get_document_metadata(
-        document_id=validated_document_id,
-        client=opensearch_client,
-    )
-
-    with country_lock(
-        source_directory,
-        _required_string(preliminary_metadata, "country_code"),
-        timeout_seconds=lock_timeout_seconds,
-    ):
-        return _reseed_contacts_from_current_docx_locked(
-            validated_document_id=validated_document_id,
-            source_directory=source_directory,
-            opensearch_client=opensearch_client,
-        )
-
-
-def reseed_contact_state_from_parsed_contacts(
-    *,
-    document_id: str,
-    country_code: str,
-    source_directory: Path,
-    contacts: Sequence[ExtractedContact],
-    docx_path: Path | None = None,
-) -> None:
+def reseed_contact_state_from_parsed_contacts(*, document_id: str, country_code: str, source_directory: Path, contacts: Sequence[ExtractedContact], docx_path: Path | None=None) -> None:
     """
     Entirely replace structured contact state from a just-accepted
     DOCX.
@@ -1332,125 +509,38 @@ def reseed_contact_state_from_parsed_contacts(
     docx_path remains optional for backward compatibility with callers
     that seed already-parsed contacts without a source DOCX.
     """
-
-    previous_state = read_contact_state(
-        source_directory,
-        document_id,
-    )
-
-    previous_marker = is_admin_modified_since_upload(
-        source_directory,
-        document_id,
-    )
-
+    previous_state = read_contact_state(source_directory, document_id)
+    previous_marker = is_admin_modified_since_upload(source_directory, document_id)
     if docx_path is None:
-        new_contacts = tuple(
-            _extracted_contact_to_record(contact)
-            for contact in contacts
-        )
+        new_contacts = tuple((_extracted_contact_to_record(contact) for contact in contacts))
     else:
-        new_contacts = _build_photo_aware_contact_records(
-            source_directory=source_directory,
-            docx_path=docx_path,
-            contacts=contacts,
-        )
-
-    previous_photo_filenames = _contact_photo_filenames(
-        (
-            previous_state.contacts
-            if previous_state is not None
-            else ()
-        )
-    )
-
-    new_photo_filenames = _contact_photo_filenames(
-        new_contacts
-    )
-
-    rollback_photo_filenames = (
-        new_photo_filenames
-        - previous_photo_filenames
-    )
-
-    superseded_photo_filenames = (
-        previous_photo_filenames
-        - new_photo_filenames
-    )
-
+        new_contacts = _build_photo_aware_contact_records(source_directory=source_directory, docx_path=docx_path, contacts=contacts)
+    previous_photo_filenames = _contact_photo_filenames(previous_state.contacts if previous_state is not None else ())
+    new_photo_filenames = _contact_photo_filenames(new_contacts)
+    rollback_photo_filenames = new_photo_filenames - previous_photo_filenames
+    superseded_photo_filenames = previous_photo_filenames - new_photo_filenames
     try:
-        write_contact_state_atomic(
-            source_directory,
-            ContactState(
-                document_id=document_id,
-                country_code=country_code,
-                contacts=new_contacts,
-            ),
-        )
-
-        reset_admin_modified(
-            source_directory,
-            document_id,
-        )
-
+        write_contact_state_atomic(source_directory, ContactState(document_id=document_id, country_code=country_code, contacts=new_contacts))
+        reset_admin_modified(source_directory, document_id)
     except Exception as original_error:
         try:
             if previous_state is not None:
-                write_contact_state_atomic(
-                    source_directory,
-                    previous_state,
-                )
+                write_contact_state_atomic(source_directory, previous_state)
             else:
-                delete_contact_state(
-                    source_directory,
-                    document_id,
-                )
-
-            write_admin_modified_marker(
-                source_directory,
-                document_id,
-                previous_marker,
-            )
-
-            for filename in sorted(
-                rollback_photo_filenames
-            ):
-                delete_contact_photo(
-                    source_directory,
-                    filename,
-                )
-
+                delete_contact_state(source_directory, document_id)
+            write_admin_modified_marker(source_directory, document_id, previous_marker)
+            for filename in sorted(rollback_photo_filenames):
+                delete_contact_photo(source_directory, filename)
         except Exception as rollback_error:
-            raise AdminDocumentRollbackError(
-                "Contact reseed failed and its filesystem rollback "
-                "was itself incomplete - manual recovery is required."
-            ) from rollback_error
-
+            raise AdminDocumentRollbackError('Contact reseed failed and its filesystem rollback was itself incomplete - manual recovery is required.') from rollback_error
         raise original_error
-
-    # State + marker now authoritatively reference the new records.
-    # Superseded files are only garbage at this point.
-    for filename in sorted(
-        superseded_photo_filenames
-    ):
+    for filename in sorted(superseded_photo_filenames):
         try:
-            delete_contact_photo(
-                source_directory,
-                filename,
-            )
+            delete_contact_photo(source_directory, filename)
         except ContactPhotoStorageError:
-            # Do not convert an already-successful authoritative
-            # reseed into a false failure because stale unreferenced
-            # garbage could not be removed.
             pass
 
-
-
-def apply_structured_contact_state_to_chunks(
-    *,
-    chunks: list[Any],
-    document_id: str,
-    source_directory: Path,
-) -> list[Any]:
+def apply_structured_contact_state_to_chunks(*, chunks: list[Any], document_id: str, source_directory: Path) -> list[Any]:
     """
     Mission "ORDER 8G-B1", section 10 - "Refresh must not silently
     replace Admin-edited contacts with stale contact text from the
@@ -1467,80 +557,33 @@ def apply_structured_contact_state_to_chunks(
     existing parsed-DOCX contact behavior - and no sidecar is created
     merely because this ran.
     """
-
     state = read_contact_state(source_directory, document_id)
-
     if state is None:
         return chunks
-
-    non_contact_chunks = [
-        chunk
-        for chunk in chunks
-        if not (
-            chunk.legal_topic is None
-            and chunk.subsection == "Contact"
-        )
-    ]
-
-    if not non_contact_chunks and not chunks:
+    non_contact_chunks = [chunk for chunk in chunks if not (chunk.legal_topic is None and chunk.subsection == 'Contact')]
+    if not non_contact_chunks and (not chunks):
         return chunks
-
     reference_chunk = chunks[0]
-
-    metadata = DocumentMetadata(
-        country=reference_chunk.country,
-        country_code=reference_chunk.country_code,
-        reference_year=reference_chunk.reference_year,
-        language=reference_chunk.language,
-        source_filename=reference_chunk.source_filename,
-        source_format=reference_chunk.source_format,
-    )
-
-    replacement_contact_chunk = build_contact_chunk_for_contacts(
-        [
-            _record_to_extracted_contact(record)
-            for record in state.contacts
-        ],
-        metadata,
-    )
-
+    metadata = DocumentMetadata(country=reference_chunk.country, country_code=reference_chunk.country_code, reference_year=reference_chunk.reference_year, language=reference_chunk.language, source_filename=reference_chunk.source_filename, source_format=reference_chunk.source_format)
+    replacement_contact_chunk = build_contact_chunk_for_contacts([_record_to_extracted_contact(record) for record in state.contacts], metadata)
     if replacement_contact_chunk is not None:
         non_contact_chunks.append(replacement_contact_chunk)
-
     return non_contact_chunks
-
 
 @dataclass(frozen=True, slots=True)
 class ContactBootstrapReport:
     """Result of running the controlled legacy contact bootstrap."""
-
     documents_seen: int
     contacts_seeded: int
     zero_contact_documents: int
     documents_skipped_existing_state: int
     dry_run: bool
 
+def _default_document_lister(*, source_directory: Path, client: OpenSearch | None):
+    from app.services.admin_document_replacement import list_indexed_documents
+    return list_indexed_documents(source_directory=source_directory, client=client)
 
-def _default_document_lister(
-    *,
-    source_directory: Path,
-    client: OpenSearch | None,
-):
-    from app.services.admin_documents import list_indexed_documents
-
-    return list_indexed_documents(
-        source_directory=source_directory,
-        client=client,
-    )
-
-
-def bootstrap_legacy_contacts(
-    *,
-    source_directory: Path,
-    client: OpenSearch | None = None,
-    dry_run: bool = True,
-    document_lister=_default_document_lister,
-) -> ContactBootstrapReport:
+def bootstrap_legacy_contacts(*, source_directory: Path, client: OpenSearch | None=None, dry_run: bool=True, document_lister=_default_document_lister) -> ContactBootstrapReport:
     """
     Seed structured contact state for every currently-indexed document
     that does not already have one (mission "ORDER 8G-B1", section 6).
@@ -1555,93 +598,234 @@ def bootstrap_legacy_contacts(
     services, so tests can supply a fixed catalog without a real
     OpenSearch aggregation query.
     """
-
     opensearch_client = _get_client(client)
-
-    catalog = document_lister(
-        source_directory=source_directory,
-        client=opensearch_client,
-    )
-
+    catalog = document_lister(source_directory=source_directory, client=opensearch_client)
     documents_seen = 0
     contacts_seeded = 0
     zero_contact_documents = 0
     documents_skipped_existing_state = 0
-
     for summary in catalog.documents:
         if not summary.source_file_present:
             continue
-
-        if read_contact_state(
-            source_directory,
-            summary.document_id,
-        ) is not None:
+        if read_contact_state(source_directory, summary.document_id) is not None:
             documents_skipped_existing_state += 1
             continue
-
         try:
-            resolved_source = resolve_document_source_path(
-                source_root=source_directory,
-                country_code=summary.country_code,
-                source_filename=summary.source_filename,
-            )
-
+            resolved_source = resolve_document_source_path(source_root=source_directory, country_code=summary.country_code, source_filename=summary.source_filename)
         except DocumentSourceConflictError:
             continue
-
         if resolved_source.path is None:
             continue
-
         documents_seen += 1
-
-        parsed_contacts = extract_contacts_from_docx(
-            resolved_source.path,
-            country=summary.country,
-        )
-
-        # A legacy contact whose contact_person names multiple people
-        # (e.g. France's own "Caroline Scherrmann and Florence
-        # Bacquet", sharing one comma-joined email string) becomes one
-        # Admin-managed ContactRecord per person - each with their own
-        # stable id, assigned here and never again (bootstrap never
-        # revisits a document once it has structured state - see the
-        # skip check above) - only when the person/email split is
-        # unambiguous. Never split when it is not: see
-        # split_combined_legacy_contact's own docstring.
+        parsed_contacts = extract_contacts_from_docx(resolved_source.path, country=summary.country)
         expanded_contacts: list[ExtractedContact] = []
-
         for contact in parsed_contacts:
             split_contacts = split_combined_legacy_contact(contact)
-            expanded_contacts.extend(
-                split_contacts if split_contacts is not None else [contact]
-            )
-
-        new_contacts = tuple(
-            _extracted_contact_to_record(contact)
-            for contact in expanded_contacts
-        )
-
+            expanded_contacts.extend(split_contacts if split_contacts is not None else [contact])
+        new_contacts = tuple((_extracted_contact_to_record(contact) for contact in expanded_contacts))
         if new_contacts:
             contacts_seeded += len(new_contacts)
         else:
             zero_contact_documents += 1
-
         if not dry_run:
-            write_contact_state_atomic(
-                source_directory,
-                ContactState(
-                    document_id=summary.document_id,
-                    country_code=summary.country_code,
-                    contacts=new_contacts,
-                ),
-            )
+            write_contact_state_atomic(source_directory, ContactState(document_id=summary.document_id, country_code=summary.country_code, contacts=new_contacts))
+    return ContactBootstrapReport(documents_seen=documents_seen, contacts_seeded=contacts_seeded, zero_contact_documents=zero_contact_documents, documents_skipped_existing_state=documents_skipped_existing_state, dry_run=dry_run)
 
-    return ContactBootstrapReport(
-        documents_seen=documents_seen,
-        contacts_seeded=contacts_seeded,
-        zero_contact_documents=zero_contact_documents,
-        documents_skipped_existing_state=(
-            documents_skipped_existing_state
-        ),
-        dry_run=dry_run,
-    )
+class AdminContactPhotoError(RuntimeError):
+    pass
+
+class AdminContactPhotoNotFoundError(AdminContactPhotoError):
+    pass
+MAX_ADMIN_CONTACT_PHOTO_BYTES = 10 * 1024 * 1024
+
+def _detect_image_content_type(data: bytes) -> str | None:
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if len(data) >= 12 and data[:4] == b'RIFF' and (data[8:12] == b'WEBP'):
+        return 'image/webp'
+    return None
+
+@dataclass(frozen=True)
+class AdminContactPhoto:
+    data: bytes
+    content_type: str
+    sha256: str
+
+def _state_and_contact(source_directory, document_id, contact_id):
+    try:
+        state = read_contact_state(source_directory, document_id)
+    except (OSError, ContactStateError) as exc:
+        raise AdminContactPhotoError(str(exc)) from exc
+    if state is None:
+        raise AdminContactPhotoNotFoundError('Contact not found.')
+    for index, contact in enumerate(state.contacts):
+        if contact.contact_id == contact_id:
+            return (state, index, contact)
+    raise AdminContactPhotoNotFoundError('Contact not found.')
+
+def _resolve_current_source_path_and_country(*, document_id: str, source_directory: Path, client: OpenSearch) -> tuple[Path, str | None]:
+    """The CURRENT persisted source DOCX for one document - a
+    read-only OpenSearch metadata lookup, never a reindex - together
+    with its own country display name, needed by
+    rebuild_canonical_contact_table's own country-line filtering."""
+    try:
+        document_metadata = _get_document_metadata(document_id=document_id, client=client)
+    except AdminDocumentLifecycleError as error:
+        raise AdminContactPhotoError(str(error)) from error
+    country_code = _required_string(document_metadata, 'country_code')
+    source_filename = _required_string(document_metadata, 'source_filename')
+    country = document_metadata.get('country')
+    try:
+        resolved = resolve_document_source_path(source_root=source_directory, country_code=country_code, source_filename=source_filename)
+    except DocumentSourceConflictError as error:
+        raise AdminContactPhotoError('The source DOCX could not be unambiguously resolved.') from error
+    if resolved.path is None:
+        raise AdminContactPhotoError('The source DOCX file is missing.')
+    return (resolved.path, country if isinstance(country, str) else None)
+
+def _stage_and_commit_document_bytes(*, source_path: Path, new_document_bytes: bytes) -> None:
+    """
+    Write, fsync, validate, then atomically replace the persisted
+    source DOCX - the SAME staging discipline
+    admin_document_sections.py already uses for every other DOCX
+    mutation (temp file in the same directory, fsync, validate, then
+    os.replace). Guarantees zero mutation to source_path unless this
+    returns normally: os.replace is an atomic rename on the same
+    filesystem, so it either fully applies or not at all.
+    """
+    temp_path = _make_temp_docx_path(source_path)
+    try:
+        temp_path.write_bytes(new_document_bytes)
+        _fsync_path(temp_path)
+        validate_docx_format(temp_path)
+        os.replace(temp_path, source_path)
+    except Exception as error:
+        temp_path.unlink(missing_ok=True)
+        raise AdminContactPhotoError(f'The updated source document could not be saved: {error}') from error
+    _fsync_path(source_path.parent)
+
+def _restore_original_document(*, source_path: Path, original_bytes: bytes) -> None:
+    """Restore the source DOCX to its exact pre-mutation bytes after
+    the DOCX commit succeeded but a later step (ContactState) failed -
+    an orphaned uncommitted photo is acceptable; a source DOCX left
+    out of sync with ContactState is not."""
+    try:
+        source_path.write_bytes(original_bytes)
+        _fsync_path(source_path)
+        _fsync_path(source_path.parent)
+    except Exception as error:
+        raise AdminContactPhotoError('A contact photo change failed and the source document could not be restored to its original state - manual recovery is required.') from error
+
+def _delete_photo_best_effort(source_directory: Path, filename: str) -> None:
+    try:
+        delete_contact_photo(source_directory, filename)
+    except Exception:
+        pass
+
+def read_admin_contact_photo(source_directory: Path, document_id: str, contact_id: str) -> AdminContactPhoto:
+    _, _, contact = _state_and_contact(source_directory, document_id, contact_id)
+    if not contact.photo_filename or not contact.photo_content_type or (not contact.photo_sha256):
+        raise AdminContactPhotoNotFoundError('Contact photo not found.')
+    try:
+        data = read_contact_photo(source_directory, contact.photo_filename)
+    except ContactPhotoStorageError as exc:
+        raise AdminContactPhotoNotFoundError('Contact photo not found.') from exc
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != contact.photo_sha256:
+        raise AdminContactPhotoError('Stored contact photo failed integrity validation.')
+    return AdminContactPhoto(data=data, content_type=contact.photo_content_type, sha256=actual)
+
+def replace_admin_contact_photo(source_directory: Path, document_id: str, contact_id: str, *, data: bytes, content_type: str, client: OpenSearch | None=None, lock_timeout_seconds: float=DEFAULT_LOCK_TIMEOUT_SECONDS) -> AdminContactPhoto:
+    """
+    Set a contact's photo - REPLACING its current one, or ADDING one
+    where none exists - keeping the persisted source DOCX, the
+    physical photo store, and ContactState all in sync. Fails closed
+    (raising before anything is written) when the target photo/zone
+    cannot be located unambiguously in the source DOCX.
+    """
+    if not data:
+        raise AdminContactPhotoError('Photo file is empty.')
+    if len(data) > MAX_ADMIN_CONTACT_PHOTO_BYTES:
+        raise AdminContactPhotoError('Photo file exceeds the 10 MiB limit.')
+    detected_content_type = _detect_image_content_type(data)
+    if detected_content_type is None:
+        raise AdminContactPhotoError('Only JPEG, PNG and WebP images are accepted.')
+    requested_content_type = content_type.split(';', 1)[0].strip().lower()
+    if requested_content_type != detected_content_type:
+        raise AdminContactPhotoError('Photo content does not match its declared image type.')
+    content_type = detected_content_type
+    preliminary_state, _, _ = _state_and_contact(source_directory, document_id, contact_id)
+    opensearch_client = client or get_opensearch_client()
+    with country_lock(source_directory, preliminary_state.country_code, timeout_seconds=lock_timeout_seconds):
+        state, index, contact = _state_and_contact(source_directory, document_id, contact_id)
+        source_path, country = _resolve_current_source_path_and_country(document_id=document_id, source_directory=source_directory, client=opensearch_client)
+        original_bytes = source_path.read_bytes()
+        old_filename = contact.photo_filename
+        try:
+            stored = write_contact_photo_atomic(source_directory, contact_id, data=data, content_type=content_type)
+        except ContactPhotoStorageError as exc:
+            raise AdminContactPhotoError(str(exc)) from exc
+        updated = replace(contact, photo_filename=stored.filename, photo_content_type=stored.content_type, photo_sha256=stored.sha256)
+        contacts = list(state.contacts)
+        contacts[index] = updated
+        extracted_contacts = tuple((_record_to_extracted_contact(record) for record in contacts))
+        photos = tuple((ContactPhotoPayload(data=data, content_type=content_type) if record.contact_id == contact_id else _resolve_contact_photo(record, source_directory=source_directory, source_path=source_path, country=country) for record in contacts))
+        try:
+            new_document_bytes = rebuild_canonical_contact_table(source_path, contacts=extracted_contacts, photos=photos, country=country)
+        except ContactAreaError as error:
+            _delete_photo_best_effort(source_directory, stored.filename)
+            raise AdminContactPhotoError(str(error)) from error
+        try:
+            _stage_and_commit_document_bytes(source_path=source_path, new_document_bytes=new_document_bytes)
+        except AdminContactPhotoError:
+            _delete_photo_best_effort(source_directory, stored.filename)
+            raise
+        try:
+            write_contact_state_atomic(source_directory, ContactState(document_id=state.document_id, country_code=state.country_code, contacts=tuple(contacts)))
+        except Exception as error:
+            _restore_original_document(source_path=source_path, original_bytes=original_bytes)
+            _delete_photo_best_effort(source_directory, stored.filename)
+            raise AdminContactPhotoError(f'The contact photo could not be saved: {error}') from error
+        mark_admin_modified(source_directory, document_id)
+    if old_filename and old_filename != stored.filename:
+        _delete_photo_best_effort(source_directory, old_filename)
+    return AdminContactPhoto(data=data, content_type=stored.content_type, sha256=stored.sha256)
+
+def remove_admin_contact_photo(source_directory: Path, document_id: str, contact_id: str, *, client: OpenSearch | None=None, lock_timeout_seconds: float=DEFAULT_LOCK_TIMEOUT_SECONDS) -> bool:
+    """
+    Remove a contact's photo from the persisted source DOCX, the
+    physical photo store, and ContactState together. Fails closed
+    (raising before anything is written) when the photo cannot be
+    located unambiguously in the source DOCX.
+    """
+    preliminary_state, _, preliminary_contact = _state_and_contact(source_directory, document_id, contact_id)
+    if preliminary_contact.photo_filename is None:
+        return False
+    opensearch_client = client or get_opensearch_client()
+    with country_lock(source_directory, preliminary_state.country_code, timeout_seconds=lock_timeout_seconds):
+        state, index, contact = _state_and_contact(source_directory, document_id, contact_id)
+        if contact.photo_filename is None:
+            return False
+        source_path, country = _resolve_current_source_path_and_country(document_id=document_id, source_directory=source_directory, client=opensearch_client)
+        original_bytes = source_path.read_bytes()
+        old_filename = contact.photo_filename
+        updated = replace(contact, photo_filename=None, photo_content_type=None, photo_sha256=None)
+        contacts = list(state.contacts)
+        contacts[index] = updated
+        extracted_contacts = tuple((_record_to_extracted_contact(record) for record in contacts))
+        photos = tuple((None if record.contact_id == contact_id else _resolve_contact_photo(record, source_directory=source_directory, source_path=source_path, country=country) for record in contacts))
+        try:
+            new_document_bytes = rebuild_canonical_contact_table(source_path, contacts=extracted_contacts, photos=photos, country=country)
+        except ContactAreaError as error:
+            raise AdminContactPhotoError(str(error)) from error
+        _stage_and_commit_document_bytes(source_path=source_path, new_document_bytes=new_document_bytes)
+        try:
+            write_contact_state_atomic(source_directory, ContactState(document_id=state.document_id, country_code=state.country_code, contacts=tuple(contacts)))
+        except Exception as error:
+            _restore_original_document(source_path=source_path, original_bytes=original_bytes)
+            raise AdminContactPhotoError(f'The contact photo could not be removed: {error}') from error
+        mark_admin_modified(source_directory, document_id)
+    _delete_photo_best_effort(source_directory, old_filename)
+    return True

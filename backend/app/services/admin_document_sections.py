@@ -40,7 +40,7 @@ from app.services.admin_document_lifecycle import (
     _required_string,
     _validate_document_id,
 )
-from app.services.admin_modification_marker import (
+from app.services.document_section_state import (
     mark_admin_modified,
 )
 from app.services.country_lock import (
@@ -80,7 +80,7 @@ from app.services.document_source_resolver import (
     resolve_document_source_path,
 )
 from app.clients.opensearch import get_opensearch_client
-from app.services.section_splitter import (
+from app.services.document_chunk_builder import (
     DEFAULT_MAX_CHARS,
     split_parsed_sections,
 )

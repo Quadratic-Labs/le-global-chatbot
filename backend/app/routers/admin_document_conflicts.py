@@ -26,7 +26,7 @@ from app.models.admin_documents import (
     AdminDocumentUploadResponse,
 )
 from app.security.admin import require_admin_key
-from app.services.admin_document_conflict_resolution import (
+from app.services.admin_document_replacement import (
     CountryConflictNotFoundError,
     CountryConflictResolutionError,
     build_country_conflict_review,
@@ -44,7 +44,7 @@ from app.services.admin_document_replacement import (
     AdminDocumentWarningConfirmationRequiredError,
     safe_upload_and_index_document,
 )
-from app.services.admin_documents import (
+from app.services.admin_document_replacement import (
     AdminDocumentStorageError,
     DocumentCorruptError,
     DocumentCountryUndeterminedError,

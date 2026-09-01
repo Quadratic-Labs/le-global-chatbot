@@ -44,7 +44,7 @@ from app.services.legal_subject_scope import (
     CanonicalSearchConcept,
     canonicalize_legal_subject,
 )
-from app.services.jurisdiction_resolution import (
+from app.services.country_detection import (
     resolve_city_country_codes,
 )
 from app.services.request_understanding import (

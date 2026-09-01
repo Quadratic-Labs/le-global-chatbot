@@ -27,7 +27,7 @@ from app.services.country_detection import (
     resolve_country_display_name,
     resolve_jurisdiction,
 )
-from app.services.jurisdiction_resolution import (
+from app.services.country_detection import (
     detect_unresolved_location_phrase,
     resolve_city_country_codes,
 )

@@ -69,7 +69,7 @@ from app.services.legal_catalog import (
     get_document_legal_topics_by_country,
     get_legal_catalog,
 )
-from app.services.jurisdiction_resolution import (
+from app.services.country_detection import (
     resolve_city_country_codes,
 )
 from app.services.legal_search import (

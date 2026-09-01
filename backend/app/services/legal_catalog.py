@@ -20,6 +20,15 @@ from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
 )
 
+from collections.abc import Callable
+from typing import Final
+from app.models.catalog import LegalCatalogResponse
+from app.models.chat import HISTORY_MAX_MESSAGES
+from app.models.frontend import (
+    FrontendConfigResponse,
+    FrontendLimits,
+)
+
 
 MAX_COUNTRIES: Final[int] = 300
 MAX_LEGAL_TOPICS: Final[int] = 500
@@ -493,4 +502,65 @@ def get_legal_catalog(
             aggregations=aggregations,
             aggregation_name="subsections",
         ),
+    )
+
+
+# ================================================================
+# Consolidated from frontend_config.py
+# ================================================================
+
+API_VERSION: Final[str] = "0.5.0"
+
+DEFAULT_LANGUAGE: Final[str] = "en"
+
+SUPPORTED_LANGUAGES: Final[tuple[str, ...]] = (
+    "en",
+)
+
+QUESTION_MIN_LENGTH: Final[int] = 2
+
+QUESTION_MAX_LENGTH: Final[int] = 2000
+
+MAX_SOURCES_DEFAULT: Final[int] = 6
+
+MAX_SOURCES_MIN: Final[int] = 1
+
+MAX_SOURCES_MAX: Final[int] = 10
+
+CatalogProvider = Callable[
+    [],
+    LegalCatalogResponse,
+]
+
+class FrontendConfigError(RuntimeError):
+    """Raised when frontend configuration cannot be generated."""
+
+def get_frontend_config(
+    catalog_provider: CatalogProvider = get_legal_catalog,
+) -> FrontendConfigResponse:
+    """Return the current chatbot frontend configuration."""
+
+    try:
+        catalog = catalog_provider()
+
+    except LegalCatalogError as error:
+        raise FrontendConfigError(
+            "The indexed legal catalog could not be loaded."
+        ) from error
+
+    return FrontendConfigResponse(
+        api_version=API_VERSION,
+        default_language=DEFAULT_LANGUAGE,
+        supported_languages=list(
+            SUPPORTED_LANGUAGES
+        ),
+        limits=FrontendLimits(
+            question_min_length=QUESTION_MIN_LENGTH,
+            question_max_length=QUESTION_MAX_LENGTH,
+            max_sources_default=MAX_SOURCES_DEFAULT,
+            max_sources_min=MAX_SOURCES_MIN,
+            max_sources_max=MAX_SOURCES_MAX,
+            max_history_messages=HISTORY_MAX_MESSAGES,
+        ),
+        catalog=catalog,
     )

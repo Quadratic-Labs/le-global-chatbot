@@ -221,7 +221,7 @@ class _main_ConversationStateRejectionLoggingTests(_main_ResetAppLoggerStateMixi
 import unittest as _frontend_unittest
 from app.models.catalog import LegalCatalogCountry as _frontend_LegalCatalogCountry, LegalCatalogResponse as _frontend_LegalCatalogResponse, LegalCatalogValue as _frontend_LegalCatalogValue
 from app.models.chat import HISTORY_MAX_MESSAGES as _frontend_HISTORY_MAX_MESSAGES
-from app.services.frontend_config import API_VERSION as _frontend_API_VERSION, FrontendConfigError as _frontend_FrontendConfigError, get_frontend_config as _frontend_get_frontend_config
+from app.services.legal_catalog import API_VERSION as _frontend_API_VERSION, FrontendConfigError as _frontend_FrontendConfigError, get_frontend_config as _frontend_get_frontend_config
 from app.services.legal_catalog import LegalCatalogError as _frontend_LegalCatalogError
 
 def _frontend_build_catalog() -> _frontend_LegalCatalogResponse:

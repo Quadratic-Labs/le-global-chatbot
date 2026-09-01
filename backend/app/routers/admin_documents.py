@@ -25,7 +25,7 @@ from app.models.admin_documents import (
 from app.security.admin import (
     require_admin_key,
 )
-from app.services.admin_documents import (
+from app.services.admin_document_replacement import (
     AdminDocumentCatalogError,
     AdminDocumentStorageError,
     DocumentCorruptError,

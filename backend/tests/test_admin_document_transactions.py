@@ -33,7 +33,7 @@ from unittest.mock import patch
 from opensearchpy.exceptions import OpenSearchException
 
 from app.models.document import DocumentChunk
-from app.services.admin_document_conflict_resolution import (
+from app.services.admin_document_replacement import (
     AUTO_DEDUPLICATE,
     CHOOSE_DOCUMENT,
     CountryConflictNotFoundError,
@@ -477,7 +477,7 @@ class AdminModifiedReseedRollbackTests(unittest.TestCase):
                 / "Employment Law Overview Australia.docx"
             ).write_bytes(b"same-australia")
 
-            from app.services.admin_modification_marker import (
+            from app.services.document_section_state import (
                 is_admin_modified_since_upload,
                 mark_admin_modified,
             )

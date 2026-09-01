@@ -23,12 +23,12 @@ from docx import Document
 from app.routers.admin_contacts import router
 from app.services import admin_contacts
 from app.services.admin_contacts import AdminContactMutationFailedError, AdminContactNotFoundError, add_contact, apply_structured_contact_state_to_chunks, bootstrap_legacy_contacts, delete_contact, list_contacts, reseed_contact_state_from_parsed_contacts, reseed_contacts_from_current_docx, update_contact
-from app.services.admin_contact_photos import AdminContactPhotoError, AdminContactPhotoNotFoundError, read_admin_contact_photo, remove_admin_contact_photo, replace_admin_contact_photo
+from app.services.admin_contacts import AdminContactPhotoError, AdminContactPhotoNotFoundError, read_admin_contact_photo, remove_admin_contact_photo, replace_admin_contact_photo
 from app.services.admin_document_lifecycle import AdminDocumentRollbackError, get_document_download, reindex_indexed_document
 from app.services.admin_document_replacement import safe_upload_and_index_document
-from app.services.admin_modification_marker import is_admin_modified_since_upload, mark_admin_modified
+from app.services.document_section_state import is_admin_modified_since_upload, mark_admin_modified
 from app.services.contact_document_area import ContactPhotoPayload, rebuild_canonical_contact_table
-from app.services.contact_photo_store import ContactPhotoStorageError, delete_contact_photo, read_contact_photo, write_contact_photo_atomic
+from app.services.contact_state import ContactPhotoStorageError, delete_contact_photo, read_contact_photo, write_contact_photo_atomic
 from app.services.contact_photos import extract_contact_photo_candidates
 from app.services.contact_state import ContactRecord, ContactState, ContactStateError, new_contact_id, read_contact_state, write_contact_state_atomic
 from pydantic import ValidationError
@@ -274,7 +274,7 @@ class ContactPhotoStoreTests(unittest.TestCase):
 
     def test_failed_new_write_preserves_existing_photo(self) -> None:
         old = write_contact_photo_atomic(self.source_directory, 'contact-123', data=b'old-photo', content_type='image/jpeg')
-        with patch('app.services.contact_photo_store.os.replace', side_effect=OSError('boom')):
+        with patch('app.services.contact_state.os.replace', side_effect=OSError('boom')):
             with self.assertRaises(ContactPhotoStorageError):
                 write_contact_photo_atomic(self.source_directory, 'contact-123', data=b'new-photo', content_type='image/png')
         self.assertEqual(b'old-photo', read_contact_photo(self.source_directory, old.filename))
@@ -1845,10 +1845,10 @@ from lxml import etree
 from app.services import contact_document_area as _contact_document_area
 from app.services.contact_document_area import ContactAreaError, ContactPhotoPayload, rebuild_canonical_contact_table, resolve_untracked_contact_photo
 from app.services.contact_document_photos import ContactDocumentPhotoError, add_contact_photo_to_document, add_new_contact_photo_to_document, remove_contact_photo_from_document, replace_contact_photo_in_document
-from app.services.contact_people import associate_contact_photos
+from app.services.contact_photos import associate_contact_photos
 from app.services.contact_photos import ContactPhotoCandidate, extract_contact_photo_candidates
 from app.services.docx_parser import CONTACT_TABLE_HIDDEN_MARKER, ExtractedContact, extract_contacts_from_docx, split_combined_legacy_contact
-from app.services.document_contact_materializer import _find_all_contact_runs, _is_contact_related_block
+from app.services.contact_document_photos import _find_all_contact_runs, _is_contact_related_block
 from tests.support.documents import resolve_source_root
 from tests.support.documents import make_png, require_corpus_copy, skip_if_already_canonicalized
 _test_contact_documents__SOURCE_ROOT = resolve_source_root()

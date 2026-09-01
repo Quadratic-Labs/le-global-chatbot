@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import Header, HTTPException, Request, Response, status
 
 from app.core.config import get_settings
-from app.services.admin_contact_photos import (
+from app.services.admin_contacts import (
     AdminContactPhotoError,
     AdminContactPhotoNotFoundError,
     read_admin_contact_photo,

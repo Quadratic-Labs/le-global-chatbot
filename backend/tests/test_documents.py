@@ -1087,7 +1087,7 @@ class PathSecurityTests(unittest.TestCase):
 import unittest
 from app.core.legal_taxonomy import LEGAL_TOPICS
 from app.models.document import DocumentChunk
-from app.services.document_warnings import CONTEXT_WARNING_CODE, EXPECTED_TOPICS_COUNT, STRUCTURE_WARNING_CODE, evaluate_topic_coverage, recognized_topics_for
+from app.services.admin_document_replacement import CONTEXT_WARNING_CODE, EXPECTED_TOPICS_COUNT, STRUCTURE_WARNING_CODE, evaluate_topic_coverage, recognized_topics_for
 
 def _chunk(*, legal_topic: str | None, document_type: str='comparator') -> DocumentChunk:
     return DocumentChunk(document_id='doc_' + 'a' * 64, chunk_id='chunk_' + 'a' * 64, country='Testland', country_code='ZZ', legal_topic=legal_topic, document_type=document_type, language='en', section=legal_topic or 'General', subsection=None, content='Some content.', source_filename='test.docx', source_format='docx', content_hash='hash')
@@ -2235,7 +2235,7 @@ class LegacySubsectionParserTests(unittest.TestCase):
 
 import unittest
 from app.services.docx_parser import ParsedSection
-from app.services.section_splitter import SectionSplitterError, split_parsed_sections, split_text
+from app.services.document_chunk_builder import SectionSplitterError, split_parsed_sections, split_text
 
 class SectionSplitterTests(unittest.TestCase):
 

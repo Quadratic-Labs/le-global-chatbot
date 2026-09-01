@@ -2110,7 +2110,7 @@ from app.models.chat import LegalAnswerSource, LegalChatRequest, LegalChatRespon
 from app.routers import chat
 from app.services import chat_contact_cards
 from app.services.chat_metrics import LegalChatMetrics
-from app.services.contact_photo_store import write_contact_photo_atomic
+from app.services.contact_state import write_contact_photo_atomic
 from app.services.contact_state import ContactRecord, ContactState, write_contact_state_atomic
 from app.services.request_understanding import CurrentMessageDelta, DeterministicHints, RequestUnderstandingAction, RequestUnderstandingResult
 

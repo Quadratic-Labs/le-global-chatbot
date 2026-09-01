@@ -67,7 +67,7 @@ from app.services.country_detection import (
     resolve_country_display_name,
     resolve_jurisdiction,
 )
-from app.services.jurisdiction_resolution import (
+from app.services.country_detection import (
     resolve_city_country_codes,
 )
 from app.services.legal_catalog import LegalCatalogError

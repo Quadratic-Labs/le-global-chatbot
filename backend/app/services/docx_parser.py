@@ -2810,7 +2810,7 @@ CONTACT_BOX_HIDDEN_MARKER: Final[str] = (
 
 # Closes a hidden-marker block inserted directly among ordinary body
 # paragraphs (a document with no pre-existing Contact text box at all
-# - see app.services.document_contact_materializer's in-flow-paragraph
+# - see app.services.contact_document_photos's in-flow-paragraph
 # fallback). A floating text box's own bounds already delimit its
 # content unambiguously, so this end marker is only ever needed - and
 # only ever looked for - when the block lives among plain body
@@ -2898,7 +2898,7 @@ def extract_deterministic_contact_blocks(
     Recognize the hidden-marker Contact block a materialized Download
     DOCX carries - either one <w:txbxContent> block (the document's own
     real Contact text box, reused and resized in place by
-    app.services.document_contact_materializer) or, for a document with
+    app.services.contact_document_photos) or, for a document with
     no pre-existing Contact box at all, a run of plain in-flow body
     paragraphs bounded by a hidden start and end marker - whose first
     line is the hidden marker.
