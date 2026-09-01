@@ -1,19 +1,26 @@
 """
-Tests for the Admin-managed canonical contact table primitive (the
-Word-native in-flow table that replaced both this module's own earlier
-hand-authored floating-textbox design - rejected by real Microsoft
-Word - and the original two-box-cloning design before it).
+Tests for the DOCX mechanics behind Admin-managed contacts: the
+canonical, Word-native in-flow contact table (the design that replaced
+both an earlier hand-authored floating-textbox design - rejected by real
+Microsoft Word - and the original two-box-cloning design before it), the
+older floating-shape photo mutation primitives still used to detect
+whether a document's Contact area is in that OLD format, raw contact-
+photo extraction from a DOCX's own image relationships, and
+contact/photo association by geometry or position.
 
-Mirrors the established real-corpus convention: exercise the REAL
-Australia/Portugal baselines (temp copies, never the files themselves),
-skipping gracefully when unavailable, and prove structural correctness
-(XML validity, no dangling relationships, no new floating shapes)
-rather than merely checking that strings exist somewhere in
-document.xml.
+Mirrors the established real-corpus convention throughout this suite:
+exercise the REAL corpus documents (temp copies, never the files
+themselves - see tests.support.corpus_paths/tests.support.documents),
+skipping gracefully when the corpus is unavailable, and proving
+structural correctness (XML validity, no dangling relationships, no new
+floating shapes) rather than merely checking that strings exist
+somewhere in document.xml.
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
 import re
 import tempfile
 import unittest
@@ -22,7 +29,9 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from docx import Document
 from docx import Document as WordDocument
+from lxml import etree
 
 from app.services import contact_document_area as _contact_document_area
 from app.services.contact_document_area import (
@@ -31,61 +40,53 @@ from app.services.contact_document_area import (
     rebuild_canonical_contact_table,
     resolve_untracked_contact_photo,
 )
-from app.services.contact_photos import extract_contact_photo_candidates
+from app.services.contact_document_photos import (
+    ContactDocumentPhotoError,
+    add_contact_photo_to_document,
+    add_new_contact_photo_to_document,
+    remove_contact_photo_from_document,
+    replace_contact_photo_in_document,
+)
+from app.services.contact_people import associate_contact_photos
+from app.services.contact_photos import (
+    ContactPhotoCandidate,
+    extract_contact_photo_candidates,
+)
 from app.services.docx_parser import (
     CONTACT_TABLE_HIDDEN_MARKER,
     ExtractedContact,
     extract_contacts_from_docx,
     split_combined_legacy_contact,
 )
+from app.services.document_contact_materializer import (
+    _find_all_contact_runs,
+    _is_contact_related_block,
+)
 
-
-from tests.corpus_paths import resolve_source_root
+from tests.support.corpus_paths import resolve_source_root
+from tests.support.documents import (
+    make_png,
+    require_corpus_copy,
+    skip_if_already_canonicalized,
+)
 
 SOURCE_ROOT = resolve_source_root()
 
 
-def _make_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
-    """A minimal but well-formed RGB PNG - real-sized (never 1x1), so
-    python-docx's own image-header parser (used to compute a photo's
-    proportional height) accepts it the same way it accepts a real
-    camera photo, unlike a degenerate single-pixel fixture."""
-
-    import struct
-    import zlib
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data))
-        )
-
-    signature = b"\x89PNG\r\n\x1a\n"
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    raw = b"".join(
-        b"\x00" + bytes(rgb) * width for _ in range(height)
-    )
-    image_data = zlib.compress(raw)
-    return (
-        signature
-        + chunk(b"IHDR", header)
-        + chunk(b"IDAT", image_data)
-        + chunk(b"IEND", b"")
-    )
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-_VALID_PNG = _make_png(183, 234, (200, 50, 50))
+_VALID_PNG = make_png(183, 234, (200, 50, 50))
 
 
 def _make_webp_vp8l(width: int, height: int) -> bytes:
     """A minimal, real, valid lossless (VP8L) WebP image - the format
-    Pillow's default Image.save(format="WEBP") produces for a
-    synthetic in-memory image, and the one this environment's own
-    _WebpImageHeader parser (contact_document_area.py) must recognize
-    for python-docx to embed it at all (python-docx 1.2.0 ships no
-    WebP support whatsoever - confirmed directly)."""
+    Pillow's default Image.save(format="WEBP") produces for a synthetic
+    in-memory image, and the one this environment's own _WebpImageHeader
+    parser (contact_document_area.py) must recognize for python-docx to
+    embed it at all (python-docx 1.2.0 ships no WebP support whatsoever -
+    confirmed directly)."""
 
     import struct
 
@@ -101,9 +102,9 @@ def _make_webp_vp8l(width: int, height: int) -> bytes:
 
 
 def _make_webp_vp8(width: int, height: int) -> bytes:
-    """A minimal, real, valid lossy (simple VP8) WebP image - the
-    other real-world sub-format a browser/screenshot tool commonly
-    produces, exercising a different byte layout than VP8L."""
+    """The other real-world WebP sub-format (simple lossy VP8) - a
+    different byte layout than VP8L, commonly produced by a browser or
+    screenshot tool."""
 
     import struct
 
@@ -127,6 +128,11 @@ _W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _PIC_NS = "{http://schemas.openxmlformats.org/drawingml/2006/picture}"
 
 
+# =========================================================================
+# CANONICAL CONTACT TABLE (contact_document_area.py)
+# =========================================================================
+
+
 class ContactDocumentAreaTests(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -134,24 +140,9 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
 
     def _require_copy(self, filename: str) -> Path:
-        source = SOURCE_ROOT / filename
-
-        if not source.exists():
-            self.skipTest(f"Real corpus source unavailable: {source}")
-
-        original_bytes = source.read_bytes()
-        copy_path = Path(self.temp.name) / filename
-        copy_path.write_bytes(original_bytes)
-
-        self.addCleanup(
-            lambda: self.assertEqual(
-                original_bytes,
-                source.read_bytes(),
-                f"{source} was mutated by this test.",
-            )
+        return require_corpus_copy(
+            self, SOURCE_ROOT, filename, Path(self.temp.name)
         )
-
-        return copy_path
 
     def _structural_checks(self, path: Path) -> None:
         """Zip integrity, XML well-formedness, no dangling
@@ -249,9 +240,9 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_add_first_contact_with_photo_produces_coherent_block(
         self,
     ) -> None:
-        """Test items 1 and 2: canonicalizing AU's own organic contact
-        area leaves no large empty band (Introduction follows the new
-        table directly) and the sole contact keeps its own photo.
+        """Canonicalizing AU's own organic contact area leaves no large
+        empty band (Introduction follows the new table directly) and
+        the sole contact keeps its own photo.
 
         The "no empty band" check asserts the semantic contract
         directly (no decorative, text-less/picture-less
@@ -345,9 +336,9 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertEqual(michael_photo.data, photos[0].data)
 
     def test_two_contacts_two_distinct_photos(self) -> None:
-        """Test item 3: two contacts, each with its own distinct
-        photo, round-trip as two separate contacts with two separate
-        photos - never merged or cross-associated."""
+        """Two contacts, each with its own distinct photo, round-trip
+        as two separate contacts with two separate photos - never
+        merged or cross-associated."""
 
         path = self._require_copy("AU.docx")
 
@@ -389,8 +380,8 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertIn(_sha(jane_photo.data), shas)
 
     def test_three_contacts_all_preserved_in_order(self) -> None:
-        """Test item 4: three contacts round-trip in the same order,
-        with the same field values."""
+        """Three contacts round-trip in the same order, with the same
+        field values."""
 
         path = self._require_copy("AU.docx")
         michael = extract_contacts_from_docx(path, country="Australia")[0]
@@ -423,9 +414,9 @@ class ContactDocumentAreaTests(unittest.TestCase):
         )
 
     def test_contact_without_photo_produces_coherent_block(self) -> None:
-        """Test item 5: a contact with no photo at all still produces
-        a coherent block - an empty right cell, never a missing row or
-        misaligned text."""
+        """A contact with no photo at all still produces a coherent
+        block - an empty right cell, never a missing row or misaligned
+        text."""
 
         path = self._require_copy("AU.docx")
         michael = extract_contacts_from_docx(path, country="Australia")[0]
@@ -452,8 +443,8 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertEqual(0, len(photos))
 
     def test_delete_contact_b_leaves_a_intact(self) -> None:
-        """Test item 6: rebuilding from a contact list with B removed
-        leaves B's text/photo gone and A's text/photo untouched."""
+        """Rebuilding from a contact list with B removed leaves B's
+        text/photo gone and A's text/photo untouched."""
 
         path = self._require_copy("AU.docx")
         michael = extract_contacts_from_docx(path, country="Australia")[0]
@@ -535,8 +526,8 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertEqual(0, len(extract_contacts_from_docx(path)))
 
     def test_legal_content_unchanged(self) -> None:
-        """Test item 9: real legal section text (well past the
-        contact area) is byte-identical after the rebuild."""
+        """Real legal section text (well past the contact area) is
+        byte-identical after the rebuild."""
 
         path = self._require_copy("AU.docx")
 
@@ -642,19 +633,15 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertEqual(2, len(reparsed))
 
     # =====================================================================
-    # "FERMER LE CRUD CONTACTS AVANT STREAMING" mission (2026-08-25):
-    # historical Argentina/Canada incidents ("le document observé après
-    # Add montrait encore Nicolás Grandi dans l'ancien bloc et Mohamed
-    # Amine ZARROUKI dans un nouveau bloc plus bas" / "canonical contacts
-    # + duplicated plain text contact block avant Introduction") both
-    # predate this module's current single-rebuild design (see its own
-    # module docstring: two earlier, abandoned approaches). Real Canada
-    # (still un-canonicalized, verified directly) proves the CURRENT
-    # mechanism already removes a real legacy floating-shape carrier
-    # correctly. The invariant below is the general, non-country-specific
-    # backstop: even if some OTHER country's own legacy shape geometry
-    # ever defeats _remove_legacy_carrier_and_get_anchor's detection, the
-    # mutation fails loudly instead of silently persisting two areas.
+    # Real Argentina/Canada incidents predate this module's current
+    # single-rebuild design (see its own module docstring: two earlier,
+    # abandoned approaches). Real Canada (still un-canonicalized, verified
+    # directly) proves the CURRENT mechanism already removes a real legacy
+    # floating-shape carrier correctly. The invariant below is the
+    # general, non-country-specific backstop: even if some OTHER
+    # country's own legacy shape geometry ever defeats
+    # _remove_legacy_carrier_and_get_anchor's detection, the mutation
+    # fails loudly instead of silently persisting two areas.
     # =====================================================================
 
     def test_canada_legacy_floating_carrier_add_produces_single_zone(
@@ -742,9 +729,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
         )
         document.element.body.insert(0, table._tbl)
 
-        from io import BytesIO
-
-        output = BytesIO()
+        output = io.BytesIO()
         document.save(output)
 
         with self.assertRaises(ContactAreaError) as raised:
@@ -785,9 +770,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
         )
         document.element.body.insert(0, extra_table._tbl)
 
-        from io import BytesIO
-
-        output = BytesIO()
+        output = io.BytesIO()
         document.save(output)
 
         with self.assertRaises(ContactAreaError) as raised:
@@ -905,13 +888,12 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_each_of_the_six_fields_individually_empty_round_trips(
         self,
     ) -> None:
-        """Section 4 (mission "FERMER LE CRUD CONTACTS AVANT
-        STREAMING"): all six fields are individually optional. address/
-        website-both-empty (France's own real shape) and member_firm-
-        empty (IE/IN's own real shape) are already covered elsewhere;
-        this closes the remaining combinations - contact_person and
-        email individually empty - at the actual DOCX round-trip layer,
-        not just the AdminContactWriteRequest validation layer (see
+        """All six fields are individually optional. address/website-
+        both-empty (France's own real shape) and member_firm-empty
+        (IE/IN's own real shape) are already covered elsewhere; this
+        closes the remaining combinations - contact_person and email
+        individually empty - at the actual DOCX round-trip layer, not
+        just the AdminContactWriteRequest validation layer (see
         AdminContactWriteRequestOptionalFieldTests in
         test_admin_contacts.py for that one)."""
 
@@ -955,8 +937,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_multiple_contacts_with_different_missing_fields_and_a_duplicate(
         self,
     ) -> None:
-        """Mission 'FINAL CONTACT CRUD BLOCKER', items C/D/E in one
-        table: several contacts with DIFFERENT missing-field shapes,
+        """Several contacts with DIFFERENT missing-field shapes,
         content deliberately chosen to fool a content-based classifier
         (a postal code, a phone-like substring embedded in an address,
         an apartment/unit number, a scheme-less URL, accented/unicode
@@ -1042,7 +1023,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
             "françois.müller@example.test", reparsed[0].email
         )
 
-    def test_webp_lossless_contact_photo_can_be_embedded(self) -> None:
+    def test_webp_contact_photo_can_be_embedded(self) -> None:
         """Real bug, reproduced directly against pre-fix code: python-
         docx 1.2.0 has no WebP header parser at all, so ANY Add+Photo/
         Edit+Photo/Replace-Photo mutation with a WebP file (a format
@@ -1051,76 +1032,52 @@ class ContactDocumentAreaTests(unittest.TestCase):
         failed with a raw UnrecognizedImageError wrapped as
         ContactAreaError. contact_document_area.py registers a small,
         dependency-free WebP header parser into python-docx's own
-        image factory; this proves a genuine lossless (VP8L) WebP -
-        what Pillow produces by default - now embeds and round-trips
-        correctly, with no image library added."""
+        image factory; this proves both real-world WebP sub-formats -
+        lossless VP8L (what Pillow produces by default) and lossy
+        simple VP8 (a different byte layout, common from a browser or
+        screenshot tool) - now embed and round-trip correctly, with no
+        image library added."""
 
         path = self._require_copy("AU.docx")
-
         baseline = extract_contacts_from_docx(path, country="Australia")
 
-        new_contact = ExtractedContact(
-            member_firm="WebP Test Firm",
-            contact_person="WebP Test Person",
-            email="webp@example.test",
-        )
-        photo = ContactPhotoPayload(
-            data=_VALID_WEBP_LOSSLESS, content_type="image/webp"
-        )
+        webp_variants = {
+            "lossless (VP8L)": _VALID_WEBP_LOSSLESS,
+            "lossy (VP8)": _VALID_WEBP_LOSSY,
+        }
 
-        new_bytes = rebuild_canonical_contact_table(
-            path,
-            contacts=(*baseline, new_contact),
-            photos=(*([None] * len(baseline)), photo),
-            country="Australia",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
+        for variant_name, webp_bytes in webp_variants.items():
+            with self.subTest(variant=variant_name):
+                new_contact = ExtractedContact(
+                    member_firm="WebP Test Firm",
+                    contact_person=f"WebP Test Person ({variant_name})",
+                    email="webp@example.test",
+                )
+                photo = ContactPhotoPayload(
+                    data=webp_bytes, content_type="image/webp"
+                )
 
-        candidates = extract_contact_photo_candidates(path)
-        actual_shas = {c.sha256 for c in candidates}
+                new_bytes = rebuild_canonical_contact_table(
+                    path,
+                    contacts=(*baseline, new_contact),
+                    photos=(*([None] * len(baseline)), photo),
+                    country="Australia",
+                )
+                path.write_bytes(new_bytes)
+                self._structural_checks(path)
 
-        import hashlib
+                candidates = extract_contact_photo_candidates(path)
+                actual_shas = {c.sha256 for c in candidates}
+                self.assertIn(_sha(webp_bytes), actual_shas)
 
-        self.assertIn(
-            hashlib.sha256(_VALID_WEBP_LOSSLESS).hexdigest(), actual_shas
-        )
-
-        reparsed = extract_contacts_from_docx(path, country="Australia")
-        self.assertEqual(len(baseline) + 1, len(reparsed))
-        self.assertEqual("WebP Test Person", reparsed[-1].contact_person)
-
-    def test_webp_lossy_contact_photo_can_be_embedded(self) -> None:
-        """The other real-world WebP sub-format (simple lossy VP8, a
-        different byte layout than VP8L) must also embed correctly -
-        a browser or screenshot tool commonly produces this variant
-        rather than the lossless one."""
-
-        path = self._require_copy("AU.docx")
-
-        baseline = extract_contacts_from_docx(path, country="Australia")
-
-        new_contact = ExtractedContact(
-            member_firm="WebP Lossy Test Firm",
-            contact_person="WebP Lossy Test Person",
-            email="webp-lossy@example.test",
-        )
-        photo = ContactPhotoPayload(
-            data=_VALID_WEBP_LOSSY, content_type="image/webp"
-        )
-
-        new_bytes = rebuild_canonical_contact_table(
-            path,
-            contacts=(*baseline, new_contact),
-            photos=(*([None] * len(baseline)), photo),
-            country="Australia",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
-
-        reparsed = extract_contacts_from_docx(path, country="Australia")
-        self.assertEqual(len(baseline) + 1, len(reparsed))
-        self.assertEqual("WebP Lossy Test Person", reparsed[-1].contact_person)
+                reparsed = extract_contacts_from_docx(
+                    path, country="Australia"
+                )
+                self.assertEqual(len(baseline) + 1, len(reparsed))
+                self.assertEqual(
+                    f"WebP Test Person ({variant_name})",
+                    reparsed[-1].contact_person,
+                )
 
     def test_multiple_emails_on_one_line_round_trip_preserved(self) -> None:
         """Regression for the real France defect found by the
@@ -1162,68 +1119,48 @@ class ContactDocumentAreaTests(unittest.TestCase):
             reparsed[0].email,
         )
 
-    def test_ie_empty_firm_cell_phone_addition_round_trips(self) -> None:
-        """Quirk B, real case: IE's real contact (Aoife Bradley) has
-        member_firm/address/phone/website all empty. Giving her a
-        phone value must land it as phone - never misread as
-        member_firm (which the writer would otherwise never have
-        written in the first place, since it was empty to begin
-        with)."""
+    def test_empty_firm_cell_phone_addition_round_trips(self) -> None:
+        """Real cases: IE's real contact (Aoife Bradley) and IN's real
+        contact (Avik Biswas) both have member_firm/address/phone/
+        website all empty. Giving each a phone value must land it as
+        phone - never misread as member_firm (which the writer would
+        otherwise never have written in the first place, since it was
+        empty to begin with). Confirmed against both real documents,
+        since the fix is architectural (never specific to either
+        country)."""
 
-        path = self._require_copy("IE.docx")
-        baseline = extract_contacts_from_docx(path, country="Ireland")
-        self.assertEqual(1, len(baseline))
-        self.assertIsNone(baseline[0].member_firm)
-        self.assertIsNone(baseline[0].phone)
+        cases = {
+            "Ireland": ("IE.docx", "Ireland", "+353 1 234 5678"),
+            "India": ("IN.docx", "India", "+91 11 4567 8900"),
+        }
 
-        with_phone = ExtractedContact(
-            contact_person=baseline[0].contact_person,
-            phone="+353 1 234 5678",
-        )
+        for label, (filename, country, new_phone) in cases.items():
+            with self.subTest(country=label):
+                path = self._require_copy(filename)
+                baseline = extract_contacts_from_docx(path, country=country)
+                self.assertEqual(1, len(baseline))
+                self.assertIsNone(baseline[0].member_firm)
+                self.assertIsNone(baseline[0].phone)
 
-        new_bytes = rebuild_canonical_contact_table(
-            path,
-            contacts=(with_phone,),
-            photos=(None,),
-            country="Ireland",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
+                with_phone = ExtractedContact(
+                    contact_person=baseline[0].contact_person,
+                    email=baseline[0].email,
+                    phone=new_phone,
+                )
 
-        reparsed = extract_contacts_from_docx(path, country="Ireland")
-        self.assertEqual(1, len(reparsed))
-        self.assertIsNone(reparsed[0].member_firm)
-        self.assertEqual("+353 1 234 5678", reparsed[0].phone)
+                new_bytes = rebuild_canonical_contact_table(
+                    path,
+                    contacts=(with_phone,),
+                    photos=(None,),
+                    country=country,
+                )
+                path.write_bytes(new_bytes)
+                self._structural_checks(path)
 
-    def test_in_empty_firm_cell_phone_addition_round_trips(self) -> None:
-        """Quirk B, real case: IN's real contact (Avik Biswas) has the
-        same all-empty firm side as IE's."""
-
-        path = self._require_copy("IN.docx")
-        baseline = extract_contacts_from_docx(path, country="India")
-        self.assertEqual(1, len(baseline))
-        self.assertIsNone(baseline[0].member_firm)
-        self.assertIsNone(baseline[0].phone)
-
-        with_phone = ExtractedContact(
-            contact_person=baseline[0].contact_person,
-            email=baseline[0].email,
-            phone="+91 11 4567 8900",
-        )
-
-        new_bytes = rebuild_canonical_contact_table(
-            path,
-            contacts=(with_phone,),
-            photos=(None,),
-            country="India",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
-
-        reparsed = extract_contacts_from_docx(path, country="India")
-        self.assertEqual(1, len(reparsed))
-        self.assertIsNone(reparsed[0].member_firm)
-        self.assertEqual("+91 11 4567 8900", reparsed[0].phone)
+                reparsed = extract_contacts_from_docx(path, country=country)
+                self.assertEqual(1, len(reparsed))
+                self.assertIsNone(reparsed[0].member_firm)
+                self.assertEqual(new_phone, reparsed[0].phone)
 
     def test_us_noop_rebuild_preserves_embedded_url_and_website(self) -> None:
         """Quirk C, real case: US's real address is a prose sentence
@@ -1345,10 +1282,10 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertIn("phone", message)
 
     # =====================================================================
-    # FRANCE: legacy plain-paragraph contact area (mission "FINAL CONTACT
-    # CRUD CLOSURE") - France's real legacy contact lives in ordinary body
-    # paragraphs near the END of the document, immediately before "YOUR
-    # L&E GLOBAL POC", not a floating shape near the start like AU/BE.
+    # FRANCE: legacy plain-paragraph contact area - France's real legacy
+    # contact lives in ordinary body paragraphs near the END of the
+    # document, immediately before "YOUR L&E GLOBAL POC", not a floating
+    # shape near the start like AU/BE.
     # =====================================================================
 
     def _france_split_contacts(self) -> tuple[ExtractedContact, ExtractedContact]:
@@ -1389,11 +1326,10 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_france_canonical_table_replaces_legacy_block_before_poc(
         self,
     ) -> None:
-        """Sections 3-5: the canonical table must land at the EXACT
-        location the legacy plain-paragraph block occupied - before
-        "YOUR L&E GLOBAL POC" - never the document start, with the old
-        legacy text fully removed and the POC/Jessica Stout block
-        untouched."""
+        """The canonical table must land at the EXACT location the
+        legacy plain-paragraph block occupied - before "YOUR L&E
+        GLOBAL POC" - never the document start, with the old legacy
+        text fully removed and the POC/Jessica Stout block untouched."""
 
         path = self._require_copy("FR.docx")
         caroline, florence = self._france_split_contacts()
@@ -1462,12 +1398,12 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_france_add_temporary_contact_then_delete_round_trips(
         self,
     ) -> None:
-        """Section 14's exact acceptance scenario: Caroline/Florence
-        baseline -> add a temporary third contact -> full-field
-        round-trip valid, in order -> delete the temporary contact ->
-        back to exactly Caroline/Florence, with no ContactAreaError at
-        any stage (the internal round-trip validator is never
-        weakened or bypassed - the data is made to satisfy it)."""
+        """Caroline/Florence baseline -> add a temporary third contact
+        -> full-field round-trip valid, in order -> delete the
+        temporary contact -> back to exactly Caroline/Florence, with no
+        ContactAreaError at any stage (the internal round-trip
+        validator is never weakened or bypassed - the data is made to
+        satisfy it)."""
 
         path = self._require_copy("FR.docx")
         caroline, florence = self._france_split_contacts()
@@ -1512,8 +1448,8 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_france_photo_stays_with_the_correct_split_contact(
         self,
     ) -> None:
-        """Section 16: a photo attached to only one of the two split
-        France contacts must never migrate to the other."""
+        """A photo attached to only one of the two split France
+        contacts must never migrate to the other."""
 
         path = self._require_copy("FR.docx")
         caroline, florence = self._france_split_contacts()
@@ -1541,9 +1477,8 @@ class ContactDocumentAreaTests(unittest.TestCase):
         )
 
     def test_france_clearing_website_persists_as_cleared(self) -> None:
-        """Section 13: clearing a previously-set field must round-trip
-        as actually cleared, never silently retaining the stale
-        value."""
+        """Clearing a previously-set field must round-trip as actually
+        cleared, never silently retaining the stale value."""
 
         path = self._require_copy("FR.docx")
         caroline, florence = self._france_split_contacts()
@@ -1588,23 +1523,21 @@ class ContactDocumentAreaTests(unittest.TestCase):
     def test_belgium_combined_contact_splits_consistently_like_france(
         self,
     ) -> None:
-        """Section 10/24 regression control - verified directly against
-        the real corpus rather than assumed: Belgium's own real legacy
-        contact ALSO names two people sharing one comma-joined email
-        string ("Chris van Olmen and Nicolas Simon"), the identical
-        shape to France's. The multi-person split is a general,
-        country-agnostic rule (never a France-specific exception), so
-        it correctly and safely applies here too - this is the
-        consistency the split logic must have, not a special case to
-        avoid. What must genuinely stay unaffected (the real
-        regression-control concern) is the ALREADY-validated canonical
-        table mechanism's own handling of an explicitly-given,
-        already-distinct multi-contact list: split_combined_legacy_
-        contact is only ever invoked once, at legacy bootstrap time -
-        never during an ordinary rebuild/update round-trip - so two
-        contacts already split (by bootstrap or given directly, as
-        here) keep round-tripping as two distinct, unmerged contacts
-        exactly as before this mission."""
+        """Verified directly against the real corpus rather than
+        assumed: Belgium's own real legacy contact ALSO names two
+        people sharing one comma-joined email string ("Chris van Olmen
+        and Nicolas Simon"), the identical shape to France's. The
+        multi-person split is a general, country-agnostic rule (never a
+        France-specific exception), so it correctly and safely applies
+        here too - this is the consistency the split logic must have,
+        not a special case to avoid. What must genuinely stay
+        unaffected is the ALREADY-validated canonical table mechanism's
+        own handling of an explicitly-given, already-distinct
+        multi-contact list: split_combined_legacy_contact is only ever
+        invoked once, at legacy bootstrap time - never during an
+        ordinary rebuild/update round-trip - so two contacts already
+        split (by bootstrap or given directly, as here) keep
+        round-tripping as two distinct, unmerged contacts."""
 
         path = self._require_copy(
             "Labour and Employment Law in Belgium 2026.docx"
@@ -1637,9 +1570,9 @@ class ContactDocumentAreaTests(unittest.TestCase):
         )
 
         # Once split (mirroring what bootstrap_legacy_contacts would
-        # persist into ContactState), the canonical table mechanism -
-        # untouched by this mission - must keep them distinct across
-        # rebuilds, never re-merging or re-splitting them.
+        # persist into ContactState), the canonical table mechanism
+        # must keep them distinct across rebuilds, never re-merging or
+        # re-splitting them.
         new_bytes = rebuild_canonical_contact_table(
             path, contacts=tuple(split),
             photos=tuple(None for _ in split), country="Belgium",
@@ -1661,10 +1594,9 @@ class ContactDocumentAreaTests(unittest.TestCase):
             )
 
     # =====================================================================
-    # CANONICAL FIELD DETERMINISM (mission "FERMER LE CRUD CONTACTS AVANT
-    # STREAMING"): the canonical table is a format this system owns (both
-    # writer and reader), so its own round-trip must be fully
-    # deterministic - never dependent on content heuristics that can
+    # CANONICAL FIELD DETERMINISM: the canonical table is a format this
+    # system owns (both writer and reader), so its own round-trip must be
+    # fully deterministic - never dependent on content heuristics that can
     # misclassify a value shaped like a different field (a postal code
     # that looks phone-shaped, a real phone number embedded inside an
     # address). Confirmed live: a global Add+Photo dry-run over the real
@@ -1680,89 +1612,70 @@ class ContactDocumentAreaTests(unittest.TestCase):
     # classification as before.
     # =====================================================================
 
-    def test_brazil_adversarial_address_phone_never_swaps(self) -> None:
-        path = self._require_copy(
-            "Labour and Employment Law in Brazil 2026.docx"
-        )
+    def test_adversarial_address_phone_never_swaps(self) -> None:
+        """The identical field-tag mechanism, confirmed independently
+        against three real, differently-shaped adversarial addresses -
+        never a country-specific patch."""
 
-        adversarial = ExtractedContact(
-            member_firm="Tozzini Freire",
-            contact_person="Gabriela Lima",
-            email="glima@tozzinifreire.com.br",
-            address=(
-                "Rua Borges Lagoa, 1328, 04038-904 São Paulo, "
-                "+55 115 086 5000"
+        cases = {
+            "Brazil": (
+                "Labour and Employment Law in Brazil 2026.docx",
+                ExtractedContact(
+                    member_firm="Tozzini Freire",
+                    contact_person="Gabriela Lima",
+                    email="glima@tozzinifreire.com.br",
+                    address=(
+                        "Rua Borges Lagoa, 1328, 04038-904 São Paulo, "
+                        "+55 115 086 5000"
+                    ),
+                    phone="04038-904",
+                ),
             ),
-            phone="04038-904",
-        )
-
-        new_bytes = rebuild_canonical_contact_table(
-            path, contacts=(adversarial,), photos=(None,),
-            country="Brazil",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
-
-        reparsed = extract_contacts_from_docx(path, country="Brazil")
-        self.assertEqual(1, len(reparsed))
-        self.assertEqual(adversarial.address, reparsed[0].address)
-        self.assertEqual(adversarial.phone, reparsed[0].phone)
-
-    def test_romania_adversarial_address_phone_never_swaps(self) -> None:
-        path = self._require_copy(
-            "Labour and Employment Law in Romania 2026.docx"
-        )
-
-        adversarial = ExtractedContact(
-            member_firm="Volonciu & Associates",
-            contact_person="Magda Volonciu",
-            email="magdavolonciu@volonciu.ro",
-            address=(
-                "No. 35 Alexandru Constantinescu Street, 2nd Floor, "
-                "011471 1st District Bucharest, +40 372 755 699"
+            "Romania": (
+                "Labour and Employment Law in Romania 2026.docx",
+                ExtractedContact(
+                    member_firm="Volonciu & Associates",
+                    contact_person="Magda Volonciu",
+                    email="magdavolonciu@volonciu.ro",
+                    address=(
+                        "No. 35 Alexandru Constantinescu Street, 2nd "
+                        "Floor, 011471 1st District Bucharest, "
+                        "+40 372 755 699"
+                    ),
+                    phone="011471 1",
+                ),
             ),
-            phone="011471 1",
-        )
-
-        new_bytes = rebuild_canonical_contact_table(
-            path, contacts=(adversarial,), photos=(None,),
-            country="Romania",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
-
-        reparsed = extract_contacts_from_docx(path, country="Romania")
-        self.assertEqual(1, len(reparsed))
-        self.assertEqual(adversarial.address, reparsed[0].address)
-        self.assertEqual(adversarial.phone, reparsed[0].phone)
-
-    def test_singapore_adversarial_address_phone_never_swaps(self) -> None:
-        path = self._require_copy(
-            "Employment Law Overview Singapore 2026.docx"
-        )
-
-        adversarial = ExtractedContact(
-            member_firm="Clyde & Co Clasis",
-            contact_person="Thomas Choo",
-            email="thomas.choo@clydeco.com",
-            address=(
-                "12 Marina Boulevard | , Marina Bay Financial Centre "
-                "Tower 3 | #30 - 03, 018982 Singapore, +65 654 465 00"
+            "Singapore": (
+                "Employment Law Overview Singapore 2026.docx",
+                ExtractedContact(
+                    member_firm="Clyde & Co Clasis",
+                    contact_person="Thomas Choo",
+                    email="thomas.choo@clydeco.com",
+                    address=(
+                        "12 Marina Boulevard | , Marina Bay Financial "
+                        "Centre Tower 3 | #30 - 03, 018982 Singapore, "
+                        "+65 654 465 00"
+                    ),
+                    phone="30 - 03",
+                ),
             ),
-            phone="30 - 03",
-        )
+        }
 
-        new_bytes = rebuild_canonical_contact_table(
-            path, contacts=(adversarial,), photos=(None,),
-            country="Singapore",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
+        for country, (filename, adversarial) in cases.items():
+            with self.subTest(country=country):
+                path = self._require_copy(filename)
 
-        reparsed = extract_contacts_from_docx(path, country="Singapore")
-        self.assertEqual(1, len(reparsed))
-        self.assertEqual(adversarial.address, reparsed[0].address)
-        self.assertEqual(adversarial.phone, reparsed[0].phone)
+                new_bytes = rebuild_canonical_contact_table(
+                    path, contacts=(adversarial,), photos=(None,),
+                    country=country,
+                )
+                path.write_bytes(new_bytes)
+                self._structural_checks(path)
+
+                reparsed = extract_contacts_from_docx(path, country=country)
+                self.assertEqual(1, len(reparsed))
+                self.assertEqual(adversarial.address, reparsed[0].address)
+                self.assertEqual(adversarial.phone, reparsed[0].phone)
 
     def test_address_never_mistaken_for_website(self) -> None:
         """An address value that happens to contain a URL-shaped
@@ -1797,7 +1710,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
         """Every one of the six fields, including deliberately
         adversarial/ambiguous shapes, must round-trip byte-for-byte
         through a canonical rebuild - the general contract this whole
-        mission exists to guarantee, not just the three reported
+        mechanism exists to guarantee, not just the reported
         countries."""
 
         path = self._require_copy("AU.docx")
@@ -1822,7 +1735,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertEqual(1, len(reparsed))
         self.assertEqual(adversarial, reparsed[0])
 
-    def test_china_website_without_www_prefix_never_leaks_into_address(
+    def test_website_without_www_prefix_never_leaks_into_address(
         self,
     ) -> None:
         """Explains a real, previously-observed divergence: a global
@@ -1835,62 +1748,45 @@ class ContactDocumentAreaTests(unittest.TestCase):
         the dedicated website field at all; without it, the value fell
         through into address instead, and website came back None.
         Confirmed by reproducing this exact error message against the
-        real China contact on the pre-fix code."""
+        real China and Spain contacts on the pre-fix code - the
+        identical architectural fix, not a country-specific patch."""
 
-        path = self._require_copy("CN.docx")
-        baseline = extract_contacts_from_docx(path, country="China")[0]
+        cases = {
+            "China": ("CN.docx", "China"),
+            "Spain": (
+                "Labour and Employment Law in Spain 2026.docx", "Spain",
+            ),
+        }
 
-        edited = ExtractedContact(
-            member_firm=baseline.member_firm,
-            contact_person=baseline.contact_person,
-            email=baseline.email,
-            phone=baseline.phone,
-            address=baseline.address,
-            website=baseline.website.replace("www.", ""),
-        )
+        for label, (filename, country) in cases.items():
+            with self.subTest(country=label):
+                path = self._require_copy(filename)
+                baseline = extract_contacts_from_docx(
+                    path, country=country
+                )[0]
 
-        new_bytes = rebuild_canonical_contact_table(
-            path, contacts=(edited,), photos=(None,), country="China",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
+                edited = ExtractedContact(
+                    member_firm=baseline.member_firm,
+                    contact_person=baseline.contact_person,
+                    email=baseline.email,
+                    phone=baseline.phone,
+                    address=baseline.address,
+                    website=baseline.website.replace("www.", ""),
+                )
 
-        reparsed = extract_contacts_from_docx(path, country="China")
-        self.assertEqual(1, len(reparsed))
-        self.assertEqual(edited.address, reparsed[0].address)
-        self.assertEqual(edited.website, reparsed[0].website)
+                new_bytes = rebuild_canonical_contact_table(
+                    path, contacts=(edited,), photos=(None,),
+                    country=country,
+                )
+                path.write_bytes(new_bytes)
+                self._structural_checks(path)
 
-    def test_spain_website_without_www_prefix_never_leaks_into_address(
-        self,
-    ) -> None:
-        """The identical scenario, confirmed against the real Spain
-        contact too - the same architectural fix, not a China-specific
-        patch."""
-
-        path = self._require_copy(
-            "Labour and Employment Law in Spain 2026.docx"
-        )
-        baseline = extract_contacts_from_docx(path, country="Spain")[0]
-
-        edited = ExtractedContact(
-            member_firm=baseline.member_firm,
-            contact_person=baseline.contact_person,
-            email=baseline.email,
-            phone=baseline.phone,
-            address=baseline.address,
-            website=baseline.website.replace("www.", ""),
-        )
-
-        new_bytes = rebuild_canonical_contact_table(
-            path, contacts=(edited,), photos=(None,), country="Spain",
-        )
-        path.write_bytes(new_bytes)
-        self._structural_checks(path)
-
-        reparsed = extract_contacts_from_docx(path, country="Spain")
-        self.assertEqual(1, len(reparsed))
-        self.assertEqual(edited.address, reparsed[0].address)
-        self.assertEqual(edited.website, reparsed[0].website)
+                reparsed = extract_contacts_from_docx(
+                    path, country=country
+                )
+                self.assertEqual(1, len(reparsed))
+                self.assertEqual(edited.address, reparsed[0].address)
+                self.assertEqual(edited.website, reparsed[0].website)
 
     def test_old_untagged_canonical_table_still_reads_correctly(
         self,
@@ -1900,7 +1796,7 @@ class ContactDocumentAreaTests(unittest.TestCase):
         directly: AR.docx's real production canonical table has none
         of them), must keep reading correctly via the same content-
         based fallback classification this reader has always used -
-        this mission never breaks an already-deployed canonical
+        this mechanism never breaks an already-deployed canonical
         table, it only makes NEW ones fully deterministic."""
 
         path = self._require_copy("AU.docx")
@@ -1960,12 +1856,6 @@ class ContactDocumentAreaTests(unittest.TestCase):
         self.assertEqual(contact, reparsed[0])
 
 
-def _sha(data: bytes) -> str:
-    import hashlib
-
-    return hashlib.sha256(data).hexdigest()
-
-
 def _build_synthetic_france_shaped_docx(path: Path) -> None:
     """
     A minimal, from-scratch DOCX matching France's own real structure
@@ -2013,10 +1903,9 @@ def _build_synthetic_france_shaped_docx(path: Path) -> None:
 class FranceSyntheticContactCrudTests(unittest.TestCase):
     """
     Permanent, corpus-independent coverage of France's own special
-    contact shape (mission "FINAL CONTACT CRUD BLOCKER", item H) - a
-    synthetic fixture built fresh in setUp, immune to real corpus
-    content drift (unlike ContactDocumentAreaTests._france_split_
-    contacts, which now skips because real FR.docx has since been
+    contact shape - a synthetic fixture built fresh in setUp, immune to
+    real corpus content drift (unlike ContactDocumentAreaTests._france_
+    split_contacts, which now skips because real FR.docx has since been
     canonicalized by genuine Admin usage in production).
     """
 
@@ -2183,6 +2072,1131 @@ class FranceSyntheticContactCrudTests(unittest.TestCase):
         )
         reparsed = extract_contacts_from_docx(self.path, country="France")
         self.assertIsNone(reparsed[0].website)
+
+
+# =========================================================================
+# OLD FLOATING-SHAPE PHOTO MUTATION PRIMITIVES (contact_document_photos.py)
+#
+# The mechanism the canonical contact table (above) replaced for the
+# textual contact area; contact_document_photos.py's own low-level image
+# mutation primitives (replace/remove/add-by-name/add-new-anchor) remain a
+# real, independently importable part of this service module, and
+# _is_contact_related_block/_find_all_contact_runs (bottom of this file)
+# still detect whether a document's Contact area is in this OLD format.
+# =========================================================================
+
+# Degenerate (not real-dimensioned) fixtures are deliberately fine here -
+# unlike contact_document_area.py's canonical table, these primitives
+# never compute a photo's proportional height from its own header, so a
+# minimal 1x1-scale placeholder round-trips exactly like a real photo
+# would.
+_LEGACY_VALID_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffd9"
+)
+_LEGACY_VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000"
+    "000108060000001f15c4890000000a49444154789c63"
+    "60000002000100ffff03000006000557bfabd4000000"
+    "0049454e44ae426082"
+)
+
+
+class RealCorpusContactDocumentPhotoTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def _require_copy(self, filename: str) -> Path:
+        return require_corpus_copy(
+            self, SOURCE_ROOT, filename, Path(self.temp.name)
+        )
+
+    def _unrelated_parts(self, path: Path) -> dict[str, bytes]:
+        """Every zip part except document.xml/rels/content-types -
+        the parts a photo mutation must never touch."""
+
+        skip = {
+            "word/document.xml",
+            "word/_rels/document.xml.rels",
+            "[Content_Types].xml",
+        }
+
+        with zipfile.ZipFile(path) as archive:
+            return {
+                name: archive.read(name)
+                for name in archive.namelist()
+                if name not in skip
+            }
+
+    def test_belgium_replace_isolates_the_other_contacts_photo(
+        self,
+    ) -> None:
+        path = self._require_copy(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+
+        original_candidates = extract_contact_photo_candidates(path)
+        by_name = {
+            c.source_filename: c for c in original_candidates
+        }
+        chris = by_name["image2.jpg"]
+        chris_sha = chris.sha256
+        nicolas_sha = by_name["image1.png"].sha256
+
+        original_paragraphs = len(Document(str(path)).paragraphs)
+        unrelated_before = self._unrelated_parts(path)
+        del unrelated_before[chris.media_path]
+
+        new_bytes = replace_contact_photo_in_document(
+            path,
+            target_sha256=chris_sha,
+            new_data=_LEGACY_VALID_JPEG,
+            new_content_type="image/jpeg",
+        )
+
+        out = Path(self.temp.name) / "belgium_replaced.docx"
+        out.write_bytes(new_bytes)
+
+        new_shas = {
+            c.sha256 for c in extract_contact_photo_candidates(out)
+        }
+
+        self.assertIn(
+            hashlib.sha256(_LEGACY_VALID_JPEG).hexdigest(), new_shas
+        )
+        self.assertNotIn(chris_sha, new_shas)
+        self.assertIn(nicolas_sha, new_shas)
+
+        self.assertEqual(
+            original_paragraphs, len(Document(str(out)).paragraphs)
+        )
+        unrelated_after = self._unrelated_parts(out)
+        del unrelated_after[chris.media_path]
+        self.assertEqual(unrelated_before, unrelated_after)
+
+    def test_belgium_remove_isolates_the_other_contacts_photo(
+        self,
+    ) -> None:
+        path = self._require_copy(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+        skip_if_already_canonicalized(self, path)
+
+        by_name = {
+            c.source_filename: c.sha256
+            for c in extract_contact_photo_candidates(path)
+        }
+        chris_sha = by_name["image2.jpg"]
+        nicolas_sha = by_name["image1.png"]
+
+        original_paragraphs = len(Document(str(path)).paragraphs)
+
+        new_bytes = remove_contact_photo_from_document(
+            path,
+            target_sha256=nicolas_sha,
+        )
+
+        out = Path(self.temp.name) / "belgium_removed.docx"
+        out.write_bytes(new_bytes)
+
+        remaining = extract_contact_photo_candidates(out)
+
+        self.assertEqual(1, len(remaining))
+        self.assertEqual(chris_sha, remaining[0].sha256)
+        self.assertEqual(
+            original_paragraphs, len(Document(str(out)).paragraphs)
+        )
+
+    def test_belgium_add_into_a_shared_zone_fails_closed(
+        self,
+    ) -> None:
+        """
+        Chris and Nicolas share ONE combined "CONTACT PERSON" textbox
+        zone, disambiguated only by their two photos' own separate
+        geometry - never by two separate zones. Adding a photo for
+        Nicolas after his own is removed has no safe, deterministic
+        place to insert it (the zone still names Chris too), so this
+        must fail closed rather than guess.
+        """
+
+        path = self._require_copy(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+
+        by_name = {
+            c.source_filename: c.sha256
+            for c in extract_contact_photo_candidates(path)
+        }
+        nicolas_sha = by_name["image1.png"]
+
+        removed_bytes = remove_contact_photo_from_document(
+            path,
+            target_sha256=nicolas_sha,
+        )
+        removed_path = Path(self.temp.name) / "belgium_removed.docx"
+        removed_path.write_bytes(removed_bytes)
+
+        with self.assertRaises(ContactDocumentPhotoError):
+            add_contact_photo_to_document(
+                removed_path,
+                contact_person="Nicolas Simon",
+                new_data=_LEGACY_VALID_JPEG,
+                new_content_type="image/jpeg",
+                other_contact_persons=["Chris van Olmen"],
+            )
+
+    def test_germany_add_to_a_genuinely_photo_less_contact(
+        self,
+    ) -> None:
+        path = self._require_copy("DE.docx")
+
+        original_candidates = extract_contact_photo_candidates(path)
+        self.assertEqual(
+            0,
+            len(original_candidates),
+            "Tobias Pusch is expected to have no existing photo in "
+            "the real corpus - if this fails, the corpus changed and "
+            "this test's premise needs revisiting.",
+        )
+
+        original_paragraphs = len(Document(str(path)).paragraphs)
+
+        new_bytes = add_contact_photo_to_document(
+            path,
+            contact_person="Tobias Pusch",
+            new_data=_LEGACY_VALID_PNG,
+            new_content_type="image/png",
+            other_contact_persons=[],
+        )
+
+        out = Path(self.temp.name) / "de_added.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual(
+            hashlib.sha256(_LEGACY_VALID_PNG).hexdigest(),
+            candidates[0].sha256,
+        )
+        self.assertEqual(
+            original_paragraphs, len(Document(str(out)).paragraphs)
+        )
+
+    def test_argentina_replace_then_remove_single_contact(
+        self,
+    ) -> None:
+        path = self._require_copy("AR.docx")
+
+        original_candidates = extract_contact_photo_candidates(path)
+        self.assertEqual(1, len(original_candidates))
+        target_sha = original_candidates[0].sha256
+
+        original_paragraphs = len(Document(str(path)).paragraphs)
+
+        replaced_bytes = replace_contact_photo_in_document(
+            path,
+            target_sha256=target_sha,
+            new_data=_LEGACY_VALID_JPEG,
+            new_content_type="image/jpeg",
+        )
+        replaced_path = Path(self.temp.name) / "ar_replaced.docx"
+        replaced_path.write_bytes(replaced_bytes)
+
+        replaced_candidates = extract_contact_photo_candidates(
+            replaced_path
+        )
+        self.assertEqual(1, len(replaced_candidates))
+        self.assertEqual(
+            hashlib.sha256(_LEGACY_VALID_JPEG).hexdigest(),
+            replaced_candidates[0].sha256,
+        )
+        self.assertEqual(
+            original_paragraphs,
+            len(Document(str(replaced_path)).paragraphs),
+        )
+
+        removed_bytes = remove_contact_photo_from_document(
+            replaced_path,
+            target_sha256=hashlib.sha256(_LEGACY_VALID_JPEG).hexdigest(),
+        )
+        removed_path = Path(self.temp.name) / "ar_removed.docx"
+        removed_path.write_bytes(removed_bytes)
+
+        self.assertEqual(
+            0, len(extract_contact_photo_candidates(removed_path))
+        )
+        self.assertEqual(
+            original_paragraphs,
+            len(Document(str(removed_path)).paragraphs),
+        )
+
+    def test_replace_of_an_unlocatable_sha_fails_closed(
+        self,
+    ) -> None:
+        path = self._require_copy("AR.docx")
+
+        with self.assertRaises(ContactDocumentPhotoError):
+            replace_contact_photo_in_document(
+                path,
+                target_sha256="0" * 64,
+                new_data=_LEGACY_VALID_JPEG,
+                new_content_type="image/jpeg",
+            )
+
+    def test_remove_of_an_unlocatable_sha_fails_closed(
+        self,
+    ) -> None:
+        path = self._require_copy("AR.docx")
+
+        with self.assertRaises(ContactDocumentPhotoError):
+            remove_contact_photo_from_document(
+                path,
+                target_sha256="0" * 64,
+            )
+
+    def test_add_for_an_unknown_contact_person_fails_closed(
+        self,
+    ) -> None:
+        path = self._require_copy("DE.docx")
+
+        with self.assertRaises(ContactDocumentPhotoError):
+            add_contact_photo_to_document(
+                path,
+                contact_person="Nobody Real",
+                new_data=_LEGACY_VALID_PNG,
+                new_content_type="image/png",
+                other_contact_persons=[],
+            )
+
+    def test_replace_of_the_existing_zone_now_uses_true_geometry(
+        self,
+    ) -> None:
+        """
+        Regression guard for a fixed bug: adding a photo for an
+        EXISTING named zone must genuinely geometrically overlap that
+        zone (reason "GEOMETRY"), never merely happen to be the sole
+        remaining portrait in the whole document (reason
+        "UNIQUE_PORTRAIT") - the fallback only ever works by
+        coincidence and breaks the moment the document has more than
+        one photo total, exactly the scenario a brand-new second
+        contact's photo introduces.
+        """
+
+        path = self._require_copy("DE.docx")
+
+        new_bytes = add_contact_photo_to_document(
+            path,
+            contact_person="Tobias Pusch",
+            new_data=_LEGACY_VALID_PNG,
+            new_content_type="image/png",
+            other_contact_persons=[],
+        )
+
+        out = Path(self.temp.name) / "de_geometry.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+        self.assertEqual(1, len(candidates))
+        self.assertEqual("GEOMETRY", candidates[0].reason)
+
+    def test_add_new_contact_photo_anchors_to_the_largest_zone_alongside_an_existing_photo(
+        self,
+    ) -> None:
+        """
+        The core blocker scenario this primitive exists for: a
+        document that ALREADY has one contact's photo, and a genuinely
+        brand-new second contact (whose name cannot possibly appear
+        anywhere yet) also gets a photo. Both must round-trip as
+        independently valid, GEOMETRY-reasoned candidates - never
+        relying on the "exactly one remaining portrait" fallback,
+        which cannot disambiguate once there is more than one
+        unassociated photo.
+        """
+
+        path = self._require_copy("AR.docx")
+        skip_if_already_canonicalized(self, path)
+
+        original = extract_contact_photo_candidates(path)
+        self.assertEqual(1, len(original))
+        original_sha = original[0].sha256
+
+        original_paragraphs = len(Document(str(path)).paragraphs)
+
+        new_bytes = add_new_contact_photo_to_document(
+            path,
+            new_data=_LEGACY_VALID_JPEG,
+            new_content_type="image/jpeg",
+        )
+
+        out = Path(self.temp.name) / "ar_new_contact.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+        self.assertEqual(2, len(candidates))
+
+        for candidate in candidates:
+            self.assertEqual(
+                "GEOMETRY",
+                candidate.reason,
+                "must be a real geometric match, never a fallback "
+                "that only works by coincidence",
+            )
+
+        new_shas = {c.sha256 for c in candidates}
+        self.assertIn(original_sha, new_shas)
+        self.assertIn(
+            hashlib.sha256(_LEGACY_VALID_JPEG).hexdigest(), new_shas
+        )
+        self.assertEqual(
+            original_paragraphs, len(Document(str(out)).paragraphs)
+        )
+
+    def test_add_new_contact_photo_into_belgiums_shared_zone_isolates_existing_photos(
+        self,
+    ) -> None:
+        """
+        Belgium's shared "CONTACT PERSON" zone (Chris + Nicolas) is
+        the document's only (and therefore largest) CONTACT PERSON
+        zone - a brand-new third contact's photo anchors there too,
+        and must never disturb either of the two existing contacts'
+        own photos.
+        """
+
+        path = self._require_copy(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+        skip_if_already_canonicalized(self, path)
+
+        original_shas = {
+            c.sha256 for c in extract_contact_photo_candidates(path)
+        }
+        self.assertEqual(2, len(original_shas))
+
+        new_bytes = add_new_contact_photo_to_document(
+            path,
+            new_data=_LEGACY_VALID_PNG,
+            new_content_type="image/png",
+        )
+
+        out = Path(self.temp.name) / "belgium_new_contact.docx"
+        out.write_bytes(new_bytes)
+
+        candidates = extract_contact_photo_candidates(out)
+        new_shas = {c.sha256 for c in candidates}
+
+        self.assertEqual(3, len(new_shas))
+        self.assertTrue(original_shas.issubset(new_shas))
+        self.assertIn(
+            hashlib.sha256(_LEGACY_VALID_PNG).hexdigest(), new_shas
+        )
+
+    def test_add_new_contact_photo_fails_closed_with_no_contact_zone_at_all(
+        self,
+    ) -> None:
+        """
+        A document with genuinely zero "CONTACT PERSON" zones (no
+        structural home at all) must fail closed rather than insert
+        the photo at an arbitrary position such as the document's end.
+        """
+
+        path = self._require_copy("PT.docx")
+
+        self.assertEqual(0, len(extract_contact_photo_candidates(path)))
+
+        with self.assertRaises(ContactDocumentPhotoError):
+            add_new_contact_photo_to_document(
+                path,
+                new_data=_LEGACY_VALID_JPEG,
+                new_content_type="image/jpeg",
+            )
+
+
+# =========================================================================
+# RAW PHOTO EXTRACTION (contact_photos.py)
+# =========================================================================
+
+
+class RealCorpusContactPhotoTests(unittest.TestCase):
+
+    def _require(self, filename: str) -> Path:
+        path = SOURCE_ROOT / filename
+
+        if not path.exists():
+            self.skipTest(
+                f"Real corpus source unavailable: {path}"
+            )
+
+        return path
+
+    def test_belgium_has_exactly_two_contact_photos(self) -> None:
+        path = self._require(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+        skip_if_already_canonicalized(self, path)
+
+        photos = extract_contact_photo_candidates(path)
+
+        self.assertEqual(2, len(photos))
+
+        self.assertEqual(
+            ["image2.jpg", "image1.png"],
+            [photo.source_filename for photo in photos],
+        )
+
+        self.assertEqual(
+            ["GEOMETRY", "GEOMETRY"],
+            [photo.reason for photo in photos],
+        )
+
+        for photo in photos:
+            self.assertTrue(photo.data)
+            self.assertTrue(photo.sha256)
+            self.assertTrue(photo.content_type.startswith("image/"))
+
+    def test_ireland_rejects_the_wide_false_positive(self) -> None:
+        path = self._require("IE.docx")
+
+        photos = extract_contact_photo_candidates(path)
+
+        self.assertEqual(1, len(photos))
+        self.assertEqual(
+            "image2.jpg",
+            photos[0].source_filename,
+        )
+
+    def test_indonesia_rejects_pagoda_and_logo(self) -> None:
+        path = self._require("ID.docx")
+
+        photos = extract_contact_photo_candidates(path)
+
+        self.assertEqual(1, len(photos))
+        self.assertEqual(
+            "image3.jpeg",
+            photos[0].source_filename,
+        )
+        self.assertEqual(
+            "UNIQUE_PORTRAIT",
+            photos[0].reason,
+        )
+
+    def test_chile_has_no_contact_photo(self) -> None:
+        path = self._require("CL.docx")
+
+        self.assertEqual(
+            [],
+            extract_contact_photo_candidates(path),
+        )
+
+    def test_germany_has_no_contact_photo(self) -> None:
+        path = self._require("DE.docx")
+
+        self.assertEqual(
+            [],
+            extract_contact_photo_candidates(path),
+        )
+
+    def test_india_has_no_contact_photo(self) -> None:
+        path = self._require("IN.docx")
+
+        self.assertEqual(
+            [],
+            extract_contact_photo_candidates(path),
+        )
+
+    def test_france_has_no_contact_photo(self) -> None:
+        path = self._require("FR.docx")
+        skip_if_already_canonicalized(self, path)
+
+        self.assertEqual(
+            [],
+            extract_contact_photo_candidates(path),
+        )
+
+    def test_result_is_deterministic(self) -> None:
+        path = self._require(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+
+        first = extract_contact_photo_candidates(path)
+        second = extract_contact_photo_candidates(path)
+
+        self.assertEqual(
+            [
+                (
+                    item.source_filename,
+                    item.sha256,
+                    item.reason,
+                )
+                for item in first
+            ],
+            [
+                (
+                    item.source_filename,
+                    item.sha256,
+                    item.reason,
+                )
+                for item in second
+            ],
+        )
+
+    def test_candidate_is_an_immutable_value_object(self) -> None:
+        candidate = ContactPhotoCandidate(
+            source_filename="portrait.jpg",
+            content_type="image/jpeg",
+            data=b"photo",
+            sha256="abc",
+            reason="GEOMETRY",
+        )
+
+        with self.assertRaises(
+            (AttributeError, TypeError),
+        ):
+            candidate.source_filename = "changed.jpg"
+
+
+# =========================================================================
+# CONTACT/PHOTO ASSOCIATION (contact_people.py)
+# =========================================================================
+
+
+def _photo(name: str) -> ContactPhotoCandidate:
+    return ContactPhotoCandidate(
+        source_filename=name,
+        content_type="image/jpeg",
+        data=name.encode(),
+        sha256="sha-" + name,
+        reason="GEOMETRY",
+    )
+
+
+class ContactPhotoAssociationUnitTests(unittest.TestCase):
+
+    def test_single_contact_single_photo_is_associated(self) -> None:
+        contact = ExtractedContact(
+            member_firm="Firm",
+            contact_person="Jane Doe",
+            email="jane@example.com",
+            phone="+1 111",
+            address="Address",
+            website="example.com",
+        )
+
+        result = associate_contact_photos(
+            [contact],
+            [_photo("jane.jpg")],
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual("Jane Doe", result[0].contact_person)
+        self.assertEqual("jane@example.com", result[0].email)
+        self.assertEqual(
+            "jane.jpg",
+            result[0].photo.source_filename,
+        )
+
+    def test_single_contact_without_photo_is_preserved(self) -> None:
+        contact = ExtractedContact(
+            member_firm="Firm",
+            contact_person="Jane Doe",
+            email="jane@example.com",
+            phone="+1 111",
+            address="Address",
+            website="example.com",
+        )
+
+        result = associate_contact_photos(
+            [contact],
+            [],
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual("Jane Doe", result[0].contact_person)
+        self.assertIsNone(result[0].photo)
+
+    def test_two_existing_contacts_two_photos_are_mapped_in_order(
+        self,
+    ) -> None:
+        contacts = [
+            ExtractedContact(
+                member_firm="Firm",
+                contact_person="Person One",
+                email="one@example.com",
+            ),
+            ExtractedContact(
+                member_firm="Firm",
+                contact_person="Person Two",
+                email="two@example.com",
+            ),
+        ]
+
+        result = associate_contact_photos(
+            contacts,
+            [
+                _photo("one.jpg"),
+                _photo("two.jpg"),
+            ],
+        )
+
+        self.assertEqual(2, len(result))
+
+        self.assertEqual(
+            ("Person One", "one@example.com", "one.jpg"),
+            (
+                result[0].contact_person,
+                result[0].email,
+                result[0].photo.source_filename,
+            ),
+        )
+
+        self.assertEqual(
+            ("Person Two", "two@example.com", "two.jpg"),
+            (
+                result[1].contact_person,
+                result[1].email,
+                result[1].photo.source_filename,
+            ),
+        )
+
+    def test_combined_contact_is_split_only_when_photo_count_matches(
+        self,
+    ) -> None:
+        contact = ExtractedContact(
+            member_firm="Shared Firm",
+            contact_person="Person One and Person Two",
+            email="one@example.com, two@example.com",
+            phone="+32 123",
+            address="Shared address",
+            website="firm.example",
+        )
+
+        result = associate_contact_photos(
+            [contact],
+            [
+                _photo("one.jpg"),
+                _photo("two.jpg"),
+            ],
+        )
+
+        self.assertEqual(2, len(result))
+
+        self.assertEqual("Person One", result[0].contact_person)
+        self.assertEqual("one@example.com", result[0].email)
+        self.assertEqual("one.jpg", result[0].photo.source_filename)
+
+        self.assertEqual("Person Two", result[1].contact_person)
+        self.assertEqual("two@example.com", result[1].email)
+        self.assertEqual("two.jpg", result[1].photo.source_filename)
+
+        # Shared firm-level fields are copied to each autonomous card.
+        for item in result:
+            self.assertEqual("Shared Firm", item.member_firm)
+            self.assertEqual("+32 123", item.phone)
+            self.assertEqual("Shared address", item.address)
+            self.assertEqual("firm.example", item.website)
+
+    def test_combined_contact_without_photos_is_not_split(self) -> None:
+        contact = ExtractedContact(
+            member_firm="Firm",
+            contact_person="Person One and Person Two",
+            email="one@example.com, two@example.com",
+        )
+
+        result = associate_contact_photos(
+            [contact],
+            [],
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual(
+            "Person One and Person Two",
+            result[0].contact_person,
+        )
+        self.assertEqual(
+            "one@example.com, two@example.com",
+            result[0].email,
+        )
+        self.assertIsNone(result[0].photo)
+
+    def test_mismatched_person_email_photo_counts_never_guess(self) -> None:
+        contact = ExtractedContact(
+            member_firm="Firm",
+            contact_person="Person One and Person Two",
+            email="one@example.com",
+        )
+
+        result = associate_contact_photos(
+            [contact],
+            [
+                _photo("one.jpg"),
+                _photo("two.jpg"),
+            ],
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual(
+            "Person One and Person Two",
+            result[0].contact_person,
+        )
+        self.assertEqual(
+            "one@example.com",
+            result[0].email,
+        )
+        self.assertIsNone(result[0].photo)
+
+    def test_extra_photos_never_get_arbitrarily_assigned(self) -> None:
+        contact = ExtractedContact(
+            member_firm="Firm",
+            contact_person="Jane Doe",
+            email="jane@example.com",
+        )
+
+        result = associate_contact_photos(
+            [contact],
+            [
+                _photo("a.jpg"),
+                _photo("b.jpg"),
+            ],
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertIsNone(result[0].photo)
+
+
+class RealCorpusContactPersonPhotoTests(unittest.TestCase):
+
+    def _require(self, filename: str) -> Path:
+        path = SOURCE_ROOT / filename
+
+        if not path.exists():
+            self.skipTest(
+                f"Real corpus source unavailable: {path}"
+            )
+
+        return path
+
+    def test_belgium_becomes_two_individual_contacts(self) -> None:
+        path = self._require(
+            "Labour and Employment Law in Belgium 2026.docx"
+        )
+        skip_if_already_canonicalized(self, path)
+
+        parsed = extract_contacts_from_docx(path)
+        photos = extract_contact_photo_candidates(path)
+
+        self.assertEqual(1, len(parsed))
+        self.assertEqual(2, len(photos))
+
+        result = associate_contact_photos(
+            parsed,
+            photos,
+        )
+
+        self.assertEqual(2, len(result))
+
+        self.assertEqual(
+            "Chris van Olmen",
+            result[0].contact_person,
+        )
+        self.assertEqual(
+            "chris.van.olmen@vow.be",
+            result[0].email,
+        )
+        self.assertEqual(
+            "image2.jpg",
+            result[0].photo.source_filename,
+        )
+
+        self.assertEqual(
+            "Nicolas Simon",
+            result[1].contact_person,
+        )
+        self.assertEqual(
+            "nicolas.simon@vow.be",
+            result[1].email,
+        )
+        self.assertEqual(
+            "image1.png",
+            result[1].photo.source_filename,
+        )
+
+        for contact in result:
+            self.assertEqual(
+                "Van Olmen & Wynant",
+                contact.member_firm,
+            )
+            self.assertEqual(
+                "+32 264 405 11",
+                contact.phone,
+            )
+            self.assertEqual(
+                "www.vow.be",
+                contact.website,
+            )
+
+    def test_france_remains_backward_compatible_without_photos(
+        self,
+    ) -> None:
+        path = self._require("FR.docx")
+        skip_if_already_canonicalized(self, path)
+
+        parsed = extract_contacts_from_docx(path)
+        photos = extract_contact_photo_candidates(path)
+
+        self.assertEqual([], photos)
+
+        result = associate_contact_photos(
+            parsed,
+            photos,
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual(
+            "Caroline Scherrmann and Florence Bacquet",
+            result[0].contact_person,
+        )
+        self.assertEqual(
+            "scherrmann@flichy.com, bacquet@flichy.com",
+            result[0].email,
+        )
+        self.assertIsNone(result[0].photo)
+
+
+# =========================================================================
+# OLD FLOATING-SHAPE CONTACT-BOX DETECTION
+# (document_contact_materializer.py)
+#
+# This module used to ALSO drive materialize_effective_docx() (a
+# per-download ephemeral DOCX rebuild); that function was removed once
+# every Admin mutation started persisting its effective result into the
+# source DOCX atomically before returning (see
+# test_admin_documents_router_integration.py's DownloadHttpContractTests
+# and backend/integration_tests/docx_contact_mutation_matrix.py for that
+# coverage). What remains here - _is_contact_related_block/
+# _find_all_contact_runs - is still live: contact_document_photos.py uses
+# it to detect whether a document's Contact area is still the OLD
+# floating-shape format.
+# =========================================================================
+
+
+def _textbox_run_xml(
+    lines: list[str],
+    width_emu: int = 1000000,
+    height_emu: int = 500000,
+) -> str:
+    inner_paragraphs = "".join(
+        f"<w:p><w:r><w:t>{line}</w:t></w:r></w:p>" for line in lines
+    )
+    return (
+        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        "<w:rPr><w:noProof/></w:rPr>"
+        "<w:drawing><wp:anchor>"
+        f'<wp:extent cx="{width_emu}" cy="{height_emu}"/>'
+        '<wp:docPr id="1" name="Box"/>'
+        "<a:graphic>"
+        '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        "<wps:wsp>"
+        f"<wps:txbx><w:txbxContent>{inner_paragraphs}</w:txbxContent></wps:txbx>"
+        "</wps:wsp></a:graphicData></a:graphic>"
+        "</wp:anchor></w:drawing></w:r>"
+    )
+
+
+def _build_docx_with_contact_textbox_at(
+    paragraphs: list[str],
+    textbox_paragraph_index: int,
+    lines: list[str] | None = None,
+    width_emu: int = 1000000,
+    height_emu: int = 500000,
+) -> bytes:
+    """
+    A real, openable DOCX with a minimal but structurally faithful
+    floating Contact text box (CONTACT PERSON marker + name + email,
+    matching the real corpus's own <w:txbxContent> shape, wrapped in a
+    DrawingML <w:drawing><wp:anchor> run so _extract_extent and the
+    <w:r>/<w:txbxContent> nesting _find_run_span must see through both
+    apply) injected into one specific paragraph.
+    """
+
+    document = Document()
+    for text in paragraphs:
+        document.add_paragraph(text)
+
+    target_paragraph = document.paragraphs[textbox_paragraph_index]
+
+    run_element = etree.fromstring(
+        _textbox_run_xml(
+            lines
+            or ["CONTACT PERSON", "Test Person", "test.person@example.com"],
+            width_emu=width_emu,
+            height_emu=height_emu,
+        ).encode("utf-8")
+    )
+    target_paragraph._p.append(run_element)
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def _document_xml_of(docx_bytes: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        return archive.read("word/document.xml").decode("utf-8")
+
+
+class IsContactRelatedBlockTests(unittest.TestCase):
+    def test_contact_person_block_is_classified_as_contact_related(
+        self,
+    ) -> None:
+        self.assertTrue(
+            _is_contact_related_block(["CONTACT PERSON", "Jane Doe"])
+        )
+
+    def test_firm_block_with_email_is_classified_as_contact_related(
+        self,
+    ) -> None:
+        self.assertTrue(
+            _is_contact_related_block(["SOME FIRM", "info@example.com"])
+        )
+
+    def test_firm_block_with_phone_is_classified_as_contact_related(
+        self,
+    ) -> None:
+        self.assertTrue(
+            _is_contact_related_block(["SOME FIRM", "+1 555 000 1234"])
+        )
+
+    def test_plain_branding_block_is_not_contact_related(self) -> None:
+        self.assertFalse(_is_contact_related_block(["www.leglobal.law"]))
+
+    def test_document_title_block_is_not_contact_related(self) -> None:
+        self.assertFalse(
+            _is_contact_related_block(
+                ["Employment Law Overview - Testland"]
+            )
+        )
+
+
+class FindAllContactRunsTests(unittest.TestCase):
+    """
+    Regression coverage for two bugs found and fixed together: (1)
+    _find_run_span originally took the first "</w:r>" after a
+    txbxContent's start, which is actually an INNER run nested inside
+    the box's own paragraphs, not the enclosing floating-shape run: it
+    must instead balance nested <w:r>/</w:r> tags. (2) a floating
+    shape's Choice and Fallback branches each produce their own
+    <w:txbxContent> regex match for the SAME enclosing run; the second
+    occurrence must be recognized as already-covered by the first
+    match's span, not re-resolved (which - before the fix - picked one
+    of the first branch's own inner runs as a bogus second "run").
+    """
+
+    def test_finds_single_contact_run_with_its_extent(self) -> None:
+        docx_bytes = _build_docx_with_contact_textbox_at(
+            ["Title", "Body"],
+            textbox_paragraph_index=0,
+            width_emu=1234000,
+            height_emu=567000,
+        )
+
+        runs = _find_all_contact_runs(_document_xml_of(docx_bytes))
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].width_emu, 1234000)
+        self.assertEqual(runs[0].height_emu, 567000)
+
+    def test_ignores_non_contact_textboxes(self) -> None:
+        document = Document()
+        document.add_paragraph("Title")
+        document.add_paragraph("Body")
+
+        branding_run = etree.fromstring(
+            _textbox_run_xml(["www.leglobal.law"]).encode("utf-8")
+        )
+        document.paragraphs[0]._p.append(branding_run)
+
+        buffer = io.BytesIO()
+        document.save(buffer)
+
+        runs = _find_all_contact_runs(_document_xml_of(buffer.getvalue()))
+        self.assertEqual(runs, [])
+
+    def test_two_separate_contact_runs_both_found_and_largest_is_selectable(
+        self,
+    ) -> None:
+        document = Document()
+        document.add_paragraph("Title")
+
+        small_run = etree.fromstring(
+            _textbox_run_xml(
+                ["CONTACT PERSON", "Jane Doe", "jane@example.com"],
+                width_emu=500000,
+                height_emu=300000,
+            ).encode("utf-8")
+        )
+        large_run = etree.fromstring(
+            _textbox_run_xml(
+                ["SOME FIRM", "firm@example.com"],
+                width_emu=2000000,
+                height_emu=1000000,
+            ).encode("utf-8")
+        )
+        document.paragraphs[0]._p.append(small_run)
+        document.paragraphs[0]._p.append(large_run)
+
+        buffer = io.BytesIO()
+        document.save(buffer)
+
+        runs = _find_all_contact_runs(_document_xml_of(buffer.getvalue()))
+
+        self.assertEqual(len(runs), 2)
+        primary = max(runs, key=lambda run: run.width_emu * run.height_emu)
+        self.assertEqual(primary.width_emu, 2000000)
+
+    def test_choice_and_fallback_style_duplicate_txbxcontent_is_one_run(
+        self,
+    ) -> None:
+        # Mirrors a real floating shape's mc:Choice/mc:Fallback pair:
+        # the SAME visible box content appears twice inside one <w:r>,
+        # each occurrence separately matched by the txbxContent regex.
+        # Must resolve to exactly one run, not two.
+        document = Document()
+        document.add_paragraph("Title")
+
+        inner = (
+            "<w:p><w:r><w:t>CONTACT PERSON</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Jane Doe</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>jane@example.com</w:t></w:r></w:p>"
+        )
+        duplicated_run_xml = (
+            '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<mc:AlternateContent "
+            'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            '<mc:Choice Requires="wps">'
+            f"<w:txbxContent>{inner}</w:txbxContent>"
+            "</mc:Choice>"
+            "<mc:Fallback>"
+            f"<w:txbxContent>{inner}</w:txbxContent>"
+            "</mc:Fallback>"
+            "</mc:AlternateContent>"
+            "</w:r>"
+        )
+        run_element = etree.fromstring(duplicated_run_xml.encode("utf-8"))
+        document.paragraphs[0]._p.append(run_element)
+
+        buffer = io.BytesIO()
+        document.save(buffer)
+
+        runs = _find_all_contact_runs(_document_xml_of(buffer.getvalue()))
+        self.assertEqual(
+            len(runs), 1,
+            "Choice+Fallback duplicate content must resolve to one run, "
+            "not one real run plus a bogus nested-run duplicate",
+        )
 
 
 if __name__ == "__main__":
