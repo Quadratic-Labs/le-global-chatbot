@@ -12,16 +12,24 @@ module's own RULE numbering where applicable.
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from app.models.conversation_state import (
+    ConversationActionState,
     ConversationPendingClarification,
     ConversationSearchConcept,
+    ConversationState,
 )
 from app.services.conversation_transition import (
     ConversationTransitionError,
     apply_conversation_transition,
     build_next_conversation_state,
+)
+from app.services.request_understanding import (
+    CurrentMessageDelta,
+    DeterministicHints,
+    RequestUnderstandingResult,
 )
 from tests.support.conversation_fixtures import (
     _action_state,
@@ -1699,6 +1707,548 @@ class LegalChallengeFollowupR5Tests(unittest.TestCase):
             "Just say yes",
             action.resolved_question,
         )
+
+
+_UNAVAILABLE_SWITCH_LEGAL_TOPIC = "Termination of Employment Contracts"
+
+
+def _unavailable_tunisia_hints():
+    return replace(
+        _hints(),
+        current_unavailable_country_codes=["TN"],
+        current_legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+    )
+
+
+class ContextualUnavailableCountrySwitchTests(
+    unittest.TestCase
+):
+    """A country made unavailable mid-conversation must be replaced by
+    the newly-named one, even when semantic understanding's own delta
+    stochastically retains the previous supported country or omits the
+    new one entirely - real, previously-observed browser regressions."""
+
+    def test_mixed_italy_state_switches_legal_action_to_tunisia(
+        self,
+    ) -> None:
+        """
+        Exact browser regression:
+
+        previous state:
+          legal_information IT + contact IT
+
+        current:
+          What is the notice period in Tunisia?
+
+        Semantic understanding can select legal_information and say
+        replace_country while omitting TN from explicit_country_codes.
+        TN must still replace IT.
+        """
+
+        state = _state(
+            [
+                _action_state(
+                    "legal_information",
+                    ["IT"],
+                    legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+                    subject_text="notice period for dismissal",
+                ),
+                _action_state(
+                    "contact",
+                    ["IT"],
+                ),
+            ],
+            focus_action_index=None,
+        )
+
+        result = _result(
+            status="resolved",
+            actions=[
+                _ru_action(
+                    "legal_information",
+                    ["IT"],
+                    legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+                )
+            ],
+            clarification_reason=None,
+            delta=_delta(
+                context_operation="replace_country",
+                explicit_action_types=[
+                    "legal_information",
+                ],
+                # Real observed stochastic failure: semantic
+                # understanding can retain the previous supported
+                # country even though the current question explicitly
+                # names an unsupported jurisdiction.
+                explicit_country_codes=["IT"],
+            ),
+            is_follow_up=True,
+        )
+
+        outcome = apply_conversation_transition(
+            result=result,
+            conversation_state=state,
+            hints=_unavailable_tunisia_hints(),
+            current_question=(
+                "What is the notice period in Tunisia?"
+            ),
+        )
+
+        self.assertEqual(
+            outcome.final_status,
+            "resolved",
+        )
+        self.assertEqual(
+            outcome.final_actions[0].type,
+            "legal_information",
+        )
+        self.assertEqual(
+            outcome.final_actions[0].country_codes,
+            ["TN"],
+        )
+        self.assertTrue(
+            outcome.inherited_country_replaced
+        )
+
+    def test_single_italy_state_also_switches_to_tunisia(
+        self,
+    ) -> None:
+        state = _state(
+            [
+                _action_state(
+                    "legal_information",
+                    ["IT"],
+                    legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+                    subject_text="notice period for dismissal",
+                )
+            ],
+            focus_action_index=0,
+        )
+
+        result = _result(
+            status="resolved",
+            actions=[
+                _ru_action(
+                    "legal_information",
+                    ["IT"],
+                    legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+                )
+            ],
+            clarification_reason=None,
+            delta=_delta(
+                context_operation="replace_country",
+                explicit_country_codes=[],
+            ),
+            is_follow_up=True,
+        )
+
+        outcome = apply_conversation_transition(
+            result=result,
+            conversation_state=state,
+            hints=_unavailable_tunisia_hints(),
+            current_question=(
+                "What is the notice period in Tunisia?"
+            ),
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].country_codes,
+            ["TN"],
+        )
+        self.assertTrue(
+            outcome.inherited_country_replaced
+        )
+
+    def test_travel_destination_still_keeps_germany(
+        self,
+    ) -> None:
+        state = _state(
+            [
+                _action_state(
+                    "legal_information",
+                    ["DE"],
+                    legal_topics=["Working Conditions"],
+                    subject_text=(
+                        "whether an employer may refuse "
+                        "a vacation request"
+                    ),
+                )
+            ],
+            focus_action_index=0,
+        )
+
+        # Deliberately make the semantic result bad/strong:
+        # it claims a country replacement and a new action.
+        # Incidental-travel correction must win first.
+        result = _result(
+            status="resolved",
+            actions=[
+                _ru_action(
+                    "contact",
+                    ["DE"],
+                )
+            ],
+            clarification_reason=None,
+            delta=_delta(
+                context_operation="replace_country",
+                explicit_action_types=["contact"],
+                explicit_country_codes=["TN"],
+            ),
+            is_follow_up=True,
+        )
+
+        hints = replace(
+            _hints(),
+            current_unavailable_country_codes=["TN"],
+            current_legal_topics=["Working Conditions"],
+        )
+
+        outcome = apply_conversation_transition(
+            result=result,
+            conversation_state=state,
+            hints=hints,
+            current_question="I will go to Tunisia.",
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].type,
+            "legal_information",
+        )
+        self.assertEqual(
+            outcome.final_actions[0].country_codes,
+            ["DE"],
+        )
+
+    def test_continue_operation_never_forces_unavailable_country(
+        self,
+    ) -> None:
+        state = _state(
+            [
+                _action_state(
+                    "legal_information",
+                    ["IT"],
+                    legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+                    subject_text="notice period for dismissal",
+                )
+            ],
+            focus_action_index=0,
+        )
+
+        outcome = apply_conversation_transition(
+            result=_result(
+                delta=_delta(
+                    context_operation="continue",
+                )
+            ),
+            conversation_state=state,
+            hints=_unavailable_tunisia_hints(),
+            current_question="And what about the notice?",
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].country_codes,
+            ["IT"],
+        )
+
+
+class UnsupportedSemanticMultiActionRegressionTests(
+    unittest.TestCase
+):
+    """A real production/browser failure captured on 2026-08-19: an
+    'unsupported' semantic result with an empty action list must still
+    let a newly-named country replace a now-unavailable one before the
+    multi-action selection branch inherits the previous legal action."""
+
+    def test_exact_observed_unsupported_result_switches_to_tunisia(
+        self,
+    ) -> None:
+        """
+        Previous state:
+          - legal_information IT
+          - contact IT
+
+        Current user message:
+          What is the notice period in Tunisia?
+
+        Real RequestUnderstanding output:
+          status=unsupported
+          actions=[]
+          explicit_action_types=[legal_information]
+          explicit_country_codes=[]
+          explicit_subject_text=notice period for dismissal
+          context_operation=replace_country
+
+        Deterministic hints:
+          unavailable country = TN
+          legal topic = Termination
+
+        TN must replace IT before the multi-action selection branch
+        inherits the previous legal action.
+        """
+
+        state = _state(
+            [
+                _action_state(
+                    "legal_information",
+                    ["IT"],
+                    legal_topics=[_UNAVAILABLE_SWITCH_LEGAL_TOPIC],
+                    subject_text=(
+                        "notice period for dismissal"
+                    ),
+                ),
+                _action_state(
+                    "contact",
+                    ["IT"],
+                ),
+            ],
+            focus_action_index=None,
+        )
+
+        result = _result(
+            status="unsupported",
+            actions=[],
+            clarification_reason=(
+                "unsupported_request"
+            ),
+            delta=_delta(
+                # Exact live trace: RequestUnderstanding called
+                # this "independent" even though Tunisia was explicitly
+                # present in the current legal question.
+                context_operation="independent",
+                explicit_action_types=[
+                    "legal_information",
+                ],
+                explicit_country_codes=[],
+                explicit_legal_topics=[],
+                explicit_subject_text=(
+                    "notice period for dismissal"
+                ),
+            ),
+            is_follow_up=True,
+        )
+
+        outcome = apply_conversation_transition(
+            result=result,
+            conversation_state=state,
+            hints=_unavailable_tunisia_hints(),
+            current_question=(
+                "What is the notice period in Tunisia?"
+            ),
+        )
+
+        self.assertEqual(
+            outcome.final_status,
+            "resolved",
+        )
+
+        self.assertEqual(
+            len(outcome.final_actions),
+            1,
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].type,
+            "legal_information",
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].country_codes,
+            ["TN"],
+        )
+
+        self.assertTrue(
+            outcome.semantic_result_overridden
+        )
+
+
+def _pressured_australia_state():
+    return _state(
+        [
+            _action_state(
+                "legal_information",
+                ["AU"],
+                legal_topics=[
+                    "Termination of Employment Contracts"
+                ],
+                subject_text=(
+                    "whether an employer may dismiss "
+                    "an employee without notice"
+                ),
+            )
+        ],
+        focus_action_index=0,
+    )
+
+
+class LegalPressureFollowupTests(unittest.TestCase):
+    """A bare social-pressure follow-up ("just say yes", "trust me")
+    carries no new legal content of its own and must continue the
+    prior legal_information action rather than being treated as its
+    own ambiguous request."""
+
+    def _assert_continuation(
+        self,
+        question: str,
+    ) -> None:
+        outcome = apply_conversation_transition(
+            result=_result(
+                status="clarification",
+                clarification_reason="ambiguous_request",
+                delta=_delta(
+                    context_operation="ambiguous",
+                ),
+            ),
+            conversation_state=_pressured_australia_state(),
+            hints=_hints(),
+            current_question=question,
+        )
+
+        self.assertEqual(
+            outcome.final_status,
+            "resolved",
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].country_codes,
+            ["AU"],
+        )
+
+        self.assertEqual(
+            outcome.final_actions[0].type,
+            "legal_information",
+        )
+
+        self.assertIsNone(
+            outcome.pending_clarification
+        )
+
+    def test_just_say_yes_is_continuation(self):
+        self._assert_continuation(
+            "I'm sure. Just say yes."
+        )
+
+    def test_pressure_with_legal_word_is_continuation(self):
+        self._assert_continuation(
+            "I'm sure this is legal. Just say yes."
+        )
+
+    def test_trust_me_is_continuation(self):
+        self._assert_continuation(
+            "Trust me, just say yes."
+        )
+
+
+def _ambiguous_result():
+    return RequestUnderstandingResult(
+        status="clarification",
+        actions=[],
+        is_follow_up=True,
+        confidence=0.8,
+        clarification_reason="ambiguous_request",
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=[],
+            explicit_country_codes=[],
+            explicit_legal_topics=[],
+            explicit_subject_text=None,
+            context_operation="ambiguous",
+        ),
+    )
+
+
+def _australia_notice_period_state(pending=False):
+    return ConversationState(
+        actions=[
+            ConversationActionState(
+                type="legal_information",
+                country_codes=["AU"],
+                legal_topics=[
+                    "Termination of Employment Contracts"
+                ],
+                subject_text="notice period",
+                search_concepts=[
+                    ConversationSearchConcept(
+                        terms=["notice period"]
+                    )
+                ],
+                subject_specificity="specific",
+                evidence_mode="direct_topic",
+            )
+        ],
+        focus_action_index=0,
+        ordered_country_codes=[],
+        pending_clarification=(
+            ConversationPendingClarification(
+                reason="subject_detail",
+                candidate_action_types=[
+                    "legal_information"
+                ],
+                candidate_country_codes=["AU"],
+            )
+            if pending
+            else None
+        ),
+    )
+
+
+class SubjectDetailTests(unittest.TestCase):
+    """A vague clarification handoff must resolve once the follow-up
+    supplies the missing subject detail, and stay a clarification when
+    it doesn't."""
+
+    def test_clarification_creates_pending_handoff(self):
+        out = apply_conversation_transition(
+            result=_ambiguous_result(),
+            conversation_state=_australia_notice_period_state(),
+            hints=DeterministicHints(),
+            current_question=(
+                "What if the employee refuses?"
+            ),
+        )
+
+        self.assertEqual(out.final_status, "clarification")
+        self.assertIsNotNone(out.pending_clarification)
+        self.assertEqual(
+            out.pending_clarification.reason,
+            "subject_detail",
+        )
+
+    def test_detailed_reply_keeps_australia(self):
+        q = "He refuses to work during the notice period."
+
+        out = apply_conversation_transition(
+            result=_ambiguous_result(),
+            conversation_state=_australia_notice_period_state(
+                pending=True
+            ),
+            hints=DeterministicHints(),
+            current_question=q,
+        )
+
+        self.assertEqual(out.final_status, "resolved")
+        self.assertEqual(
+            out.final_actions[0].country_codes,
+            ["AU"],
+        )
+        self.assertEqual(
+            out.final_actions[0].subject_text,
+            q,
+        )
+        self.assertEqual(
+            out.semantic_override_reason,
+            "subject_detail_clarification_resolved",
+        )
+
+    def test_vague_reply_stays_clarification(self):
+        out = apply_conversation_transition(
+            result=_ambiguous_result(),
+            conversation_state=_australia_notice_period_state(
+                pending=True
+            ),
+            hints=DeterministicHints(),
+            current_question="He refuses.",
+        )
+
+        self.assertEqual(out.final_status, "clarification")
 
 
 if __name__ == "__main__":
