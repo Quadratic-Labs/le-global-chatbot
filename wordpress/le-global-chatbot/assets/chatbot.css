@@ -447,6 +447,7 @@
     display: grid;
     gap: 12px;
     margin-top: 16px;
+    padding: 0;
 }
 
 .le-global-chatbot__contact-card {
