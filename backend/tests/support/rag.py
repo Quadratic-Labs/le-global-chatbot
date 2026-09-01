@@ -166,3 +166,82 @@ class FakeGenerationClient:
             text=self.answer,
             model=self.model,
         )
+
+# SHARED_EVIDENCE_GATING_FIXTURES_FOR_STREAMING
+from app.models.conversation_state import ConversationSearchConcept
+
+
+def _evidence_build_hit(
+    *,
+    chunk_id: str = "chunk-1",
+    country: str = "United Kingdom",
+    country_code: str = "GB",
+    section: str = "Working Conditions",
+    subsection: str = "General",
+    content: str = "General working conditions information.",
+    legal_topic: str = "Working Conditions",
+    score: float = 12.5,
+) -> LegalSearchHit:
+    return LegalSearchHit(
+        score=score,
+        document_id=f"document-{country_code.lower()}",
+        chunk_id=chunk_id,
+        country=country,
+        country_code=country_code,
+        legal_topic=legal_topic,
+        document_type="comparator",
+        language="en",
+        section=section,
+        subsection=subsection,
+        content=content,
+        source_filename=(
+            f"Labour and Employment Law in {country} 2026.docx"
+        ),
+        source_format="docx",
+        reference_year=2026,
+    )
+
+
+def _evidence_make_search_function(
+    hits: list[LegalSearchHit],
+):
+    def fake_search(request: object) -> LegalSearchResponse:
+        return LegalSearchResponse(
+            query=request.query,
+            total=len(hits),
+            limit=request.limit,
+            offset=0,
+            took_ms=1,
+            hits=hits,
+        )
+
+    return fake_search
+
+
+def _evidence_remote_work_concept() -> ConversationSearchConcept:
+    return ConversationSearchConcept(
+        terms=["remote work", "telework", "teleworking"]
+    )
+
+
+def _evidence_make_country_scoped_search_function(
+    hits_by_country: dict[str, list[LegalSearchHit]],
+):
+    def fake_search(request: object) -> LegalSearchResponse:
+        hits = [
+            hit
+            for code in request.country_codes
+            for hit in hits_by_country.get(code, [])
+        ]
+
+        return LegalSearchResponse(
+            query=request.query,
+            total=len(hits),
+            limit=request.limit,
+            offset=0,
+            took_ms=1,
+            hits=hits,
+        )
+
+    return fake_search
+
