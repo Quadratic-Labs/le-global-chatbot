@@ -1,11 +1,10 @@
 """
-Shared fixtures for legal-chat router tests: fake catalog/document-topic
-providers, fake generation/understanding OpenAI clients (including
-fail-fast "must not be called" doubles), and JSON-payload builders for
-RequestUnderstanding action/result/delta shapes.
-
-Extracted from test_chat.py, which previously defined these at module
-level while test_chat_stream.py imported them from it directly.
+Shared fixtures for legal-chat and streaming router tests: fake catalog/
+document-topic providers, fake generation/understanding/streaming OpenAI
+clients (including fail-fast "must not be called" doubles), JSON-payload
+builders for RequestUnderstanding action/result/delta shapes, and a
+helper that splits text into DELTA events the way a real provider
+dribbles tokens out.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import time
 from typing import Any
 
 from app.clients.openai_responses import GeneratedText, OpenAIResponseError
+from app.clients.openai_responses_stream import StreamEvent, StreamEventType
 from app.core.country_registry import COUNTRIES
 from app.models.catalog import LegalCatalogCountry, LegalCatalogResponse
 from app.models.search import LegalSearchHit, LegalSearchResponse
@@ -23,30 +23,26 @@ from app.models.search import LegalSearchHit, LegalSearchResponse
 def _document_topic_provider(
     country_codes: list[str],
 ) -> dict[str, list[str]]:
-    """
-    Fake DocumentLegalTopicsProvider - mission "ORDER 8F-A" - no live
-    document legal topics for any country, matching every test in this
-    file written before that mission (none of them concern the new
-    document_legal_topics concept).
-    """
+    """Fake DocumentLegalTopicsProvider - no document legal topics for
+    any country, matching every test that doesn't concern that
+    concept."""
 
     return {}
 
 
 # country_registry.COUNTRIES answers "can this country be detected/
-# named at all" (mission "ORDER 5C" grew it to include several
-# countries - France, Germany among them - registered only so an
-# admin upload for them resolves to "detected but not allowed"/
-# "detected and allowed" rather than "undetermined"; most of those
-# additions have no real indexed content yet). It is deliberately NOT
-# mirrored 1:1 into this fake catalog: doing so would silently claim
-# every registered country is indexed, which is exactly the France/
-# Germany-shaped bug this test suite exists to catch. France and
-# Germany are excluded here to represent their real, current
-# production state - registered and admin-upload-allowed, but not
-# (yet) indexed - which is also why they remain this suite's two
-# go-to examples of "recognized but unavailable" rather than
-# "unregistered" (Kenya/Nigeria cover that different case instead).
+# named at all" - some countries are registered there (so an admin
+# upload for them resolves to "detected but not allowed"/"detected
+# and allowed" rather than "undetermined") without yet having real
+# indexed content. It is deliberately NOT mirrored 1:1 into this fake
+# catalog: doing so would silently claim every registered country is
+# indexed, which is exactly the France/Germany-shaped bug this test
+# suite exists to catch. France and Germany are excluded here to
+# represent their real, current production state - registered and
+# admin-upload-allowed, but not (yet) indexed - which is also why
+# they remain this suite's two go-to examples of "recognized but
+# unavailable" rather than "unregistered" (Kenya/Nigeria cover that
+# different case instead).
 _NOT_YET_INDEXED_CODES: frozenset[str] = frozenset({"FR", "DE"})
 
 
@@ -136,6 +132,36 @@ def _build_hit(
     )
 
 
+def _build_contact_hit(
+    *,
+    country_code: str,
+    country: str,
+    content: str = (
+        "Member firm: Test Firm\nEmail: contact@test-firm.example"
+    ),
+) -> LegalSearchHit:
+    """Build one valid Contact-subsection search hit."""
+
+    return LegalSearchHit(
+        score=10.0,
+        document_id=f"document-{country_code.lower()}",
+        chunk_id=f"chunk-{country_code.lower()}-contact",
+        country=country,
+        country_code=country_code,
+        legal_topic=None,
+        document_type="overview",
+        language="en",
+        section=f"Employment Law Overview {country}",
+        subsection="Contact",
+        content=content,
+        source_filename=(
+            f"Labour and Employment Law in {country} 2026.docx"
+        ),
+        source_format="docx",
+        reference_year=2026,
+    )
+
+
 class FakeGenerationClient:
     """Test text-generation client."""
 
@@ -170,6 +196,69 @@ class FakeGenerationClient:
             text=self.answer,
             model=self.model,
         )
+
+
+class _RepairOnlyClient:
+    """
+    Sync generation client double used ONLY for the hidden repair
+    call in the streaming architecture.
+
+    Deliberately NOT FakeGenerationClient: that fake's "second call
+    returns repair_answer" logic assumes ONE client serves both the
+    first AND the repair generate() call - true for
+    answer_legal_question(), but never true for streaming, where the
+    first generation always goes through a separate
+    FakeStreamGenerationClient and this sync client's own generate()
+    is called for repair only (its first-ever call IS the repair
+    call) - so it always returns the one configured answer, no
+    call-count logic needed.
+    """
+
+    model = "test-model"
+
+    def __init__(self, answer: str, *, raise_error: bool = False) -> None:
+        self.answer = answer
+        self.raise_error = raise_error
+        self.calls: list[tuple[str, str]] = []
+
+    def generate(self, instructions: str, input_text: str) -> GeneratedText:
+        self.calls.append((instructions, input_text))
+
+        if self.raise_error:
+            raise OpenAIResponseError("boom")
+
+        return GeneratedText(text=self.answer, model=self.model)
+
+
+class FakeStreamGenerationClient:
+    """Scripted streaming test double for the final-answer generation
+    stage only - satisfies TextStreamGenerationClient (model + async
+    stream())."""
+
+    model = "test-stream-model"
+
+    def __init__(self, events: list[StreamEvent]) -> None:
+        self._events = events
+        self.calls: list[tuple[str, str]] = []
+
+    async def stream(self, instructions: str, input_text: str):
+        self.calls.append((instructions, input_text))
+
+        for event in self._events:
+            yield event
+
+
+def _delta_events(text: str, *, chunk_size: int = 1) -> list[StreamEvent]:
+    """Split `text` into `chunk_size`-character DELTA events, then a
+    COMPLETED event - simulating a real provider dribbling out an
+    answer token by token."""
+
+    events = [
+        StreamEvent(type=StreamEventType.DELTA, text=text[i:i + chunk_size])
+        for i in range(0, len(text), chunk_size)
+    ]
+    events.append(StreamEvent(type=StreamEventType.COMPLETED))
+    return events
 
 
 def _unexpected_search(
@@ -292,17 +381,17 @@ class FakeUnderstandingClient:
     """
     Test double for the semantic-understanding OpenAI client.
 
-    RequestUnderstanding is now the primary router for every free-text
+    RequestUnderstanding is the primary router for every free-text
     request (see app/services/request_understanding.py), so every test
-    below that calls resolve_legal_chat_response with a free-text
-    question must supply one of these, returning exactly the JSON a
-    correct, well-behaved semantic-understanding call would have
-    produced for that test's scenario. Every call is captured
-    (instructions/input_text) so a test can assert what the model
-    actually received - in particular that the full conversation
-    history reaches it (see HistoryContextTests), which matters since
-    there is no separate, smaller history window anymore: the model
-    gets the whole validated history directly and decides itself.
+    that calls resolve_legal_chat_response with a free-text question
+    must supply one of these, returning exactly the JSON a correct,
+    well-behaved semantic-understanding call would have produced for
+    that test's scenario. Every call is captured (instructions/
+    input_text) so a test can assert what the model actually received
+    - in particular that the full conversation history reaches it,
+    which matters since there is no separate, smaller history window:
+    the model gets the whole validated history directly and decides
+    itself.
     """
 
     def __init__(
@@ -351,36 +440,6 @@ class _FailingUnderstandingClient:
             "boom",
             retryable=False,
         )
-
-
-def _build_contact_hit(
-    *,
-    country_code: str,
-    country: str,
-    content: str = (
-        "Member firm: Test Firm\nEmail: contact@test-firm.example"
-    ),
-) -> LegalSearchHit:
-    """Build one valid Contact-subsection search hit."""
-
-    return LegalSearchHit(
-        score=10.0,
-        document_id=f"document-{country_code.lower()}",
-        chunk_id=f"chunk-{country_code.lower()}-contact",
-        country=country,
-        country_code=country_code,
-        legal_topic=None,
-        document_type="overview",
-        language="en",
-        section=f"Employment Law Overview {country}",
-        subsection="Contact",
-        content=content,
-        source_filename=(
-            f"Labour and Employment Law in {country} 2026.docx"
-        ),
-        source_format="docx",
-        reference_year=2026,
-    )
 
 
 class NoCallGenerationClient:
