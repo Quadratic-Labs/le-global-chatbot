@@ -19,45 +19,21 @@ from app.services.legal_catalog import (
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
 )
+from tests.support.opensearch_fixtures import FakeOpenSearchClient
 
-
-class FakeOpenSearchClient:
-    """Minimal OpenSearch client for catalog tests."""
-
-    def __init__(
-        self,
-        response: dict[str, Any] | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.response = response
-        self.error = error
-        self.index: str | None = None
-        self.body: dict[str, Any] | None = None
-
-    def search(
-        self,
-        index: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.index = index
-        self.body = body
-
-        if self.error is not None:
-            raise self.error
-
-        return self.response or {
-            "aggregations": {
-                "countries": {
-                    "buckets": [],
-                },
-                "legal_topics": {
-                    "buckets": [],
-                },
-                "subsections": {
-                    "buckets": [],
-                },
-            }
-        }
+_EMPTY_CATALOG_RESPONSE: dict[str, Any] = {
+    "aggregations": {
+        "countries": {
+            "buckets": [],
+        },
+        "legal_topics": {
+            "buckets": [],
+        },
+        "subsections": {
+            "buckets": [],
+        },
+    }
+}
 
 
 class LegalCatalogTests(unittest.TestCase):
@@ -188,7 +164,9 @@ class LegalCatalogTests(unittest.TestCase):
     def test_empty_catalog_is_supported(
         self,
     ) -> None:
-        client = FakeOpenSearchClient()
+        client = FakeOpenSearchClient(
+            response=_EMPTY_CATALOG_RESPONSE
+        )
 
         response = get_legal_catalog(
             client=client

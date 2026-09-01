@@ -23,41 +23,17 @@ from app.services.legal_search import (
 from app.services.opensearch_index import (
     LEGAL_DOCUMENTS_ALIAS,
 )
+from tests.support.opensearch_fixtures import FakeOpenSearchClient
 
-
-class FakeOpenSearchClient:
-    """Minimal OpenSearch client used by unit tests."""
-
-    def __init__(
-        self,
-        response: dict[str, Any] | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.response = response
-        self.error = error
-        self.index: str | None = None
-        self.body: dict[str, Any] | None = None
-
-    def search(
-        self,
-        index: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.index = index
-        self.body = body
-
-        if self.error is not None:
-            raise self.error
-
-        return self.response or {
-            "took": 0,
-            "hits": {
-                "total": {
-                    "value": 0,
-                },
-                "hits": [],
-            },
-        }
+_EMPTY_SEARCH_RESPONSE: dict[str, Any] = {
+    "took": 0,
+    "hits": {
+        "total": {
+            "value": 0,
+        },
+        "hits": [],
+    },
+}
 
 
 class LegalSearchTests(
@@ -373,7 +349,9 @@ class LegalSearchTests(
     def test_search_returns_empty_result(
         self,
     ) -> None:
-        client = FakeOpenSearchClient()
+        client = FakeOpenSearchClient(
+            response=_EMPTY_SEARCH_RESPONSE
+        )
 
         response = search_legal_documents(
             request=LegalSearchRequest(
