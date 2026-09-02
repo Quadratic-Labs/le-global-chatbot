@@ -43,7 +43,7 @@ from docx import Document
 from app.core.country_registry import CountryMetadataMismatchError
 from app.core.legal_taxonomy import get_canonical_legal_topic, normalize_topic
 from app.services.document_chunk_builder import AmbiguousDocumentCountryError, DocumentMetadata, InvalidDocxFormatError, UndeterminableDocumentCountryError, UnknownLegalTopicError, build_document_chunks, build_document_chunks_from_docx, metadata_from_content, validate_docx_format
-from app.services.docx_country_marker import write_country_marker
+from app.services.document_chunk_builder import write_country_marker
 from app.services.docx_parser import ParsedSection
 
 def _test_document_chunk_builder__build_docx(directory: Path, title_lines: list[str], body_paragraphs: list[str] | None=None, filename: str='document.docx') -> Path:
@@ -1160,7 +1160,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from docx import Document
-from app.services.docx_country_marker import CountryMarker, InvalidCountryMarkerValueError, read_country_marker, write_country_marker
+from app.services.document_chunk_builder import CountryMarker, InvalidCountryMarkerValueError, read_country_marker, write_country_marker
 
 def _test_docx_country_marker__build_docx(directory: Path, paragraphs: list[str]) -> Path:
     document = Document()

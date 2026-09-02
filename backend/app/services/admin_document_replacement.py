@@ -27,7 +27,7 @@ from app.core.country_registry import CountryMetadataMismatchError, UnknownCount
 from app.models.admin_documents import AdminDocumentUploadResponse
 from app.services.document_section_state import is_admin_modified_since_upload
 from app.services.country_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, country_lock
-from app.services.docx_country_marker import InvalidCountryMarkerValueError, read_country_marker, write_country_marker
+from app.services.document_chunk_builder import InvalidCountryMarkerValueError, read_country_marker, write_country_marker
 from app.services.document_chunk_builder import DOCUMENT_FAMILY, AmbiguousDocumentCountryError, InvalidDocxFormatError, UndeterminableDocumentCountryError, build_document_chunks_from_docx, storage_filename_for_country
 from app.services.document_indexer import DocumentIndexingError, DocumentIndexingResult, _fetch_all_chunks, replace_country_document_chunks
 from app.services.document_section_state import delete_section_edit_state

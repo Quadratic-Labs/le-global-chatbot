@@ -120,7 +120,7 @@ from app.services.contact_document_photos import (
     _run_span_for_relationship,
     _write_temp_docx,
 )
-from app.services.contact_photos import (
+from app.services.contact_document_photos import (
     ContactPhotoExtractionError,
     extract_contact_photo_candidates,
 )

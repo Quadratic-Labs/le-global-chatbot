@@ -9,12 +9,12 @@ from typing import Any, Final
 from opensearchpy import OpenSearch
 from app.clients.opensearch import get_opensearch_client
 from app.models.admin_contacts import AdminContactDeleteResponse, AdminContactListResponse, AdminContactResponse, AdminContactSummary, AdminContactWriteRequest
-from app.services.admin_document_lifecycle import AdminDocumentLifecycleError, AdminDocumentRollbackError, InvalidAdminDocumentIdError, _ensure_no_country_conflict, _get_document_metadata, _required_string
+from app.services.admin_document_lifecycle import AdminDocumentLifecycleError, AdminDocumentRollbackError, InvalidAdminDocumentIdError, _ensure_no_country_conflict, _get_document_metadata, _required_string, _get_client, _validate_document_id
 from app.services.admin_document_sections import _fsync_path, _make_temp_docx_path
 from app.services.document_section_state import is_admin_modified_since_upload, mark_admin_modified, reset_admin_modified, write_admin_modified_marker
 from app.services.contact_document_area import ContactAreaError, ContactPhotoPayload, rebuild_canonical_contact_table, resolve_untracked_contact_photo
-from app.services.contact_photos import associate_contact_photos
-from app.services.contact_photos import ContactPhotoExtractionError, extract_contact_photo_candidates
+from app.services.contact_document_photos import associate_contact_photos
+from app.services.contact_document_photos import ContactPhotoExtractionError, extract_contact_photo_candidates
 from app.services.contact_state import ContactPhotoStorageError, delete_contact_photo, read_contact_photo, write_contact_photo_atomic
 from app.services.contact_state import ContactRecord, ContactState, delete_contact_state, new_contact_id, read_contact_state, write_contact_state_atomic
 from app.services.country_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, country_lock
@@ -29,7 +29,6 @@ from app.services.document_section_state import mark_admin_modified
 from app.services.contact_document_area import ContactAreaError, ContactPhotoPayload, rebuild_canonical_contact_table
 from app.services.contact_state import ContactState, ContactStateError, read_contact_state, write_contact_state_atomic
 from app.services.document_chunk_builder import validate_docx_format
-DOCUMENT_ID_PATTERN: Final[re.Pattern[str]] = re.compile('^doc_[0-9a-f]{64}$')
 
 class AdminContactNotFoundError(LookupError):
     """Raised when a specific contact_id is not found in a document's
@@ -50,21 +49,6 @@ class AdminContactMutationFailedError(RuntimeError):
     rollback fully succeeded - the previous state, index, and marker
     are all intact; nothing was left half-applied.
     """
-
-def _get_client(client: OpenSearch | None) -> OpenSearch:
-    """Return the supplied or configured OpenSearch client - the same
-    inline convention every other admin service module in this
-    codebase already uses."""
-    return client if client is not None else get_opensearch_client()
-
-def _validate_document_id(document_id: str) -> str:
-    """Validate one deterministic document identifier - reuses the
-    exact pattern admin_document_lifecycle.py already validates
-    against, never a second, independently maintained regex."""
-    normalized_document_id = document_id.strip()
-    if not DOCUMENT_ID_PATTERN.fullmatch(normalized_document_id):
-        raise InvalidAdminDocumentIdError('The document identifier is invalid.')
-    return normalized_document_id
 
 def _record_to_extracted_contact(record: ContactRecord) -> ExtractedContact:
     """
