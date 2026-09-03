@@ -1366,6 +1366,8 @@ final class LE_Global_Chatbot_Plugin
             self::STREAM_PHP_EXECUTION_TIME_SECONDS
         );
 
+        self::prepare_stream_output();
+
         $backend_url = untrailingslashit(
             $configuration['url']
         ) . self::BACKEND_CHAT_STREAM_PATH;
@@ -1505,6 +1507,26 @@ final class LE_Global_Chatbot_Plugin
 
             if (function_exists('flush')) {
                 flush();
+            }
+        }
+    }
+
+    /**
+     * Prepare this REST request for progressive streaming.
+     *
+     * WordPress or another plugin may install an output buffer around
+     * REST requests. flush() alone cannot bypass such a buffer, so it
+     * must be removed before streaming the backend response.
+     */
+    private static function prepare_stream_output(): void
+    {
+        if (function_exists('ini_set')) {
+            @ini_set('zlib.output_compression', '0');
+        }
+
+        while (ob_get_level() > 0) {
+            if (!@ob_end_clean()) {
+                break;
             }
         }
     }
