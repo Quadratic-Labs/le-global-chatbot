@@ -1347,6 +1347,17 @@
                             record
                         );
                     }
+
+                    if (
+                        record
+                        && record.type === "delta"
+                    ) {
+                        return new Promise((resolve) => {
+                            defaultScheduleStreamWork(resolve);
+                        });
+                    }
+
+                    return undefined;
                 }
 
                 requestInFlight = true;
@@ -2898,7 +2909,7 @@
                     );
 
                     if (typeof onProtocolEvent === "function") {
-                        onProtocolEvent(record);
+                        await onProtocolEvent(record);
                     }
                 }
             }
