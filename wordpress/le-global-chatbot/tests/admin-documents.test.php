@@ -1291,20 +1291,33 @@ $render_upload_visible_text = preg_replace(
     ' ',
     strip_tags($render_upload_source)
 );
-$warning_text = 'Important: Upload one document per country. Uploading a new document replaces the existing document for that country, including all employment-law content currently used by the chatbot for that country.';
+$warning_text = 'Upload a country-specific document to replace the existing one (including all information and contact details)';
 
 check(
     'the upload panel renders the exact required warning text',
     str_contains($render_upload_visible_text, $warning_text),
     true
 );
+$warning_position = strpos(
+    $render_upload_source,
+    'Upload a country-specific document to replace the'
+);
+$description_position = strpos(
+    $render_upload_source,
+    'Maximum file size: 25 MB each.'
+);
+$dropzone_position = strpos(
+    $render_upload_source,
+    'le-global-chatbot-admin__dropzone'
+);
+
 check(
     'the warning is inside Upload after its description and before the dropzone',
-    !str_contains($render_page_source, $warning_text)
-        && strpos($render_upload_source, 'Maximum file size: 25 MB each.')
-            < strpos($render_upload_source, '<strong>Important:</strong>')
-        && strpos($render_upload_source, '<strong>Important:</strong>')
-            < strpos($render_upload_source, 'le-global-chatbot-admin__dropzone'),
+    $description_position !== false
+        && $warning_position !== false
+        && $dropzone_position !== false
+        && $description_position < $warning_position
+        && $warning_position < $dropzone_position,
     true
 );
 check(

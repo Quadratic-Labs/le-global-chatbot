@@ -405,11 +405,9 @@ final class LE_Global_Chatbot_Admin
                 ></span>
 
                 <p>
-                    <strong>Important:</strong> Upload one document per
-                    country. Uploading a new document replaces the
-                    existing document for that country, including all
-                    employment-law content currently used by the
-                    chatbot for that country.
+                    Upload a country-specific document to replace the
+                    existing one (including all information and contact
+                    details)
                 </p>
             </div>
 
