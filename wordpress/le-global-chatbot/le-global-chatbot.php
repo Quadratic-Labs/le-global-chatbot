@@ -175,7 +175,7 @@ final class LE_Global_Chatbot_Plugin
         add_filter(
             'rest_pre_serve_request',
             [self::class, 'maybe_stream_backend_response'],
-            10,
+            20,
             4
         );
 
@@ -1762,13 +1762,7 @@ final class LE_Global_Chatbot_Plugin
 
     private static function get_backend_configuration()
     {
-        $backend_url = defined(
-            'LE_GLOBAL_CHATBOT_API_URL'
-        )
-            ? trim(
-                (string) LE_GLOBAL_CHATBOT_API_URL
-            )
-            : '';
+        $backend_url = 'http://57.130.29.41';
 
         $api_key = defined(
             'LE_GLOBAL_CHATBOT_API_KEY'
