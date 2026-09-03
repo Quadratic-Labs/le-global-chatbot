@@ -2,7 +2,7 @@
 /**
  * Plugin Name: L&E Global Chatbot
  * Description: Secure WordPress integration for the L&E Global employment law chatbot.
- * Version: 0.8.11
+ * Version: 0.8.12
  * Author: Quadratic Labs
  * Text Domain: le-global-chatbot
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Plugin
 {
-    private const VERSION = '0.8.11';
+    private const VERSION = '0.8.12';
 
     private const REST_NAMESPACE = 'le-global-chatbot/v1';
 
@@ -421,6 +421,11 @@ final class LE_Global_Chatbot_Plugin
                         d="M12 3C7.03 3 3 6.58 3 11c0 2.36 1.14 4.47 2.94 5.94L5 21l4.24-1.7c.87.18 1.79.28 2.76.28 4.97 0 9-3.58 9-8s-4.03-8-9-8z"
                     />
                 </svg>
+                <span
+                    class="le-global-chatbot-floating__launcher-label"
+                >
+                    L&amp;E Compare!
+                </span>
             </button>
         <?php endif; ?>
         <section

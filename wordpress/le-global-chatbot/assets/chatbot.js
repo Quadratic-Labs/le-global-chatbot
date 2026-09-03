@@ -1353,7 +1353,12 @@
                         && record.type === "delta"
                     ) {
                         return new Promise((resolve) => {
-                            defaultScheduleStreamWork(resolve);
+                            setTimeout(
+                                () => {
+                                    defaultScheduleStreamWork(resolve);
+                                },
+                                20
+                            );
                         });
                     }
 

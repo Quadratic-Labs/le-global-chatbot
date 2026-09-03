@@ -279,15 +279,21 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 60px;
+    gap: 10px;
+    width: auto;
     height: 60px;
-    padding: 0;
+    padding: 0 20px 0 16px;
     border: 0;
-    border-radius: 50%;
+    border-radius: 999px;
     background: var(--le-global-primary, #0d6efd);
     color: #fff;
     cursor: pointer;
     box-shadow: 0 10px 30px rgba(13, 110, 253, 0.35);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
 }
 
 .le-global-chatbot-floating
@@ -298,6 +304,13 @@
 .le-global-chatbot-floating
 > .le-global-chatbot-floating__launcher svg {
     display: block;
+    flex: 0 0 auto;
+}
+
+.le-global-chatbot-floating__launcher-label {
+    display: block;
+    font: inherit;
+    color: inherit;
 }
 
 .le-global-chatbot-floating--open
