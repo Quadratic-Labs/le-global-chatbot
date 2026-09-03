@@ -120,9 +120,6 @@ services:
 
   backend:
     image: le-global-backend:release-fdc461f
-    build:
-      context: ../backend
-      dockerfile: Dockerfile
 
     container_name: le-global-backend
     restart: unless-stopped
