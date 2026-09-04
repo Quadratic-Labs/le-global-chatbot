@@ -900,11 +900,27 @@ legal_topics bucket:
   rule or concept beyond its general topic area; "broad" when the
   question genuinely is the whole topic area itself (e.g. "explain
   dismissal rules").
-- evidence_mode: "direct_topic" for one precise concept that must itself
-  appear in the evidence; "relation_required" when the subject depends on
-  a relation between two or more distinct concepts, never satisfied by
-  each concept appearing in a different, unrelated place; "broad_topic"
-  for a genuinely broad question about a whole topic area.
+- evidence_mode: "direct_topic" for one precise concept, or for several
+  independent facets explicitly requested as separate points within the
+  same legal topic. Independent facets do NOT form a relation merely
+  because the user asks for them together. For example, "valid grounds,
+  notice and statutory severance" is a list of separate points, not a
+  relation.
+- Use "relation_required" only when the legal question depends on how two
+  or more concepts interact, for example "dismissal while on sick leave".
+  Never use relation_required merely because several independent points
+  are requested in one answer.
+- Use "broad_topic" for a genuinely broad question about a whole topic
+  area.
+- When the user explicitly lists several independent facets, create
+  exactly one search_concepts group per requested facet. Do not add an
+  umbrella concept for the broad action or legal topic when the narrower
+  requested facets already cover it. For example, when the user asks for
+  valid grounds, notice and statutory severance, do not add "dismissal"
+  or "termination of employment" as an additional fourth concept group.
+- When the user's wording already names a requested facet, use that
+  wording as the first term of the corresponding search_concepts group,
+  followed only by direct synonyms.
 Leave all four null for a contact action.
 
 Country resolution: you are given every country the

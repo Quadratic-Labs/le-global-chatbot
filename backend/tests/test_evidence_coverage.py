@@ -640,6 +640,84 @@ class SubjectTextOverlapFallbackCounterExampleTests(unittest.TestCase):
         self.assertEqual(status, "insufficient")
 
 
+
+class QualifiedLegalTermMatchingRegressionTests(
+    unittest.TestCase
+):
+    """
+    Leading legal qualifiers may be omitted only when a meaningful
+    multi-word phrase remains. Never degrade to a generic one-word
+    concept match.
+    """
+
+    def test_statutory_severance_pay_matches_severance_pay(
+        self,
+    ) -> None:
+        hit = _hit(
+            (
+                "The severance pay resulting from an objective "
+                "dismissal is twenty days salary per year of service."
+            )
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [_Concept(["statutory severance pay"])],
+                "direct_topic",
+            ),
+            "direct",
+        )
+
+    def test_smoke_severance_synonyms_match_severance_pay(
+        self,
+    ) -> None:
+        hit = _hit(
+            (
+                "A severance payment will only be required in "
+                "certain cases. Severance pay resulting from "
+                "objective dismissal is twenty days salary per "
+                "year of service."
+            )
+        )
+
+        concepts = [
+            _Concept(
+                [
+                    "statutory severance",
+                    "statutory redundancy payment",
+                    "mandatory severance",
+                ]
+            )
+        ]
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                concepts,
+                "direct_topic",
+            ),
+            "direct",
+        )
+
+    def test_statutory_severance_does_not_reduce_to_one_word(
+        self,
+    ) -> None:
+        hit = _hit(
+            "The employee may receive severance."
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [_Concept(["statutory severance"])],
+                "direct_topic",
+            ),
+            "insufficient",
+        )
+
+
+
 class AnswerMentionsConceptsTests(unittest.TestCase):
     """Used only for subject_drift detection on the generated text."""
 

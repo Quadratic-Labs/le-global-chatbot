@@ -261,6 +261,56 @@ class CatalogueTests(unittest.TestCase):
         self.assertIn("Spain", result.answer)
         self.assertNotIn("Australia", result.answer)
 
+    def test_legal_comparison_formatting_is_not_country_catalogue(
+        self,
+    ) -> None:
+        base = (
+            "Compare France, Germany, Spain and the United Kingdom "
+            "on Termination of Employment Contracts. "
+            "Focus on valid grounds, notice and statutory severance "
+            "only where the available information supports those "
+            "points. "
+        )
+
+        formatting_requests = (
+            "Separate the answer clearly by country.",
+            "Separate the comparison clearly by country.",
+            "Give one section for each country.",
+            "Structure the answer by jurisdiction.",
+        )
+
+        for formatting_request in formatting_requests:
+            with self.subTest(
+                formatting_request=formatting_request,
+            ):
+                result = _resolution(
+                    base + formatting_request
+                )
+
+                self.assertIsNone(
+                    result,
+                    msg=(
+                        "A real multi-country legal comparison must "
+                        "continue to the legal pipeline instead of "
+                        "being intercepted as a country catalogue "
+                        f"request: {formatting_request}"
+                    ),
+                )
+
+    def test_country_catalogue_guard_preserves_real_catalogue_query(
+        self,
+    ) -> None:
+        result = _resolution(
+            "How many countries are covered?"
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result.intent_type,
+            "supported_countries",
+        )
+        self.assertIn("3 countries", result.answer)
+
     def test_imperfect_country_count_question(self) -> None:
         result = _resolution(
             "How many country do u have?"

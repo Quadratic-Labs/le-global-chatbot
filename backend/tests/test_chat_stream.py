@@ -51,6 +51,7 @@ from app.routers.chat_stream import (
     _drain_stream_events,
     _map_stream_answer_event,
     _metadata_record,
+    _public_stream_error_message,
     _serialize_ndjson_record,
     cancel_active_stream,
     legal_chat_stream,
@@ -86,6 +87,45 @@ from tests.test_chat import (
     _understanding_result,
     _unexpected_search,
 )
+
+
+class PublicStreamErrorSanitizationTests(unittest.TestCase):
+    """Technical provider details must never reach website visitors."""
+
+    def test_max_output_tokens_is_replaced_by_broad_request_message(
+        self,
+    ) -> None:
+        message = _public_stream_error_message(
+            "OpenAI generation did not complete: max_output_tokens."
+        )
+
+        self.assertEqual(
+            (
+                "Your request is too broad to complete in one response. "
+                "Please reduce the number of countries or legal topics "
+                "and try again."
+            ),
+            message,
+        )
+        self.assertNotIn("OpenAI", message)
+        self.assertNotIn("max_output_tokens", message)
+
+    def test_provider_failure_is_replaced_by_generic_public_message(
+        self,
+    ) -> None:
+        message = _public_stream_error_message(
+            "OpenAI could not be reached in time."
+        )
+
+        self.assertEqual(
+            (
+                "The assistant could not complete your request. "
+                "Please try again."
+            ),
+            message,
+        )
+        self.assertNotIn("OpenAI", message)
+
 
 
 def _delta_events(text: str, *, chunk_size: int = 3) -> list[StreamEvent]:

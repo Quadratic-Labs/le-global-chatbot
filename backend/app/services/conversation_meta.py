@@ -1306,8 +1306,26 @@ def resolve_conversation_meta(
         )
     )
 
+    # A real legal comparison must not be mistaken for a request for
+    # the supported-country catalogue merely because formatting
+    # wording contains "country"/"jurisdiction" while the legal
+    # question also contains a word such as "available".
+    #
+    # Example:
+    # "Compare France and Germany on termination ... where the
+    # available information supports it. Structure by country."
+    country_catalogue_query = _is_country_catalogue_query(text)
+
+    if (
+        country_catalogue_query
+        and len(country_codes) >= 2
+        and comparison_context
+        and detect_legal_topics(question)
+    ):
+        country_catalogue_query = False
+
     needs_country_catalog = bool(
-        _is_country_catalogue_query(text)
+        country_catalogue_query
         or _is_targeted_country_availability(
             text,
             country_codes,
@@ -1324,7 +1342,7 @@ def resolve_conversation_meta(
 
         if catalog is None:
             if (
-                _is_country_catalogue_query(text)
+                country_catalogue_query
                 or _is_targeted_country_availability(
                     text,
                     country_codes,
@@ -1345,7 +1363,7 @@ def resolve_conversation_meta(
                 for country in catalog.countries
             }
 
-            if _is_country_catalogue_query(text):
+            if country_catalogue_query:
                 return ConversationMetaResolution(
                     intent_type="supported_countries",
                     answer=_country_catalogue_answer(

@@ -1408,6 +1408,62 @@ def _retrieve_country_hits(
     )
 
 
+def _prioritize_country_hits_for_evidence(
+    hits: Sequence[LegalSearchHit],
+    search_concepts: Sequence[SearchConceptLike] | None,
+    evidence_mode: str | None,
+) -> list[LegalSearchHit]:
+    """
+    Preserve retrieval ranking unless a multi-country evidence-gated
+    request has explicit search concepts.
+
+    When it does, prefer candidates that can actually satisfy the
+    evidence policy before the final cross-country source budget is
+    applied. This prevents a country's first high-ranked but
+    evidence-insufficient hit from consuming its only slot while a
+    direct hit for the same country is already present immediately
+    behind it.
+
+    Stable within each evidence-status tier: original retrieval order
+    is preserved.
+    """
+
+    ordered_hits = list(hits)
+
+    if (
+        not ordered_hits
+        or not search_concepts
+        or evidence_mode not in ("direct_topic", "relation_required")
+    ):
+        return ordered_hits
+
+    priority = {
+        "direct": 0,
+        "partial": 1,
+        "insufficient": 2,
+    }
+
+    indexed_hits = list(enumerate(ordered_hits))
+
+    indexed_hits.sort(
+        key=lambda item: (
+            priority[
+                evaluate_evidence_status(
+                    [item[1]],
+                    list(search_concepts),
+                    evidence_mode,
+                )
+            ],
+            item[0],
+        )
+    )
+
+    return [
+        hit
+        for _, hit in indexed_hits
+    ]
+
+
 def _retrieve_search_hits(
     request: LegalChatRequest,
     search_function: SearchFunction,
@@ -1417,6 +1473,7 @@ def _retrieve_search_hits(
     metrics: LegalChatMetrics | None = None,
     search_concepts: Sequence[SearchConceptLike] | None = None,
     broad_overview: bool = False,
+    evidence_mode: str | None = None,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve legal chunks.
@@ -1554,7 +1611,11 @@ def _retrieve_search_hits(
         )
 
         country_hit_groups.append(
-            country_hits
+            _prioritize_country_hits_for_evidence(
+                hits=country_hits,
+                search_concepts=search_concepts,
+                evidence_mode=evidence_mode,
+            )
         )
 
     return (
@@ -4233,6 +4294,7 @@ def _prepare_grounded_generation(
                 metrics=metrics,
                 search_concepts=spec.search_concepts,
                 broad_overview=broad_overview,
+                evidence_mode=spec.evidence_mode,
             )
         except LegalSearchError as error:
             raise RagAnswerError(

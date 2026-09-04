@@ -1423,6 +1423,132 @@ _BROAD_LEGAL_OVERVIEW_CUE_PATTERN: Final[
 )
 
 
+_UNSUPPORTED_LEGAL_SIGNAL_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:"
+    r"law|laws|legal|illegal|unlawful|lawful|"
+    r"rights?|liabilit(?:y|ies)|"
+    r"compliance|regulat(?:ion|ions|ory)|"
+    r"tax(?:es|ation)?|"
+    r"corporate|commercial|criminal|"
+    r"immigration|visa|"
+    r"court|lawsuit|litigation|"
+    r"divorce|inheritance|probate|"
+    r"incorporat(?:e|ed|ing|ion)|"
+    r"(?:create|start|form|set\s+up)\s+"
+    r"(?:a|an|my|the)?\s*(?:company|business)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _should_offer_contact_for_unsupported_request(
+    question: str,
+) -> bool:
+    """
+    Return True only when an unsupported request is clearly legal or
+    legal-adjacent.
+
+    Non-legal requests such as weather must stay on the simple product
+    scope refusal and must not trigger contact retrieval.
+    """
+
+    return bool(
+        _UNSUPPORTED_LEGAL_SIGNAL_PATTERN.search(question)
+    )
+
+
+_GENERAL_EMPLOYMENT_REQUEST_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:"
+    r"employment(?:\s+law)?|"
+    r"labou?r\s+law|"
+    r"employers?|employees?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _try_local_missing_topic_result(
+    *,
+    question: str,
+    result: RequestUnderstandingResult,
+    previous_conversation_state: ConversationState | None,
+    hints: DeterministicHints,
+    current_country_scope: CountryAvailability,
+    current_legal_scope: LegalScope,
+) -> RequestUnderstandingResult | None:
+    """
+    Convert a fresh general employment-law request into a topic
+    clarification when one supported country is known but no supported
+    employment-law topic is identifiable.
+
+    Explicit whole-domain overview requests remain supported. Requests
+    already classified as unsupported remain untouched, preserving the
+    legal out-of-scope/contact fallback.
+    """
+
+    explicit_broad_overview = bool(
+        _BROAD_LEGAL_OVERVIEW_DOMAIN_PATTERN.search(question)
+        and _BROAD_LEGAL_OVERVIEW_CUE_PATTERN.search(question)
+    )
+
+    semantic_result_has_topic = any(
+        action.type == "legal_information"
+        and (
+            action.legal_topics
+            or action.document_legal_topics
+        )
+        for action in result.actions
+    )
+
+    if (
+        result.status == "unsupported"
+        or semantic_result_has_topic
+        or previous_conversation_state is not None
+        or hints.strong_contact_signal
+        or hints.comparison_signal
+        or current_country_scope.unavailable_codes
+        or len(current_country_scope.available_codes) != 1
+        or current_legal_scope.legal_topics
+        or explicit_broad_overview
+        or not _GENERAL_EMPLOYMENT_REQUEST_PATTERN.search(question)
+    ):
+        return None
+
+    country_code = current_country_scope.available_codes[0]
+
+    return RequestUnderstandingResult(
+        status="clarification",
+        actions=[
+            RequestUnderstandingAction(
+                type="legal_information",
+                country_codes=[country_code],
+                legal_topics=[],
+                document_legal_topics=[],
+                topic_text=None,
+                subject_text="employment law",
+                resolved_question=question.strip(),
+                search_concepts=[],
+                subject_specificity="broad",
+                evidence_mode="broad_topic",
+            )
+        ],
+        is_follow_up=False,
+        confidence=1.0,
+        clarification_reason="missing_topic",
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=["legal_information"],
+            explicit_country_codes=[country_code],
+            explicit_legal_topics=[],
+            explicit_subject_text="employment law",
+            context_operation="independent",
+        ),
+    )
+
+
 def _try_local_broad_legal_overview_result(
     *,
     question: str,
@@ -2943,6 +3069,22 @@ def resolve_legal_chat_response(
                 "broad_legal_overview"
             )
 
+        missing_topic_result = _try_local_missing_topic_result(
+            question=request.question,
+            result=result,
+            previous_conversation_state=(
+                previous_conversation_state
+            ),
+            hints=hints,
+            current_country_scope=current_country_scope,
+            current_legal_scope=current_legal_scope,
+        )
+
+        if missing_topic_result is not None:
+            result = missing_topic_result
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = "missing_topic"
+
         clear_fresh_legal_result = (
             _try_local_clear_fresh_legal_result(
                 question=request.question,
@@ -3064,13 +3206,18 @@ def resolve_legal_chat_response(
             contacts = []
             resolved_country_name: str | None = None
 
-            # A supported country is already known, so reuse the same
-            # deterministic contact fallback as the insufficient-
-            # evidence path. Unsupported/missing countries deliberately
-            # retain their existing responses and never trigger a contact
-            # lookup.
+            # Offer the country contact only when the unsupported
+            # request is clearly legal or legal-adjacent. A non-legal
+            # request such as weather must receive the simple product
+            # scope refusal and must never trigger contact retrieval.
+            #
+            # This is intentionally separate from the legal
+            # insufficient-evidence fallback, which remains unchanged.
             if (
-                current_country_scope.available_codes
+                _should_offer_contact_for_unsupported_request(
+                    request.question
+                )
+                and current_country_scope.available_codes
                 and not current_country_scope.unavailable_codes
             ):
                 resolved_country_name = resolve_country_display_name(
@@ -3470,8 +3617,8 @@ def legal_chat(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "The answer generation service "
-                "is not configured."
+                "The assistant is temporarily unavailable. "
+                "Please try again shortly."
             ),
             headers={
                 "X-Request-ID": request_id,
@@ -3482,8 +3629,8 @@ def legal_chat(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(
-                "The country detection service "
-                "is temporarily unavailable."
+                "The assistant could not complete your request. "
+                "Please try again."
             ),
             headers={
                 "X-Request-ID": request_id,
@@ -3494,8 +3641,8 @@ def legal_chat(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(
-                "The grounded legal answer service "
-                "is temporarily unavailable."
+                "The assistant could not complete your request. "
+                "Please try again."
             ),
             headers={
                 "X-Request-ID": request_id,
@@ -3512,8 +3659,8 @@ def legal_chat(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(
-                "The conversation context could not be "
-                "processed for this request."
+                "The assistant could not complete your request. "
+                "Please try again."
             ),
             headers={
                 "X-Request-ID": request_id,

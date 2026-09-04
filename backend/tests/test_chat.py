@@ -1898,6 +1898,49 @@ class NoCallGenerationClient:
         )
 
 
+
+class IndependentFacetUnderstandingPromptRegressionTests(
+    unittest.TestCase
+):
+    """Independent requested facets must not become a relation."""
+
+    def test_independent_facets_have_explicit_prompt_contract(
+        self,
+    ) -> None:
+        from app.services.request_understanding import (
+            UNDERSTANDING_INSTRUCTIONS,
+        )
+
+        normalized = " ".join(
+            UNDERSTANDING_INSTRUCTIONS.split()
+        )
+
+        self.assertIn(
+            (
+                '"valid grounds, notice and statutory severance" '
+                "is a list of separate points, not a relation."
+            ),
+            normalized,
+        )
+
+        self.assertIn(
+            (
+                "Never use relation_required merely because several "
+                "independent points are requested in one answer."
+            ),
+            normalized,
+        )
+
+        self.assertIn(
+            (
+                'do not add "dismissal" or '
+                '"termination of employment" as an additional '
+                "fourth concept group"
+            ),
+            normalized,
+        )
+
+
 class CountryContactFallbackRegressionTests(unittest.TestCase):
     """Focused contract for supported-country fallback contacts."""
 
@@ -2060,6 +2103,145 @@ class CountryContactFallbackRegressionTests(unittest.TestCase):
         self.assertFalse(response.contact_only)
         self.assertEqual(1, len(response.sources))
         self.assertEqual(["DE"], [item.country_code for item in response.contacts])
+
+    def test_a3_non_legal_weather_does_not_return_contact(
+        self,
+    ) -> None:
+        from app.routers.chat import (
+            CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
+        )
+
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                status="unsupported",
+                clarification_reason="unsupported_request",
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+        ) as contact_search:
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="What is the weather like in France?"
+                ),
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=understanding_client,
+            )
+
+        contact_search.assert_not_called()
+        self.assertEqual(
+            CLARIFICATION_UNSUPPORTED_REQUEST_ANSWER,
+            response.answer,
+        )
+        self.assertFalse(response.grounded)
+        self.assertFalse(response.contact_only)
+        self.assertEqual([], response.sources)
+        self.assertEqual([], response.contacts)
+        self.assertEqual(0, response.retrieval_total)
+
+    def test_a4_general_employment_request_asks_for_topic(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["FR"],
+                        legal_topics=[],
+                        topic_text="employment law overview",
+                        subject_text="employment law",
+                        subject_specificity="broad",
+                        evidence_mode="broad_topic",
+                    )
+                ],
+                current_message_delta=_current_message_delta(
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["FR"],
+                    explicit_legal_topics=[],
+                    explicit_subject_text="employment law",
+                ),
+            )
+        )
+
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks",
+        ) as contact_search:
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question=(
+                        "Looking for employment law information "
+                        "about France"
+                    )
+                ),
+                catalog_provider=_catalog_provider_with_france,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=understanding_client,
+            )
+
+        contact_search.assert_not_called()
+        self.assertEqual(
+            "What employment law topic would you like information "
+            "about for France?",
+            response.answer,
+        )
+        self.assertFalse(response.grounded)
+        self.assertEqual([], response.sources)
+        self.assertEqual([], response.contacts)
+        self.assertEqual(0, response.retrieval_total)
+
+    def test_a5_general_employer_obligations_asks_for_topic(
+        self,
+    ) -> None:
+        understanding_client = FakeUnderstandingClient(
+            payload=_understanding_result(
+                actions=[
+                    _understanding_action(
+                        "legal_information",
+                        country_codes=["FR"],
+                        legal_topics=[],
+                        topic_text="employment law overview",
+                        subject_text="employer obligations",
+                        subject_specificity="broad",
+                        evidence_mode="broad_topic",
+                    )
+                ],
+                current_message_delta=_current_message_delta(
+                    explicit_action_types=["legal_information"],
+                    explicit_country_codes=["FR"],
+                    explicit_legal_topics=[],
+                    explicit_subject_text="employer obligations",
+                ),
+            )
+        )
+
+        response = resolve_legal_chat_response(
+            request=LegalChatRequest(
+                question=(
+                    "What are an employer's obligations in France?"
+                )
+            ),
+            catalog_provider=_catalog_provider_with_france,
+            document_topic_provider=_document_topic_provider,
+            search_function=_unexpected_search,
+            generation_client=NoCallGenerationClient(),
+            understanding_client=understanding_client,
+        )
+
+        self.assertEqual(
+            "What employment law topic would you like information "
+            "about for France?",
+            response.answer,
+        )
+        self.assertFalse(response.grounded)
+        self.assertEqual([], response.contacts)
+        self.assertEqual(0, response.retrieval_total)
 
     def test_b_normal_france_legal_answer_is_unchanged(
         self,

@@ -119,7 +119,7 @@ services:
       start_period: 10s
 
   backend:
-    image: le-global-backend:release-fdc461f
+    image: le-global-backend:guardrails-final-20260904-191705
 
     container_name: le-global-backend
     restart: unless-stopped

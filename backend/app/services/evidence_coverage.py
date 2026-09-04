@@ -46,6 +46,36 @@ _WHITESPACE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s+")
 _DASH_PATTERN: Final[re.Pattern[str]] = re.compile(r"[‐-―\-]")
 _TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z0-9]+")
 
+# Narrow lexical normalization for legal qualifiers that may be
+# present in RequestUnderstanding's synonym but omitted from the
+# source's ordinary wording. We only strip one leading qualifier and
+# only when at least two tokens remain, so a precise phrase such as
+# "statutory severance pay" may match "severance pay", while
+# "statutory severance" can never degrade into the overly broad
+# single-token match "severance".
+_OPTIONAL_LEADING_LEGAL_QUALIFIERS: Final[frozenset[str]] = frozenset(
+    {
+        "statutory",
+        "mandatory",
+    }
+)
+
+# Exact, conservative expansions for qualified concepts that would
+# otherwise collapse to an unsafe one-word match. These expansions
+# remain multi-word legal phrases.
+_QUALIFIED_LEGAL_TERM_EXPANSIONS: Final[
+    dict[tuple[str, ...], tuple[tuple[str, ...], ...]]
+] = {
+    ("statutory", "severance"): (
+        ("severance", "pay"),
+        ("severance", "payment"),
+    ),
+    ("mandatory", "severance"): (
+        ("severance", "pay"),
+        ("severance", "payment"),
+    ),
+}
+
 
 class SearchConceptLike(Protocol):
     """Anything exposing a `terms: list[str]` attribute."""
@@ -75,22 +105,56 @@ def _term_match_positions(
     tokens: list[str],
     term: str,
 ) -> list[int]:
-    """Every starting token index where `term` occurs as a contiguous
-    run of whole tokens inside `tokens`."""
+    """
+    Every starting token index where `term` occurs as a contiguous
+    run of whole tokens inside `tokens`.
+
+    A narrowly-qualified legal synonym may additionally match its
+    unqualified multi-word form. For example, "statutory severance
+    pay" may match "severance pay". The fallback is deliberately
+    disabled when fewer than two tokens would remain.
+    """
 
     term_tokens = _tokenize(term)
 
     if not term_tokens:
         return []
 
-    positions: list[int] = []
-    term_length = len(term_tokens)
+    variants: list[list[str]] = [term_tokens]
 
-    for start in range(len(tokens) - term_length + 1):
-        if tokens[start:start + term_length] == term_tokens:
-            positions.append(start)
+    if (
+        len(term_tokens) >= 3
+        and term_tokens[0] in _OPTIONAL_LEADING_LEGAL_QUALIFIERS
+    ):
+        unqualified_tokens = term_tokens[1:]
 
-    return positions
+        if len(unqualified_tokens) >= 2:
+            variants.append(unqualified_tokens)
+
+    for expansion in _QUALIFIED_LEGAL_TERM_EXPANSIONS.get(
+        tuple(term_tokens),
+        (),
+    ):
+        expanded_tokens = list(expansion)
+
+        if expanded_tokens not in variants:
+            variants.append(expanded_tokens)
+
+    positions: set[int] = set()
+
+    for variant_tokens in variants:
+        term_length = len(variant_tokens)
+
+        for start in range(
+            len(tokens) - term_length + 1
+        ):
+            if (
+                tokens[start:start + term_length]
+                == variant_tokens
+            ):
+                positions.add(start)
+
+    return sorted(positions)
 
 
 def _hit_haystack(hit: LegalSearchHit) -> str:

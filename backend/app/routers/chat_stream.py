@@ -181,6 +181,34 @@ def _error_record(
     }
 
 
+def _public_stream_error_message(
+    internal_message: str | None,
+) -> str:
+    """
+    Convert an internal generation failure into a safe public message.
+
+    Provider names, exception details, token limits and infrastructure
+    details must never be exposed to website visitors.
+    """
+
+    normalized = (internal_message or "").lower()
+
+    if (
+        "max_output_tokens" in normalized
+        or "max_tokens" in normalized
+    ):
+        return (
+            "Your request is too broad to complete in one response. "
+            "Please reduce the number of countries or legal topics "
+            "and try again."
+        )
+
+    return (
+        "The assistant could not complete your request. "
+        "Please try again."
+    )
+
+
 # =============================================================================
 # Structured stream metrics (GATE S4B) - exactly one terminal
 # "chat_stream_performance" log line per /chat/stream request,
@@ -667,9 +695,8 @@ async def _drain_stream_events(
                 yield _serialize_ndjson_record(
                     _error_record(
                         code="stream_generation_failed",
-                        message=(
+                        message=_public_stream_error_message(
                             item.error_message
-                            or "Answer generation failed."
                         ),
                         retryable=item.retryable,
                     )

@@ -7690,5 +7690,107 @@ class InvalidRequestMetadataTests(unittest.TestCase):
             str(error),
         )
 
+
+class MultiCountryEvidencePriorityRegressionTests(
+    unittest.TestCase
+):
+    """
+    A country's evidence-capable candidate must not be lost merely
+    because a higher-BM25 but evidence-insufficient candidate appears
+    first before the cross-country source budget is applied.
+    """
+
+    def test_direct_hit_is_prioritized_before_country_interleave(
+        self,
+    ) -> None:
+        from app.services.request_understanding import (
+            ConversationSearchConcept,
+        )
+
+        countries = {
+            "FR": "France",
+            "DE": "Germany",
+            "ES": "Spain",
+            "GB": "United Kingdom",
+        }
+
+        def fake_search(
+            request: Any,
+        ) -> LegalSearchResponse:
+            code = request.country_codes[0]
+            country = countries[code]
+
+            hits = [
+                _build_hit(
+                    chunk_id=f"{code}-insufficient",
+                    country=country,
+                    country_code=code,
+                    content=(
+                        "General information about employment "
+                        "termination procedures."
+                    ),
+                    score=100.0,
+                ),
+                _build_hit(
+                    chunk_id=f"{code}-direct",
+                    country=country,
+                    country_code=code,
+                    content=(
+                        "The employee is entitled to severance pay."
+                    ),
+                    score=90.0,
+                ),
+            ]
+
+            return LegalSearchResponse(
+                query=request.query,
+                total=len(hits),
+                limit=request.limit,
+                offset=0,
+                took_ms=1,
+                hits=hits[:request.limit],
+            )
+
+        concepts = [
+            ConversationSearchConcept(
+                terms=["severance pay"]
+            )
+        ]
+
+        total, hits = _retrieve_search_hits(
+            request=LegalChatRequest(
+                question=(
+                    "Compare France, Germany, Spain and the "
+                    "United Kingdom on severance pay."
+                ),
+                country_codes=["FR", "DE", "ES", "GB"],
+                legal_topics=[
+                    "Termination of Employment Contracts"
+                ],
+                max_sources=4,
+            ),
+            search_function=fake_search,
+            generation_client=None,
+            rerank_enabled=False,
+            search_concepts=concepts,
+            broad_overview=False,
+            evidence_mode="direct_topic",
+        )
+
+        self.assertEqual(total, 8)
+        self.assertEqual(len(hits), 4)
+
+        self.assertEqual(
+            [hit.chunk_id for hit in hits],
+            [
+                "FR-direct",
+                "DE-direct",
+                "ES-direct",
+                "GB-direct",
+            ],
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()
