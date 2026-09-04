@@ -8,7 +8,7 @@ SOURCE_ROOTS = (PLUGIN_ROOT, Path("backend"))
 
 
 class ReleaseCleanlinessContractTests(unittest.TestCase):
-    def test_runtime_versions_match_089(self):
+    def test_runtime_versions_match_0814(self):
         plugin_source = (
             PLUGIN_ROOT / "le-global-chatbot.php"
         ).read_text(encoding="utf-8")
@@ -41,7 +41,7 @@ class ReleaseCleanlinessContractTests(unittest.TestCase):
                 plugin_constant_match.group(1),
                 admin_constant_match.group(1),
             },
-            {"0.8.9"},
+            {"1.0.0"},
         )
 
     def test_temporary_streaming_diagnostics_are_absent(self):

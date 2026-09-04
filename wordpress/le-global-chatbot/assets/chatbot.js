@@ -748,6 +748,14 @@
     }
 
     function defaultScheduleStreamWork(callback) {
+        if (
+            typeof document !== "undefined"
+            && document.visibilityState === "hidden"
+        ) {
+            callback();
+            return;
+        }
+
         if (typeof requestAnimationFrame === "function") {
             requestAnimationFrame(callback);
             return;
@@ -1324,15 +1332,150 @@
                         : null
                 );
 
+                // Keep network consumption independent from the
+                // progressive visual pacing. The backend stream is
+                // consumed immediately, while visible delta records
+                // are presented one at a time at a gentle cadence.
+                const streamDeltaRenderDelayMs = 20;
+                const pendingStreamDeltaRecords = [];
+                let streamDeltaTimer = null;
+                let streamDeltaDrainResolvers = [];
+
+                function isStreamPageHidden() {
+                    return (
+                        typeof document !== "undefined"
+                        && document.visibilityState === "hidden"
+                    );
+                }
+
+                function resolveStreamDeltaDrainWaiters() {
+                    if (
+                        pendingStreamDeltaRecords.length > 0
+                        || streamDeltaTimer !== null
+                        || streamDeltaDrainResolvers.length === 0
+                    ) {
+                        return;
+                    }
+
+                    const resolvers = streamDeltaDrainResolvers;
+                    streamDeltaDrainResolvers = [];
+
+                    // The bubble controller itself renders through a
+                    // scheduled frame. Resolve only after that frame
+                    // had an opportunity to flush the final delta.
+                    defaultScheduleStreamWork(() => {
+                        resolvers.forEach((resolve) => resolve());
+                    });
+                }
+
+                function clearPendingStreamDeltas() {
+                    if (streamDeltaTimer !== null) {
+                        clearTimeout(streamDeltaTimer);
+                        streamDeltaTimer = null;
+                    }
+
+                    pendingStreamDeltaRecords.length = 0;
+                    resolveStreamDeltaDrainWaiters();
+                }
+
+                function flushPendingStreamDeltasImmediately() {
+                    if (streamDeltaTimer !== null) {
+                        clearTimeout(streamDeltaTimer);
+                        streamDeltaTimer = null;
+                    }
+
+                    if (!streamingBubbleController) {
+                        pendingStreamDeltaRecords.length = 0;
+                        resolveStreamDeltaDrainWaiters();
+                        return;
+                    }
+
+                    while (pendingStreamDeltaRecords.length > 0) {
+                        streamingBubbleController.handleEvent(
+                            pendingStreamDeltaRecords.shift()
+                        );
+                    }
+
+                    resolveStreamDeltaDrainWaiters();
+                }
+
+                function scheduleNextStreamDelta() {
+                    if (
+                        !streamingBubbleController
+                        || pendingStreamDeltaRecords.length === 0
+                    ) {
+                        resolveStreamDeltaDrainWaiters();
+                        return;
+                    }
+
+                    // Background tabs may throttle timers and animation
+                    // frames. Do not pace the visual queue there:
+                    // immediately catch the bubble up to the network
+                    // stream so the answer is ready when the visitor
+                    // returns.
+                    if (isStreamPageHidden()) {
+                        flushPendingStreamDeltasImmediately();
+                        return;
+                    }
+
+                    if (streamDeltaTimer !== null) {
+                        return;
+                    }
+
+                    streamDeltaTimer = setTimeout(() => {
+                        streamDeltaTimer = null;
+
+                        if (isStaleRequest()) {
+                            pendingStreamDeltaRecords.length = 0;
+                            resolveStreamDeltaDrainWaiters();
+                            return;
+                        }
+
+                        const nextRecord = (
+                            pendingStreamDeltaRecords.shift()
+                        );
+
+                        if (nextRecord) {
+                            streamingBubbleController.handleEvent(
+                                nextRecord
+                            );
+                        }
+
+                        if (pendingStreamDeltaRecords.length > 0) {
+                            scheduleNextStreamDelta();
+                        } else {
+                            resolveStreamDeltaDrainWaiters();
+                        }
+                    }, streamDeltaRenderDelayMs);
+                }
+
+                function enqueueStreamDelta(record) {
+                    pendingStreamDeltaRecords.push(record);
+
+                    if (isStreamPageHidden()) {
+                        flushPendingStreamDeltasImmediately();
+                        return;
+                    }
+
+                    scheduleNextStreamDelta();
+                }
+
+                function waitForStreamDeltaDrain() {
+                    return new Promise((resolve) => {
+                        streamDeltaDrainResolvers.push(resolve);
+
+                        if (
+                            pendingStreamDeltaRecords.length === 0
+                            && streamDeltaTimer === null
+                        ) {
+                            resolveStreamDeltaDrainWaiters();
+                        }
+                    });
+                }
+
                 function handleStreamProtocolEvent(record) {
-                    // GATE S9B: the ONLY place a request_id ever
-                    // becomes known - the `start` record is the sole
-                    // place the backend reveals one. Guarded by
-                    // isStaleRequest() so a late/stray event from an
-                    // already-superseded request (e.g. one that lost
-                    // the race against a fresh "New conversation")
-                    // can never overwrite the CURRENT request's own
-                    // tracked id with a stale one.
+                    // GATE S9B: the start event is the sole source of
+                    // the backend request identifier.
                     if (
                         record
                         && record.type === "start"
@@ -1342,24 +1485,68 @@
                         activeStreamRequestId = record.request_id;
                     }
 
-                    if (streamingBubbleController) {
-                        streamingBubbleController.handleEvent(
-                            record
-                        );
+                    if (!streamingBubbleController) {
+                        return undefined;
                     }
 
                     if (
                         record
                         && record.type === "delta"
                     ) {
-                        return new Promise((resolve) => {
-                            setTimeout(
-                                () => {
-                                    defaultScheduleStreamWork(resolve);
-                                },
-                                20
-                            );
+                        // Queue only the visual presentation. Never
+                        // return a Promise here: requestStream must
+                        // continue consuming the network immediately.
+                        enqueueStreamDelta(record);
+                        return undefined;
+                    }
+
+                    if (
+                        record
+                        && (
+                            record.type === "discard"
+                            || record.type === "replacement"
+                            || record.type === "error"
+                        )
+                    ) {
+                        // These protocol events supersede provisional
+                        // deltas, so no stale queued text may appear
+                        // afterwards.
+                        clearPendingStreamDeltas();
+                        streamingBubbleController.handleEvent(record);
+                        return undefined;
+                    }
+
+                    if (
+                        record
+                        && record.type === "validating"
+                        && (
+                            pendingStreamDeltaRecords.length > 0
+                            || streamDeltaTimer !== null
+                        )
+                    ) {
+                        // Preserve visible protocol ordering. This is
+                        // near the end of generation; delta network
+                        // consumption has already remained non-blocking.
+                        return waitForStreamDeltaDrain().then(() => {
+                            if (!isStaleRequest()) {
+                                streamingBubbleController.handleEvent(
+                                    record
+                                );
+                            }
                         });
+                    }
+
+                    streamingBubbleController.handleEvent(record);
+
+                    if (
+                        record
+                        && record.type === "done"
+                    ) {
+                        // The network response is complete. Allow the
+                        // final visual delta to appear before the
+                        // existing settled-turn renderer replaces the
+                        // provisional bubble.
+                        return waitForStreamDeltaDrain();
                     }
 
                     return undefined;

@@ -9,7 +9,7 @@ if (!defined('ABSPATH')) {
 
 final class LE_Global_Chatbot_Admin
 {
-    private const VERSION = '0.8.9';
+    private const VERSION = '1.0.0';
 
     private const PAGE_SLUG = 'le-global-chatbot';
 

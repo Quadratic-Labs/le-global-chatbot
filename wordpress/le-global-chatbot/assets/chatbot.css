@@ -297,11 +297,6 @@
 }
 
 .le-global-chatbot-floating
-> .le-global-chatbot-floating__launcher:hover {
-    background: var(--le-global-primary-hover, #0b5ed7);
-}
-
-.le-global-chatbot-floating
 > .le-global-chatbot-floating__launcher svg {
     display: block;
     flex: 0 0 auto;
@@ -830,3 +825,186 @@
 }
 
 /* === L&E GLOBAL SIMPLE HOVER EFFECT END === */
+
+/* === L&E GLOBAL CLIENT THEME PROTECTION START === */
+
+/*
+ * Protect the chatbot from generic client-theme rules.
+ * Every rule remains strictly scoped to the chatbot.
+ */
+
+/* Base typography / sizing. */
+html body .le-global-chatbot,
+html body .le-global-chatbot * {
+    box-sizing: border-box;
+}
+
+html body .le-global-chatbot {
+    color: #17212b !important;
+}
+
+/* Conversation title. */
+html body .le-global-chatbot
+.le-global-chatbot__panel-header
+.le-global-chatbot__panel-heading
+> h2.le-global-chatbot__title {
+    color: #200e32 !important;
+}
+
+/* User message. */
+html body .le-global-chatbot
+.le-global-chatbot__message--user,
+html body .le-global-chatbot
+.le-global-chatbot__message--user > p {
+    color: #ffffff !important;
+}
+
+/* Contact card structure / text. */
+html body .le-global-chatbot
+article.le-global-chatbot__contact-card {
+    color: #202b38 !important;
+}
+
+html body .le-global-chatbot
+.le-global-chatbot__contact-name {
+    color: #162435 !important;
+}
+
+html body .le-global-chatbot
+.le-global-chatbot__contact-firm {
+    color: #243448 !important;
+}
+
+html body .le-global-chatbot
+.le-global-chatbot__contact-address {
+    color: #455363 !important;
+}
+
+/*
+ * Critical fix:
+ * client theme currently turns email / telephone links white.
+ */
+html body .le-global-chatbot
+.le-global-chatbot__contact-body a[href^="mailto:"],
+html body .le-global-chatbot
+.le-global-chatbot__contact-body a[href^="tel:"] {
+    color: #183b5b !important;
+    -webkit-text-fill-color: #183b5b !important;
+}
+
+/* Protect other contact links as well. */
+html body .le-global-chatbot
+.le-global-chatbot__contact-body a {
+    color: #183b5b !important;
+    -webkit-text-fill-color: #183b5b !important;
+}
+
+/* Composer textarea must keep chatbot styling. */
+html body .le-global-chatbot
+textarea.le-global-chatbot__question {
+    color: #17212b !important;
+    background-color: #ffffff !important;
+}
+
+/* Placeholder must not inherit client-theme colors. */
+html body .le-global-chatbot
+textarea.le-global-chatbot__question::placeholder {
+    color: #7b8794 !important;
+    opacity: 1 !important;
+}
+
+/* Send button. */
+html body .le-global-chatbot--floating
+.le-global-chatbot__submit {
+    background-color: #0d6efd !important;
+    border-color: #0d6efd !important;
+    color: #ffffff !important;
+}
+
+html body .le-global-chatbot--floating
+.le-global-chatbot__submit:hover:not(:disabled) {
+    background-color: #000a21 !important;
+    border-color: #000a21 !important;
+    color: #ffffff !important;
+}
+
+/* New conversation button. */
+html body .le-global-chatbot
+.le-global-chatbot__new-conversation {
+    background-color: #eb7a5c !important;
+    border-color: #eb7a5c !important;
+    color: #ffffff !important;
+}
+
+html body .le-global-chatbot
+.le-global-chatbot__new-conversation:hover {
+    background-color: #d9684f !important;
+    border-color: #d9684f !important;
+    color: #ffffff !important;
+}
+
+/* Close button. */
+html body .le-global-chatbot
+.le-global-chatbot-floating__close {
+    background-color: #eb7a5c !important;
+    border-color: #eb7a5c !important;
+    color: #ffffff !important;
+}
+
+html body .le-global-chatbot
+.le-global-chatbot-floating__close:hover {
+    background-color: #d9684f !important;
+    border-color: #d9684f !important;
+    color: #ffffff !important;
+}
+
+
+/* Floating launcher protection against client-theme button rules. */
+html body .le-global-chatbot-floating
+> button.le-global-chatbot-floating__launcher {
+    background: #0d6efd !important;
+    background-color: #0d6efd !important;
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    border: 0 !important;
+    border-radius: 999px !important;
+    width: auto !important;
+    height: 60px !important;
+    padding: 0 20px 0 16px !important;
+    box-shadow: 0 10px 30px rgba(13, 110, 253, 0.35) !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+    text-decoration: none !important;
+}
+
+html body .le-global-chatbot-floating
+> button.le-global-chatbot-floating__launcher:hover {
+    background: var(--le-global-primary-hover, #0b5ed7) !important;
+    background-color: var(--le-global-primary-hover, #0b5ed7) !important;
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    transform: none !important;
+}
+
+html body .le-global-chatbot-floating
+> button.le-global-chatbot-floating__launcher
+.le-global-chatbot-floating__launcher-label {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
+
+html body .le-global-chatbot-floating
+> button.le-global-chatbot-floating__launcher svg {
+    color: #ffffff !important;
+    fill: currentColor;
+}
+
+html body .le-global-chatbot-floating.le-global-chatbot-floating--open
+> button.le-global-chatbot-floating__launcher {
+    box-shadow:
+        0 0 0 4px rgba(13, 110, 253, 0.18),
+        0 10px 30px rgba(13, 110, 253, 0.35) !important;
+}
+
+/* === L&E GLOBAL CLIENT THEME PROTECTION END === */

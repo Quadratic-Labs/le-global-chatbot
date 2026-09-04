@@ -86,7 +86,7 @@ test("launcher keeps its pre-generic-hover color and shadow behavior", () => {
     assert.equal(launcherHoverRules.length, 1);
     assert.match(
         launcherHoverRules[0].declarations,
-        /background: var\(--le-global-primary-hover, #0b5ed7\);/
+        /background: var\(--le-global-primary-hover, #0b5ed7\) !important;/
     );
     assert.equal(
         launcherHoverRules[0].declarations.includes("#000a21"),
