@@ -692,24 +692,71 @@ def _merge_country_codes(
 def _passthrough(
     result: RequestUnderstandingResult,
 ) -> TransitionOutcome:
-    """No conversation_state, or nothing this engine needs to do -
-    trust the classifier's own result exactly as given."""
+    """Pass through and retain only resumable routing context."""
 
     pending_clarification = None
 
     if (
         result.status == "clarification"
-        and result.clarification_reason == "missing_country"
         and len(result.actions) == 1
-        and result.actions[0].type == "contact"
     ):
-        pending_clarification = ConversationPendingClarification(
-            reason="missing_country",
-            candidate_action_types=["contact"],
-            candidate_country_codes=[],
-        )
-        contact_missing_country_pending = True
-        del contact_missing_country_pending
+        action = result.actions[0]
+        reason = result.clarification_reason
+
+        pending_reason = None
+
+        if reason in {
+            "missing_country",
+            "missing_comparison_countries",
+        }:
+            pending_reason = "missing_country"
+
+        elif reason in {
+            "missing_topic",
+            "missing_comparison_topic",
+        }:
+            pending_reason = "missing_topic"
+
+        if (
+            pending_reason is not None
+            and action.type
+            in {
+                "contact",
+                "legal_information",
+                "comparison",
+            }
+        ):
+            update = {
+                "reason": pending_reason,
+                "candidate_action_types": [action.type],
+                "candidate_country_codes":
+                    list(action.country_codes),
+            }
+
+            if action.type != "contact":
+                update.update(
+                    {
+                        "candidate_legal_topics":
+                            list(action.legal_topics),
+                        "candidate_subject_text":
+                            action.effective_subject_text(),
+                        "candidate_search_concepts": [
+                            {
+                                "terms": list(concept.terms)
+                            }
+                            for concept
+                            in action.search_concepts
+                        ],
+                        "candidate_subject_specificity":
+                            action.subject_specificity,
+                        "candidate_evidence_mode":
+                            action.evidence_mode,
+                    }
+                )
+
+            pending_clarification = (
+                ConversationPendingClarification(**update)
+            )
 
     return TransitionOutcome(
         final_status=result.status,
@@ -1321,6 +1368,183 @@ def _correct_delta_for_pressure_challenge_followup(
 
 
 
+def _resolve_legal_pending_clarification(
+    *,
+    result: RequestUnderstandingResult,
+    conversation_state: ConversationState,
+    hints: DeterministicHints,
+    current_question: str | None,
+) -> TransitionOutcome | None:
+    """Resume one structured legal/comparison clarification."""
+
+    pending = conversation_state.pending_clarification
+
+    if (
+        pending is None
+        or len(pending.candidate_action_types) != 1
+        or pending.candidate_action_types[0]
+        not in {"legal_information", "comparison"}
+        or hints.strong_contact_signal
+    ):
+        return None
+
+    action_type = pending.candidate_action_types[0]
+    reason = pending.reason
+
+    if reason not in {"missing_country", "missing_topic"}:
+        return None
+
+    if reason == "missing_country":
+        country_codes = list(
+            dict.fromkeys(
+                [
+                    *hints.current_country_codes,
+                    *hints.current_unavailable_country_codes,
+                ]
+            )
+        )
+
+        if not country_codes and current_question is not None:
+            city_codes, _ = resolve_city_country_codes(
+                current_question
+            )
+            if len(city_codes) == 1:
+                country_codes = sorted(city_codes)
+    else:
+        country_codes = list(
+            pending.candidate_country_codes
+        )
+
+    if (
+        (
+            action_type == "legal_information"
+            and len(country_codes) != 1
+        )
+        or (
+            action_type == "comparison"
+            and len(country_codes) < 2
+        )
+    ):
+        return None
+
+    action: RequestUnderstandingAction | None = None
+
+    if reason == "missing_topic":
+        if (
+            len(result.actions) == 1
+            and result.actions[0].type
+            in {"legal_information", "comparison"}
+        ):
+            action = result.actions[0].model_copy(
+                update={
+                    "type": action_type,
+                    "country_codes": country_codes,
+                }
+            )
+
+        if action is None:
+            legal_topics = list(
+                hints.current_legal_topics
+            )
+
+            if not legal_topics:
+                return None
+
+            subject = (
+                current_question.strip()
+                if current_question
+                else legal_topics[0]
+            )
+
+            action = RequestUnderstandingAction(
+                type=action_type,
+                country_codes=country_codes,
+                legal_topics=legal_topics,
+                topic_text=None,
+                resolved_question=_build_resolved_question(
+                    action_type=action_type,
+                    country_codes=country_codes,
+                    subject_text=subject,
+                ),
+                subject_text=subject,
+                search_concepts=[
+                    ConversationSearchConcept(
+                        terms=[subject]
+                    )
+                ],
+                subject_specificity="broad",
+                evidence_mode="direct_topic",
+            )
+
+    else:
+        legal_topics = list(
+            pending.candidate_legal_topics
+        )
+
+        subject = (
+            pending.candidate_subject_text
+            or " ".join(legal_topics).strip()
+        )
+
+        if not subject:
+            return None
+
+        concepts = [
+            ConversationSearchConcept(
+                terms=list(concept.terms)
+            )
+            for concept in pending.candidate_search_concepts
+        ]
+
+        if not concepts:
+            concepts = [
+                ConversationSearchConcept(
+                    terms=[subject]
+                )
+            ]
+
+        action = RequestUnderstandingAction(
+            type=action_type,
+            country_codes=country_codes,
+            legal_topics=legal_topics,
+            topic_text=(
+                None
+                if legal_topics
+                else subject[:200]
+            ),
+            resolved_question=_build_resolved_question(
+                action_type=action_type,
+                country_codes=country_codes,
+                subject_text=subject,
+            ),
+            subject_text=subject,
+            search_concepts=concepts,
+            subject_specificity=(
+                pending.candidate_subject_specificity
+                or "broad"
+            ),
+            evidence_mode=(
+                pending.candidate_evidence_mode
+                or "direct_topic"
+            ),
+        )
+
+    return TransitionOutcome(
+        final_status="resolved",
+        final_actions=[action],
+        final_clarification_reason=None,
+        pending_clarification=None,
+        semantic_result_overridden=True,
+        semantic_override_reason=f"pending_{reason}_resolved",
+        context_inheritance_applied=True,
+        inherited_action_type=action_type,
+        inherited_country_replaced=(
+            reason == "missing_country"
+        ),
+    )
+
+
+
 def _resolve_contact_missing_country_pending(
     *,
     conversation_state: ConversationState,
@@ -1552,6 +1776,18 @@ def apply_conversation_transition(
 
     if contact_pending_outcome is not None:
         return contact_pending_outcome
+
+    legal_pending_outcome = (
+        _resolve_legal_pending_clarification(
+            result=result,
+            conversation_state=canonicalized_state,
+            hints=hints,
+            current_question=current_question,
+        )
+    )
+
+    if legal_pending_outcome is not None:
+        return legal_pending_outcome
 
     result = _correct_delta_for_country_only_followup(
         result=result,

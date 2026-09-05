@@ -37,6 +37,7 @@ def _hit(
     section: str = "Working Conditions",
     subsection: str = "General",
     country_code: str = "ES",
+    legal_topic: str = "Working Conditions",
 ) -> LegalSearchHit:
     return LegalSearchHit(
         score=10.0,
@@ -44,7 +45,7 @@ def _hit(
         chunk_id=f"chunk-{hash((content, section, subsection))}",
         country="Spain",
         country_code=country_code,
-        legal_topic="Working Conditions",
+        legal_topic=legal_topic,
         document_type="comparator",
         language="en",
         section=section,
@@ -718,6 +719,139 @@ class QualifiedLegalTermMatchingRegressionTests(
 
 
 
+
+class DeterministicSubjectFallbackEvidenceTests(unittest.TestCase):
+    """Stable literal-question fallback must remain conservative."""
+
+    def test_relevant_working_hours_source_can_be_partial(self) -> None:
+        hit = _hit(
+            "The maximum regular working hours should not exceed "
+            "8 hours a day and 40 hours in a week. Overtime refers "
+            "to work hours exceeding regular work hours. The total "
+            "extended work hours in a month are subject to statutory "
+            "requirements.",
+            country_code="TW",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [
+                    _Concept(["standard schedule arrangement"]),
+                    _Concept(["calendar overtime allowance"]),
+                ],
+                "direct_topic",
+                subject_text="employee scheduling provisions",
+                deterministic_subject_text=(
+                    "what are normal working hours and daily "
+                    "monthly limits for overtime"
+                ),
+                expected_country_codes=frozenset({"TW"}),
+                expected_legal_topics=frozenset(
+                    {"Working Conditions"}
+                ),
+            ),
+            "partial",
+        )
+
+    def test_remote_work_does_not_match_general_work_hours(self) -> None:
+        hit = _hit(
+            "General work hours are eight hours per day.",
+            country_code="ES",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [_Concept(["remote work", "telework"])],
+                "direct_topic",
+                subject_text="unmatched semantic subject",
+                deterministic_subject_text=(
+                    "what are the rules for remote work"
+                ),
+                expected_country_codes=frozenset({"ES"}),
+                expected_legal_topics=frozenset(
+                    {"Working Conditions"}
+                ),
+            ),
+            "insufficient",
+        )
+
+    def test_wrong_country_stays_insufficient(self) -> None:
+        hit = _hit(
+            "Normal working hours and monthly overtime limits apply.",
+            country_code="TW",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [_Concept(["unmatched phrase"])],
+                "direct_topic",
+                subject_text="unmatched subject",
+                deterministic_subject_text=(
+                    "normal working hours monthly overtime limits"
+                ),
+                expected_country_codes=frozenset({"ES"}),
+                expected_legal_topics=frozenset(
+                    {"Working Conditions"}
+                ),
+            ),
+            "insufficient",
+        )
+
+    def test_wrong_legal_topic_stays_insufficient(self) -> None:
+        hit = _hit(
+            "Normal working hours and monthly overtime limits apply.",
+            country_code="TW",
+            legal_topic="Working Conditions",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [_Concept(["unmatched phrase"])],
+                "direct_topic",
+                subject_text="unmatched subject",
+                deterministic_subject_text=(
+                    "normal working hours monthly overtime limits"
+                ),
+                expected_country_codes=frozenset({"TW"}),
+                expected_legal_topics=frozenset(
+                    {"Termination of Employment Contracts"}
+                ),
+            ),
+            "insufficient",
+        )
+
+    def test_relation_required_ignores_deterministic_fallback(
+        self,
+    ) -> None:
+        hit = _hit(
+            "Normal working hours and monthly overtime limits apply.",
+            country_code="TW",
+        )
+
+        self.assertEqual(
+            evaluate_evidence_status(
+                [hit],
+                [
+                    _Concept(["dismissal"]),
+                    _Concept(["sick leave"]),
+                ],
+                "relation_required",
+                subject_text="unmatched relation",
+                deterministic_subject_text=(
+                    "normal working hours monthly overtime limits"
+                ),
+                expected_country_codes=frozenset({"TW"}),
+                expected_legal_topics=frozenset(
+                    {"Working Conditions"}
+                ),
+            ),
+            "insufficient",
+        )
+
 class AnswerMentionsConceptsTests(unittest.TestCase):
     """Used only for subject_drift detection on the generated text."""
 
@@ -771,5 +905,97 @@ class AnswerMentionsConceptsTests(unittest.TestCase):
         )
 
 
+
+class IrelandSplitConceptCoverageTests(unittest.TestCase):
+    def test_direct_topic_can_cover_independent_concepts_across_hits(
+        self,
+    ) -> None:
+        class Concept:
+            def __init__(self, terms: list[str]) -> None:
+                self.terms = terms
+
+        concepts = [
+            Concept(
+                [
+                    "maximum average weekly working time",
+                    "weekly working time limit",
+                    "working time average",
+                ]
+            ),
+            Concept(
+                [
+                    "overtime pay",
+                    "statutory entitlement to overtime",
+                    "overtime compensation",
+                ]
+            ),
+        ]
+
+        hits = [
+            _hit(
+                (
+                    "There is no set rate of pay regarding overtime "
+                    "in Ireland but, where overtime is required, at "
+                    "least the national minimum wage rate must be paid."
+                ),
+                subsection="Overtime",
+                country_code="IE",
+                legal_topic="Working Conditions",
+            ),
+            _hit(
+                (
+                    "An employee may not work more than a maximum "
+                    "average of 48 working hours in each period of "
+                    "seven days."
+                ),
+                subsection="Maximum Working Week",
+                country_code="IE",
+                legal_topic="Working Conditions",
+            ),
+        ]
+
+        status = evaluate_evidence_status(
+            hits,
+            concepts,
+            "direct_topic",
+            expected_country_codes=frozenset({"IE"}),
+            expected_legal_topics=frozenset(
+                {"Working Conditions"}
+            ),
+        )
+
+        self.assertEqual(status, "direct")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class AnswerConceptMorphologyRegressionTests(unittest.TestCase):
+    """Answer-only matching must tolerate harmless wording variation."""
+
+    def test_statutory_minimum_notice_matches_statutory_notice(self) -> None:
+        self.assertTrue(
+            answer_mentions_concepts(
+                "The employer must give statutory minimum notice.",
+                [_Concept(["statutory notice"])],
+                "direct_topic",
+            )
+        )
+
+    def test_monitoring_matches_monitor_wording(self) -> None:
+        self.assertTrue(
+            answer_mentions_concepts(
+                "Employers may monitor and record employees' emails.",
+                [_Concept(["monitor employees emails"])],
+                "direct_topic",
+            )
+        )
+
+    def test_remote_work_does_not_match_general_working_conditions(self) -> None:
+        self.assertFalse(
+            answer_mentions_concepts(
+                "General working conditions apply.",
+                [_Concept(["remote work", "telework"])],
+                "direct_topic",
+            )
+        )

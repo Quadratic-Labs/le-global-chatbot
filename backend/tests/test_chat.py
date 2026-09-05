@@ -6825,23 +6825,14 @@ class AssistantHelpContinuityTests(unittest.TestCase):
             ["ES", "PE", "AU"],
         )
 
-    def test_scenario_d_comparison_guidance_context_not_retained(
+    def test_scenario_d_comparison_guidance_context_retained(
         self,
     ) -> None:
         """
-        Mission "PATCH PRODUIT 0.4.3", section 21 scenario D - a bare
-        "Can you compare Spain and Peru?" guidance response never
-        stores a conversation_state at all (it is a pure meta answer,
-        no legal action was resolved), so a later bare "Overtime
-        rules." cannot be reassembled into "compare overtime rules in
-        Spain and Peru" - retaining that pending-topic context would
-        need a new ConversationState field for a help-originated
-        pending comparison, which this patch deliberately does not
-        add (see the mission's own explicit fallback instruction).
-        The very next real turn must still behave sensibly - never
-        crash, never silently invent a comparison - falling through
-        to RequestUnderstanding's own existing clarification for an
-        incomplete request.
+        A comparison request containing countries but no legal topic
+        stores a missing-topic pending clarification. A later topic-only
+        reply completes that pending comparison and reuses the original
+        countries without asking for them again.
         """
 
         guidance = resolve_legal_chat_response(
@@ -6854,8 +6845,32 @@ class AssistantHelpContinuityTests(unittest.TestCase):
             generation_client=NoCallGenerationClient(),
             understanding_client=NoCallUnderstandingClient(),
         )
+
         self.assertFalse(guidance.grounded)
-        self.assertIsNone(guidance.conversation_state)
+        self.assertIsNotNone(guidance.conversation_state)
+
+        state = guidance.conversation_state
+        assert state is not None
+
+        self.assertIsNotNone(
+            state.pending_clarification
+        )
+
+        pending = state.pending_clarification
+        assert pending is not None
+
+        self.assertEqual(
+            pending.reason,
+            "missing_topic",
+        )
+        self.assertEqual(
+            pending.candidate_action_types,
+            ["comparison"],
+        )
+        self.assertEqual(
+            pending.candidate_country_codes,
+            ["ES", "PE"],
+        )
 
         follow_up_understanding = FakeUnderstandingClient(
             payload=_understanding_result(
@@ -6864,7 +6879,9 @@ class AssistantHelpContinuityTests(unittest.TestCase):
                 actions=[
                     _understanding_action(
                         "legal_information",
-                        legal_topics=["Working Conditions"],
+                        legal_topics=[
+                            "Working Conditions"
+                        ],
                         topic_text="overtime rules",
                     )
                 ],
@@ -6872,19 +6889,163 @@ class AssistantHelpContinuityTests(unittest.TestCase):
             )
         )
 
+        captured_requests = []
+
+        def fake_legal_answer(*args, **kwargs):
+            legal_request = kwargs.get("request")
+
+            if legal_request is None:
+                legal_request = next(
+                    (
+                        arg
+                        for arg in args
+                        if isinstance(
+                            arg,
+                            LegalChatRequest,
+                        )
+                    ),
+                    None,
+                )
+
+            self.assertIsNotNone(legal_request)
+
+            captured_requests.append(
+                legal_request
+            )
+
+            return guidance.model_copy(
+                update={
+                    "question": legal_request.question,
+                    "answer": (
+                        "Resolved comparison stub."
+                    ),
+                    "grounded": True,
+                    "conversation_state": None,
+                }
+            )
+
         follow_up = resolve_legal_chat_response(
             request=LegalChatRequest(
                 question="Overtime rules.",
-                conversation_state=guidance.conversation_state,
+                conversation_state=(
+                    guidance.conversation_state
+                ),
             ),
             catalog_provider=_catalog_provider,
             document_topic_provider=_document_topic_provider,
             search_function=_unexpected_search,
             generation_client=NoCallGenerationClient(),
             understanding_client=follow_up_understanding,
+            legal_answer_generation_fn=fake_legal_answer,
         )
-        self.assertFalse(follow_up.grounded)
+
         self.assertTrue(follow_up.answer)
+
+        self.assertEqual(
+            len(captured_requests),
+            1,
+        )
+
+        resolved_request = captured_requests[0]
+
+        self.assertEqual(
+            resolved_request.country_codes,
+            ["ES", "PE"],
+        )
+        self.assertEqual(
+            resolved_request.legal_topics,
+            ["Working Conditions"],
+        )
+
+
+    def test_generic_country_legal_information_retains_country(
+        self,
+    ) -> None:
+        """
+        Generic legal-information wording with one explicit country
+        must ask for the employment-law topic while retaining that
+        country in pending clarification state.
+        """
+
+        cases = [
+            (
+                "Germany legal information",
+                "DE",
+                _catalog_provider_with_germany,
+            ),
+            (
+                "Netherlands legal information",
+                "NL",
+                _catalog_provider,
+            ),
+            (
+                "Philippines legal information",
+                "PH",
+                _catalog_provider,
+            ),
+            (
+                "Taiwan legal information",
+                "TW",
+                _catalog_provider,
+            ),
+        ]
+
+        for (
+            question,
+            expected_country,
+            case_catalog_provider,
+        ) in cases:
+            with self.subTest(question=question):
+                response = resolve_legal_chat_response(
+                    request=LegalChatRequest(
+                        question=question
+                    ),
+                    catalog_provider=case_catalog_provider,
+                    document_topic_provider=(
+                        _document_topic_provider
+                    ),
+                    search_function=_unexpected_search,
+                    generation_client=(
+                        NoCallGenerationClient()
+                    ),
+                    understanding_client=(
+                        FakeUnderstandingClient(
+                            payload=_understanding_result(
+                                status="clarification",
+                                clarification_reason=(
+                                    "ambiguous_request"
+                                ),
+                                actions=[],
+                                is_follow_up=False,
+                            )
+                        )
+                    ),
+                )
+
+                self.assertFalse(response.grounded)
+                self.assertIsNotNone(
+                    response.conversation_state
+                )
+
+                state = response.conversation_state
+                assert state is not None
+
+                pending = state.pending_clarification
+                self.assertIsNotNone(pending)
+                assert pending is not None
+
+                self.assertEqual(
+                    pending.reason,
+                    "missing_topic",
+                )
+                self.assertEqual(
+                    pending.candidate_action_types,
+                    ["legal_information"],
+                )
+                self.assertEqual(
+                    pending.candidate_country_codes,
+                    [expected_country],
+                )
 
     def test_scenario_e_canada_capabilities_then_notice_requirements(
         self,

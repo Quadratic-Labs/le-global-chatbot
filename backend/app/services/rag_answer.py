@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Final, Protocol
 
 from app.clients.openai_responses import (
@@ -49,6 +49,7 @@ from app.models.search import (
 from app.services.evidence_coverage import (
     SearchConceptLike,
     answer_mentions_concepts,
+    count_covered_concepts,
     evaluate_evidence_status,
 )
 from app.services.legal_search import (
@@ -1414,18 +1415,12 @@ def _prioritize_country_hits_for_evidence(
     evidence_mode: str | None,
 ) -> list[LegalSearchHit]:
     """
-    Preserve retrieval ranking unless a multi-country evidence-gated
-    request has explicit search concepts.
+    Prefer evidence-capable hits while preserving retrieval quality.
 
-    When it does, prefer candidates that can actually satisfy the
-    evidence policy before the final cross-country source budget is
-    applied. This prevents a country's first high-ranked but
-    evidence-insufficient hit from consuming its only slot while a
-    direct hit for the same country is already present immediately
-    behind it.
-
-    Stable within each evidence-status tier: original retrieval order
-    is preserved.
+    For a multi-facet request, first retain the existing evidence-tier
+    ordering, then greedily bring forward hits that cover search
+    concept groups not yet represented. Ties preserve the existing
+    ranking. No extra retrieval or model call is performed.
     """
 
     ordered_hits = list(hits)
@@ -1433,9 +1428,12 @@ def _prioritize_country_hits_for_evidence(
     if (
         not ordered_hits
         or not search_concepts
-        or evidence_mode not in ("direct_topic", "relation_required")
+        or evidence_mode
+        not in ("direct_topic", "relation_required")
     ):
         return ordered_hits
+
+    concepts = list(search_concepts)
 
     priority = {
         "direct": 0,
@@ -1450,7 +1448,7 @@ def _prioritize_country_hits_for_evidence(
             priority[
                 evaluate_evidence_status(
                     [item[1]],
-                    list(search_concepts),
+                    concepts,
                     evidence_mode,
                 )
             ],
@@ -1458,10 +1456,81 @@ def _prioritize_country_hits_for_evidence(
         )
     )
 
-    return [
+    tier_ordered_hits = [
         hit
         for _, hit in indexed_hits
     ]
+
+    # A single concept has no cross-facet diversity problem.
+    # Preserve the historical behavior exactly in that case.
+    if len(concepts) <= 1:
+        return tier_ordered_hits
+
+    coverage_by_index: list[frozenset[int]] = []
+
+    for hit in tier_ordered_hits:
+        coverage_by_index.append(
+            frozenset(
+                concept_index
+                for concept_index, concept
+                in enumerate(concepts)
+                if evaluate_evidence_status(
+                    [hit],
+                    [concept],
+                    "direct_topic",
+                )
+                == "direct"
+            )
+        )
+
+    uncovered = set(range(len(concepts)))
+    remaining = list(
+        enumerate(tier_ordered_hits)
+    )
+    selected: list[LegalSearchHit] = []
+
+    while uncovered and remaining:
+        best_position: int | None = None
+        best_gain = 0
+
+        for position, (base_index, _) in enumerate(
+            remaining
+        ):
+            gain = len(
+                coverage_by_index[base_index]
+                & uncovered
+            )
+
+            # Strictly greater only: equal gains keep the
+            # pre-existing evidence/retrieval order.
+            if gain > best_gain:
+                best_gain = gain
+                best_position = position
+
+        if best_position is None or best_gain == 0:
+            break
+
+        base_index, hit = remaining.pop(
+            best_position
+        )
+
+        selected.append(hit)
+
+        uncovered.difference_update(
+            coverage_by_index[base_index]
+        )
+
+    # Once all discoverable facets have been represented,
+    # preserve the previous ordering for every remaining hit.
+    selected.extend(
+        hit
+        for _, hit in remaining
+    )
+
+    return selected
+
+
+
 
 
 def _retrieve_search_hits(
@@ -1706,7 +1775,22 @@ def _allocate_country_context_budgets(
                 len(country_hits) - position
             )
 
-            if position == 0:
+            # Preserve the historical preference for the best-ranked
+            # source when the country has enough context budget.
+            #
+            # When the whole country budget fits inside one source cap,
+            # however, giving all of it to the first hit would erase
+            # every complementary hit already selected for that country.
+            # In that narrow case, share the same country budget across
+            # its selected hits instead. Total context size is unchanged.
+            if (
+                position == 0
+                and (
+                    len(country_hits) == 1
+                    or country_budget
+                    > maximum_source_characters
+                )
+            ):
                 source_budget = min(
                     maximum_source_characters,
                     remaining_budget,
@@ -4262,12 +4346,38 @@ def _prepare_grounded_generation(
     hits_by_spec: list[list[LegalSearchHit]] = []
 
     for spec in specs:
+        retrieval_legal_topics = list(
+            dict.fromkeys(
+                spec.legal_topics or request.legal_topics
+            )
+        )
+
+        # Keep the semantic legal topic unchanged, but widen the
+        # document-retrieval scope when the user explicitly asks for
+        # notice periods. In the validated country documents, notice
+        # rules may live under Employment Contracts even when the
+        # overall question concerns termination.
+        asks_for_notice = any(
+            "notice" in term.casefold()
+            for concept in (spec.search_concepts or [])
+            for term in concept.terms
+        )
+
+        if (
+            asks_for_notice
+            and "Termination of Employment Contracts"
+                in retrieval_legal_topics
+            and "Employment Contracts"
+                not in retrieval_legal_topics
+        ):
+            retrieval_legal_topics.append(
+                "Employment Contracts"
+            )
+
         spec_request = request.model_copy(
             update={
                 "country_codes": spec.country_codes,
-                "legal_topics": (
-                    spec.legal_topics or request.legal_topics
-                ),
+                "legal_topics": retrieval_legal_topics,
             }
         )
 
@@ -4346,6 +4456,7 @@ def _prepare_grounded_generation(
     insufficient_evidence_answer_parts: list[str] = []
     partial_evidence_instruction = ""
     evidence_status_by_key: dict[str, str] = {}
+    concept_coverage_by_key: dict[str, str] = {}
     filtered_hits_by_spec: list[list[LegalSearchHit]] = []
     gated_codes_by_spec: list[set[str]] = []
     insufficient_codes_by_spec: list[set[str]] = []
@@ -4370,6 +4481,32 @@ def _prepare_grounded_generation(
             )
         )
 
+        deterministic_subject_text: str | None = None
+
+        # Stabilize evidence gating for a simple fresh/single-scope
+        # legal request without changing retrieval or generation.
+        #
+        # RequestUnderstanding remains the primary source of semantic
+        # concepts. The literal user question is used only as a final
+        # lexical fallback when there is exactly one evidence spec and
+        # one country. Comparisons and mixed actions therefore retain
+        # their existing per-action semantics unchanged.
+        if (
+            len(specs) == 1
+            and len(spec_codes) == 1
+            and current_user_question
+        ):
+            canonical_user_subject = canonicalize_legal_subject(
+                subject_text=current_user_question.strip(),
+                search_concepts=[],
+                scoped_country_codes=spec_codes,
+            ).subject_text
+
+            if canonical_user_subject:
+                deterministic_subject_text = (
+                    canonical_user_subject.strip() or None
+                )
+
         spec_hits_by_country: dict[str, list[LegalSearchHit]] = {}
         for hit in spec_hits:
             spec_hits_by_country.setdefault(
@@ -4385,6 +4522,7 @@ def _prepare_grounded_generation(
                 spec.search_concepts or [],
                 spec.evidence_mode,
                 subject_text=spec.subject_text,
+                deterministic_subject_text=deterministic_subject_text,
                 expected_country_codes=frozenset(spec_codes),
                 expected_legal_topics=spec_legal_topics,
             )
@@ -4395,6 +4533,15 @@ def _prepare_grounded_generation(
                 else f"{code}#{spec_index}"
             )
             evidence_status_by_key[metric_key] = status
+
+            if spec.search_concepts:
+                covered, total = count_covered_concepts(
+                    spec_hits_by_country.get(code, []),
+                    spec.search_concepts,
+                )
+                concept_coverage_by_key[metric_key] = (
+                    f"{covered}/{total}"
+                )
 
             if status == "insufficient":
                 spec_insufficient_codes.add(code)
@@ -4453,6 +4600,11 @@ def _prepare_grounded_generation(
     if metrics is not None and evidence_status_by_key:
         metrics.evidence_status_by_country = dict(
             evidence_status_by_key
+        )
+
+    if metrics is not None and concept_coverage_by_key:
+        metrics.concept_coverage_by_country = dict(
+            concept_coverage_by_key
         )
 
     # A country is fully insufficient only when every spec that gates
@@ -4681,13 +4833,39 @@ def answer_legal_question(
     def _generate_with_instructions(
         instructions: str,
     ) -> GeneratedText:
-        try:
+        result: GeneratedText | None = None
+        last_error: OpenAIResponseError | None = None
+
+        for provider_attempt in range(2):
             call_started_at = perf_counter()
 
-            result = client.generate(
-                instructions=instructions,
-                input_text=model_input,
-            )
+            try:
+                result = client.generate(
+                    instructions=instructions,
+                    input_text=model_input,
+                )
+
+            except OpenAIResponseError as error:
+                elapsed_ms = (
+                    perf_counter() - call_started_at
+                ) * 1000
+
+                if metrics is not None:
+                    metrics.openai_ms += elapsed_ms
+                    metrics.answer_generation_openai_ms += elapsed_ms
+
+                last_error = error
+
+                if (
+                    not error.retryable
+                    or provider_attempt == 1
+                ):
+                    raise RagAnswerError(
+                        "Grounded answer generation failed."
+                    ) from error
+
+                sleep(error.retry_delay_seconds())
+                continue
 
             elapsed_ms = (
                 perf_counter() - call_started_at
@@ -4697,10 +4875,12 @@ def answer_legal_question(
                 metrics.openai_ms += elapsed_ms
                 metrics.answer_generation_openai_ms += elapsed_ms
 
-        except OpenAIResponseError as error:
+            break
+
+        if result is None:
             raise RagAnswerError(
                 "Grounded answer generation failed."
-            ) from error
+            ) from last_error
 
         return dataclasses.replace(
             result,
@@ -5245,26 +5425,52 @@ async def stream_answer_legal_question(
         _generate_with_instructions, using the plain (non-streaming)
         client so repair text is never provisionally visible."""
 
-        try:
+        last_error: OpenAIResponseError | None = None
+
+        for provider_attempt in range(2):
             call_started_at = perf_counter()
 
-            result = sync_client.generate(
-                instructions=instructions,
-                input_text=model_input,
-            )
+            try:
+                result = sync_client.generate(
+                    instructions=instructions,
+                    input_text=model_input,
+                )
 
-            elapsed_ms = (
-                perf_counter() - call_started_at
-            ) * 1000
+                elapsed_ms = (
+                    perf_counter() - call_started_at
+                ) * 1000
 
-            if metrics is not None:
-                metrics.openai_ms += elapsed_ms
-                metrics.answer_generation_openai_ms += elapsed_ms
+                if metrics is not None:
+                    metrics.openai_ms += elapsed_ms
+                    metrics.answer_generation_openai_ms += elapsed_ms
 
-        except OpenAIResponseError as error:
+                break
+
+            except OpenAIResponseError as error:
+                elapsed_ms = (
+                    perf_counter() - call_started_at
+                ) * 1000
+
+                if metrics is not None:
+                    metrics.openai_ms += elapsed_ms
+                    metrics.answer_generation_openai_ms += elapsed_ms
+
+                last_error = error
+
+                if (
+                    not error.retryable
+                    or provider_attempt == 1
+                ):
+                    raise RagAnswerError(
+                        "Grounded answer generation failed."
+                    ) from error
+
+                sleep(error.retry_delay_seconds())
+
+        else:
             raise RagAnswerError(
                 "Grounded answer generation failed."
-            ) from error
+            ) from last_error
 
         return dataclasses.replace(
             result,

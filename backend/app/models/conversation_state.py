@@ -249,6 +249,32 @@ class ConversationPendingClarification(BaseModel):
         default_factory=list
     )
 
+    candidate_legal_topics: list[str] = Field(
+        default_factory=list
+    )
+
+    candidate_subject_text: str | None = Field(
+        default=None,
+        max_length=MAX_SUBJECT_TEXT_CHARACTERS,
+    )
+
+    candidate_search_concepts: list[
+        ConversationSearchConcept
+    ] = Field(
+        default_factory=list,
+        max_length=MAX_SEARCH_CONCEPT_GROUPS,
+    )
+
+    candidate_subject_specificity: Literal[
+        "broad", "specific"
+    ] | None = None
+
+    candidate_evidence_mode: Literal[
+        "broad_topic",
+        "direct_topic",
+        "relation_required",
+    ] | None = None
+
     class Config:
         extra = "forbid"
 

@@ -863,6 +863,30 @@ class AmbiguousCityClarificationTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_atlantis_requires_country_clarification(
+        self,
+    ) -> None:
+        result = _resolution(
+            "What are the termination rules in Atlantis?"
+        )
+
+        self.assertIsNotNone(result)
+
+        assert result is not None
+
+        self.assertEqual(
+            result.intent_type,
+            "unknown_locality_clarification",
+        )
+        self.assertIn(
+            "Atlantis",
+            result.answer,
+        )
+        self.assertNotIn(
+            "South Africa",
+            result.answer,
+        )
+
     def test_two_country_comparison_is_never_hijacked(self) -> None:
         # AMBIGUOUS for resolve_jurisdiction too, but matched_location
         # is unset for this case - must fall through to normal

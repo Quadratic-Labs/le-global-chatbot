@@ -197,6 +197,149 @@ def _hit_covers_concept(
     return bool(_concept_group_positions(tokens, concept))
 
 
+_DIRECT_TOPIC_ORDERLESS_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "be",
+        "by",
+        "for",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
+
+_DIRECT_TOPIC_ORDERLESS_MAX_SPAN_TOKENS = 24
+
+_DIRECT_TOPIC_GRAMMATICAL_EQUIVALENTS = {
+    "daily": frozenset({"day"}),
+    "day": frozenset({"daily"}),
+    "weekly": frozenset({"week"}),
+    "week": frozenset({"weekly"}),
+    "monthly": frozenset({"month"}),
+    "month": frozenset({"monthly"}),
+    "yearly": frozenset({"year"}),
+    "year": frozenset({"yearly"}),
+    "hourly": frozenset({"hour", "hours"}),
+    "hour": frozenset({"hourly", "hours"}),
+    "hours": frozenset({"hour", "hourly"}),
+}
+
+
+def _direct_topic_tokens_equivalent(
+    expected: str,
+    actual: str,
+) -> bool:
+    if expected == actual:
+        return True
+
+    return actual in _DIRECT_TOPIC_GRAMMATICAL_EQUIVALENTS.get(
+        expected,
+        frozenset(),
+    )
+
+
+def _term_has_orderless_proximity_match(
+    tokens: list[str],
+    term: str,
+) -> bool:
+    """
+    Conservative direct-topic fallback for wording changes where the
+    same distinctive words appear in a different order or with short
+    intervening text.
+
+    It deliberately requires:
+    - at least two distinctive term tokens;
+    - at least 75% of them to be present;
+    - those matches to occur within a short token window.
+
+    This is not used by relation_required evidence.
+    """
+
+    term_tokens = list(
+        dict.fromkeys(
+            token
+            for token in _tokenize(term)
+            if token not in _DIRECT_TOPIC_ORDERLESS_STOPWORDS
+        )
+    )
+
+    if len(term_tokens) < 2:
+        return False
+
+    required = max(
+        2,
+        (3 * len(term_tokens) + 3) // 4,
+    )
+
+    events = []
+
+    for index, actual_token in enumerate(tokens):
+        for expected_token in term_tokens:
+            if _direct_topic_tokens_equivalent(
+                expected_token,
+                actual_token,
+            ):
+                events.append(
+                    (index, expected_token)
+                )
+
+    if len({token for _, token in events}) < required:
+        return False
+
+    left = 0
+    counts: dict[str, int] = {}
+
+    for right, (position, token) in enumerate(events):
+        counts[token] = counts.get(token, 0) + 1
+
+        while (
+            position - events[left][0]
+            > _DIRECT_TOPIC_ORDERLESS_MAX_SPAN_TOKENS
+        ):
+            left_token = events[left][1]
+            counts[left_token] -= 1
+            if counts[left_token] == 0:
+                del counts[left_token]
+            left += 1
+
+        if len(counts) >= required:
+            return True
+
+    return False
+
+
+def _hit_covers_direct_topic_concept(
+    hit: LegalSearchHit,
+    concept: SearchConceptLike,
+) -> bool:
+    """
+    Direct-topic concept matching only.
+
+    Keep the existing exact phrase/synonym match first, then allow a
+    conservative order-insensitive proximity fallback. Relation
+    evidence keeps its existing stricter matcher.
+    """
+
+    if _hit_covers_concept(hit, concept):
+        return True
+
+    tokens = _tokenize(_hit_haystack(hit))
+
+    return any(
+        _term_has_orderless_proximity_match(tokens, term)
+        for term in concept.terms
+    )
+
+
 def _hit_covers_relation(
     hit: LegalSearchHit,
     search_concepts: list[SearchConceptLike],
@@ -275,12 +418,44 @@ def _significant_subject_tokens(subject_text: str) -> list[str]:
     ]
 
 
+_DETERMINISTIC_SUBJECT_TOKEN_EQUIVALENTS: dict[
+    str,
+    frozenset[str],
+] = {
+    "daily": frozenset({"daily", "day"}),
+    "monthly": frozenset({"monthly", "month"}),
+    "weekly": frozenset({"weekly", "week"}),
+    "yearly": frozenset({"yearly", "year"}),
+    "hourly": frozenset({"hourly", "hour"}),
+}
+
+
+def _deterministic_subject_token_present(
+    token: str,
+    hit_tokens: set[str],
+) -> bool:
+    """
+    Conservative morphology for the final deterministic evidence
+    fallback only.
+
+    These are grammatical time-unit variants, not semantic synonyms.
+    The normal retrieval/concept matcher remains exact.
+    """
+    forms = _DETERMINISTIC_SUBJECT_TOKEN_EQUIVALENTS.get(
+        token,
+        frozenset({token}),
+    )
+
+    return bool(forms & hit_tokens)
+
+
 def _hit_has_substantial_subject_overlap(
     hit: LegalSearchHit,
     subject_text: str,
     *,
     expected_country_codes: frozenset[str] = frozenset(),
     expected_legal_topics: frozenset[str] = frozenset(),
+    strict_majority: bool = False,
 ) -> bool:
     """
     A weaker, last-resort signal than an exact concept-phrase match:
@@ -334,11 +509,28 @@ def _hit_has_substantial_subject_overlap(
 
     hit_tokens = set(_tokenize(_hit_haystack(hit)))
 
-    overlap_count = sum(
-        1 for token in subject_tokens if token in hit_tokens
+    overlap_count = (
+        sum(
+            1
+            for token in subject_tokens
+            if _deterministic_subject_token_present(
+                token,
+                hit_tokens,
+            )
+        )
+        if strict_majority
+        else sum(
+            1
+            for token in subject_tokens
+            if token in hit_tokens
+        )
     )
 
-    required_overlap = max(1, (len(subject_tokens) + 1) // 2)
+    required_overlap = (
+        (len(subject_tokens) // 2) + 1
+        if strict_majority
+        else max(1, (len(subject_tokens) + 1) // 2)
+    )
 
     return overlap_count >= required_overlap
 
@@ -355,12 +547,43 @@ class _SubjectTextConcept:
         self.terms = [subject_text]
 
 
+
+def count_covered_concepts(
+    hits: list[LegalSearchHit],
+    search_concepts: list[SearchConceptLike],
+) -> tuple[int, int]:
+    """
+    Return how many requested concept groups are covered by at least
+    one retrieved hit.
+
+    This is observability only. It does not change evidence-gating
+    semantics or promote partial evidence to direct evidence.
+    """
+
+    total = len(search_concepts)
+
+    if total == 0:
+        return 0, 0
+
+    covered = sum(
+        1
+        for concept in search_concepts
+        if any(
+            _hit_covers_concept(hit, concept)
+            for hit in hits
+        )
+    )
+
+    return covered, total
+
+
 def evaluate_evidence_status(
     hits: list[LegalSearchHit],
     search_concepts: list[SearchConceptLike],
     evidence_mode: str,
     *,
     subject_text: str | None = None,
+    deterministic_subject_text: str | None = None,
     reranked_direct_chunk_ids: frozenset[str] = frozenset(),
     expected_country_codes: frozenset[str] = frozenset(),
     expected_legal_topics: frozenset[str] = frozenset(),
@@ -438,13 +661,78 @@ def evaluate_evidence_status(
 
         return "insufficient"
 
+    # direct_topic normally represents one precise concept.
+    # When semantic understanding provides several independent
+    # concept groups, however, one covered group must not promote the
+    # whole multi-facet request to direct evidence.
+    if evidence_mode == "direct_topic" and len(effective_concepts) > 1:
+        if any(
+            hit.chunk_id in reranked_direct_chunk_ids
+            for hit in hits
+        ):
+            return "direct"
+
+        total = len(effective_concepts)
+        covered = sum(
+            1
+            for concept in effective_concepts
+            if any(
+                _hit_covers_direct_topic_concept(
+                    hit,
+                    concept,
+                )
+                for hit in hits
+            )
+        )
+
+        if covered == total:
+            return "direct"
+
+        if covered > 0:
+            return "partial"
+
+        if subject_text and any(
+            _hit_has_substantial_subject_overlap(
+                hit,
+                subject_text,
+                expected_country_codes=expected_country_codes,
+                expected_legal_topics=expected_legal_topics,
+            )
+            for hit in hits
+        ):
+            return "partial"
+
+        # Last-resort deterministic stability signal. The caller may
+        # provide the literal current user question after removing its
+        # geographic scope. It is deliberately weaker than concept
+        # matching and may only admit PARTIAL evidence. Unlike the
+        # semantic subject fallback above, it requires a strict
+        # majority of distinctive words so an adjacent-topic chunk
+        # cannot pass from one shared generic word.
+        if deterministic_subject_text and any(
+            _hit_has_substantial_subject_overlap(
+                hit,
+                deterministic_subject_text,
+                expected_country_codes=expected_country_codes,
+                expected_legal_topics=expected_legal_topics,
+                strict_majority=True,
+            )
+            for hit in hits
+        ):
+            return "partial"
+
+        return "insufficient"
+
     # direct_topic: one precise concept, one group is enough.
     for hit in hits:
         if hit.chunk_id in reranked_direct_chunk_ids:
             return "direct"
 
         if any(
-            _hit_covers_concept(hit, concept)
+            _hit_covers_direct_topic_concept(
+                hit,
+                concept,
+            )
             for concept in effective_concepts
         ):
             return "direct"
@@ -469,7 +757,123 @@ def evaluate_evidence_status(
     ):
         return "partial"
 
+    if deterministic_subject_text and any(
+        _hit_has_substantial_subject_overlap(
+            hit,
+            deterministic_subject_text,
+            expected_country_codes=expected_country_codes,
+            expected_legal_topics=expected_legal_topics,
+            strict_majority=True,
+        )
+        for hit in hits
+    ):
+        return "partial"
+
     return "insufficient"
+
+
+def _answer_token_forms(token: str) -> set[str]:
+    """
+    Conservative morphology used only when validating generated answer
+    text. Retrieval/evidence matching deliberately remains exact.
+    """
+
+    forms = {token}
+
+    if len(token) > 4 and token.endswith("ies"):
+        forms.add(token[:-3] + "y")
+
+    if len(token) > 5 and token.endswith("ing"):
+        forms.add(token[:-3])
+
+    if len(token) > 4 and token.endswith("ed"):
+        stem = token[:-2]
+        forms.add(stem)
+        forms.add(stem + "e")
+
+    if (
+        len(token) > 4
+        and token.endswith("s")
+        and not token.endswith(("ss", "us", "is"))
+    ):
+        forms.add(token[:-1])
+
+    return forms
+
+
+def _answer_term_matches(
+    answer_tokens: list[str],
+    term: str,
+) -> bool:
+    """
+    Answer-only concept matching.
+
+    First preserve the exact matcher. As a fallback, allow small
+    grammatical variations and short intervening modifiers, while
+    still requiring every meaningful token from the requested concept
+    to occur in one compact window.
+
+    This function is intentionally NOT used for retrieval or evidence
+    admission.
+    """
+
+    if _term_match_positions(answer_tokens, term):
+        return True
+
+    term_tokens = [
+        token
+        for token in _tokenize(term)
+        if (
+            token not in _SUBJECT_FRAMING_WORDS
+            and len(token) > 2
+        )
+    ]
+
+    if not term_tokens:
+        return False
+
+    term_forms = [
+        _answer_token_forms(token)
+        for token in term_tokens
+    ]
+
+    answer_forms = [
+        _answer_token_forms(token)
+        for token in answer_tokens
+    ]
+
+    if len(term_forms) == 1:
+        return any(
+            term_forms[0] & candidate
+            for candidate in answer_forms
+        )
+
+    # Permit only a compact local window. This catches wording such as
+    # "statutory minimum notice" for "statutory notice" and
+    # "monitor ... employees' emails" for monitoring-related concepts,
+    # without treating words scattered across the answer as a match.
+    max_window = len(term_forms) + 4
+
+    for start in range(len(answer_forms)):
+        window = answer_forms[start:start + max_window]
+
+        if all(
+            any(required & candidate for candidate in window)
+            for required in term_forms
+        ):
+            return True
+
+    return False
+
+
+def _answer_concept_group_matches(
+    answer_tokens: list[str],
+    concept: SearchConceptLike,
+) -> bool:
+    return any(
+        _answer_term_matches(answer_tokens, term)
+        for term in concept.terms
+    )
 
 
 def answer_mentions_concepts(
@@ -490,11 +894,17 @@ def answer_mentions_concepts(
 
     if evidence_mode == "relation_required":
         return all(
-            _concept_group_positions(tokens, concept)
+            _answer_concept_group_matches(
+                tokens,
+                concept,
+            )
             for concept in search_concepts
         )
 
     return any(
-        _concept_group_positions(tokens, concept)
+        _answer_concept_group_matches(
+            tokens,
+            concept,
+        )
         for concept in search_concepts
     )

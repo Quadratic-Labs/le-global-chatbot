@@ -1443,6 +1443,31 @@ _UNSUPPORTED_LEGAL_SIGNAL_PATTERN: Final[
 )
 
 
+_PROMPT_OVERRIDE_CUE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:ignore|disregard|forget|bypass|override)\b"
+    r"[\s\S]{0,160}"
+    r"\b(?:instructions?|rules?|restrictions?|polic(?:y|ies)|"
+    r"employment\s+law)\b",
+    re.IGNORECASE,
+)
+
+
+_OBVIOUS_NON_LEGAL_TARGET_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:"
+    r"weather|forecast|temperature|"
+    r"restaurants?|recipes?|"
+    r"sports?|football|soccer|basketball|"
+    r"hotels?|tourism|travel|"
+    r"movies?|music|games?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _should_offer_contact_for_unsupported_request(
     question: str,
 ) -> bool:
@@ -1453,6 +1478,12 @@ def _should_offer_contact_for_unsupported_request(
     Non-legal requests such as weather must stay on the simple product
     scope refusal and must not trigger contact retrieval.
     """
+
+    if (
+        _PROMPT_OVERRIDE_CUE_PATTERN.search(question)
+        and _OBVIOUS_NON_LEGAL_TARGET_PATTERN.search(question)
+    ):
+        return False
 
     return bool(
         _UNSUPPORTED_LEGAL_SIGNAL_PATTERN.search(question)
@@ -1465,6 +1496,7 @@ _GENERAL_EMPLOYMENT_REQUEST_PATTERN: Final[
     r"\b(?:"
     r"employment(?:\s+law)?|"
     r"labou?r\s+law|"
+    r"legal\s+(?:information|info)|"
     r"employers?|employees?"
     r")\b",
     re.IGNORECASE,
@@ -2675,6 +2707,27 @@ def resolve_legal_chat_response(
         ) * 1000
         metrics.log()
 
+        help_conversation_state = request.conversation_state
+
+        if (
+            help_intent.intent_type == "comparison_guidance"
+            and len(help_intent.referenced_country_codes) >= 2
+        ):
+            help_conversation_state = ConversationState(
+                actions=[],
+                focus_action_index=None,
+                ordered_country_codes=[],
+                pending_clarification=(
+                    ConversationPendingClarification(
+                        reason="missing_topic",
+                        candidate_action_types=["comparison"],
+                        candidate_country_codes=list(
+                            help_intent.referenced_country_codes
+                        ),
+                    )
+                ),
+            )
+
         return LegalChatResponse(
             question=request.question.strip(),
             answer=build_assistant_help_answer(
@@ -2684,7 +2737,7 @@ def resolve_legal_chat_response(
             model=None,
             retrieval_total=0,
             sources=[],
-            conversation_state=request.conversation_state,
+            conversation_state=help_conversation_state,
         )
 
     try:

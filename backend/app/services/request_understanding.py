@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Final
 
 from pydantic import (
@@ -1086,6 +1086,72 @@ Supported countries (code: name): {countries}
 """.strip()
 
 
+
+_FRESH_CONTEXT_SECTION_START: Final[str] = (
+    "Use the conversation history to resolve references"
+)
+
+_FRESH_CONTEXT_SECTION_END: Final[str] = (
+    "For every legal_information or comparison action"
+)
+
+_FRESH_CONTEXT_INSTRUCTIONS: Final[str] = """
+This request has no conversation history and no structured prior state.
+Classify only the current message.
+
+For current_message_delta:
+- include only action types, countries, legal topics and subject text
+  explicitly expressed by the current message;
+- use context_operation="independent";
+- set is_follow_up=false;
+- never invent prior context or infer a continuation.
+""".strip()
+
+
+def _build_understanding_instructions(
+    *,
+    catalog: LegalCatalogResponse,
+    has_context: bool,
+) -> str:
+    """
+    Build the semantic-understanding instructions.
+
+    Contextual requests retain the complete historical/follow-up
+    instructions byte-for-byte. Fresh requests omit only the section
+    whose rules exclusively describe conversation-state inheritance
+    and follow-up resolution.
+    """
+
+    instructions = UNDERSTANDING_INSTRUCTIONS
+
+    if not has_context:
+        start = instructions.find(
+            _FRESH_CONTEXT_SECTION_START
+        )
+        end = instructions.find(
+            _FRESH_CONTEXT_SECTION_END
+        )
+
+        if start == -1 or end == -1 or end <= start:
+            raise RuntimeError(
+                "Fresh understanding prompt markers are invalid."
+            )
+
+        instructions = (
+            instructions[:start]
+            + _FRESH_CONTEXT_INSTRUCTIONS
+            + "\n\n"
+            + instructions[end:]
+        )
+
+    return instructions.replace(
+        "{legal_topics}",
+        ", ".join(CANONICAL_LEGAL_TOPICS),
+    ).replace(
+        "{countries}",
+        _build_supported_country_list(catalog),
+    )
+
 def _build_understanding_input(
     *,
     current_question: str,
@@ -1507,12 +1573,11 @@ def understand_request(
             error=type(error).__name__,
         )
 
-    instructions = UNDERSTANDING_INSTRUCTIONS.replace(
-        "{legal_topics}",
-        ", ".join(CANONICAL_LEGAL_TOPICS),
-    ).replace(
-        "{countries}",
-        _build_supported_country_list(catalog),
+    instructions = _build_understanding_instructions(
+        catalog=catalog,
+        has_context=bool(
+            history or conversation_state is not None
+        ),
     )
 
     input_text = _build_understanding_input(
@@ -1560,6 +1625,10 @@ def understand_request(
                     if error.status_code
                     else "transient_network_error"
                 )
+
+                # Do not immediately hit the provider again inside the
+                # same rate-limit / transient-failure window.
+                sleep(error.retry_delay_seconds())
                 continue
 
             return RequestUnderstandingOutcome(
