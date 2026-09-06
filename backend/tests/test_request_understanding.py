@@ -516,7 +516,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
             ["contact", "legal_information", "comparison"],
         )
 
-    def test_more_than_three_actions_is_rejected(self) -> None:
+    def test_more_than_four_actions_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             RequestUnderstandingResult(
                 **_resolved_result(
@@ -525,6 +525,7 @@ class RequestUnderstandingResultModelTests(unittest.TestCase):
                         _legal_action(country_codes=["ES"]),
                         _comparison_action(country_codes=["MX", "GB"]),
                         _contact_action(country_codes=["AU"]),
+                        _contact_action(country_codes=["FR"]),
                     ]
                 )
             )

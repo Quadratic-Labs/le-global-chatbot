@@ -54,7 +54,7 @@ CLARIFICATION_REASONS: tuple[str, ...] = (
     "ambiguous_reference",
 )
 
-MAX_ACTIONS = 3
+MAX_ACTIONS = 4
 # Not capped to a small fixed number: an existing, already-supported
 # product capability compares as many countries as a single request
 # names (e.g. a 6+ country comparison) - conversation_state must be

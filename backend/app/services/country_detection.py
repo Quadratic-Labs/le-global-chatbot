@@ -31,6 +31,8 @@ CountryCatalogProvider = Callable[
 
 
 COUNTRY_ALIAS_OVERRIDES: Final[dict[str, str]] = {
+    "Moroccan": "MA",
+    "russia": "RU",
     "uk": "GB",
     "u.k.": "GB",
     "great britain": "GB",
@@ -50,6 +52,7 @@ COUNTRY_ALIAS_OVERRIDES: Final[dict[str, str]] = {
 
 COUNTRY_DISPLAY_NAME_OVERRIDES: Final[dict[str, str]] = {
     "TW": "Taiwan",
+    "RU": "Russia",
 }
 
 
@@ -294,6 +297,7 @@ _COUNTRY_DEMONYMS: Final[dict[str, list[str]]] = {
     "JP": ["Japanese"],
     "KR": ["Korean", "South Korean"],
     "MX": ["Mexican"],
+    "MA": ["Moroccan"],
     "NL": ["Dutch"],
     "NO": ["Norwegian"],
     "NZ": ["New Zealand"],

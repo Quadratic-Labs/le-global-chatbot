@@ -1430,16 +1430,106 @@ def _resolve_legal_pending_clarification(
     action: RequestUnderstandingAction | None = None
 
     if reason == "missing_topic":
+        service_context = (
+            pending.candidate_subject_text or ""
+        ).strip()
+
+        # Only treat the pending subject as retained factual context
+        # for the narrow memory case currently supported by the
+        # router: length of service.
+        retain_service_context = (
+            bool(service_context)
+            and "year" in service_context.casefold()
+            and "service" in service_context.casefold()
+        )
+
         if (
             len(result.actions) == 1
             and result.actions[0].type
             in {"legal_information", "comparison"}
         ):
-            action = result.actions[0].model_copy(
-                update={
-                    "type": action_type,
-                    "country_codes": country_codes,
-                }
+            base_action = result.actions[0]
+
+            legal_topics = (
+                list(base_action.legal_topics)
+                or list(hints.current_legal_topics)
+            )
+
+            document_legal_topics = list(
+                base_action.document_legal_topics
+            )
+
+            current_subject = (
+                base_action.effective_subject_text()
+                or (
+                    current_question.strip()
+                    if current_question
+                    else ""
+                )
+                or " ".join(legal_topics).strip()
+            )
+
+            if not current_subject:
+                return None
+
+            combined_subject = current_subject
+
+            if (
+                retain_service_context
+                and service_context.casefold()
+                not in combined_subject.casefold()
+            ):
+                combined_subject = (
+                    combined_subject.rstrip(" .")
+                    + " for an employee with "
+                    + service_context
+                )
+
+            search_concepts = [
+                ConversationSearchConcept(
+                    terms=list(concept.terms)
+                )
+                for concept in base_action.search_concepts
+            ]
+
+            if not search_concepts:
+                search_concepts = [
+                    ConversationSearchConcept(
+                        terms=[current_subject]
+                    )
+                ]
+
+            action = RequestUnderstandingAction(
+                type=action_type,
+                country_codes=country_codes,
+                legal_topics=legal_topics,
+                document_legal_topics=document_legal_topics,
+                topic_text=(
+                    None
+                    if (
+                        legal_topics
+                        or document_legal_topics
+                    )
+                    else (
+                        base_action.topic_text
+                        or current_subject[:200]
+                    )
+                ),
+                resolved_question=_build_resolved_question(
+                    action_type=action_type,
+                    country_codes=country_codes,
+                    subject_text=combined_subject,
+                ),
+                subject_text=combined_subject,
+                search_concepts=search_concepts,
+                subject_specificity=(
+                    base_action.subject_specificity
+                    or "specific"
+                ),
+                evidence_mode=(
+                    base_action.evidence_mode
+                    or "direct_topic"
+                ),
             )
 
         if action is None:
@@ -1450,11 +1540,24 @@ def _resolve_legal_pending_clarification(
             if not legal_topics:
                 return None
 
-            subject = (
+            current_subject = (
                 current_question.strip()
                 if current_question
                 else legal_topics[0]
             )
+
+            combined_subject = current_subject
+
+            if (
+                retain_service_context
+                and service_context.casefold()
+                not in combined_subject.casefold()
+            ):
+                combined_subject = (
+                    combined_subject.rstrip(" .")
+                    + " for an employee with "
+                    + service_context
+                )
 
             action = RequestUnderstandingAction(
                 type=action_type,
@@ -1464,15 +1567,15 @@ def _resolve_legal_pending_clarification(
                 resolved_question=_build_resolved_question(
                     action_type=action_type,
                     country_codes=country_codes,
-                    subject_text=subject,
+                    subject_text=combined_subject,
                 ),
-                subject_text=subject,
+                subject_text=combined_subject,
                 search_concepts=[
                     ConversationSearchConcept(
-                        terms=[subject]
+                        terms=[current_subject]
                     )
                 ],
-                subject_specificity="broad",
+                subject_specificity="specific",
                 evidence_mode="direct_topic",
             )
 

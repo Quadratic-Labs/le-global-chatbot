@@ -1020,6 +1020,47 @@ def _suggest_country_code(
     return best_code
 
 
+def _suggest_country_code_for_unresolved_locality(
+    text: str,
+) -> str | None:
+    """
+    Use a stricter fuzzy threshold for a word already identified as an
+    unresolved locality. This prevents invented names such as
+    Ruritania from being converted into a real but different country.
+    """
+
+    candidate_text = _country_typo_fragment(text)
+
+    if not candidate_text:
+        return None
+
+    suggested_code = _suggest_country_code(text)
+
+    if suggested_code is None:
+        return None
+
+    best_score = 0.0
+
+    for name, code in _country_typo_candidates():
+        if code != suggested_code:
+            continue
+
+        best_score = max(
+            best_score,
+            difflib.SequenceMatcher(
+                None,
+                candidate_text,
+                name,
+            ).ratio(),
+        )
+
+    return (
+        suggested_code
+        if best_score >= 0.85
+        else None
+    )
+
+
 def resolve_conversation_meta(
     *,
     question: str,
@@ -1474,11 +1515,56 @@ def resolve_conversation_meta(
             )
 
             if unresolved_locality is not None:
+                # Before treating the phrase as an unknown locality,
+                # reuse the existing conservative country typo matcher.
+                # This recovers high-confidence mistakes such as
+                # "Germnay" -> Germany, while invented/unknown names
+                # such as "Atlantis" remain unresolved.
+                suggested_code = (
+                    _suggest_country_code_for_unresolved_locality(
+                        _normalize(unresolved_locality)
+                    )
+                )
+
+                if suggested_code is not None:
+                    catalog = _safe_catalog(catalog_provider)
+                    catalog_names = (
+                        _catalog_country_map(catalog)
+                        if catalog is not None
+                        else {}
+                    )
+
+                    display_name = _display_name(
+                        suggested_code,
+                        catalog_names,
+                    )
+
+                    if suggested_code in catalog_names:
+                        availability = (
+                            f"{display_name} is currently available "
+                            "in the validated corpus."
+                        )
+                    else:
+                        availability = (
+                            f"{display_name} is not currently "
+                            "available in the validated corpus."
+                        )
+
+                    return ConversationMetaResolution(
+                        intent_type="country_suggestion",
+                        answer=(
+                            f"Did you mean {display_name}? "
+                            f"{availability}"
+                        ),
+                        preserve_conversation_state=False,
+                    )
+
                 return ConversationMetaResolution(
                     intent_type="unknown_locality_clarification",
                     answer=(
-                        f"Which country is {unresolved_locality} "
-                        "in? I can help once I know the country."
+                        f"I could not reliably identify "
+                        f"{unresolved_locality} as a country or "
+                        "location. Which country do you mean?"
                     ),
                     preserve_conversation_state=False,
                 )
