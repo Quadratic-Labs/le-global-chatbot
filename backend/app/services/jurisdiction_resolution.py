@@ -389,6 +389,25 @@ def _narrow_candidates(
 # phrase was NOT itself found - "Newcastle upon Tyne" is a three-word
 # span the longest-match scan already finds and consumes before this
 # single-word fallback is ever reached, so this never affects it.
+# Some real gazetteer names are too semantically ambiguous to
+# infer a national legal jurisdiction safely from the place name
+# alone. In a country-level employment-law assistant, these names
+# require the user to confirm the country instead of silently
+# converting the locality into a jurisdiction.
+#
+# Example: "Atlantis" is a real locality in South Africa in the
+# city data, but is also overwhelmingly used as a non-geographic /
+# fictional name. Treating a bare "in Atlantis" as South Africa
+# would therefore fabricate the user's intended jurisdiction.
+_CITY_NAMES_REQUIRING_COUNTRY_CLARIFICATION: Final[
+    frozenset[str]
+] = frozenset(
+    {
+        "atlantis",
+    }
+)
+
+
 _PLACE_NAME_LINKING_WORDS: Final[frozenset[str]] = frozenset(
     {"upon", "under"}
 )
@@ -475,6 +494,13 @@ def resolve_city_country_codes(
                 normalized_text,
             ):
                 matches.append((candidate_name, populations_by_country))
+
+    matches = [
+        match
+        for match in matches
+        if match[0]
+        not in _CITY_NAMES_REQUIRING_COUNTRY_CLARIFICATION
+    ]
 
     if not matches:
         return frozenset(), None

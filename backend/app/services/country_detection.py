@@ -31,6 +31,8 @@ CountryCatalogProvider = Callable[
 
 
 COUNTRY_ALIAS_OVERRIDES: Final[dict[str, str]] = {
+    "Moroccan": "MA",
+    "russia": "RU",
     "uk": "GB",
     "u.k.": "GB",
     "great britain": "GB",
@@ -41,8 +43,16 @@ COUNTRY_ALIAS_OVERRIDES: Final[dict[str, str]] = {
     "america": "US",
     "south korea": "KR",
     "czechia": "CZ",
+    "taiwan": "TW",
+    "taiwanese": "TW",
     "uae": "AE",
     "u.a.e.": "AE",
+}
+
+
+COUNTRY_DISPLAY_NAME_OVERRIDES: Final[dict[str, str]] = {
+    "TW": "Taiwan",
+    "RU": "Russia",
 }
 
 
@@ -287,6 +297,7 @@ _COUNTRY_DEMONYMS: Final[dict[str, list[str]]] = {
     "JP": ["Japanese"],
     "KR": ["Korean", "South Korean"],
     "MX": ["Mexican"],
+    "MA": ["Moroccan"],
     "NL": ["Dutch"],
     "NO": ["Norwegian"],
     "NZ": ["New Zealand"],
@@ -297,6 +308,7 @@ _COUNTRY_DEMONYMS: Final[dict[str, list[str]]] = {
     "SE": ["Swedish"],
     "SG": ["Singaporean"],
     "TH": ["Thai"],
+    "TW": ["Taiwanese"],
     "US": ["American"],
     "VN": ["Vietnamese"],
     "ZA": ["South African"],
@@ -323,14 +335,23 @@ def resolve_country_display_name(
 ) -> str:
     """Return a readable display name for one ISO alpha-2 country code."""
 
+    normalized_code = country_code.upper()
+
+    override = COUNTRY_DISPLAY_NAME_OVERRIDES.get(
+        normalized_code
+    )
+
+    if override is not None:
+        return override
+
     country = pycountry.countries.get(
-        alpha_2=country_code.upper()
+        alpha_2=normalized_code
     )
 
     if country is not None:
         return country.name
 
-    return country_code.upper()
+    return normalized_code
 
 
 def detect_mentioned_country_codes(
@@ -354,7 +375,7 @@ def detect_mentioned_country_codes(
         return []
 
     candidates: list[
-        tuple[int, int, str]
+        tuple[int, int, int, str]
     ] = []
 
     for phrase, pattern, country_code in _COUNTRY_PHRASE_PATTERNS:
@@ -364,6 +385,7 @@ def detect_mentioned_country_codes(
             candidates.append(
                 (
                     match.start(),
+                    match.end(),
                     -len(
                         phrase
                     ),
@@ -374,14 +396,26 @@ def detect_mentioned_country_codes(
     candidates.sort(
         key=lambda candidate: (
             candidate[0],
-            candidate[1],
+            candidate[2],
         )
     )
 
     detected_codes: list[str] = []
     seen_codes: set[str] = set()
+    accepted_spans: list[tuple[int, int]] = []
 
-    for _, _, country_code in candidates:
+    for start, end, _, country_code in candidates:
+        if any(
+            start >= accepted_start
+            and end <= accepted_end
+            for accepted_start, accepted_end in accepted_spans
+        ):
+            continue
+
+        accepted_spans.append(
+            (start, end)
+        )
+
         if country_code in seen_codes:
             continue
 

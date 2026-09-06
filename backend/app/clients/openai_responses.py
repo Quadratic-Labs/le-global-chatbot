@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any
@@ -19,6 +20,90 @@ OPENAI_RESPONSES_URL = (
 
 class OpenAIConfigurationError(RuntimeError):
     """Raised when OpenAI configuration is incomplete."""
+
+
+_RETRY_DURATION_PART = re.compile(
+    r"(\d+(?:\.\d+)?)(ms|s|m|h)"
+)
+
+
+def _parse_retry_duration_seconds(
+    value: str | None,
+) -> float | None:
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+
+    if not normalized:
+        return None
+
+    # Standard Retry-After numeric seconds.
+    try:
+        return max(float(normalized), 0.0)
+    except ValueError:
+        pass
+
+    # OpenAI x-ratelimit-reset-* style durations such as
+    # "500ms", "2s", "1m30s".
+    total = 0.0
+    position = 0
+
+    for match in _RETRY_DURATION_PART.finditer(normalized):
+        if match.start() != position:
+            return None
+
+        amount = float(match.group(1))
+        unit = match.group(2)
+
+        if unit == "ms":
+            total += amount / 1000.0
+        elif unit == "s":
+            total += amount
+        elif unit == "m":
+            total += amount * 60.0
+        elif unit == "h":
+            total += amount * 3600.0
+
+        position = match.end()
+
+    if position != len(normalized) or position == 0:
+        return None
+
+    return total
+
+
+def _http_retry_after_seconds(
+    error: HTTPError,
+) -> float | None:
+    headers = getattr(error, "headers", None)
+
+    if headers is None:
+        return None
+
+    # Prefer the explicit HTTP Retry-After header.
+    retry_after = _parse_retry_duration_seconds(
+        headers.get("Retry-After")
+    )
+
+    if retry_after is not None:
+        return retry_after
+
+    # Otherwise use OpenAI rate-limit reset information when present.
+    reset_values = []
+
+    for header_name in (
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    ):
+        parsed = _parse_retry_duration_seconds(
+            headers.get(header_name)
+        )
+
+        if parsed is not None:
+            reset_values.append(parsed)
+
+    return max(reset_values) if reset_values else None
 
 
 class OpenAIResponseError(RuntimeError):
@@ -39,10 +124,26 @@ class OpenAIResponseError(RuntimeError):
         *,
         retryable: bool = False,
         status_code: int | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+    def retry_delay_seconds(
+        self,
+        *,
+        default: float = 2.0,
+        maximum: float = 8.0,
+    ) -> float:
+        delay = (
+            self.retry_after_seconds
+            if self.retry_after_seconds is not None
+            else default
+        )
+
+        return min(max(delay, 0.25), maximum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +402,9 @@ class OpenAIResponsesClient:
                 error_message,
                 retryable=error.code in (429, 500, 502, 503, 504),
                 status_code=error.code,
+                retry_after_seconds=(
+                    _http_retry_after_seconds(error)
+                ),
             ) from error
 
         except (

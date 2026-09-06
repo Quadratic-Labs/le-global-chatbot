@@ -730,6 +730,85 @@ def _resolve_unique_capital_country_code(
     return None
 
 
+def _supported_demonym_country_codes(
+    *,
+    question: str,
+    catalog_provider: CountryCatalogProvider,
+) -> list[str]:
+    """
+    Return supported countries explicitly expressed through a curated
+    national adjective/demonym, e.g. German -> DE.
+
+    This does not change general country detection. It is consumed only
+    by narrowly-scoped deterministic routing.
+    """
+
+    from app.services.country_detection import (
+        get_country_demonyms,
+    )
+
+    normalized_question = (
+        " "
+        + re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            question.casefold(),
+        ).strip()
+        + " "
+    )
+
+    result: list[str] = []
+
+    catalog = catalog_provider()
+
+    for country in catalog.countries:
+        raw_code = getattr(
+            country,
+            "country_code",
+            None,
+        )
+
+        if raw_code is None:
+            raw_code = getattr(
+                country,
+                "value",
+                None,
+            )
+
+        if not isinstance(raw_code, str):
+            continue
+
+        candidate_code = raw_code.strip().upper()
+
+        if len(candidate_code) != 2:
+            continue
+
+        for demonym in get_country_demonyms(
+            candidate_code
+        ):
+            normalized_demonym = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                demonym.casefold(),
+            ).strip()
+
+            if (
+                normalized_demonym
+                and (
+                    " "
+                    + normalized_demonym
+                    + " "
+                )
+                in normalized_question
+            ):
+                if candidate_code not in result:
+                    result.append(candidate_code)
+
+                break
+
+    return result
+
+
 def _resolve_current_country_scope(
     request: LegalChatRequest,
     catalog_provider: CountryCatalogProvider,
@@ -750,6 +829,33 @@ def _resolve_current_country_scope(
         request=request,
         catalog_provider=catalog_provider,
     )
+
+    if _CHOICE_OF_LAW_REQUEST_PATTERN.search(
+        request.question
+    ):
+        demonym_codes = _supported_demonym_country_codes(
+            question=request.question,
+            catalog_provider=catalog_provider,
+        )
+
+        merged_available_codes = list(
+            dict.fromkeys(
+                [
+                    *scope.available_codes,
+                    *demonym_codes,
+                ]
+            )
+        )
+
+        if merged_available_codes != list(
+            scope.available_codes
+        ):
+            scope = CountryAvailability(
+                available_codes=merged_available_codes,
+                unavailable_codes=list(
+                    scope.unavailable_codes
+                ),
+            )
 
     if (
         scope.available_codes
@@ -1141,6 +1247,163 @@ def _build_contact_section(
     )
 
 
+_CHOICE_OF_LAW_REQUEST_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"(?:"
+    r"\bchoice\s+of\s+law\b|"
+    r"\bgoverning\s+(?:employment\s+)?law\b|"
+    r"\bwhich\s+country(?:'s)?\s+(?:employment\s+)?law\b|"
+    r"\bwhich\s+(?:employment\s+)?law\s+"
+    r"(?:applies|governs)\b|"
+    r"\b(?:employment\s+)?law\s+"
+    r"(?:automatically\s+)?(?:applies|governs)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _try_local_choice_of_law_recovery(
+    *,
+    question: str,
+    result: RequestUnderstandingResult,
+    current_country_scope: CountryAvailability,
+    catalog_provider: CountryCatalogProvider,
+) -> RequestUnderstandingResult | None:
+    """
+    Recover a clearly expressed employment choice-of-law question when
+    probabilistic request understanding incorrectly returns
+    missing_topic.
+
+    This does not determine WHICH country's law governs. It only
+    preserves the legal subject the user explicitly asked about so the
+    normal grounded RAG path can decide whether the validated material
+    supports an answer.
+    """
+
+    if not _CHOICE_OF_LAW_REQUEST_PATTERN.search(question):
+        return None
+
+    # Choice-of-law classification must not depend on the stochastic
+    # semantic result when the current message itself clearly expresses
+    # a cross-border applicable-law question.
+    #
+    # Recover:
+    # - missing_topic clarification; or
+    # - one legal_information action that semantic understanding already
+    #   resolved but may have scoped to only one of the two countries.
+    #
+    # Do not override contacts, multi-action plans, explicit comparison
+    # plans or unsupported requests here.
+    if result.status == "clarification":
+        if result.clarification_reason != "missing_topic":
+            return None
+    elif result.status == "resolved":
+        if (
+            len(result.actions) != 1
+            or result.actions[0].type != "legal_information"
+        ):
+            return None
+    else:
+        return None
+
+    country_codes = list(
+        dict.fromkeys(
+            current_country_scope.available_codes
+        )
+    )
+
+    for candidate_code in _supported_demonym_country_codes(
+        question=question,
+        catalog_provider=catalog_provider,
+    ):
+        if candidate_code not in country_codes:
+            country_codes.append(candidate_code)
+
+    # Deterministic normalization is deliberately cross-border only.
+    # A normal one-country question containing words such as
+    # "employment law applies" must stay under ordinary routing.
+    if len(country_codes) < 2:
+        return None
+
+    existing_action = next(
+        (
+            action
+            for action in result.actions
+            if action.type == "legal_information"
+        ),
+        None,
+    )
+
+    action_updates = {
+        "country_codes": country_codes,
+        "legal_topics": [],
+        "document_legal_topics": [],
+        "topic_text": "applicable law / choice of law for employment",
+        "resolved_question": question,
+        "subject_text": "applicable employment law / choice of law",
+        "search_concepts": [
+            {
+                "terms": [
+                    "applicable law",
+                    "choice of law",
+                    "governing law",
+                ]
+            },
+            {
+                "terms": [
+                    "place of work",
+                    "habitual place of work",
+                    "workplace location",
+                ]
+            },
+            {
+                "terms": [
+                    "employer establishment",
+                    "employer registered office",
+                    "employer domicile",
+                ]
+            },
+        ],
+        "subject_specificity": "specific",
+        "evidence_mode": "direct_topic",
+    }
+
+    if existing_action is not None:
+        action_payload = existing_action.model_dump()
+        action_payload.update(action_updates)
+    else:
+        action_payload = {
+            "type": "legal_information",
+            **action_updates,
+        }
+
+    action = RequestUnderstandingAction.model_validate(
+        action_payload
+    )
+
+    return result.model_copy(
+        update={
+            "status": "resolved",
+            "actions": [action],
+            "clarification_reason": None,
+            "confidence": max(
+                float(result.confidence),
+                0.99,
+            ),
+            "current_message_delta": CurrentMessageDelta(
+                explicit_action_types=["legal_information"],
+                explicit_country_codes=country_codes,
+                explicit_legal_topics=[],
+                explicit_subject_text=(
+                    "applicable employment law / choice of law"
+                ),
+                context_operation="independent",
+            ),
+        }
+    )
+
+
 def _clarification_answer_for(
     result: RequestUnderstandingResult,
 ) -> str:
@@ -1443,6 +1706,31 @@ _UNSUPPORTED_LEGAL_SIGNAL_PATTERN: Final[
 )
 
 
+_PROMPT_OVERRIDE_CUE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:ignore|disregard|forget|bypass|override)\b"
+    r"[\s\S]{0,160}"
+    r"\b(?:instructions?|rules?|restrictions?|polic(?:y|ies)|"
+    r"employment\s+law)\b",
+    re.IGNORECASE,
+)
+
+
+_OBVIOUS_NON_LEGAL_TARGET_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:"
+    r"weather|forecast|temperature|"
+    r"restaurants?|recipes?|"
+    r"sports?|football|soccer|basketball|"
+    r"hotels?|tourism|travel|"
+    r"movies?|music|games?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _should_offer_contact_for_unsupported_request(
     question: str,
 ) -> bool:
@@ -1453,6 +1741,12 @@ def _should_offer_contact_for_unsupported_request(
     Non-legal requests such as weather must stay on the simple product
     scope refusal and must not trigger contact retrieval.
     """
+
+    if (
+        _PROMPT_OVERRIDE_CUE_PATTERN.search(question)
+        and _OBVIOUS_NON_LEGAL_TARGET_PATTERN.search(question)
+    ):
+        return False
 
     return bool(
         _UNSUPPORTED_LEGAL_SIGNAL_PATTERN.search(question)
@@ -1465,6 +1759,7 @@ _GENERAL_EMPLOYMENT_REQUEST_PATTERN: Final[
     r"\b(?:"
     r"employment(?:\s+law)?|"
     r"labou?r\s+law|"
+    r"legal\s+(?:information|info)|"
     r"employers?|employees?"
     r")\b",
     re.IGNORECASE,
@@ -1500,6 +1795,10 @@ def _try_local_missing_topic_result(
         and (
             action.legal_topics
             or action.document_legal_topics
+            or (
+                action.topic_text
+                and _CHOICE_OF_LAW_REQUEST_PATTERN.search(question)
+            )
         )
         for action in result.actions
     )
@@ -1680,6 +1979,383 @@ def _try_local_clear_fresh_legal_result(
             context_operation="independent",
         ),
     )
+
+
+
+
+def _try_local_parallel_multi_action_result(
+    *,
+    request: LegalChatRequest,
+    result: RequestUnderstandingResult | None,
+    catalog_provider,
+) -> RequestUnderstandingResult | None:
+    """
+    Recover a fresh list of simple independent country-scoped actions
+    when semantic understanding silently drops part of an explicit
+    comma-separated request.
+
+    This is deliberately conservative:
+    - fresh request only;
+    - no comparison wording;
+    - at least three independently resolvable clauses;
+    - only a small set of direct legal concepts;
+    - existing semantic result is kept whenever it already covers the
+      same or a richer action/country set.
+
+    It is a recovery path, never the normal understanding path.
+    """
+
+    question = " ".join(request.question.split())
+
+    if not question:
+        return None
+
+    folded = question.casefold()
+
+    if any(
+        token in folded
+        for token in (
+            "compare ",
+            "compare,",
+            "comparison",
+            "contrast ",
+            "difference between",
+        )
+    ):
+        return None
+
+    # These requests are intentionally written as independent clauses.
+    normalized = (
+        question
+        .replace("; ", ", ")
+        .replace(" and the UK ", ", the UK ")
+        .replace(" and UK ", ", UK ")
+    )
+
+    clauses = [
+        part.strip(" .")
+        for part in normalized.split(",")
+        if part.strip(" .")
+    ]
+
+    if len(clauses) < 3:
+        return None
+
+    actions: list[RequestUnderstandingAction] = []
+    explicit_codes: list[str] = []
+
+    def add_code(code: str) -> None:
+        if code not in explicit_codes:
+            explicit_codes.append(code)
+
+    for clause in clauses:
+        clause_request = request.model_copy(
+            update={
+                "question": clause,
+                "country_codes": [],
+                "legal_topics": [],
+                "subsections": [],
+            }
+        )
+
+        scope = resolve_country_availability(
+            request=clause_request,
+            catalog_provider=catalog_provider,
+        )
+
+        available = list(scope.available_codes)
+        unavailable = list(scope.unavailable_codes)
+
+        # The general country detector intentionally focuses on
+        # country names/aliases. For this deterministic recovery only,
+        # also resolve curated demonyms for countries present in the
+        # validated catalog (German, French, Irish, etc.).
+        #
+        # Unsupported jurisdictions remain handled by the normal
+        # detector above — e.g. Moroccan -> MA.
+        if not available and not unavailable:
+            import re
+
+            from app.services.country_detection import (
+                get_country_demonyms,
+            )
+
+            normalized_clause = (
+                " "
+                + re.sub(
+                    r"[^a-z0-9]+",
+                    " ",
+                    clause.casefold(),
+                ).strip()
+                + " "
+            )
+
+            demonym_matches: list[str] = []
+
+            for country in catalog_provider().countries:
+                candidate_code = country.country_code.upper()
+
+                for demonym in get_country_demonyms(
+                    candidate_code
+                ):
+                    normalized_demonym = re.sub(
+                        r"[^a-z0-9]+",
+                        " ",
+                        demonym.casefold(),
+                    ).strip()
+
+                    if (
+                        normalized_demonym
+                        and (
+                            " "
+                            + normalized_demonym
+                            + " "
+                        )
+                        in normalized_clause
+                    ):
+                        if candidate_code not in demonym_matches:
+                            demonym_matches.append(
+                                candidate_code
+                            )
+
+            if len(demonym_matches) == 1:
+                available = demonym_matches
+
+        for code in available:
+            add_code(code)
+
+        for code in unavailable:
+            add_code(code)
+
+        if len(available) != 1:
+            # Unsupported and non-legal fragments are intentionally not
+            # executable actions. They are handled by the outer router.
+            continue
+
+        code = available[0]
+        lower = clause.casefold()
+
+        if (
+            "contact" in lower
+            or "who can i contact" in lower
+            or "who should i contact" in lower
+            or "who to contact" in lower
+            or "l&e global contact" in lower
+        ):
+            actions.append(
+                RequestUnderstandingAction(
+                    type="contact",
+                    country_codes=[code],
+                    legal_topics=[],
+                    document_legal_topics=[],
+                    topic_text=None,
+                    resolved_question=clause,
+                    subject_text=None,
+                    search_concepts=[],
+                    subject_specificity=None,
+                    evidence_mode=None,
+                )
+            )
+            continue
+
+        if "severance" in lower or "redundancy pay" in lower:
+            actions.append(
+                RequestUnderstandingAction(
+                    type="legal_information",
+                    country_codes=[code],
+                    legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                    document_legal_topics=[],
+                    topic_text=None,
+                    resolved_question=clause,
+                    subject_text="statutory severance",
+                    search_concepts=[
+                        {
+                            "terms": [
+                                "statutory severance",
+                                "severance pay",
+                                "redundancy pay",
+                            ]
+                        }
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            )
+            continue
+
+        if (
+            "working hours" in lower
+            or "working time" in lower
+            or "work hours" in lower
+        ):
+            actions.append(
+                RequestUnderstandingAction(
+                    type="legal_information",
+                    country_codes=[code],
+                    legal_topics=["Working Conditions"],
+                    document_legal_topics=[],
+                    topic_text=None,
+                    resolved_question=clause,
+                    subject_text="working hours",
+                    search_concepts=[
+                        {
+                            "terms": [
+                                "working hours",
+                                "working time",
+                                "hours of work",
+                                "maximum working hours",
+                            ]
+                        }
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            )
+            continue
+
+        if "overtime" in lower:
+            actions.append(
+                RequestUnderstandingAction(
+                    type="legal_information",
+                    country_codes=[code],
+                    legal_topics=["Working Conditions"],
+                    document_legal_topics=[],
+                    topic_text=None,
+                    resolved_question=clause,
+                    subject_text="overtime rules",
+                    search_concepts=[
+                        {
+                            "terms": [
+                                "overtime",
+                                "overtime pay",
+                                "extra hours",
+                                "overtime rates",
+                            ]
+                        }
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            )
+            continue
+
+        if "dismiss" in lower or "termination" in lower:
+            actions.append(
+                RequestUnderstandingAction(
+                    type="legal_information",
+                    country_codes=[code],
+                    legal_topics=[
+                        "Termination of Employment Contracts"
+                    ],
+                    document_legal_topics=[],
+                    topic_text=None,
+                    resolved_question=clause,
+                    subject_text="dismissal law",
+                    search_concepts=[
+                        {
+                            "terms": [
+                                "dismissal",
+                                "termination of employment",
+                                "grounds for termination",
+                            ]
+                        }
+                    ],
+                    subject_specificity="specific",
+                    evidence_mode="direct_topic",
+                )
+            )
+
+    # A mixed request may contain two executable supported actions
+    # plus an explicitly unsupported jurisdiction or an unrelated
+    # fragment. Three clauses are still required above, but only two
+    # executable actions are necessary for safe recovery.
+    if (
+        len(actions) < 2
+        or len(explicit_codes) < 2
+    ):
+        return None
+
+    existing_actions = (
+        list(result.actions or [])
+        if result is not None
+        else []
+    )
+
+    existing_signature = {
+        (
+            action.type,
+            tuple(action.country_codes),
+        )
+        for action in existing_actions
+    }
+
+    recovered_signature = {
+        (
+            action.type,
+            tuple(action.country_codes),
+        )
+        for action in actions
+    }
+
+    # Keep the semantic plan only when it already contains every
+    # independently recovered explicit action. Action COUNT alone is
+    # not evidence of completeness: a stochastic semantic result may
+    # return four actions while silently replacing or mis-scoping one
+    # of the explicitly requested country/task pairs.
+    if recovered_signature.issubset(existing_signature):
+        return None
+
+    return RequestUnderstandingResult(
+        status="resolved",
+        actions=actions,
+        is_follow_up=False,
+        confidence=1.0,
+        clarification_reason=None,
+        current_message_delta=CurrentMessageDelta(
+            explicit_action_types=[
+                action.type
+                for action in actions
+            ],
+            explicit_country_codes=explicit_codes,
+            explicit_legal_topics=list(
+                dict.fromkeys(
+                    topic
+                    for action in actions
+                    for topic in action.legal_topics
+                )
+            ),
+            explicit_subject_text=None,
+            context_operation="independent",
+        ),
+    )
+
+
+def _strip_unrequested_comparison_section(
+    answer: str,
+) -> str:
+    """
+    Remove a model-created Comparison section when no comparison
+    action exists. Country sections before it remain untouched.
+    """
+
+    lines = answer.splitlines()
+
+    for index, line in enumerate(lines):
+        normalized = (
+            line.strip()
+            .strip("*# ")
+            .rstrip(":")
+            .casefold()
+        )
+
+        if normalized == "comparison":
+            return "\n".join(
+                lines[:index]
+            ).rstrip()
+
+    return answer.rstrip()
 
 
 def _resolve_conservative_fallback(
@@ -2101,6 +2777,51 @@ def _execute_resolved_plan(
             # legitimately span a country where a canonical topic was
             # never live at all) is untouched, and explicit/dynamic
             # document-topic priority (above) is unaffected either way.
+            # Preserve deterministic canonical concept coverage.
+            #
+            # A semantic understanding result may legitimately choose
+            # one nearby live document section, but it must not narrow
+            # away another canonical section that the literal action
+            # wording deterministically requires.
+            #
+            # Example (generic, not country-specific):
+            # "statutory notice period" belongs to both Employment
+            # Contracts and Termination of Employment Contracts in the
+            # canonical taxonomy. Selecting only the latter can hide a
+            # dedicated Notice Period section in the former and create
+            # a false evidence-insufficiency answer.
+            #
+            # An explicitly named live document-topic title remains
+            # more specific and therefore keeps its existing priority.
+            action_question_text = (
+                action.resolved_question
+                if action.resolved_question
+                else request.question
+            )
+
+            deterministic_action_topics = [
+                topic
+                for topic in detect_legal_topics(
+                    action_question_text
+                )
+                if topic in CANONICAL_LEGAL_TOPICS
+                and (
+                    action.type != "legal_information"
+                    or len(action_scope.available_codes) != 1
+                    or not live_document_topics_for_action
+                    or topic in live_document_topics_for_action
+                )
+            ]
+
+            explicit_document_topics = (
+                detect_document_legal_topics(
+                    action_question_text,
+                    sorted(live_document_topics_for_action),
+                )
+                if action.type != "comparison"
+                else []
+            )
+
             validated_topics = [
                 topic
                 for topic in action.legal_topics
@@ -2113,6 +2834,25 @@ def _execute_resolved_plan(
                 )
             ]
 
+            # Explicit client-supplied legal_topics remain binding.
+            # Otherwise deterministic canonical detection is the
+            # coverage floor: semantic understanding may add useful
+            # topics, but may not silently remove those directly
+            # implied by the user's action wording.
+            if (
+                not request.legal_topics
+                and deterministic_action_topics
+                and not explicit_document_topics
+            ):
+                validated_topics = (
+                    deterministic_action_topics
+                    + [
+                        topic
+                        for topic in validated_topics
+                        if topic not in deterministic_action_topics
+                    ]
+                )
+
             validated_document_topics = (
                 [
                     topic
@@ -2122,6 +2862,18 @@ def _execute_resolved_plan(
                 if action.type != "comparison"
                 else []
             )
+
+            # A model-selected document section must not override a
+            # deterministic canonical concept unless the user actually
+            # named that live section title. This keeps custom/live
+            # document topics available when they are genuinely the
+            # user's subject, while preventing semantic narrowing.
+            if (
+                not request.legal_topics
+                and deterministic_action_topics
+                and not explicit_document_topics
+            ):
+                validated_document_topics = []
 
             for topic in validated_topics:
                 if topic not in merged_legal_topics:
@@ -2144,7 +2896,12 @@ def _execute_resolved_plan(
             executed.append(
                 (
                     action.model_copy(
-                        update={"legal_topics": validated_topics}
+                        update={
+                            "legal_topics": validated_topics,
+                            "document_legal_topics": (
+                                validated_document_topics
+                            ),
+                        }
                     ),
                     action_scope.available_codes,
                 )
@@ -2259,6 +3016,86 @@ def _execute_resolved_plan(
             # request's other actions (0.4.2 hardening) - see
             # LegalActionEvidenceSpec. Still exactly one combined
             # generation call.
+            # Preserve explicitly named unsupported jurisdictions.
+            # Request-understanding actions contain only supported codes,
+            # while deterministic hints retain unsupported names/codes.
+            # They must survive so the final response can explain that
+            # those jurisdictions are not covered instead of asking the
+            # user for a country they already supplied.
+            for unavailable_code in (
+                hints.current_unavailable_country_codes
+            ):
+                if unavailable_code not in merged_unavailable_codes:
+                    merged_unavailable_codes.append(
+                        unavailable_code
+                    )
+
+            # Semantic understanding may identify an explicitly named
+            # real jurisdiction that the deterministic first-pass
+            # detector could not recognize from a demonym/adjective,
+            # for example "Moroccan". Actions intentionally contain
+            # supported countries only, but current_message_delta keeps
+            # the complete explicit jurisdiction set. Resolve those
+            # codes deterministically here and preserve unsupported
+            # jurisdictions in the final product-level note.
+            semantic_explicit_codes = (
+                list(
+                    result.current_message_delta
+                    .explicit_country_codes
+                )
+                if result.current_message_delta is not None
+                else []
+            )
+
+            if semantic_explicit_codes:
+                semantic_country_scope = (
+                    resolve_country_availability(
+                        request=request.model_copy(
+                            update={
+                                "country_codes":
+                                    semantic_explicit_codes
+                            }
+                        ),
+                        catalog_provider=catalog_provider,
+                    )
+                )
+
+                for unavailable_code in (
+                    semantic_country_scope.unavailable_codes
+                ):
+                    if (
+                        unavailable_code
+                        not in merged_unavailable_codes
+                    ):
+                        merged_unavailable_codes.append(
+                            unavailable_code
+                        )
+
+            # One product-level source budget is shared by all
+            # legal actions. Reserve capacity only for explicitly
+            # requested contact actions here. The RAG layer allocates
+            # the remaining legal budget across LegalActionEvidenceSpec
+            # objects according to countries/facets, rather than giving
+            # every action the same arbitrarily reduced allowance.
+            if contact_actions:
+                legal_source_budget = max(
+                    1,
+                    request.max_sources
+                    - min(
+                        len(contact_actions),
+                        max(0, request.max_sources - 1),
+                    ),
+                )
+
+                if legal_source_budget < prepared_request.max_sources:
+                    prepared_request = (
+                        prepared_request.model_copy(
+                            update={
+                                "max_sources": legal_source_budget
+                            }
+                        )
+                    )
+
             legal_response = legal_answer_generation_fn(
                 prepared_request,
                 search_function=search_function,
@@ -2281,7 +3118,19 @@ def _execute_resolved_plan(
                 ),
             )
 
-            answer_parts.append(legal_response.answer)
+            legal_answer_text = legal_response.answer
+
+            if not any(
+                action.type == "comparison"
+                for action in legal_type_actions
+            ):
+                legal_answer_text = (
+                    _strip_unrequested_comparison_section(
+                        legal_answer_text
+                    )
+                )
+
+            answer_parts.append(legal_answer_text)
             sources.extend(legal_response.sources)
             grounded = legal_response.grounded
             model_used = legal_response.model
@@ -2367,6 +3216,38 @@ def _execute_resolved_plan(
         else:
             metrics.outcome = "fallback_missing_country"
             answer_parts.append(MISSING_COUNTRY_ANSWER)
+
+    # A mixed request may contain valid legal actions plus an obvious
+    # unrelated request. The legal generation receives only the legal
+    # actions; add the product-level scope refusal deterministically so
+    # the unrelated fragment is neither silently ignored nor answered
+    # from general knowledge.
+    if legal_type_actions:
+        combined_answer_text = "\n".join(answer_parts).casefold()
+        question_lower = request.question.casefold()
+
+        out_of_scope_fragments = (
+            (
+                "weather",
+                "The weather request is outside this assistant's "
+                "employment-law scope.",
+            ),
+            (
+                "restaurant",
+                "The restaurant request is outside this assistant's "
+                "employment-law scope.",
+            ),
+        )
+
+        for fragment, message in out_of_scope_fragments:
+            if (
+                fragment in question_lower
+                and fragment not in combined_answer_text
+            ):
+                answer_parts.append(message)
+                combined_answer_text = (
+                    "\n".join(answer_parts).casefold()
+                )
 
     for action in contact_actions:
         action_scope = resolve_country_availability(
@@ -2609,12 +3490,123 @@ def resolve_legal_chat_response(
 
         return cached_catalog_results[0]
 
+    # A user may establish narrow employment context before asking
+    # the actual legal question, e.g. "I work in Germany and have
+    # 8 years of service; remember this for my next question."
+    #
+    # Keep only the jurisdiction and length-of-service fact in the
+    # existing client-carried conversation_state. This is deliberately
+    # narrow: it is not a general personal-memory store.
+    if request.conversation_state is None:
+        memory_text = request.question.strip()
+        memory_lower = memory_text.casefold()
+
+        service_match = re.search(
+            r"\b(\d{1,2})\s+years?\s+of\s+service\b",
+            memory_text,
+            flags=re.IGNORECASE,
+        )
+
+        memory_cue = (
+            "remember" in memory_lower
+            or "next question" in memory_lower
+            or "use these details" in memory_lower
+        )
+
+        if (
+            service_match is not None
+            and memory_cue
+            and not detect_legal_topics(memory_text)
+        ):
+            memory_scope = resolve_country_availability(
+                request.model_copy(
+                    update={"country_codes": []}
+                ),
+                catalog_provider=memoized_catalog_provider,
+            )
+
+            if (
+                len(memory_scope.available_codes) == 1
+                and not memory_scope.unavailable_codes
+            ):
+                memory_country_code = (
+                    memory_scope.available_codes[0]
+                )
+                memory_country = resolve_country_display_name(
+                    memory_country_code
+                )
+                memory_years = int(service_match.group(1))
+                memory_subject = (
+                    f"{memory_years} years of service"
+                )
+
+                memory_state = ConversationState(
+                    actions=[],
+                    focus_action_index=None,
+                    ordered_country_codes=[],
+                    pending_clarification=(
+                        ConversationPendingClarification(
+                            reason="missing_topic",
+                            candidate_action_types=[
+                                "legal_information"
+                            ],
+                            candidate_country_codes=[
+                                memory_country_code
+                            ],
+                            candidate_legal_topics=[],
+                            candidate_subject_text=memory_subject,
+                            candidate_search_concepts=[],
+                            candidate_subject_specificity="specific",
+                            candidate_evidence_mode="direct_topic",
+                        )
+                    ),
+                )
+
+                metrics.outcome = "context_memory_setup"
+                metrics.conversation_state_emitted = True
+                metrics.total_ms = (
+                    perf_counter() - total_started_at
+                ) * 1000
+                metrics.log()
+
+                return LegalChatResponse(
+                    question=request.question.strip(),
+                    answer=(
+                        f"I'll keep {memory_country} and "
+                        f"{memory_subject} for your next "
+                        "employment-law question."
+                    ),
+                    grounded=False,
+                    model=None,
+                    retrieval_total=0,
+                    sources=[],
+                    conversation_state=memory_state,
+                )
+
     meta_resolution = resolve_conversation_meta(
         question=request.question,
         history=request.history,
         conversation_state=request.conversation_state,
         catalog_provider=memoized_catalog_provider,
     )
+
+    # A structured legal clarification already waiting for its topic
+    # takes precedence over a generic meta interpretation of wording
+    # such as "what country are we discussing?" when the same new
+    # message also supplies a real employment-law topic.
+    if (
+        meta_resolution is not None
+        and request.conversation_state is not None
+        and request.conversation_state.pending_clarification
+        is not None
+        and (
+            request.conversation_state
+            .pending_clarification.reason
+            == "missing_topic"
+        )
+        and detect_legal_topics(request.question)
+    ):
+        meta_resolution = None
 
     if meta_resolution is not None:
         metrics.outcome = (
@@ -2659,9 +3651,24 @@ def resolve_legal_chat_response(
         )
     )
 
+    pending_legal_topic_resume = (
+        request.conversation_state is not None
+        and request.conversation_state.pending_clarification
+        is not None
+        and (
+            request.conversation_state
+            .pending_clarification.reason
+            == "missing_topic"
+        )
+        and bool(detect_legal_topics(request.question))
+    )
+
     help_intent = (
         None
-        if contextual_contact_country_codes is not None
+        if (
+            contextual_contact_country_codes is not None
+            or pending_legal_topic_resume
+        )
         else detect_assistant_help_intent(
             request.question,
             tuple(country.code for country in COUNTRIES),
@@ -2675,6 +3682,27 @@ def resolve_legal_chat_response(
         ) * 1000
         metrics.log()
 
+        help_conversation_state = request.conversation_state
+
+        if (
+            help_intent.intent_type == "comparison_guidance"
+            and len(help_intent.referenced_country_codes) >= 2
+        ):
+            help_conversation_state = ConversationState(
+                actions=[],
+                focus_action_index=None,
+                ordered_country_codes=[],
+                pending_clarification=(
+                    ConversationPendingClarification(
+                        reason="missing_topic",
+                        candidate_action_types=["comparison"],
+                        candidate_country_codes=list(
+                            help_intent.referenced_country_codes
+                        ),
+                    )
+                ),
+            )
+
         return LegalChatResponse(
             question=request.question.strip(),
             answer=build_assistant_help_answer(
@@ -2684,7 +3712,7 @@ def resolve_legal_chat_response(
             model=None,
             retrieval_total=0,
             sources=[],
-            conversation_state=request.conversation_state,
+            conversation_state=help_conversation_state,
         )
 
     try:
@@ -2832,6 +3860,19 @@ def resolve_legal_chat_response(
                 question=request.question,
                 conversation_state=previous_conversation_state,
             )
+            local_method = "local_deterministic"
+
+            if local_result is None:
+                local_result = (
+                    _try_local_parallel_multi_action_result(
+                        request=request,
+                        result=None,
+                        catalog_provider=memoized_catalog_provider,
+                    )
+                )
+                local_method = (
+                    "local_deterministic_multi_action"
+                )
 
             if local_result is None:
                 metrics.request_understanding_method = "fallback"
@@ -2859,18 +3900,31 @@ def resolve_legal_chat_response(
 
                 return response
 
-            # A bare country-only follow-up, resolved deterministically
-            # with no further OpenAI call - proceed exactly as if
-            # understanding had itself returned this result.
-            metrics.request_understanding_method = (
-                "local_deterministic"
-            )
+            # Continue through the normal resolved-plan path exactly as
+            # if semantic understanding had returned these actions.
+            metrics.request_understanding_method = local_method
             metrics.request_understanding_error = outcome.error
             result = local_result
         else:
             result = outcome.result
 
             metrics.request_understanding_method = "semantic"
+
+        choice_of_law_recovery = (
+            _try_local_choice_of_law_recovery(
+                question=request.question,
+                result=result,
+                current_country_scope=current_country_scope,
+                catalog_provider=memoized_catalog_provider,
+            )
+        )
+
+        if choice_of_law_recovery is not None:
+            result = choice_of_law_recovery
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "deterministic_choice_of_law"
+            )
 
         # The semantic classifier is probabilistic. A fresh request
         # must never ask the user to provide country/topic again when
@@ -3010,6 +4064,14 @@ def resolve_legal_chat_response(
             and current_legal_scope.is_supported
             and not hints.strong_contact_signal
             and not hints.comparison_signal
+            # This recovery is intentionally for a genuinely simple
+            # one-scope request only. A compound request containing
+            # several comma-separated tasks must stay in semantic
+            # planning; collapsing it to the single deterministic
+            # country detected from one clause can erase the other
+            # legal actions and create an invalid grounding structure.
+            and request.question.count(",") < 2
+            and " then " not in request.question.casefold()
         ):
             metrics.request_understanding_confidence = (
                 result.confidence
@@ -3106,6 +4168,21 @@ def resolve_legal_chat_response(
         )
 
         transition_started_at = perf_counter()
+
+        parallel_multi_action_result = (
+            _try_local_parallel_multi_action_result(
+                request=request,
+                result=result,
+                catalog_provider=memoized_catalog_provider,
+            )
+        )
+
+        if parallel_multi_action_result is not None:
+            result = parallel_multi_action_result
+            metrics.semantic_result_overridden = True
+            metrics.semantic_override_reason = (
+                "parallel_multi_action_recovery"
+            )
 
         transition_outcome = apply_conversation_transition(
             result=result,
@@ -3411,6 +4488,98 @@ def resolve_legal_chat_response(
             max_source_characters=max_source_characters,
             legal_answer_generation_fn=legal_answer_generation_fn,
         )
+
+        # Final product-level cleanup uses the literal user question,
+        # not a rewritten legal retrieval question.
+        #
+        # 1. Independent legal actions must never acquire an invented
+        #    Comparison section.
+        # 2. A mixed legal + weather request must explicitly refuse
+        #    only the weather fragment instead of silently dropping it.
+        final_answer = response.answer
+
+        has_comparison_action = any(
+            action.type == "comparison"
+            for action in final_result.actions
+        )
+
+        has_legal_action = any(
+            action.type in {
+                "legal_information",
+                "comparison",
+            }
+            for action in final_result.actions
+        )
+
+        if not has_comparison_action:
+            final_answer = (
+                _strip_unrequested_comparison_section(
+                    final_answer
+                )
+            )
+
+        literal_question = request.question.casefold()
+
+        # Recover unsupported jurisdictions directly from the literal
+        # current user message. The semantic plan intentionally keeps
+        # only executable/supported legal actions, so unsupported
+        # jurisdictions must be restored at the product layer rather
+        # than silently disappearing from a mixed request.
+        literal_country_scope = resolve_country_availability(
+            request=request.model_copy(
+                update={"country_codes": []}
+            ),
+            catalog_provider=memoized_catalog_provider,
+        )
+
+        if literal_country_scope.unavailable_codes:
+            unavailable_answer = _unavailable_countries_answer(
+                literal_country_scope.unavailable_codes
+            )
+
+            if (
+                unavailable_answer.casefold()
+                not in final_answer.casefold()
+            ):
+                final_answer = (
+                    final_answer.rstrip()
+                    + "\n\nNote: "
+                    + unavailable_answer
+                )
+
+        if (
+            has_legal_action
+            and re.search(
+                r"https?://\S+",
+                request.question,
+                flags=re.IGNORECASE,
+            )
+            and "external webpage" not in final_answer.casefold()
+        ):
+            final_answer = (
+                "I cannot access or rely on the external webpage "
+                "you linked. I can answer only from this chatbot's "
+                "validated L&E Global employment-law content."
+                "\n\n"
+                + final_answer.lstrip()
+            )
+
+        if (
+            has_legal_action
+            and "weather" in literal_question
+            and "weather" not in final_answer.casefold()
+        ):
+            final_answer = (
+                final_answer.rstrip()
+                + "\n\n"
+                + "The weather request is outside this assistant's "
+                  "employment-law scope."
+            )
+
+        if final_answer != response.answer:
+            response = response.model_copy(
+                update={"answer": final_answer}
+            )
 
         if requires_personalised_legal_caution(
             request.question

@@ -585,6 +585,13 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
                     "topic_text": None,
                     "resolved_question": None,
                 },
+                {
+                    "type": "contact",
+                    "country_codes": ["FR"],
+                    "legal_topics": [],
+                    "topic_text": None,
+                    "resolved_question": None,
+                },
             ],
             "is_follow_up": False,
             "confidence": 0.9,
@@ -600,7 +607,7 @@ class MalformedOrInjectedResponseResilienceTests(unittest.TestCase):
 
         response = resolve_legal_chat_response(
             request=LegalChatRequest(
-                question="Give me contacts in Peru, Spain, Australia and the UK."
+                question="Give me contacts in Peru, Spain, Australia, the UK and France."
             ),
             catalog_provider=_catalog_provider,
             document_topic_provider=_document_topic_provider,

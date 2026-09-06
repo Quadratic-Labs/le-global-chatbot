@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Final, Protocol
 
 from app.clients.openai_responses import (
@@ -49,6 +49,7 @@ from app.models.search import (
 from app.services.evidence_coverage import (
     SearchConceptLike,
     answer_mentions_concepts,
+    count_covered_concepts,
     evaluate_evidence_status,
 )
 from app.services.legal_search import (
@@ -386,6 +387,49 @@ Rules:
     requires case-specific confirmation. Do not mention extracts,
     documents, retrieval, context limits, or system limitations in
     the answer.
+30A. Never declare one jurisdiction objectively "best", "most
+    favourable", "better for employees", or equivalent merely by
+    weighing different legal protections yourself. If the user asks
+    which country is best, compare the requested objective rules and
+    explain that the validated material does not establish one
+    universal overall ranking unless an explicit common criterion in
+    the evidence supports that conclusion.
+30C. In a mixed request containing executable legal actions plus
+    unsupported jurisdictions or unrelated out-of-scope requests,
+    generate structured grounded country sections ONLY for the
+    executable legal actions represented by the supplied evidence.
+    Never create a legal country section, bullet, citation, factual
+    answer, or comparison entry for an unsupported jurisdiction or
+    unrelated request such as weather, restaurants or tax. Those
+    fragments are handled by the application layer separately. They
+    must not alter the required grounding structure of the supported
+    legal answer.
+30D. Create a "Comparison" section only when the user's current
+    request explicitly asks to compare, contrast, identify differences
+    between, or jointly evaluate jurisdictions. Several independent
+    legal-information actions in one request do NOT become a comparison.
+    For example, asking for French severance, Taiwan working hours and
+    Irish overtime requires separate country answers, not a Comparison
+    section.
+
+30E. Never state that a requested legal facet cannot be confirmed when
+    the supplied evidence directly establishes that same facet. In
+    particular, when a dedicated section or passage directly supports
+    the requested point, answer that point from the evidence instead
+    of adding a contradictory insufficiency disclaimer.
+
+30F. When a mixed request also contains a clearly unrelated non-employment
+    request, answer the valid employment-law actions and add at most one
+    short uncited plain-text sentence explaining that the unrelated part
+    is outside this assistant's employment-law scope. Do not create a
+    country heading, legal bullet, citation, comparison entry, or factual
+    answer for that unrelated part.
+
+30B. Never expose or refer to internal retrieval mechanics. Do not say
+    "supplied extracts", "materials supplied", "retrieved chunks",
+    "internal documents", "context provided", or similar wording.
+    When evidence does not support a requested point, simply state that
+    the requested point cannot be reliably confirmed.
 31. In a comparison, give every country a comparable level of
     detail: when concrete figures are available for a country, state
     them instead of describing that country only in general terms.
@@ -443,7 +487,7 @@ Rules:
     "materials", "retrieval", or "context" to explain an evidence limitation to the
     user. When one requested branch cannot be established, use plain
     user-facing wording such as "I cannot reliably confirm the rule for
-    that branch from the available L&E Global information."
+    that branch."
 """.strip()
 
 
@@ -1225,8 +1269,11 @@ def _retrieve_country_hits(
     generation_client: TextGenerationClient | None,
     rerank_enabled: bool,
     rerank_pool_multiplier: int,
+    search_concepts: Sequence[SearchConceptLike] | None = None,
+    evidence_mode: str | None = None,
     metrics: LegalChatMetrics | None = None,
     broad_overview: bool = False,
+    topic_union_search: bool = False,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve and select up to output_limit hits for one country.
@@ -1331,6 +1378,54 @@ def _retrieve_country_hits(
         )
 
     if len(normalized_topics) <= 1:
+        # A single legal-topic bucket may still contain several
+        # independently requested facets. Fetch a wider candidate pool
+        # only when the request actually carries several independent
+        # search concepts. Ordinary single-topic requests retain the
+        # original search limit and one-search behaviour.
+        if (
+            output_limit > 1
+            and search_concepts
+            and len(search_concepts) > 1
+        ):
+            candidate_output_limit = min(
+                max(
+                    output_limit * 3,
+                    MIN_CANDIDATE_LIMIT_PER_COUNTRY,
+                ),
+                MAX_RERANK_POOL_SIZE,
+            )
+
+            response = run_search(
+                _build_search_request(
+                    query=retrieval_query,
+                    request=request,
+                    country_codes=[country_code],
+                    limit=candidate_output_limit,
+                )
+            )
+
+            hits = response.hits
+
+            if rerank_enabled:
+                hits = run_rerank(hits)
+
+            return (
+                response.total,
+                hits[:candidate_output_limit],
+            )
+
+        return _broad_search()
+
+    # One requested legal facet may legitimately span more than one
+    # document topic. Search that topic union once rather than issuing
+    # one OpenSearch request per topic. This preserves the historical
+    # one-search behaviour for focused questions while still allowing
+    # the union of topic filters to retrieve the relevant chunk.
+    #
+    # True multi-facet requests keep the per-topic candidate expansion
+    # below because they carry several independent search concepts.
+    if topic_union_search:
         return _broad_search()
 
     retrieval_total = 0
@@ -1396,8 +1491,21 @@ def _retrieve_country_hits(
     if rerank_enabled:
         combined_hits = run_rerank(combined_hits)
 
+    # Search-concept prioritisation must happen BEFORE the
+    # topic-balanced pool is truncated. Otherwise a dedicated facet
+    # chunk such as "Notice Period" can be discarded in favour of a
+    # different Employment Contracts chunk before the evidence-aware
+    # selector ever sees it.
+    concept_prioritized_hits = (
+        _prioritize_country_hits_for_evidence(
+            hits=combined_hits,
+            search_concepts=search_concepts,
+            evidence_mode=evidence_mode,
+        )
+    )
+
     selected_hits = _select_topic_balanced_hits(
-        hits=combined_hits,
+        hits=concept_prioritized_hits,
         legal_topics=normalized_topics,
         limit=output_limit,
     )
@@ -1414,18 +1522,12 @@ def _prioritize_country_hits_for_evidence(
     evidence_mode: str | None,
 ) -> list[LegalSearchHit]:
     """
-    Preserve retrieval ranking unless a multi-country evidence-gated
-    request has explicit search concepts.
+    Prefer evidence-capable hits while preserving retrieval quality.
 
-    When it does, prefer candidates that can actually satisfy the
-    evidence policy before the final cross-country source budget is
-    applied. This prevents a country's first high-ranked but
-    evidence-insufficient hit from consuming its only slot while a
-    direct hit for the same country is already present immediately
-    behind it.
-
-    Stable within each evidence-status tier: original retrieval order
-    is preserved.
+    For a multi-facet request, first retain the existing evidence-tier
+    ordering, then greedily bring forward hits that cover search
+    concept groups not yet represented. Ties preserve the existing
+    ranking. No extra retrieval or model call is performed.
     """
 
     ordered_hits = list(hits)
@@ -1433,9 +1535,12 @@ def _prioritize_country_hits_for_evidence(
     if (
         not ordered_hits
         or not search_concepts
-        or evidence_mode not in ("direct_topic", "relation_required")
+        or evidence_mode
+        not in ("direct_topic", "relation_required")
     ):
         return ordered_hits
+
+    concepts = list(search_concepts)
 
     priority = {
         "direct": 0,
@@ -1450,7 +1555,7 @@ def _prioritize_country_hits_for_evidence(
             priority[
                 evaluate_evidence_status(
                     [item[1]],
-                    list(search_concepts),
+                    concepts,
                     evidence_mode,
                 )
             ],
@@ -1458,10 +1563,300 @@ def _prioritize_country_hits_for_evidence(
         )
     )
 
-    return [
+    tier_ordered_hits = [
         hit
         for _, hit in indexed_hits
     ]
+
+    # A single concept has no cross-facet diversity problem.
+    # Preserve the historical behavior exactly in that case.
+    if len(concepts) <= 1:
+        return tier_ordered_hits
+
+    coverage_by_index: list[frozenset[int]] = []
+
+    for hit in tier_ordered_hits:
+        coverage_by_index.append(
+            frozenset(
+                concept_index
+                for concept_index, concept
+                in enumerate(concepts)
+                if evaluate_evidence_status(
+                    [hit],
+                    [concept],
+                    "direct_topic",
+                )
+                == "direct"
+            )
+        )
+
+    uncovered = set(range(len(concepts)))
+    remaining = list(
+        enumerate(tier_ordered_hits)
+    )
+    selected: list[LegalSearchHit] = []
+
+    while uncovered and remaining:
+        best_position: int | None = None
+        best_gain = 0
+
+        for position, (base_index, _) in enumerate(
+            remaining
+        ):
+            gain = len(
+                coverage_by_index[base_index]
+                & uncovered
+            )
+
+            # Strictly greater only: equal gains keep the
+            # pre-existing evidence/retrieval order.
+            if gain > best_gain:
+                best_gain = gain
+                best_position = position
+
+        if best_position is None or best_gain == 0:
+            break
+
+        base_index, hit = remaining.pop(
+            best_position
+        )
+
+        selected.append(hit)
+
+        uncovered.difference_update(
+            coverage_by_index[base_index]
+        )
+
+    # Once all discoverable facets have been represented,
+    # preserve the previous ordering for every remaining hit.
+    selected.extend(
+        hit
+        for _, hit in remaining
+    )
+
+    return selected
+
+
+
+
+
+def _select_comparison_hits_for_evidence(
+    hit_groups: Sequence[Sequence[LegalSearchHit]],
+    search_concepts: Sequence[SearchConceptLike] | None,
+    evidence_mode: str | None,
+    limit: int,
+) -> list[LegalSearchHit]:
+    """
+    Select comparison evidence with a global country/concept budget.
+
+    The historical round-robin guaranteed one hit per country but gave
+    every remaining slot to countries appearing first in the request.
+    With four countries and six sources that meant countries 1 and 2
+    always received the two complementary sources, even when countries
+    3 or 4 had more important uncovered requested facets.
+
+    Keep the one-source-per-country guarantee, then spend every
+    remaining source on the country/hit that covers the greatest number
+    of that country's still-uncovered requested concepts.
+    """
+
+    groups = [
+        _deduplicate_hits(group)
+        for group in hit_groups
+    ]
+
+    if limit <= 0:
+        return []
+
+    if (
+        not search_concepts
+        or evidence_mode
+        not in ("direct_topic", "relation_required")
+    ):
+        return _interleave_hits(
+            hit_groups=groups,
+            limit=limit,
+        )
+
+    concepts = list(search_concepts)
+
+    def structural_concept_score(
+        hit: LegalSearchHit,
+        concept_indexes: set[int] | frozenset[int],
+    ) -> int:
+        """
+        Prefer a chunk whose section/subsection title directly names an
+        uncovered requested facet. This is only a tie-breaker after
+        direct evidence coverage, never a replacement for the evidence
+        gate.
+        """
+
+        title = " ".join(
+            str(value or "")
+            for value in (
+                getattr(hit, "section", None),
+                getattr(hit, "subsection", None),
+            )
+        ).casefold()
+
+        score = 0
+
+        for concept_index in concept_indexes:
+            concept = concepts[concept_index]
+
+            normalized_terms = [
+                " ".join(term.casefold().split())
+                for term in concept.terms
+                if term.strip()
+            ]
+
+            # Strong title matches for common legal facet labels.
+            if any(
+                (
+                    term in title
+                    or (
+                        "notice" in term
+                        and "notice" in title
+                    )
+                    or (
+                        "dismiss" in term
+                        and (
+                            "dismiss" in title
+                            or "termination" in title
+                        )
+                    )
+                    or (
+                        "severance" in term
+                        and "severance" in title
+                    )
+                    or (
+                        "overtime" in term
+                        and "overtime" in title
+                    )
+                )
+                for term in normalized_terms
+            ):
+                score += 1
+
+        return score
+
+    def coverage(
+        hit: LegalSearchHit,
+    ) -> frozenset[int]:
+        return frozenset(
+            index
+            for index, concept in enumerate(concepts)
+            if evaluate_evidence_status(
+                [hit],
+                [concept],
+                "direct_topic",
+            )
+            == "direct"
+        )
+
+    coverage_cache: dict[str, frozenset[int]] = {}
+
+    def hit_coverage(
+        hit: LegalSearchHit,
+    ) -> frozenset[int]:
+        if hit.chunk_id not in coverage_cache:
+            coverage_cache[hit.chunk_id] = coverage(hit)
+
+        return coverage_cache[hit.chunk_id]
+
+    selected: list[LegalSearchHit] = []
+    selected_ids: set[str] = set()
+
+    uncovered_by_group = {
+        index: set(range(len(concepts)))
+        for index in range(len(groups))
+    }
+
+    # First guarantee representation of every requested country.
+    for group_index, group in enumerate(groups):
+        if len(selected) >= limit:
+            break
+
+        candidates = [
+            hit
+            for hit in group
+            if hit.chunk_id not in selected_ids
+        ]
+
+        if not candidates:
+            continue
+
+        best_hit = max(
+            enumerate(candidates),
+            key=lambda item: (
+                len(hit_coverage(item[1])),
+                structural_concept_score(
+                    item[1],
+                    hit_coverage(item[1]),
+                ),
+                -item[0],
+            ),
+        )[1]
+
+        selected.append(best_hit)
+        selected_ids.add(best_hit.chunk_id)
+
+        uncovered_by_group[group_index].difference_update(
+            hit_coverage(best_hit)
+        )
+
+    # Spend remaining slots where they improve concept coverage most.
+    while len(selected) < limit:
+        best_candidate = None
+        best_score = None
+
+        for group_index, group in enumerate(groups):
+            for rank, hit in enumerate(group):
+                if hit.chunk_id in selected_ids:
+                    continue
+
+                gained_concepts = (
+                    hit_coverage(hit)
+                    & uncovered_by_group[group_index]
+                )
+
+                gain = len(gained_concepts)
+
+                score = (
+                    gain,
+                    structural_concept_score(
+                        hit,
+                        gained_concepts,
+                    ),
+                    -rank,
+                    -group_index,
+                )
+
+                if (
+                    best_score is None
+                    or score > best_score
+                ):
+                    best_score = score
+                    best_candidate = (
+                        group_index,
+                        hit,
+                    )
+
+        if best_candidate is None:
+            break
+
+        group_index, hit = best_candidate
+
+        selected.append(hit)
+        selected_ids.add(hit.chunk_id)
+
+        uncovered_by_group[group_index].difference_update(
+            hit_coverage(hit)
+        )
+
+    return selected
+
+
 
 
 def _retrieve_search_hits(
@@ -1474,6 +1869,7 @@ def _retrieve_search_hits(
     search_concepts: Sequence[SearchConceptLike] | None = None,
     broad_overview: bool = False,
     evidence_mode: str | None = None,
+    topic_union_search: bool = False,
 ) -> tuple[int, list[LegalSearchHit]]:
     """
     Retrieve legal chunks.
@@ -1559,8 +1955,11 @@ def _retrieve_search_hits(
             generation_client=generation_client,
             rerank_enabled=rerank_enabled,
             rerank_pool_multiplier=rerank_pool_multiplier,
+            search_concepts=search_concepts,
+            evidence_mode=evidence_mode,
             metrics=metrics,
             broad_overview=broad_overview,
+            topic_union_search=topic_union_search,
         )
 
         return (
@@ -1603,7 +2002,10 @@ def _retrieve_search_hits(
             generation_client=generation_client,
             rerank_enabled=rerank_enabled,
             rerank_pool_multiplier=rerank_pool_multiplier,
+            search_concepts=search_concepts,
+            evidence_mode=evidence_mode,
             metrics=metrics,
+            topic_union_search=topic_union_search,
         )
 
         retrieval_total += (
@@ -1620,8 +2022,10 @@ def _retrieve_search_hits(
 
     return (
         retrieval_total,
-        _interleave_hits(
+        _select_comparison_hits_for_evidence(
             hit_groups=country_hit_groups,
+            search_concepts=search_concepts,
+            evidence_mode=evidence_mode,
             limit=request.max_sources,
         ),
     )
@@ -1706,7 +2110,22 @@ def _allocate_country_context_budgets(
                 len(country_hits) - position
             )
 
-            if position == 0:
+            # Preserve the historical preference for the best-ranked
+            # source when the country has enough context budget.
+            #
+            # When the whole country budget fits inside one source cap,
+            # however, giving all of it to the first hit would erase
+            # every complementary hit already selected for that country.
+            # In that narrow case, share the same country budget across
+            # its selected hits instead. Total context size is unchanged.
+            if (
+                position == 0
+                and (
+                    len(country_hits) == 1
+                    or country_budget
+                    > maximum_source_characters
+                )
+            ):
                 source_budget = min(
                     maximum_source_characters,
                     remaining_budget,
@@ -2624,6 +3043,7 @@ def _validate_no_repetition(
 
 
 FORBIDDEN_INTERNAL_PHRASES: Final[tuple[str, ...]] = (
+    "available l&e global information",
     "provided extracts",
     "supplied extracts",
     "available extracts",
@@ -3057,7 +3477,8 @@ _CHOICE_OF_LAW_RELATION_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"choice\s+of\s+law|"
     r"applicable\s+(?:employment\s+)?law|"
     r"governing\s+(?:employment\s+)?law|"
-    r"(?:employment\s+)?law\s+(?:applies|governs)|"
+    r"(?:employment\s+)?law\s+"
+    r"(?:automatically\s+)?(?:applies|governs)|"
     r"governed\s+by\s+(?:.+?\s+)?law|"
     r"foreign\s+employment\s+law|"
     r"mandatory\s+(?:employment\s+)?law|"
@@ -3175,6 +3596,25 @@ def _validate_partial_answer_relevance(
                 ):
                     continue
 
+                # For a choice-of-law question, once the answer has
+                # admitted that the governing law cannot be confirmed,
+                # a later bullet must itself discuss which law
+                # governs/applies. Generic overlap such as "place of
+                # work" must not make an adjacent domestic rule look
+                # relevant to the actual conflict-of-laws question.
+                return [
+                    QualityError(
+                        error_type="subject_drift",
+                        message=(
+                            "After stating that the applicable "
+                            "employment law cannot be reliably "
+                            "confirmed, keep only material that "
+                            "directly addresses which law governs "
+                            "or applies."
+                        ),
+                    )
+                ]
+
             if _bullet_matches_search_concepts(
                 bullet=bullet,
                 search_concepts=search_concepts,
@@ -3197,6 +3637,804 @@ def _validate_partial_answer_relevance(
 
     return []
 
+
+
+
+
+def _trim_post_limitation_subject_drift(
+    *,
+    answer: str,
+    search_concepts: Sequence[SearchConceptLike],
+    evidence_mode: str,
+    country_codes: Sequence[str],
+) -> str:
+    """
+    Deterministic last-resort cleanup for one narrow quality defect.
+
+    This function is called only after normal generation, validation,
+    one OpenAI repair attempt, and a remaining subject_drift warning.
+
+    For a single-country answer, once the first bullet explicitly says
+    that the exact requested proposition cannot be reliably confirmed,
+    the answer stops there. Later bullets are removed rather than
+    filling the response with adjacent/background legal rules.
+
+    No legal wording is invented or rewritten here. Existing grounded
+    text is only removed.
+    """
+
+    normalized_codes = _normalize_country_codes(country_codes)
+
+    if (
+        not normalized_codes
+        or not search_concepts
+    ):
+        return answer
+
+    requested_codes = set(normalized_codes)
+    choice_of_law_subject = _is_choice_of_law_subject(
+        search_concepts
+    )
+    sections = _parse_country_sections(answer)
+
+    if not sections:
+        return answer
+
+    changed = False
+    rebuilt_sections: list[str] = []
+
+    relevant_country_sections = []
+
+    if choice_of_law_subject:
+        for candidate_section in sections:
+            if (
+                candidate_section.kind != "country"
+                or not candidate_section.bullets
+            ):
+                continue
+
+            candidate_code = _resolve_section_country_code(
+                section_title=candidate_section.title,
+                requested_country_codes=country_codes,
+            )
+
+            if candidate_code in requested_codes:
+                relevant_country_sections.append(
+                    candidate_section
+                )
+
+    all_choice_of_law_country_sections_limited = bool(
+        choice_of_law_subject
+        and relevant_country_sections
+        and all(
+            _LIMITATION_BULLET_PATTERN.search(
+                candidate_section.bullets[0]
+            )
+            for candidate_section
+            in relevant_country_sections
+        )
+    )
+
+    for section in sections:
+        bullets = list(section.bullets)
+
+        if (
+            section.kind == "country"
+            and bullets
+        ):
+            section_code = _resolve_section_country_code(
+                section_title=section.title,
+                requested_country_codes=country_codes,
+            )
+
+            if (
+                section_code in requested_codes
+                and _LIMITATION_BULLET_PATTERN.search(
+                    bullets[0]
+                )
+                and len(bullets) > 1
+            ):
+                bullets = bullets[:1]
+                changed = True
+
+        if (
+            choice_of_law_subject
+            and section.kind == "comparison"
+            and all_choice_of_law_country_sections_limited
+        ):
+            # The country sections already contain the strongest
+            # grounded conclusion available: governing law cannot be
+            # confirmed. A comparison section made only from adjacent
+            # domestic rules cannot improve that answer.
+            changed = True
+            continue
+
+        if (
+            choice_of_law_subject
+            and section.kind == "comparison"
+            and bullets
+        ):
+            directly_relevant_bullets = [
+                bullet
+                for bullet in bullets
+                if _CHOICE_OF_LAW_RELATION_PATTERN.search(
+                    bullet
+                )
+            ]
+
+            if (
+                directly_relevant_bullets
+                and len(directly_relevant_bullets) < len(bullets)
+            ):
+                bullets = directly_relevant_bullets
+                changed = True
+
+        section_lines = [section.title]
+
+        section_lines.extend(
+            f"- {bullet}"
+            for bullet in bullets
+        )
+
+        rebuilt_sections.append(
+            "\n".join(section_lines)
+        )
+
+    if not changed:
+        return answer
+
+    return "\n\n".join(rebuilt_sections).strip()
+
+
+def _choice_of_law_limitation_directly_addresses_subject(
+    *,
+    answer: str,
+    search_concepts: Sequence[SearchConceptLike],
+    country_codes: Sequence[str],
+) -> bool:
+    """
+    True only when every requested country section directly states a
+    choice-of-law limitation.
+
+    This permits deterministic post-limitation trimming to be accepted
+    without treating the resulting short answer as generic subject
+    drift. No legal proposition is added or rewritten.
+    """
+
+    if not _is_choice_of_law_subject(search_concepts):
+        return False
+
+    requested_codes = set(
+        _normalize_country_codes(country_codes)
+    )
+
+    if not requested_codes:
+        return False
+
+    directly_addressed_codes: set[str] = set()
+
+    for section in _parse_country_sections(answer):
+        if (
+            section.kind != "country"
+            or not section.bullets
+        ):
+            continue
+
+        section_code = _resolve_section_country_code(
+            section_title=section.title,
+            requested_country_codes=country_codes,
+        )
+
+        if section_code not in requested_codes:
+            continue
+
+        first_bullet = section.bullets[0]
+
+        if (
+            _LIMITATION_BULLET_PATTERN.search(first_bullet)
+            and _CHOICE_OF_LAW_RELATION_PATTERN.search(
+                first_bullet
+            )
+        ):
+            directly_addressed_codes.add(section_code)
+
+    return requested_codes <= directly_addressed_codes
+
+
+_PRECISE_SERVICE_NOTICE_YEARS_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"(?:"
+    r"\b(?P<years_before>\d{1,2})\s+years?\s+"
+    r"(?:of\s+)?(?:service|seniority)\b"
+    r"|"
+    r"\b(?:service|seniority)\s+(?:of\s+)?"
+    r"(?P<years_after>\d{1,2})\s+years?\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+_NOTICE_CALCULABLE_FORMULA_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"(?:"
+    r"\b(?:per|for\s+each|for\s+every)\s+"
+    r"(?:full\s+)?year\b"
+    r"|"
+    r"\b(?:week|weeks|month|months)\b.{0,30}"
+    r"\b(?:per|for\s+each|for\s+every)\b.{0,15}\byear\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+_NOTICE_SERVICE_DEPENDENCY_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"(?:"
+    r"\bnotice\b.{0,100}\b(?:service|seniority)\b"
+    r"|"
+    r"\b(?:service|seniority)\b.{0,100}\bnotice\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+_NOTICE_RANGE_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\b(?:"
+    r"ranging|ranges|range|"
+    r"less\s+than|more\s+than|"
+    r"up\s+to|over|under|"
+    r"from"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _precise_service_notice_value_not_explicitly_supported(
+    *,
+    spec: LegalActionEvidenceSpec,
+    hits: Sequence[LegalSearchHit],
+) -> bool:
+    """
+    Determine whether the selected evidence can actually resolve a
+    precise seniority-based notice-period question.
+
+    Evidence is sufficient when at least one of these exists:
+
+    1. An explicit mapping for the requested seniority.
+       Example: 8 years -> 3 months.
+
+    2. An applicable seniority bracket/range.
+       Example: less than 20 years -> 3 months.
+       Example: 5 to 10 years -> 3 months.
+
+    3. A calculable formula.
+       Example: one week for each full year of service.
+
+    Merely discussing notice periods, seniority or dismissal is not
+    enough. If none of the applicable rules above exists, an explicit
+    limitation is legitimate and no value may be invented.
+    """
+
+    concepts = list(spec.search_concepts or [])
+
+    subject = " ".join(
+        part
+        for part in (
+            spec.subject_text or "",
+            *(
+                term
+                for concept in concepts
+                for term in _search_concept_terms(concept)
+            ),
+        )
+        if part
+    )
+
+    if not re.search(
+        r"\bnotice(?:\s+period)?\b",
+        subject,
+        re.IGNORECASE,
+    ):
+        return False
+
+    number_words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "thirteen": 13,
+        "fourteen": 14,
+        "fifteen": 15,
+        "sixteen": 16,
+        "seventeen": 17,
+        "eighteen": 18,
+        "nineteen": 19,
+        "twenty": 20,
+    }
+
+    reverse_number_words = {
+        value: key
+        for key, value in number_words.items()
+    }
+
+    number_token = (
+        r"(?:\d{1,2}|"
+        r"one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+        r"seventeen|eighteen|nineteen|twenty)"
+    )
+
+    def parse_year_value(raw: str) -> int | None:
+        value = raw.casefold().strip()
+
+        if value.isdigit():
+            return int(value)
+
+        return number_words.get(value)
+
+    requested_match = re.search(
+        rf"\b({number_token})\s+years?\b",
+        subject,
+        re.IGNORECASE,
+    )
+
+    if requested_match is None:
+        return False
+
+    requested_years = parse_year_value(
+        requested_match.group(1)
+    )
+
+    if requested_years is None:
+        return False
+
+    requested_codes = set(
+        _normalize_country_codes(
+            spec.country_codes
+        )
+    )
+
+    country_hits = [
+        hit
+        for hit in hits
+        if hit.country_code in requested_codes
+    ]
+
+    if not country_hits:
+        return True
+
+    def is_notice_hit(
+        hit: LegalSearchHit,
+    ) -> bool:
+        searchable = " ".join(
+            (
+                str(getattr(hit, "section", "") or ""),
+                str(getattr(hit, "subsection", "") or ""),
+                hit.content,
+            )
+        )
+
+        return bool(
+            re.search(
+                r"\bnotice\b",
+                searchable,
+                re.IGNORECASE,
+            )
+        )
+
+    notice_hits = [
+        hit
+        for hit in country_hits
+        if is_notice_hit(hit)
+    ]
+
+    if not notice_hits:
+        return True
+
+    # ---------------------------------------------------------
+    # 1. CALCULABLE FORMULA
+    # ---------------------------------------------------------
+
+    if any(
+        _NOTICE_CALCULABLE_FORMULA_PATTERN.search(
+            hit.content
+        )
+        for hit in notice_hits
+    ):
+        return False
+
+    duration_pattern = re.compile(
+        r"\b(?:"
+        r"\d+(?:\.\d+)?|"
+        r"one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve"
+        r")\s+"
+        r"(?:calendar\s+)?"
+        r"(?:days?|weeks?|months?)\b",
+        re.IGNORECASE,
+    )
+
+    requested_variants = [
+        re.escape(str(requested_years))
+    ]
+
+    requested_word = reverse_number_words.get(
+        requested_years
+    )
+
+    if requested_word:
+        requested_variants.append(
+            re.escape(requested_word)
+        )
+
+    exact_requested_year_pattern = re.compile(
+        rf"\b(?:{'|'.join(requested_variants)})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    between_pattern = re.compile(
+        rf"\b(?:between|from)\s+"
+        rf"({number_token})\s+"
+        rf"(?:and|to)\s+"
+        rf"({number_token})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    dash_range_pattern = re.compile(
+        rf"\b({number_token})\s*"
+        rf"(?:-|–|—|to)\s*"
+        rf"({number_token})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    less_than_pattern = re.compile(
+        rf"\b(?:less\s+than|under|below|fewer\s+than)\s+"
+        rf"({number_token})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    at_most_pattern = re.compile(
+        rf"\b(?:up\s+to|at\s+most|no\s+more\s+than)\s+"
+        rf"({number_token})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    more_than_pattern = re.compile(
+        rf"\b(?:more\s+than|over|above)\s+"
+        rf"({number_token})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    at_least_pattern = re.compile(
+        rf"\b(?:at\s+least|not\s+less\s+than)\s+"
+        rf"({number_token})\s+years?\b",
+        re.IGNORECASE,
+    )
+
+    or_more_pattern = re.compile(
+        rf"\b({number_token})\s+years?\s+"
+        rf"(?:or\s+more|and\s+above)\b",
+        re.IGNORECASE,
+    )
+
+    or_less_pattern = re.compile(
+        rf"\b({number_token})\s+years?\s+"
+        rf"(?:or\s+less|and\s+below)\b",
+        re.IGNORECASE,
+    )
+
+    def range_applies(
+        unit: str,
+    ) -> bool:
+        for match in between_pattern.finditer(unit):
+            low = parse_year_value(match.group(1))
+            high = parse_year_value(match.group(2))
+
+            if (
+                low is not None
+                and high is not None
+                and low <= requested_years <= high
+            ):
+                return True
+
+        for match in dash_range_pattern.finditer(unit):
+            low = parse_year_value(match.group(1))
+            high = parse_year_value(match.group(2))
+
+            if (
+                low is not None
+                and high is not None
+                and low <= requested_years <= high
+            ):
+                return True
+
+        for match in less_than_pattern.finditer(unit):
+            limit = parse_year_value(match.group(1))
+
+            if (
+                limit is not None
+                and requested_years < limit
+            ):
+                return True
+
+        for match in at_most_pattern.finditer(unit):
+            limit = parse_year_value(match.group(1))
+
+            if (
+                limit is not None
+                and requested_years <= limit
+            ):
+                return True
+
+        for match in more_than_pattern.finditer(unit):
+            limit = parse_year_value(match.group(1))
+
+            if (
+                limit is not None
+                and requested_years > limit
+            ):
+                return True
+
+        for match in at_least_pattern.finditer(unit):
+            limit = parse_year_value(match.group(1))
+
+            if (
+                limit is not None
+                and requested_years >= limit
+            ):
+                return True
+
+        for match in or_more_pattern.finditer(unit):
+            limit = parse_year_value(match.group(1))
+
+            if (
+                limit is not None
+                and requested_years >= limit
+            ):
+                return True
+
+        for match in or_less_pattern.finditer(unit):
+            limit = parse_year_value(match.group(1))
+
+            if (
+                limit is not None
+                and requested_years <= limit
+            ):
+                return True
+
+        return False
+
+    for hit in notice_hits:
+        title = " ".join(
+            (
+                str(getattr(hit, "section", "") or ""),
+                str(getattr(hit, "subsection", "") or ""),
+            )
+        )
+
+        title_is_notice = bool(
+            re.search(
+                r"\bnotice\b",
+                title,
+                re.IGNORECASE,
+            )
+        )
+
+        units = [
+            unit.strip()
+            for unit in re.split(
+                r"(?<=[.!?;])\s+|[\r\n]+",
+                hit.content,
+            )
+            if unit.strip()
+        ]
+
+        for unit in units:
+            has_duration = bool(
+                duration_pattern.search(unit)
+            )
+
+            if not has_duration:
+                continue
+
+            notice_context = (
+                title_is_notice
+                or bool(
+                    re.search(
+                        r"\bnotice\b",
+                        unit,
+                        re.IGNORECASE,
+                    )
+                )
+            )
+
+            if not notice_context:
+                continue
+
+            # -------------------------------------------------
+            # 2. EXACT SENIORITY -> NOTICE DURATION
+            # -------------------------------------------------
+
+            if exact_requested_year_pattern.search(unit):
+                return False
+
+            # -------------------------------------------------
+            # 3. APPLICABLE SENIORITY RANGE -> DURATION
+            # -------------------------------------------------
+
+            if range_applies(unit):
+                return False
+
+    # The selected evidence may discuss notice periods or seniority,
+    # but it does not establish a duration applicable to the precise
+    # seniority requested. Do not invent or interpolate a value.
+    return True
+
+
+def _validate_no_false_evidence_insufficiency(
+    *,
+    answer: str,
+    specs: Sequence[LegalActionEvidenceSpec],
+    hits: Sequence[LegalSearchHit],
+) -> list[QualityError]:
+    """
+    Reject an insufficiency disclaimer when every explicitly requested
+    concept for a spec has direct evidence for every requested country.
+
+    Reuses the existing retryable `subject_drift` soft-error class so
+    this quality defect gets one normal repair attempt without changing
+    the validator taxonomy or retry policy.
+    """
+
+    normalized_answer = " ".join(
+        answer.casefold().split()
+    )
+
+    uncertainty_phrases = (
+        "cannot reliably confirm",
+        "cannot confirm",
+        "does not specify",
+        "do not specify",
+        "not enough information",
+        "insufficient information",
+    )
+
+    if not any(
+        phrase in normalized_answer
+        for phrase in uncertainty_phrases
+    ):
+        return []
+
+    for spec in specs:
+        concepts = list(
+            spec.search_concepts or []
+        )
+
+        country_codes = _normalize_country_codes(
+            spec.country_codes
+        )
+
+        if not concepts or not country_codes:
+            continue
+
+        # Evidence may be direct for the broad notice-period concept
+        # while still omitting the exact seniority tier requested by
+        # the user. In that narrow case, an explicit limitation is not
+        # a false insufficiency claim.
+        if _precise_service_notice_value_not_explicitly_supported(
+            spec=spec,
+            hits=hits,
+        ):
+            continue
+
+        fully_direct = True
+
+        for code in country_codes:
+            country_hits = [
+                hit
+                for hit in hits
+                if hit.country_code == code
+            ]
+
+            if not country_hits:
+                fully_direct = False
+                break
+
+            for concept in concepts:
+                def hit_directly_supports_concept(
+                    hit: LegalSearchHit,
+                ) -> bool:
+                    if (
+                        evaluate_evidence_status(
+                            [hit],
+                            [concept],
+                            "direct_topic",
+                        )
+                        == "direct"
+                    ):
+                        return True
+
+                    # A dedicated section/subsection title is itself a
+                    # strong structural signal for the requested facet.
+                    # This prevents a false "cannot confirm" disclaimer
+                    # when retrieval selected e.g. "Notice Period" but
+                    # the lexical evidence matcher missed the wording.
+                    title = " ".join(
+                        str(value or "")
+                        for value in (
+                            getattr(hit, "section", None),
+                            getattr(hit, "subsection", None),
+                        )
+                    ).casefold()
+
+                    terms = [
+                        " ".join(term.casefold().split())
+                        for term in concept.terms
+                        if term.strip()
+                    ]
+
+                    return any(
+                        (
+                            term in title
+                            or (
+                                "notice" in term
+                                and "notice" in title
+                            )
+                            or (
+                                "dismiss" in term
+                                and (
+                                    "dismiss" in title
+                                    or "termination" in title
+                                )
+                            )
+                            or (
+                                "overtime" in term
+                                and "overtime" in title
+                            )
+                            or (
+                                "severance" in term
+                                and "severance" in title
+                            )
+                        )
+                        for term in terms
+                    )
+
+                if not any(
+                    hit_directly_supports_concept(hit)
+                    for hit in country_hits
+                ):
+                    fully_direct = False
+                    break
+
+            if not fully_direct:
+                break
+
+        if fully_direct:
+            return [
+                QualityError(
+                    error_type="subject_drift",
+                    message=(
+                        "The answer claims that requested evidence "
+                        "cannot be confirmed even though every "
+                        "requested concept has direct evidence."
+                    ),
+                )
+            ]
+
+    return []
 
 
 def _validate_no_subject_drift(
@@ -3590,20 +4828,128 @@ def _last_assistant_answer(
     return None
 
 
+_ONLY_NUMBERS_FOLLOWUP_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"^\s*"
+    r"(?:now\s+)?"
+    r"(?:please\s+)?"
+    r"(?:"
+    r"(?:give|show|list|provide|repeat)\s+"
+    r"(?:me\s+)?"
+    r")?"
+    r"(?:"
+    r"only\s+(?:the\s+)?numbers|"
+    r"(?:the\s+)?numbers\s+only"
+    r")"
+    r"\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+_FORMAT_ONLY_CITATION_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"\[(?:\d+(?:\s*,\s*\d+)*)\]"
+)
+
+
+_FORMAT_ONLY_NUMBER_PATTERN: Final[
+    re.Pattern[str]
+] = re.compile(
+    r"(?<![\w])"
+    r"\d+(?:[.,]\d+)?"
+    r"(?:\s*[:/]\s*\d+(?:[.,]\d+)?)?"
+    r"%?"
+    r"(?![\w])"
+)
+
+
+def _format_only_numeric_tokens(
+    text: str,
+) -> list[str]:
+    """
+    Extract visible numeric values while ignoring citation numbers.
+
+    Order is preserved and duplicates are collapsed. Ratios such as
+    1:1 remain one value.
+    """
+
+    without_citations = _FORMAT_ONLY_CITATION_PATTERN.sub(
+        "",
+        text,
+    )
+
+    values: list[str] = []
+
+    for match in _FORMAT_ONLY_NUMBER_PATTERN.finditer(
+        without_citations
+    ):
+        value = re.sub(
+            r"\s+",
+            "",
+            match.group(0),
+        )
+
+        if value not in values:
+            values.append(value)
+
+    return values
+
+
 def _build_challenge_context_block(
     *,
     request: LegalChatRequest,
     current_user_question: str,
 ) -> str | None:
-    if not _CHALLENGE_MESSAGE_PATTERN.fullmatch(
-        current_user_question.strip()
-    ):
+    is_challenge = bool(
+        _CHALLENGE_MESSAGE_PATTERN.fullmatch(
+            current_user_question.strip()
+        )
+    )
+
+    is_only_numbers = bool(
+        _ONLY_NUMBERS_FOLLOWUP_PATTERN.fullmatch(
+            current_user_question.strip()
+        )
+    )
+
+    if not (is_challenge or is_only_numbers):
         return None
 
     previous_answer = _last_assistant_answer(request)
 
     if previous_answer is None:
         return None
+
+    if is_only_numbers:
+        allowed_numbers = _format_only_numeric_tokens(
+            previous_answer
+        )
+
+        return "\n".join(
+            [
+                (
+                    "PREVIOUS ASSISTANT ANSWER — CONVERSATIONAL "
+                    "CONTEXT ONLY, NOT A LEGAL SOURCE"
+                ),
+                previous_answer[:3000],
+                "",
+                "FORMAT-ONLY FOLLOW-UP",
+                (
+                    "The user is asking only to reformat the previous "
+                    "answer, not to expand it. Return only numeric "
+                    "values that already appeared in the previous "
+                    "assistant answer. Do not introduce any additional "
+                    "number, percentage, ratio, date or quantity from "
+                    "the retrieved legal material."
+                ),
+                (
+                    "Allowed numeric values: "
+                    + ", ".join(allowed_numbers)
+                ),
+            ]
+        )
 
     return "\n".join(
         [
@@ -3763,6 +5109,82 @@ def _validate_challenge_certainty_stability(
     return []
 
 
+def _validate_format_only_numeric_stability(
+    *,
+    current_user_question: str,
+    previous_assistant_answer: str | None,
+    answer: str,
+) -> list[QualityError]:
+    """
+    A formatting-only numeric follow-up must preserve exactly the
+    numeric value set of the previous answer.
+
+    Retrieved evidence may verify those values but may not add a new
+    value that the user did not ask to introduce.
+    """
+
+    if not _ONLY_NUMBERS_FOLLOWUP_PATTERN.fullmatch(
+        current_user_question.strip()
+    ):
+        return []
+
+    if not previous_assistant_answer:
+        return []
+
+    expected = _format_only_numeric_tokens(
+        previous_assistant_answer
+    )
+
+    actual = _format_only_numeric_tokens(
+        answer
+    )
+
+    if set(actual) == set(expected):
+        return []
+
+    unexpected = [
+        value
+        for value in actual
+        if value not in expected
+    ]
+
+    missing = [
+        value
+        for value in expected
+        if value not in actual
+    ]
+
+    details: list[str] = []
+
+    if unexpected:
+        details.append(
+            "remove newly introduced values: "
+            + ", ".join(unexpected)
+        )
+
+    if missing:
+        details.append(
+            "restore values from the previous answer: "
+            + ", ".join(missing)
+        )
+
+    return [
+        QualityError(
+            error_type="subject_drift",
+            message=(
+                "This is a formatting-only follow-up. "
+                "The numeric values must match the previous "
+                "assistant answer exactly. Allowed values: "
+                + ", ".join(expected)
+                + ". "
+                + "; ".join(details)
+                + ". Do not add numeric values from retrieved "
+                "background material."
+            ),
+        )
+    ]
+
+
 def _build_model_input(
     request: LegalChatRequest,
     hits: list[LegalSearchHit],
@@ -3877,6 +5299,16 @@ def _collapse_duplicate_citation_match(
     return bracket + punctuation
 
 
+
+_MIXED_SCOPE_REPAIR_GUARD: Final[str] = """
+For a mixed request, repair only the supported grounded legal
+country sections. Do not create headings or factual bullets for
+unsupported jurisdictions or unrelated out-of-scope fragments.
+Never use such fragments to satisfy the required country/citation
+structure.
+"""
+
+
 def _deduplicate_adjacent_citations(
     answer: str,
 ) -> str:
@@ -3946,6 +5378,20 @@ def sanitize_user_facing_legal_answer(
         flags=re.IGNORECASE,
     )
 
+    # Also normalize qualified container wording such as
+    # "supplied French and German extracts". The country/adjective
+    # qualifiers previously prevented the simpler container pattern
+    # above from matching.
+    sanitized = re.sub(
+        r"\b(?:the\s+)?"
+        r"(?:provided|supplied|retrieved|cited|available)\s+"
+        r"(?:[A-Za-zÀ-ÖØ-öø-ÿ&'’.-]+\s+){1,6}"
+        r"(?:extracts?|documents?|materials?|sources?)\b",
+        "the available L&E Global information",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
     # "these extracts/documents/..." is likewise an internal reference.
     sanitized = re.sub(
         r"\bthese\s+"
@@ -3963,6 +5409,7 @@ def sanitize_user_facing_legal_answer(
         r"\bthe\s+"
         r"(?:sources?|extracts?|documents?|materials?)\s+"
         r"(?:do|does)\s+not\s+"
+        r"(?:themselves\s+)?"
         r"(establish|support|contain|provide|show|indicate|address|"
         r"specify|confirm)\b",
         lambda m: (
@@ -4015,6 +5462,75 @@ def sanitize_user_facing_legal_answer(
             sanitized,
             flags=re.IGNORECASE,
         )
+
+    # Final user-facing normalization: a legal limitation should
+    # describe what can or cannot be confirmed, never the chatbot's
+    # evidence container. Earlier normalization steps may temporarily
+    # produce "the available L&E Global information"; remove that
+    # implementation-facing wording before the answer leaves this
+    # helper.
+    sanitized = re.sub(
+        r"\s+from\s+the\s+available\s+L&E\s+Global\s+information\b",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    sanitized = re.sub(
+        r"\bthe\s+available\s+L&E\s+Global\s+information\s+"
+        r"does\s+not\s+"
+        r"(?:establish|support|contain|provide|show|indicate|"
+        r"address|specify|confirm)\s+",
+        "the applicable legal rule does not establish ",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    sanitized = re.sub(
+        r"\bthe\s+available\s+L&E\s+Global\s+information\s+"
+        r"is\s+(?:insufficient|incomplete|limited)\b",
+        "the exact rule cannot be reliably confirmed",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    sanitized = re.sub(
+        r"\bthe\s+applicable\s+legal\s+rule\s+does\s+not\s+"
+        r"(?:establish|state|specify|confirm)\s+"
+        r"(whether|which|what|if)\b",
+        lambda match: (
+            "It cannot be reliably confirmed "
+            + match.group(1)
+        ),
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # A source-container limitation already normalized above may
+    # temporarily read "the applicable legal rule does not establish
+    # X". Convert that mechanically-created phrase into natural
+    # user-facing uncertainty without changing the legal proposition.
+    sanitized = re.sub(
+        r"\bthe\s+applicable\s+legal\s+rule\s+does\s+not\s+"
+        r"(?:establish|support|specify|confirm|state)\s+"
+        r"(?P<object>the\s+[^.;\n\[]+)",
+        lambda match: (
+            match.group("object").strip()
+            + " cannot be reliably confirmed"
+        ),
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Last-resort cleanup for an unexpected grammatical construction.
+    # This changes no legal proposition; it only removes the internal
+    # product/source label.
+    sanitized = re.sub(
+        r"\bthe\s+available\s+L&E\s+Global\s+information\b",
+        "the applicable legal rule",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
 
     return sanitized
 
@@ -4169,6 +5685,113 @@ class _PreparedGeneration:
     insufficient_evidence_answer_parts: list[str]
 
 
+def _allocate_action_source_budgets(
+    specs: Sequence[LegalActionEvidenceSpec],
+    max_sources: int,
+) -> list[int]:
+    """
+    Allocate one global source budget across independent legal actions.
+
+    Each requested country needs at least one source. When an action
+    explicitly requests several independent concepts, additional
+    capacity is proportional to country_count * concept_count so that
+    e.g. a DE/ES comparison asking for grounds + notice can retrieve
+    four complementary sources while a separate one-country overtime
+    action needs only one.
+
+    The returned budgets never exceed max_sources in total.
+    """
+
+    if not specs:
+        return []
+
+    # Source-budget sharing is necessary only when several independent
+    # legal actions compete for the request's global source allowance.
+    #
+    # A single action must preserve the caller's full max_sources
+    # budget. Reducing it to its minimum country/concept requirement
+    # changes historical retrieval semantics and can discard sources
+    # that the generated answer legitimately cites.
+    if len(specs) == 1:
+        return [max(1, max_sources)]
+
+    total_budget = max(1, max_sources)
+
+    desired: list[int] = []
+
+    for spec in specs:
+        country_count = max(
+            1,
+            len(_normalize_country_codes(spec.country_codes)),
+        )
+
+        concept_count = max(
+            1,
+            len(spec.search_concepts or []),
+        )
+
+        desired.append(
+            max(
+                country_count,
+                country_count * concept_count,
+            )
+        )
+
+    # Give every action enough capacity for its countries first.
+    budgets = [
+        min(
+            desired[index],
+            max(
+                1,
+                len(
+                    _normalize_country_codes(
+                        spec.country_codes
+                    )
+                ),
+            ),
+        )
+        for index, spec in enumerate(specs)
+    ]
+
+    # If even the mandatory country representation exceeds the budget,
+    # degrade conservatively in action order without ever exceeding it.
+    if sum(budgets) > total_budget:
+        remaining = total_budget
+        reduced: list[int] = []
+
+        for _ in specs:
+            if remaining <= 0:
+                reduced.append(0)
+            else:
+                reduced.append(1)
+                remaining -= 1
+
+        return reduced
+
+    remaining = total_budget - sum(budgets)
+
+    # Add complementary evidence only where an action actually has
+    # unresolved requested concept/country slots.
+    while remaining > 0:
+        progressed = False
+
+        for index in range(len(specs)):
+            if remaining <= 0:
+                break
+
+            if budgets[index] >= desired[index]:
+                continue
+
+            budgets[index] += 1
+            remaining -= 1
+            progressed = True
+
+        if not progressed:
+            break
+
+    return budgets
+
+
 def _prepare_grounded_generation(
     request: LegalChatRequest,
     search_function: SearchFunction,
@@ -4201,6 +5824,8 @@ def _prepare_grounded_generation(
     search_concepts/evidence_mode/action_specs/known_excluded_country_codes
     mean - unchanged here.
     """
+
+    routed_action_specs = bool(action_specs)
 
     specs = (
         list(action_specs)
@@ -4261,13 +5886,73 @@ def _prepare_grounded_generation(
     retrieval_total = 0
     hits_by_spec: list[list[LegalSearchHit]] = []
 
-    for spec in specs:
+    spec_source_budgets = _allocate_action_source_budgets(
+        specs=specs,
+        max_sources=request.max_sources,
+    )
+
+    for spec_index, spec in enumerate(specs):
+        retrieval_legal_topics = list(
+            dict.fromkeys(
+                spec.legal_topics or request.legal_topics
+            )
+        )
+
+        # Keep the semantic legal topic unchanged, but widen the
+        # document-retrieval scope when the user explicitly asks for
+        # notice periods. In the validated country documents, notice
+        # rules may live under Employment Contracts even when the
+        # overall question concerns termination.
+        asks_for_notice = any(
+            "notice" in term.casefold()
+            for concept in (spec.search_concepts or [])
+            for term in concept.terms
+        )
+
+        if (
+            asks_for_notice
+            and "Termination of Employment Contracts"
+                in retrieval_legal_topics
+            and "Employment Contracts"
+                not in retrieval_legal_topics
+        ):
+            retrieval_legal_topics.append(
+                "Employment Contracts"
+            )
+
+        spec_budget = (
+            spec_source_budgets[spec_index]
+            if spec_index < len(spec_source_budgets)
+            else request.max_sources
+        )
+
+        spec_country_count = max(
+            1,
+            len(
+                _normalize_country_codes(
+                    spec.country_codes
+                )
+            ),
+        )
+
+        # A focused routed question for one country may span several
+        # document-topic buckets while still representing one semantic
+        # facet. Use one union search only in that narrow case.
+        #
+        # Multi-country comparisons retain per-topic retrieval so each
+        # topic receives independent retrieval capacity.
+        topic_union_search = (
+            routed_action_specs
+            and spec_country_count == 1
+            and len(retrieval_legal_topics) > 1
+            and len(spec.search_concepts or []) <= 1
+        )
+
         spec_request = request.model_copy(
             update={
                 "country_codes": spec.country_codes,
-                "legal_topics": (
-                    spec.legal_topics or request.legal_topics
-                ),
+                "legal_topics": retrieval_legal_topics,
+                "max_sources": max(1, spec_budget),
             }
         )
 
@@ -4295,6 +5980,7 @@ def _prepare_grounded_generation(
                 search_concepts=spec.search_concepts,
                 broad_overview=broad_overview,
                 evidence_mode=spec.evidence_mode,
+                topic_union_search=topic_union_search,
             )
         except LegalSearchError as error:
             raise RagAnswerError(
@@ -4346,6 +6032,7 @@ def _prepare_grounded_generation(
     insufficient_evidence_answer_parts: list[str] = []
     partial_evidence_instruction = ""
     evidence_status_by_key: dict[str, str] = {}
+    concept_coverage_by_key: dict[str, str] = {}
     filtered_hits_by_spec: list[list[LegalSearchHit]] = []
     gated_codes_by_spec: list[set[str]] = []
     insufficient_codes_by_spec: list[set[str]] = []
@@ -4370,6 +6057,32 @@ def _prepare_grounded_generation(
             )
         )
 
+        deterministic_subject_text: str | None = None
+
+        # Stabilize evidence gating for a simple fresh/single-scope
+        # legal request without changing retrieval or generation.
+        #
+        # RequestUnderstanding remains the primary source of semantic
+        # concepts. The literal user question is used only as a final
+        # lexical fallback when there is exactly one evidence spec and
+        # one country. Comparisons and mixed actions therefore retain
+        # their existing per-action semantics unchanged.
+        if (
+            len(specs) == 1
+            and len(spec_codes) == 1
+            and current_user_question
+        ):
+            canonical_user_subject = canonicalize_legal_subject(
+                subject_text=current_user_question.strip(),
+                search_concepts=[],
+                scoped_country_codes=spec_codes,
+            ).subject_text
+
+            if canonical_user_subject:
+                deterministic_subject_text = (
+                    canonical_user_subject.strip() or None
+                )
+
         spec_hits_by_country: dict[str, list[LegalSearchHit]] = {}
         for hit in spec_hits:
             spec_hits_by_country.setdefault(
@@ -4385,6 +6098,7 @@ def _prepare_grounded_generation(
                 spec.search_concepts or [],
                 spec.evidence_mode,
                 subject_text=spec.subject_text,
+                deterministic_subject_text=deterministic_subject_text,
                 expected_country_codes=frozenset(spec_codes),
                 expected_legal_topics=spec_legal_topics,
             )
@@ -4395,6 +6109,15 @@ def _prepare_grounded_generation(
                 else f"{code}#{spec_index}"
             )
             evidence_status_by_key[metric_key] = status
+
+            if spec.search_concepts:
+                covered, total = count_covered_concepts(
+                    spec_hits_by_country.get(code, []),
+                    spec.search_concepts,
+                )
+                concept_coverage_by_key[metric_key] = (
+                    f"{covered}/{total}"
+                )
 
             if status == "insufficient":
                 spec_insufficient_codes.add(code)
@@ -4453,6 +6176,11 @@ def _prepare_grounded_generation(
     if metrics is not None and evidence_status_by_key:
         metrics.evidence_status_by_country = dict(
             evidence_status_by_key
+        )
+
+    if metrics is not None and concept_coverage_by_key:
+        metrics.concept_coverage_by_country = dict(
+            concept_coverage_by_key
         )
 
     # A country is fully insufficient only when every spec that gates
@@ -4586,6 +6314,273 @@ def _prepare_grounded_generation(
     )
 
 
+
+
+_SUBJECTIVE_RANKING_REQUEST_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    (?:
+        \b(?:best|most\s+favou?rable|better)\b
+        .{0,100}
+        \b(?:country|jurisdiction|employees?)\b
+    )
+    |
+    (?:
+        \b(?:country|jurisdiction)\b
+        .{0,100}
+        \b(?:best|most\s+favou?rable|better)\b
+    )
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+_SUBJECTIVE_RANKING_ASSERTION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    (?:
+        \b(?:is|are|was|were|remains?|appears?\s+to\s+be|
+        seems?\s+to\s+be)\b
+        .{0,120}
+        \b(?:best|most\s+favou?rable)\b
+    )
+    |
+    (?:
+        \b(?:best|most\s+favou?rable)\b
+        .{0,120}
+        \b(?:employees?|jurisdiction|among\s+these)\b
+    )
+    |
+    \bbetter\s+for\s+employees?\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _sanitize_subjective_ranking_output(
+    *,
+    question: str,
+    answer: str,
+) -> str:
+    """
+    Remove an unsupported model-created overall jurisdiction ranking
+    when the user explicitly asks which country is "best".
+
+    This runs after normal grounding/quality validation and changes no
+    retrieval, reranking, source selection, generation call count or
+    evidence budget.
+    """
+
+    if not _SUBJECTIVE_RANKING_REQUEST_PATTERN.search(question):
+        return answer
+
+    lines = answer.splitlines()
+    cleaned: list[str] = []
+    removed_citations: list[str] = []
+    removed = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if (
+            stripped.startswith("-")
+            and _SUBJECTIVE_RANKING_ASSERTION_PATTERN.search(stripped)
+        ):
+            removed = True
+
+            removed_citations.extend(
+                re.findall(
+                    r"\[[0-9,\s]+\]",
+                    line,
+                )
+            )
+
+            continue
+
+        cleaned.append(line)
+
+    if not removed:
+        return answer
+
+    citation = ""
+
+    if removed_citations:
+        citation = max(
+            removed_citations,
+            key=lambda value: len(
+                re.findall(r"\d+", value)
+            ),
+        )
+
+    neutral = (
+        "- The comparison does not establish a single overall best "
+        "jurisdiction for employees. The result depends on the "
+        "specific legal criterion being compared."
+    )
+
+    if citation:
+        neutral += f" {citation}"
+
+    # The generated comparison section is normally last, so appending
+    # this neutral conclusion keeps the answer structure natural.
+    return (
+        "\n".join(cleaned).rstrip()
+        + "\n"
+        + neutral
+    )
+
+
+
+
+
+def _sanitize_mixed_scope_repair_answer(
+    *,
+    answer: str,
+    requested_country_codes: Sequence[str],
+    known_excluded_country_codes: Sequence[str] | None,
+) -> str:
+    """
+    Harden only a repaired answer for a mixed supported/unsupported
+    request where exactly one supported jurisdiction remains.
+
+    Keep only cited legal bullets belonging to that supported country.
+    Unsupported-country messaging is added separately by the router.
+
+    Retrieval, reranking, source selection and source budgets are
+    unchanged.
+    """
+
+    allowed_codes = _normalize_country_codes(
+        requested_country_codes
+    )
+
+    excluded_codes = _normalize_country_codes(
+        known_excluded_country_codes or []
+    )
+
+    if (
+        len(allowed_codes) != 1
+        or not excluded_codes
+    ):
+        return answer
+
+    sections = _parse_grounding_sections(
+        answer=answer,
+        requested_country_codes=allowed_codes,
+    )
+
+    rebuilt: list[str] = []
+
+    for section in sections:
+
+        if (
+            section.section_kind != "country"
+            or section.country_code not in allowed_codes
+        ):
+            continue
+
+        cited_bullets = [
+            bullet
+            for bullet in section.bullets
+            if _find_citation_numbers(bullet)
+        ]
+
+        if not cited_bullets:
+            continue
+
+        rebuilt.append(
+            resolve_country_display_name(
+                section.country_code
+            )
+        )
+
+        rebuilt.extend(
+            f"- {bullet}"
+            for bullet in cited_bullets
+        )
+
+    cleaned = "\n".join(rebuilt).strip()
+
+    # If nothing grounded survived, preserve the original answer so
+    # the normal hard validator still rejects it.
+    return cleaned or answer
+
+
+
+
+
+
+_MIXED_SCOPE_STRUCTURAL_RESCUE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:weather|restaurants?)\b",
+    re.IGNORECASE,
+)
+
+
+def _rebuild_grounded_candidate(
+    *,
+    answer: str,
+    requested_country_codes: Sequence[str],
+) -> str:
+    """
+    Rebuild only canonical requested-country / comparison sections
+    from a structurally malformed generated answer.
+
+    This helper never makes a candidate trusted by itself. The complete
+    quality validator must accept the rebuilt candidate before it can
+    replace the original generation.
+    """
+
+    country_codes = _normalize_country_codes(
+        requested_country_codes
+    )
+
+    if not country_codes:
+        return answer
+
+    sections = _parse_grounding_sections(
+        answer=answer,
+        requested_country_codes=country_codes,
+    )
+
+    rebuilt: list[str] = []
+
+    for section in sections:
+
+        if (
+            section.section_kind == "country"
+            and section.country_code in country_codes
+        ):
+            if not section.bullets:
+                continue
+
+            rebuilt.append(
+                resolve_country_display_name(
+                    section.country_code
+                )
+            )
+
+            rebuilt.extend(
+                f"- {bullet.strip()}"
+                for bullet in section.bullets
+                if bullet.strip()
+            )
+
+        elif (
+            section.section_kind == "comparison"
+            and len(country_codes) >= 2
+            and section.bullets
+        ):
+            rebuilt.append("Comparison")
+
+            rebuilt.extend(
+                f"- {bullet.strip()}"
+                for bullet in section.bullets
+                if bullet.strip()
+            )
+
+    candidate = "\n".join(rebuilt).strip()
+
+    return candidate or answer
+
+
+
 def answer_legal_question(
     request: LegalChatRequest,
     search_function: SearchFunction = (
@@ -4681,13 +6676,39 @@ def answer_legal_question(
     def _generate_with_instructions(
         instructions: str,
     ) -> GeneratedText:
-        try:
+        result: GeneratedText | None = None
+        last_error: OpenAIResponseError | None = None
+
+        for provider_attempt in range(2):
             call_started_at = perf_counter()
 
-            result = client.generate(
-                instructions=instructions,
-                input_text=model_input,
-            )
+            try:
+                result = client.generate(
+                    instructions=instructions,
+                    input_text=model_input,
+                )
+
+            except OpenAIResponseError as error:
+                elapsed_ms = (
+                    perf_counter() - call_started_at
+                ) * 1000
+
+                if metrics is not None:
+                    metrics.openai_ms += elapsed_ms
+                    metrics.answer_generation_openai_ms += elapsed_ms
+
+                last_error = error
+
+                if (
+                    not error.retryable
+                    or provider_attempt == 1
+                ):
+                    raise RagAnswerError(
+                        "Grounded answer generation failed."
+                    ) from error
+
+                sleep(error.retry_delay_seconds())
+                continue
 
             elapsed_ms = (
                 perf_counter() - call_started_at
@@ -4697,10 +6718,12 @@ def answer_legal_question(
                 metrics.openai_ms += elapsed_ms
                 metrics.answer_generation_openai_ms += elapsed_ms
 
-        except OpenAIResponseError as error:
+            break
+
+        if result is None:
             raise RagAnswerError(
                 "Grounded answer generation failed."
-            ) from error
+            ) from last_error
 
         return dataclasses.replace(
             result,
@@ -4749,6 +6772,26 @@ def answer_legal_question(
                 _last_assistant_answer(request)
             ),
             answer=answer,
+        )
+
+        soft_errors = list(
+            soft_errors
+        ) + _validate_format_only_numeric_stability(
+            current_user_question=(
+                current_user_question or request.question
+            ),
+            previous_assistant_answer=(
+                _last_assistant_answer(request)
+            ),
+            answer=answer,
+        )
+
+        soft_errors = list(
+            soft_errors
+        ) + _validate_no_false_evidence_insufficiency(
+            answer=answer,
+            specs=specs,
+            hits=selected_hits,
         )
 
 
@@ -4803,6 +6846,34 @@ def answer_legal_question(
         first_generated_text.text
     )
 
+    if (
+        _MIXED_SCOPE_STRUCTURAL_RESCUE_PATTERN.search(
+            first_generated_text.text
+        )
+        and first_hard_errors
+        and {
+            error.error_type
+            for error in first_hard_errors
+        } == {"invalid_grounding_structure"}
+    ):
+        candidate_text = _rebuild_grounded_candidate(
+            answer=first_generated_text.text,
+            requested_country_codes=request.country_codes,
+        )
+
+        if candidate_text != first_generated_text.text:
+            candidate_hard, candidate_soft = _validate(
+                candidate_text
+            )
+
+            if not candidate_hard:
+                first_generated_text = dataclasses.replace(
+                    first_generated_text,
+                    text=candidate_text,
+                )
+                first_hard_errors = candidate_hard
+                first_soft_errors = candidate_soft
+
     generation_attempts = 1
     repair_triggered = False
     repair_success = False
@@ -4836,9 +6907,48 @@ def answer_legal_question(
 
         generation_attempts = 2
 
+        repaired_generated_text = dataclasses.replace(
+            repaired_generated_text,
+            text=_sanitize_mixed_scope_repair_answer(
+                answer=repaired_generated_text.text,
+                requested_country_codes=request.country_codes,
+                known_excluded_country_codes=(
+                    known_excluded_country_codes
+                ),
+            ),
+        )
+
         repaired_hard_errors, repaired_soft_errors = _validate(
             repaired_generated_text.text
         )
+
+        if (
+            _MIXED_SCOPE_STRUCTURAL_RESCUE_PATTERN.search(
+                repaired_generated_text.text
+            )
+            and repaired_hard_errors
+            and {
+                error.error_type
+                for error in repaired_hard_errors
+            } == {"invalid_grounding_structure"}
+        ):
+            candidate_text = _rebuild_grounded_candidate(
+                answer=repaired_generated_text.text,
+                requested_country_codes=request.country_codes,
+            )
+
+            if candidate_text != repaired_generated_text.text:
+                candidate_hard, candidate_soft = _validate(
+                    candidate_text
+                )
+
+                if not candidate_hard:
+                    repaired_generated_text = dataclasses.replace(
+                        repaired_generated_text,
+                        text=candidate_text,
+                    )
+                    repaired_hard_errors = candidate_hard
+                    repaired_soft_errors = candidate_soft
 
         repaired_answer_was_returned = False
 
@@ -4867,6 +6977,102 @@ def answer_legal_question(
             and generation_attempts > 1
             and repaired_answer_was_returned
         )
+
+    # A soft subject-drift warning may remain even after the normal
+    # repair. For one-country narrow questions, remove only padding
+    # that appears after an explicit evidence limitation, then run the
+    # complete validator again. Never accept the cleanup merely because
+    # it looks shorter.
+    cleanup_spec = (
+        specs[0]
+        if (
+            len(specs) == 1
+            and specs[0].search_concepts
+            and _normalize_country_codes(
+                specs[0].country_codes
+            )
+        )
+        else None
+    )
+
+    choice_of_law_cleanup_needed = bool(
+        cleanup_spec is not None
+        and _choice_of_law_limitation_directly_addresses_subject(
+            answer=final_generated_text.text,
+            search_concepts=cleanup_spec.search_concepts or [],
+            country_codes=cleanup_spec.country_codes,
+        )
+    )
+
+    if (
+        cleanup_spec is not None
+        and (
+            (
+                repair_triggered
+                and any(
+                    error.error_type == "subject_drift"
+                    for error in final_soft_errors
+                )
+            )
+            or choice_of_law_cleanup_needed
+        )
+    ):
+        trimmed_text = _trim_post_limitation_subject_drift(
+            answer=final_generated_text.text,
+            search_concepts=cleanup_spec.search_concepts or [],
+            evidence_mode=(
+                cleanup_spec.evidence_mode
+                or "broad_topic"
+            ),
+            country_codes=cleanup_spec.country_codes,
+        )
+
+        if trimmed_text != final_generated_text.text:
+            (
+                trimmed_hard_errors,
+                trimmed_soft_errors,
+            ) = _validate(trimmed_text)
+
+            # The precise-notice guard has independently established
+            # that the evidence covers the notice-period topic but does
+            # not contain the exact seniority tier requested. After
+            # deterministic removal of adjacent/background bullets,
+            # an insufficiency statement is therefore legitimate and
+            # must not be rejected again as subject_drift.
+            if _precise_service_notice_value_not_explicitly_supported(
+                spec=cleanup_spec,
+                hits=selected_hits,
+            ):
+                trimmed_soft_errors = [
+                    error
+                    for error in trimmed_soft_errors
+                    if error.error_type != "subject_drift"
+                ]
+
+            if _choice_of_law_limitation_directly_addresses_subject(
+                answer=trimmed_text,
+                search_concepts=cleanup_spec.search_concepts or [],
+                country_codes=cleanup_spec.country_codes,
+            ):
+                trimmed_soft_errors = [
+                    error
+                    for error in trimmed_soft_errors
+                    if error.error_type != "subject_drift"
+                ]
+
+            if (
+                not trimmed_hard_errors
+                and not any(
+                    error.error_type == "subject_drift"
+                    for error in trimmed_soft_errors
+                )
+            ):
+                final_generated_text = dataclasses.replace(
+                    final_generated_text,
+                    text=trimmed_text,
+                )
+                final_hard_errors = trimmed_hard_errors
+                final_soft_errors = trimmed_soft_errors
 
     # Computed unconditionally so a direct answer (no repair attempted)
     # reports a real False rather than leaving repair_success unset.
@@ -4929,6 +7135,12 @@ def answer_legal_question(
             *insufficient_evidence_answer_parts,
         )
         if part
+    )
+
+
+    final_answer = _sanitize_subjective_ranking_output(
+        question=request.question,
+        answer=final_answer,
     )
 
     return LegalChatResponse(
@@ -5200,6 +7412,26 @@ async def stream_answer_legal_question(
             answer=answer,
         )
 
+        soft_errors = list(
+            soft_errors
+        ) + _validate_format_only_numeric_stability(
+            current_user_question=(
+                current_user_question or request.question
+            ),
+            previous_assistant_answer=(
+                _last_assistant_answer(request)
+            ),
+            answer=answer,
+        )
+
+        soft_errors = list(
+            soft_errors
+        ) + _validate_no_false_evidence_insufficiency(
+            answer=answer,
+            specs=specs,
+            hits=selected_hits,
+        )
+
         for spec_index, spec in enumerate(specs):
             if not (
                 spec.evidence_mode is not None
@@ -5245,26 +7477,52 @@ async def stream_answer_legal_question(
         _generate_with_instructions, using the plain (non-streaming)
         client so repair text is never provisionally visible."""
 
-        try:
+        last_error: OpenAIResponseError | None = None
+
+        for provider_attempt in range(2):
             call_started_at = perf_counter()
 
-            result = sync_client.generate(
-                instructions=instructions,
-                input_text=model_input,
-            )
+            try:
+                result = sync_client.generate(
+                    instructions=instructions,
+                    input_text=model_input,
+                )
 
-            elapsed_ms = (
-                perf_counter() - call_started_at
-            ) * 1000
+                elapsed_ms = (
+                    perf_counter() - call_started_at
+                ) * 1000
 
-            if metrics is not None:
-                metrics.openai_ms += elapsed_ms
-                metrics.answer_generation_openai_ms += elapsed_ms
+                if metrics is not None:
+                    metrics.openai_ms += elapsed_ms
+                    metrics.answer_generation_openai_ms += elapsed_ms
 
-        except OpenAIResponseError as error:
+                break
+
+            except OpenAIResponseError as error:
+                elapsed_ms = (
+                    perf_counter() - call_started_at
+                ) * 1000
+
+                if metrics is not None:
+                    metrics.openai_ms += elapsed_ms
+                    metrics.answer_generation_openai_ms += elapsed_ms
+
+                last_error = error
+
+                if (
+                    not error.retryable
+                    or provider_attempt == 1
+                ):
+                    raise RagAnswerError(
+                        "Grounded answer generation failed."
+                    ) from error
+
+                sleep(error.retry_delay_seconds())
+
+        else:
             raise RagAnswerError(
                 "Grounded answer generation failed."
-            ) from error
+            ) from last_error
 
         return dataclasses.replace(
             result,
@@ -5418,9 +7676,48 @@ async def stream_answer_legal_question(
 
         generation_attempts = 2
 
+        repaired_generated_text = dataclasses.replace(
+            repaired_generated_text,
+            text=_sanitize_mixed_scope_repair_answer(
+                answer=repaired_generated_text.text,
+                requested_country_codes=request.country_codes,
+                known_excluded_country_codes=(
+                    known_excluded_country_codes
+                ),
+            ),
+        )
+
         repaired_hard_errors, repaired_soft_errors = _validate(
             repaired_generated_text.text
         )
+
+        if (
+            _MIXED_SCOPE_STRUCTURAL_RESCUE_PATTERN.search(
+                repaired_generated_text.text
+            )
+            and repaired_hard_errors
+            and {
+                error.error_type
+                for error in repaired_hard_errors
+            } == {"invalid_grounding_structure"}
+        ):
+            candidate_text = _rebuild_grounded_candidate(
+                answer=repaired_generated_text.text,
+                requested_country_codes=request.country_codes,
+            )
+
+            if candidate_text != repaired_generated_text.text:
+                candidate_hard, candidate_soft = _validate(
+                    candidate_text
+                )
+
+                if not candidate_hard:
+                    repaired_generated_text = dataclasses.replace(
+                        repaired_generated_text,
+                        text=candidate_text,
+                    )
+                    repaired_hard_errors = candidate_hard
+                    repaired_soft_errors = candidate_soft
 
         repaired_answer_was_returned = False
 
@@ -5444,6 +7741,101 @@ async def stream_answer_legal_question(
             and generation_attempts > 1
             and repaired_answer_was_returned
         )
+
+    # Keep the streaming endpoint's final winning text identical to
+    # /chat: remove only post-limitation padding that still fails the
+    # existing subject-relevance validator, then validate the resulting
+    # answer again before it can be emitted as REPLACEMENT.
+    cleanup_spec = (
+        specs[0]
+        if (
+            len(specs) == 1
+            and specs[0].search_concepts
+            and _normalize_country_codes(
+                specs[0].country_codes
+            )
+        )
+        else None
+    )
+
+    choice_of_law_cleanup_needed = bool(
+        cleanup_spec is not None
+        and _choice_of_law_limitation_directly_addresses_subject(
+            answer=final_generated_text.text,
+            search_concepts=cleanup_spec.search_concepts or [],
+            country_codes=cleanup_spec.country_codes,
+        )
+    )
+
+    if (
+        cleanup_spec is not None
+        and (
+            (
+                repair_triggered
+                and any(
+                    error.error_type == "subject_drift"
+                    for error in final_soft_errors
+                )
+            )
+            or choice_of_law_cleanup_needed
+        )
+    ):
+        trimmed_text = _trim_post_limitation_subject_drift(
+            answer=final_generated_text.text,
+            search_concepts=cleanup_spec.search_concepts or [],
+            evidence_mode=(
+                cleanup_spec.evidence_mode
+                or "broad_topic"
+            ),
+            country_codes=cleanup_spec.country_codes,
+        )
+
+        if trimmed_text != final_generated_text.text:
+            (
+                trimmed_hard_errors,
+                trimmed_soft_errors,
+            ) = _validate(trimmed_text)
+
+            # The precise-notice guard has independently established
+            # that the evidence covers the notice-period topic but does
+            # not contain the exact seniority tier requested. After
+            # deterministic removal of adjacent/background bullets,
+            # an insufficiency statement is therefore legitimate and
+            # must not be rejected again as subject_drift.
+            if _precise_service_notice_value_not_explicitly_supported(
+                spec=cleanup_spec,
+                hits=selected_hits,
+            ):
+                trimmed_soft_errors = [
+                    error
+                    for error in trimmed_soft_errors
+                    if error.error_type != "subject_drift"
+                ]
+
+            if _choice_of_law_limitation_directly_addresses_subject(
+                answer=trimmed_text,
+                search_concepts=cleanup_spec.search_concepts or [],
+                country_codes=cleanup_spec.country_codes,
+            ):
+                trimmed_soft_errors = [
+                    error
+                    for error in trimmed_soft_errors
+                    if error.error_type != "subject_drift"
+                ]
+
+            if (
+                not trimmed_hard_errors
+                and not any(
+                    error.error_type == "subject_drift"
+                    for error in trimmed_soft_errors
+                )
+            ):
+                final_generated_text = dataclasses.replace(
+                    final_generated_text,
+                    text=trimmed_text,
+                )
+                final_hard_errors = trimmed_hard_errors
+                final_soft_errors = trimmed_soft_errors
 
     repair_success = bool(
         repair_triggered

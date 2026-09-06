@@ -640,6 +640,9 @@ SUBSECTION_TOPIC_OVERRIDES: Final[
     normalize_subsection_label(
         "Notice of Termination and Redundancy Pay"
     ): "Termination of Employment Contracts",
+    normalize_subsection_label(
+        "Statutory Severance"
+    ): "Termination of Employment Contracts",
 }
 
 
