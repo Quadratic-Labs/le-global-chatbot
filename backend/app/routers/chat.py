@@ -1700,7 +1700,8 @@ _UNSUPPORTED_LEGAL_SIGNAL_PATTERN: Final[
     r"divorce|inheritance|probate|"
     r"incorporat(?:e|ed|ing|ion)|"
     r"(?:create|start|form|set\s+up)\s+"
-    r"(?:a|an|my|the)?\s*(?:company|business)"
+    r"(?:a|an|the|my(?:\s+own)?|your(?:\s+own)?|"
+    r"our(?:\s+own)?)?\s*(?:company|business)"
     r")\b",
     re.IGNORECASE,
 )
@@ -4288,17 +4289,50 @@ def resolve_legal_chat_response(
             # request such as weather must receive the simple product
             # scope refusal and must never trigger contact retrieval.
             #
-            # This is intentionally separate from the legal
-            # insufficient-evidence fallback, which remains unchanged.
-            if (
+            # Semantic "unsupported" results may contain no actions and
+            # therefore reach this branch without a preserved country
+            # scope. Recover one explicit/unambiguous country directly
+            # from the original request before building the existing
+            # contact fallback.
+            offer_country_contact = (
                 _should_offer_contact_for_unsupported_request(
                     request.question
                 )
-                and current_country_scope.available_codes
-                and not current_country_scope.unavailable_codes
+            )
+
+            unsupported_country_scope = current_country_scope
+
+            if (
+                offer_country_contact
+                and not unsupported_country_scope.available_codes
+                and not unsupported_country_scope.unavailable_codes
+            ):
+                recovered_country_scope = (
+                    resolve_country_availability(
+                        request=request,
+                        catalog_provider=catalog_provider,
+                    )
+                )
+
+                if (
+                    len(
+                        recovered_country_scope.available_codes
+                    ) == 1
+                    and not recovered_country_scope.unavailable_codes
+                ):
+                    unsupported_country_scope = (
+                        recovered_country_scope
+                    )
+
+            # This is intentionally separate from the legal
+            # insufficient-evidence fallback, which remains unchanged.
+            if (
+                offer_country_contact
+                and unsupported_country_scope.available_codes
+                and not unsupported_country_scope.unavailable_codes
             ):
                 resolved_country_name = resolve_country_display_name(
-                    current_country_scope.available_codes[0]
+                    unsupported_country_scope.available_codes[0]
                 )
 
                 (
@@ -4308,7 +4342,7 @@ def resolve_legal_chat_response(
                     contact_took_ms,
                 ) = _build_contact_section(
                     country_codes=(
-                        current_country_scope.available_codes
+                        unsupported_country_scope.available_codes
                     ),
                     unavailable_country_codes=[],
                     citation_offset=0,
@@ -4318,7 +4352,7 @@ def resolve_legal_chat_response(
                 metrics.retrieval_total = contact_retrieval_total
                 metrics.selected_sources = len(contact_sources)
                 metrics.resolved_country_codes = list(
-                    current_country_scope.available_codes
+                    unsupported_country_scope.available_codes
                 )
 
                 contacts = build_legal_chat_contacts(
@@ -4326,7 +4360,7 @@ def resolve_legal_chat_response(
                         _optional_contact_source_directory()
                     ),
                     requested_country_codes=(
-                        current_country_scope.available_codes
+                        unsupported_country_scope.available_codes
                     ),
                     unavailable_country_codes=[],
                     sources=contact_sources,
