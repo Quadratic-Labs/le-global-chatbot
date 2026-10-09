@@ -4160,6 +4160,7 @@ class _PreparedGeneration:
     request: LegalChatRequest
     specs: list[LegalActionEvidenceSpec]
     insufficient_codes_by_spec: list[set[str]]
+    contact_required_country_codes: list[str]
     selected_hits: list[LegalSearchHit]
     retrieval_total: int
     context_text: str
@@ -4346,6 +4347,7 @@ def _prepare_grounded_generation(
     insufficient_evidence_answer_parts: list[str] = []
     partial_evidence_instruction = ""
     evidence_status_by_key: dict[str, str] = {}
+    contact_required_country_codes: set[str] = set()
     filtered_hits_by_spec: list[list[LegalSearchHit]] = []
     gated_codes_by_spec: list[set[str]] = []
     insufficient_codes_by_spec: list[set[str]] = []
@@ -4395,6 +4397,9 @@ def _prepare_grounded_generation(
                 else f"{code}#{spec_index}"
             )
             evidence_status_by_key[metric_key] = status
+
+            if status in {"insufficient", "partial"}:
+                contact_required_country_codes.add(code)
 
             if status == "insufficient":
                 spec_insufficient_codes.add(code)
@@ -4576,6 +4581,9 @@ def _prepare_grounded_generation(
         request=request,
         specs=specs,
         insufficient_codes_by_spec=insufficient_codes_by_spec,
+        contact_required_country_codes=sorted(
+            contact_required_country_codes
+        ),
         selected_hits=selected_hits,
         retrieval_total=retrieval_total,
         context_text=context_text,
@@ -4584,6 +4592,55 @@ def _prepare_grounded_generation(
         client=client,
         insufficient_evidence_answer_parts=insufficient_evidence_answer_parts,
     )
+
+
+
+_UNCERTAIN_LEGAL_ANSWER_PATTERN = re.compile(
+    r"\b(?:I|we)\s+(?:cannot|can't|could not|am unable to|are unable to)"
+    r"\s+(?:reliably\s+)?"
+    r"(?:confirm|determine|establish|verify|provide)\b"
+    r"|\b(?:cannot|can't|could not)\s+(?:be\s+)?"
+    r"(?:reliably\s+)?"
+    r"(?:confirmed|determined|established|verified)\b"
+    r"|\brequires?\s+(?:case-specific\s+)?confirmation\b",
+    re.IGNORECASE,
+)
+
+
+def _contact_countries_for_validated_answer(
+    prepared: _PreparedGeneration,
+    answer: str,
+) -> list[str]:
+    """Identify countries requiring human follow-up."""
+
+    country_codes = _normalize_country_codes([
+        code
+        for spec in prepared.specs
+        for code in spec.country_codes
+    ])
+
+    required = set(
+        prepared.contact_required_country_codes
+    )
+
+    for section in _parse_grounding_sections(
+        answer=answer,
+        requested_country_codes=country_codes,
+    ):
+        if (
+            section.section_kind == "country"
+            and section.country_code
+            and any(
+                _UNCERTAIN_LEGAL_ANSWER_PATTERN.search(bullet)
+                for bullet in section.bullets
+            )
+        ):
+            required.add(section.country_code)
+
+    return [
+        code for code in country_codes
+        if code in required
+    ]
 
 
 def answer_legal_question(
@@ -4934,6 +4991,11 @@ def answer_legal_question(
     return LegalChatResponse(
         question=request.question.strip(),
         answer=final_answer,
+        contact_required_country_codes=(
+            _contact_countries_for_validated_answer(
+                prepared, final_answer
+            )
+        ),
         grounded=True,
         model=generated_text.model,
         retrieval_total=retrieval_total,
@@ -5500,6 +5562,11 @@ async def stream_answer_legal_question(
     result = LegalChatResponse(
         question=request.question.strip(),
         answer=final_answer,
+        contact_required_country_codes=(
+            _contact_countries_for_validated_answer(
+                prepared, final_answer
+            )
+        ),
         grounded=True,
         model=generated_text.model,
         retrieval_total=retrieval_total,

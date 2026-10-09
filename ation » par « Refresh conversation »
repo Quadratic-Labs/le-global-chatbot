@@ -1,0 +1,25 @@
+[35mbackend/app/routers/chat.py[m[36m:[m[32m88[m[36m:[mfrom app.services.[1;31mrag_answer[m import (
+[35mbackend/app/routers/chat.py[m[36m:[m[32m1717[m[36m:[m    # Mission "ORDER 8F-A", section 10 - an exact, [1;31msingle-country[m live
+[35mbackend/app/routers/chat.py[m[36m:[m[32m1731[m[36m:[m        [1;31msingle_country[m_code = current_country_scope.available_codes[0]
+[35mbackend/app/routers/chat.py[m[36m:[m[32m1736[m[36m:[m                [1;31msingle_country[m_code, []
+[35mbackend/app/routers/chat.py[m[36m:[m[32m2099[m[36m:[m            # check. Scoped deliberately to [1;31msingle-country[m legal_
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m15[m[36m:[mstream_answer_legal_question() ([1;31mrag_answer[m.py, GATE S3/S3B) - and
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m21[m[36m:[mThis module owns 100% of the NDJSON wire format. [1;31mrag_answer[m.py and
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m22[m[36m:[mchat.py know nothing about it - StreamAnswerEvent ([1;31mrag_answer[m.py) is
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m69[m[36m:[mfrom app.services.[1;31mrag_answer[m import (
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m246[m[36m:[m    stream_answer_legal_question() ([1;31mrag_answer[m.py, S3) - populated
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m319[m[36m:[m# The RAG service ([1;31mrag_answer[m.py) never sees any of this.
+[35mbackend/app/routers/chat_stream.py[m[36m:[m[32m811[m[36m:[m        # _retrieve_search_hits ([1;31mrag_answer[m.py), reached exclusively
+[35mbackend/app/services/evidence_coverage.py[m[36m:[m[32m6[m[36m:[mright broad legal_topic/section. Reused by [1;31mrag_answer[m.py before
+[35mbackend/app/services/evidence_coverage.py[m[36m:[m[32m384[m[36m:[m    (see [1;31mrag_answer[m.py's existing _rerank_hits, only ever run when
+[35mbackend/app/services/evidence_coverage.py[m[36m:[m[32m483[m[36m:[m    (see [1;31mrag_answer[m.py), never to gate retrieval.
+[35mbackend/app/services/rag_answer.py[m[36m:[m[32m266[m[36m:[mFor a broad [1;31msingle-country[m employment-law overview:
+[35mbackend/app/services/rag_answer.py[m[36m:[m[32m312[m[36m:[m13. For a focused [1;31msingle-country[m question, normally provide no more
+[35mbackend/app/services/rag_answer.py[m[36m:[m[32m395[m[36m:[m33. For a focused [1;31msingle-country[m question, normally use two to four
+[35mbackend/app/services/rag_answer.py[m[36m:[m[32m440[m[36m:[m    [1;31msingle country[m must remain inside that country's section and must
+[35mbackend/app/services/rag_answer.py[m[36m:[m[32m2489[m[36m:[m                        "A [1;31msingle-country[m answer must "
+[35mbackend/app/services/rag_answer.py[m[36m:[m[32m3465[m[36m:[m            "[1;31msingle-country[m answer, use no more than six bullets.\n"
+[35mbackend/app/services/request_understanding.py[m[36m:[m[32m155[m[36m:[m    # document topic applies). [1;31mSingle-country[m ("legal_information")
+[35mbackend/app/services/request_understanding.py[m[36m:[m[32m997[m[36m:[mWhen a [1;31msingle-country[m legal_information question clearly concerns one
+[35mbackend/app/services/request_understanding.py[m[36m:[m[32m1061[m[36m:[m  the [1;31msingle country[m this legal_information action concerns. Empty for
+[35mbackend/app/services/request_understanding.py[m[36m:[m[32m1434[m[36m:[m    Mirrors _parse_rerank_order's convention ([1;31mrag_answer[m.py): never

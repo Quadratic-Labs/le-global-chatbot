@@ -290,6 +290,12 @@ class LegalChatResponse(BaseModel):
         default_factory=list
     )
 
+    # Countries requiring lawyer follow-up for uncertain
+    # or insufficiently supported legal information.
+    contact_required_country_codes: list[str] = PydanticField(
+        default_factory=list
+    )
+
     # Explicit override for the client's contact-only card rendering
     # heuristic (which otherwise infers "contact only" from an absent
     # conversation_state). False marks a response whose answer text is
