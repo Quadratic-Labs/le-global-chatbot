@@ -31,6 +31,7 @@ from app.models.chat import (
 )
 from app.models.conversation_state import ConversationPendingClarification
 from app.models.conversation_state import ConversationState
+from app.models.conversation_state import LegalQuestionCount
 from app.services.assistant_help import (
     build_assistant_help_answer,
     detect_assistant_help_intent,
@@ -85,6 +86,9 @@ from app.services.legal_topic_detection import (
     detect_document_legal_topics,
     detect_legal_topics,
     resolve_legal_scope,
+)
+from app.services.legal_answer_presentation import (
+    present_validated_legal_answer_as_prose,
 )
 from app.services.rag_answer import (
     sanitize_user_facing_legal_answer,
@@ -497,20 +501,20 @@ def _unavailable_countries_answer(
         country = display_names[0]
 
         return (
-            f"{country} is not currently covered by the validated "
-            "L&E Global documents available in this chatbot. "
-            "I therefore cannot provide employment-law information "
-            f"or a validated L&E Global contact for {country}."
+            "Unfortunately the information you requested for "
+            f"{country} is not available at this time, please let "
+            "me know if you want me to list the countries that the "
+            "information is available for without "
+            f"{country}."
         )
 
     countries = _format_country_list(display_names)
 
     return (
-        "The following countries are not currently covered by the "
-        "validated L&E Global documents available in this chatbot: "
-        f"{countries}. I therefore cannot provide employment-law "
-        "information or validated L&E Global contacts for those "
-        "countries."
+        "Unfortunately the information you requested for the following countries: "
+        f"{countries}, is not available at this time. "
+        "Please let me know if you want me to list the countries "
+        "that the information is available for, excluding those countries."
     )
 
 
@@ -964,6 +968,35 @@ def _build_deterministic_hints(
     return hints, current_country_scope, current_legal_scope
 
 
+
+
+def _contact_card_user_message(
+    *,
+    cards: list,
+    country_codes: list[str],
+) -> str:
+    """Contact card introductory text, never contact details.
+
+    This must depend on the actual serialized contact cards, not on
+    a retrieved Contact source: a source can lack validated sidecar
+    data and therefore produce zero cards in the public response.
+    """
+    if cards:
+        return (
+            "For case-specific guidance, you can use "
+            "the L&E Global contacts below:"
+        )
+
+    names = [
+        resolve_country_display_name(code)
+        for code in dict.fromkeys(country_codes)
+    ]
+    if names:
+        return (
+            "Contact details for " + ", ".join(names)
+            + " are not currently available through this assistant."
+        )
+    return "Contact details are not currently available through this assistant."
 
 
 def _build_contact_section(
@@ -1845,7 +1878,15 @@ def _resolve_conservative_fallback(
 
         return LegalChatResponse(
             question=request.question.strip(),
-            answer=contact_answer,
+            answer=_contact_card_user_message(
+                cards=contacts,
+                # An unindexed or unsupported country may exist only
+                # in unavailable_codes. Keep its name in the response.
+                country_codes=[
+                    *current_country_scope.available_codes,
+                    *current_country_scope.unavailable_codes,
+                ],
+            ),
             grounded=bool(sources),
             model=None,
             retrieval_total=retrieval_total,
@@ -2205,7 +2246,8 @@ def _present_single_country_evidence(
             kept.append(group)
 
     referral = (
-        "For the unconfirmed legal point(s), please "
+        "The available documents do not establish the specific legal "
+        "requirement requested. Please "
         f"contact the L&E Global member firm in {country_name} "
         "for further guidance."
     )
@@ -2215,6 +2257,64 @@ def _present_single_country_evidence(
     while kept_lines and not kept_lines[-1].strip():
         kept_lines.pop()
     return "\n".join([lines[0], *kept_lines, "- " + referral])
+
+
+def _advance_legal_question_counts(
+    previous_state: ConversationState | None,
+    executed: list[tuple[RequestUnderstandingAction, list[str]]],
+) -> tuple[list[LegalQuestionCount], set[str]]:
+    """Deterministic manager rule: add contact from question 2 per pair.
+
+    The client keeps the bounded counts in conversation_state; the model
+    neither chooses the threshold nor supplies contacts. Only a resolved
+    single-country legal_information action with one canonical topic counts.
+    Comparisons, explicit contact requests and non-legal turns do not count.
+    Distinct pairs survive intervening questions about other topics/countries.
+    """
+
+    counts = {
+        (entry.country_code, entry.legal_topic): entry.count
+        for entry in (
+            previous_state.legal_question_counts
+            if previous_state is not None
+            else []
+        )
+    }
+    repeated_country_codes: set[str] = set()
+    seen_this_turn: set[tuple[str, str]] = set()
+
+    for action, available_codes in executed:
+        if action.type != "legal_information" or len(available_codes) != 1:
+            continue
+        code = available_codes[0].upper()
+        # A question can legitimately resolve to multiple canonical themes.
+        # Count each distinct resolved pair once for this user turn.
+        for topic in dict.fromkeys(action.legal_topics):
+            if topic not in CANONICAL_LEGAL_TOPICS:
+                continue
+            pair = (code, topic)
+            if pair in seen_this_turn:
+                continue
+            seen_this_turn.add(pair)
+            count = min(2, counts.pop(pair, 0) + 1)
+            counts[pair] = count
+            if count == 2:
+                repeated_country_codes.add(code)
+
+    # Bound the JSON sent back to WordPress. Evict the oldest pair first,
+    # never any current pair, and do not grow unbounded with a long session.
+    latest = list(counts.items())[-24:]
+    return (
+        [
+            LegalQuestionCount(
+                country_code=code,
+                legal_topic=topic,
+                count=count,
+            )
+            for (code, topic), count in latest
+        ],
+        repeated_country_codes,
+    )
 
 
 def _execute_resolved_plan(
@@ -2273,6 +2373,12 @@ def _execute_resolved_plan(
     grounded = False
     model_used: str | None = None
     retrieval_total = 0
+    legal_question_counts = list(
+        request.conversation_state.legal_question_counts
+        if request.conversation_state is not None
+        else []
+    )
+    repeated_contact_codes: set[str] = set()
 
     if legal_type_actions:
         merged_available_codes: list[str] = []
@@ -2452,8 +2558,55 @@ def _execute_resolved_plan(
                         evidence_mode=(
                             action.resolved_evidence_mode()
                         ),
+                        allow_cross_topic_fallback=(
+                            action.type == "legal_information"
+                            and not request.legal_topics
+                            and not action.document_legal_topics
+                        ),
+                        retrieval_question=(
+                            action.resolved_question
+                            if action.resolved_question
+                            else None
+                        ),
                     )
                 )
+
+        # Count the ACTUALLY resolved country and canonical topic, not
+        # guesses from historical user text or LLM answer wording.
+        legal_question_counts, repeated_contact_codes = (
+            _advance_legal_question_counts(
+                request.conversation_state, executed
+            )
+        )
+
+        # Manager rule: the legal comparison itself is capped at six
+        # countries. max_sources is a citation budget, NOT a country
+        # limit; increasing it must never bypass the product rule.
+        # Resolve the full union of jurisdictions before any retrieval,
+        # so 7+ countries receive the SAME friendly response from the
+        # stable resolver, REST API and NDJSON stream.
+        comparison_scope = set(merged_available_codes)
+        comparison_scope.update(merged_unavailable_codes)
+        if len(comparison_scope) > 6:
+            metrics.outcome = "comparison_country_limit"
+            metrics.request_actions = result.action_types
+            metrics.resolved_action_countries = resolved_action_countries
+            metrics.resolved_action_topics = resolved_action_topics
+            metrics.resolved_country_codes = sorted(comparison_scope)
+            metrics.model = None
+            metrics.selected_sources = 0
+            metrics.retrieval_total = 0
+            return _build_comparison_source_budget_response(
+                request=request,
+                error=InvalidLegalChatRequestError(
+                    "A comparison may include no more than 6 countries.",
+                    code="comparison_source_budget",
+                    details={
+                        "country_count": len(comparison_scope),
+                        "max_sources": request.max_sources,
+                    },
+                ),
+            )
 
         # Explicit legal_topics on the original request are a binding
         # retrieval constraint - they override whatever the model
@@ -2541,11 +2694,41 @@ def _execute_resolved_plan(
             else:
                 formatted_legal_answer = legal_response.answer
 
+            # Convert *only the final validated display* into prose.
+            # Keep internal RAG bullets for evidence/citation validation,
+            # uncertainty filtering and streaming repair.
+            if legal_response.grounded and not merged_unavailable_codes:
+                law_labels: dict[str, str] = {}
+                for code in merged_available_codes:
+                    country_name = resolve_country_display_name(code)
+                    demonyms = get_country_demonyms(code)
+                    law_name = (
+                        "UK" if code.upper() == "GB"
+                        else "US" if code.upper() == "US"
+                        else demonyms[0] if demonyms else country_name
+                    )
+                    prefix = f"Under {law_name} law"
+                    law_labels[country_name] = prefix
+                    law_labels[prefix + ":"] = prefix
+                formatted_legal_answer = (
+                    present_validated_legal_answer_as_prose(
+                        formatted_legal_answer,
+                        law_labels=law_labels,
+                        split_themes=(
+                            len(merged_available_codes) == 1
+                            and len(set(merged_legal_topics)) > 1
+                        ),
+                    )
+                )
+
             answer_parts.append(formatted_legal_answer)
             sources.extend(legal_response.sources)
             grounded = legal_response.grounded
             contact_required_country_codes.update(
                 legal_response.contact_required_country_codes
+            )
+            contact_required_country_codes.update(
+                repeated_contact_codes
             )
             if not legal_response.grounded:
                 contact_required_country_codes.update(
@@ -2573,6 +2756,7 @@ def _execute_resolved_plan(
                 for code in merged_available_codes
                 if (
                     not legal_response.grounded
+                    or code.upper() in repeated_contact_codes
                     or code.upper() in {
                         value.upper()
                         for value in
@@ -2602,34 +2786,25 @@ def _execute_resolved_plan(
                     fallback_contact_retrieval_total
                 )
 
-                if fallback_contact_sources:
-                    # The structured `contacts` field below is the
-                    # single source of contact-card detail (name,
-                    # firm, email, phone) - never re-serialize it into
-                    # the answer text too, or the visitor sees every
-                    # contact twice (once as text, once as its card).
-                    answer_parts.append(
-                        "For case-specific guidance, you can use "
-                        "the L&E Global contacts below:"
-                    )
-                    grounded = True
-                elif fallback_contact_answer:
-                    # Never promise a contact "below" when the
-                    # country currently has no validated contact.
-                    answer_parts.append(fallback_contact_answer)
-
-                contacts.extend(
-                    build_legal_chat_contacts(
-                        source_directory=(
-                            _optional_contact_source_directory()
-                        ),
-                        requested_country_codes=(
-                            required_contact_codes
-                        ),
-                        unavailable_country_codes=[],
-                        sources=fallback_contact_sources,
+                fallback_contact_cards = build_legal_chat_contacts(
+                    source_directory=(
+                        _optional_contact_source_directory()
+                    ),
+                    requested_country_codes=required_contact_codes,
+                    unavailable_country_codes=[],
+                    sources=fallback_contact_sources,
+                )
+                contacts.extend(fallback_contact_cards)
+                # A retrieved Contact chunk does not guarantee that
+                # a validated structured contact card exists.
+                answer_parts.append(
+                    _contact_card_user_message(
+                        cards=fallback_contact_cards,
+                        country_codes=required_contact_codes,
                     )
                 )
+                if fallback_contact_cards:
+                    grounded = True
 
                 sources.extend(fallback_contact_sources)
 
@@ -2676,23 +2851,34 @@ def _execute_resolved_plan(
         metrics.opensearch_ms += took_ms
         retrieval_total += contact_retrieval_total
 
-        if contact_answer:
-            answer_parts.append(contact_answer)
-
-        contacts.extend(
-            build_legal_chat_contacts(
-                source_directory=(
-                    _optional_contact_source_directory()
-                ),
-                requested_country_codes=(
-                    action_scope.available_codes
-                ),
-                unavailable_country_codes=(
-                    action_scope.unavailable_codes
-                ),
-                sources=contact_sources,
-            )
+        explicit_contact_cards = build_legal_chat_contacts(
+            source_directory=(
+                _optional_contact_source_directory()
+            ),
+            requested_country_codes=(
+                action_scope.available_codes
+            ),
+            unavailable_country_codes=(
+                action_scope.unavailable_codes
+            ),
+            sources=contact_sources,
         )
+        contacts.extend(explicit_contact_cards)
+        # Never append `contact_answer`: it contains raw phone,
+        # address and email lines and duplicates public contact cards.
+        if action_scope.available_codes:
+            answer_parts.append(
+                _contact_card_user_message(
+                    cards=explicit_contact_cards,
+                    country_codes=action_scope.available_codes,
+                )
+            )
+        if action_scope.unavailable_codes:
+            answer_parts.append(
+                _unavailable_countries_answer(
+                    action_scope.unavailable_codes
+                )
+            )
 
         sources.extend(contact_sources)
 
@@ -2736,6 +2922,16 @@ def _execute_resolved_plan(
         next_conversation_state = build_next_conversation_state(
             executed=executed
         )
+        if next_conversation_state is not None:
+            next_conversation_state = ConversationState.model_validate(
+                {
+                    **next_conversation_state.model_dump(),
+                    "legal_question_counts": [
+                        entry.model_dump()
+                        for entry in legal_question_counts
+                    ],
+                }
+            )
     except Exception:
         # Constructing the next conversation_state must never cost
         # the user their already-resolved answer - degrade to
@@ -3817,37 +4013,11 @@ def _build_comparison_source_budget_response(
     FriendlyInvalidRequestHttpTests) protects this extraction.
     """
 
-    country_count = error.details.get("country_count")
-
-    if (
-        not isinstance(country_count, int)
-        or country_count <= 0
-    ):
-        country_count = request.max_sources + 1
-
-    source_word = (
-        "source"
-        if request.max_sources == 1
-        else "sources"
-    )
-    country_word = (
-        "country"
-        if request.max_sources == 1
-        else "countries"
-    )
-
     return LegalChatResponse(
         question=request.question.strip(),
         answer=(
-            f"This comparison includes "
-            f"{country_count} countries, but the "
-            f"current response can cite up to "
-            f"{request.max_sources} {source_word}. "
-            "To keep at least one source for each "
-            f"country, please choose up to "
-            f"{request.max_sources} {country_word} "
-            "or split the comparison into smaller "
-            "groups."
+            "The chatbot can compare a maximum of 6 countries. "
+            "Please limit the scope of your comparison."
         ),
         grounded=False,
         model=None,

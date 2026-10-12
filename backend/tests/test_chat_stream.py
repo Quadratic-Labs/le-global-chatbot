@@ -784,7 +784,7 @@ class RouteMechanismTests(unittest.TestCase):
             )
         self.assertEqual("start", records[0]["type"])
         self.assertEqual("delta", records[1]["type"])
-        self.assertIn("9 countries", records[1]["text"])
+        self.assertEqual('The chatbot can compare a maximum of 6 countries. Please limit the scope of your comparison.', records[1]["text"])
         self.assertEqual("metadata", records[2]["type"])
         self.assertEqual("done", records[3]["type"])
 
@@ -2244,7 +2244,13 @@ class NamedEarlyResponseRouteTests(unittest.TestCase):
 
         types = [r["type"] for r in records]
         self.assertEqual(["start", "delta", "metadata", "done"], types)
-        self.assertIn("Test Firm", records[1]["text"])
+        self.assertEqual(
+            "For case-specific guidance, you can use "
+            "the L&E Global contacts below:",
+            records[1]["text"],
+        )
+        self.assertNotIn("Test Firm", records[1]["text"])
+        self.assertNotIn("jane@test-firm.example", records[1]["text"])
 
         metadata = records[2]
         self.assertTrue(metadata["grounded"])
@@ -2434,20 +2440,7 @@ class ComparisonRouteTests(unittest.TestCase):
         self._assert_clean_comparison_stream(records, codes=codes, answer=answer)
 
     def test_current_stable_code_maximum_is_ten_not_six(self) -> None:
-        """
-        PRE_EXISTING_PRODUCT_CONSTRAINT_DRIFT (reported, not fixed, per
-        this mission's standing instruction): the product-documented
-        comparison maximum is 6 countries, but the actual stable-code
-        ceiling is 10 - LegalChatRequest.max_sources' Pydantic le=10 is
-        the ONLY hard limit found anywhere in chat.py/rag_answer.py/
-        request_understanding.py (country_codes itself has no
-        max_length/model_validator constraint at all), and the
-        comparison_source_budget check is `max_sources < country_count`
-        (strict), so max_sources=10 with exactly 10 country_codes is
-        genuinely reachable through the real dispatch/streaming path -
-        proven end to end here, not merely inferred from reading the
-        Pydantic Field() definition.
-        """
+        """A higher citation budget cannot bypass the six-country limit."""
 
         codes = ["GB", "ES", "IT", "CZ", "SE", "CH", "PL", "PT", "NL", "BE"]
         names = {
@@ -2466,7 +2459,18 @@ class ComparisonRouteTests(unittest.TestCase):
                     legal_chat_stream(request=request, x_request_id="compare-10"),
                 )
             )
-        self._assert_clean_comparison_stream(records, codes=codes, answer=answer)
+        self.assertEqual(
+            ["start", "delta", "metadata", "done"],
+            [record["type"] for record in records],
+        )
+        self.assertEqual(
+            "The chatbot can compare a maximum of 6 countries. "
+            "Please limit the scope of your comparison.",
+            records[1]["text"],
+        )
+        self.assertFalse(records[2]["grounded"])
+        self.assertEqual([], records[2]["sources"])
+
 
     def test_eleven_countries_exceeds_even_the_current_maximum(self) -> None:
         """
@@ -2532,9 +2536,14 @@ class ComparisonRouteTests(unittest.TestCase):
                 )
 
         types = [r["type"] for r in records]
-        self.assertEqual(["start", "replacement", "metadata", "done"], types)
-        self.assertIn("11 countries", records[1]["text"])
+        self.assertEqual(["start", "delta", "metadata", "done"], types)
+        self.assertEqual(
+            "The chatbot can compare a maximum of 6 countries. "
+            "Please limit the scope of your comparison.",
+            records[1]["text"],
+        )
         self.assertFalse(records[2]["grounded"])
+        self.assertEqual([], records[2]["sources"])
 
         metric_payloads = [
             json.loads(record.getMessage())
@@ -2792,11 +2801,8 @@ class StableVsStreamEquivalenceTests(unittest.TestCase):
             understanding_client=make_understanding_client(),
         )
         self.assertEqual(
-            repaired_answer.replace(
-                "United Kingdom\n",
-                "Under UK law:\n",
-                1,
-            ),
+            "Under UK law, employees are entitled to paid parental "
+            "leave for four weeks [1].",
             stable.answer,
         )
 

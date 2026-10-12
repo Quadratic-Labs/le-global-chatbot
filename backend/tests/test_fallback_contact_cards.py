@@ -292,7 +292,12 @@ class MissingEvidenceContactCardTests(unittest.TestCase):
         )
 
         self.assertTrue(response.grounded)
-        self.assertEqual(contact_answer, response.answer)
+        self.assertEqual(
+            "For case-specific guidance, you can use "
+            "the L&E Global contacts below:",
+            response.answer,
+        )
+        self.assertNotIn("Robert Hill", response.answer)
         self.assertEqual([source], response.sources)
         self.assertEqual(
             [("GB", "Robert Hill")],

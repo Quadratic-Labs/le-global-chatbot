@@ -2320,11 +2320,8 @@ class CountryContactFallbackRegressionTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            legal_answer.replace(
-                "France\n",
-                "Under French law:\n",
-                1,
-            ),
+            "Under French law, employers must follow the validated "
+            "termination rules described in the source. [1]",
             response.answer,
         )
         self.assertTrue(response.grounded)
@@ -2358,7 +2355,7 @@ class CountryContactFallbackRegressionTests(unittest.TestCase):
         contact_search.assert_not_called()
         self.assertFalse(response.grounded)
         self.assertEqual([], response.contacts)
-        self.assertIn("not currently covered", response.answer)
+        self.assertIn("Unfortunately the information you requested for", response.answer)
 
     def test_d_question_without_country_still_clarifies(
         self,
@@ -3312,8 +3309,16 @@ class ContactIntentTests(unittest.TestCase):
             "PE",
         )
 
-        self.assertIn(
+        self.assertNotIn(
             "Test Firm",
+            response.answer,
+        )
+        self.assertNotIn(
+            "contact@test-firm.example",
+            response.answer,
+        )
+        self.assertIn(
+            "not currently available through this assistant",
             response.answer,
         )
 
@@ -3324,6 +3329,46 @@ class ContactIntentTests(unittest.TestCase):
                 "employment lawyer in Peru."
             ),
         )
+
+    def test_direct_contact_request_with_validated_card_only(self) -> None:
+        card = LegalChatContact(
+            contact_id="test-pe-card",
+            country_code="PE",
+            member_firm="Test Firm",
+            contact_person="Contact Lawyer",
+            email="contact@test-firm.example",
+        )
+        contact_result = LegalSearchResponse(
+            query="",
+            total=1,
+            limit=20,
+            offset=0,
+            took_ms=1,
+            hits=[_build_contact_hit(country_code="PE", country="Peru")],
+        )
+        with mock.patch(
+            "app.routers.chat.search_contact_chunks", return_value=contact_result
+        ), mock.patch(
+            "app.routers.chat.build_legal_chat_contacts", return_value=[card]
+        ):
+            response = resolve_legal_chat_response(
+                request=LegalChatRequest(
+                    question="Give me the contact details for an employment lawyer in Peru."
+                ),
+                catalog_provider=_catalog_provider,
+                document_topic_provider=_document_topic_provider,
+                search_function=_unexpected_search,
+                generation_client=NoCallGenerationClient(),
+                understanding_client=_FailingUnderstandingClient(),
+            )
+        self.assertEqual([card], response.contacts)
+        self.assertEqual(
+            "For case-specific guidance, you can use the L&E Global contacts below:",
+            response.answer,
+        )
+        self.assertNotIn("Test Firm", response.answer)
+        self.assertNotIn("contact@test-firm.example", response.answer)
+        self.assertTrue(response.grounded)
 
     def test_member_firm_phrase_variant(
         self,
@@ -7080,10 +7125,10 @@ class FriendlyInvalidRequestHttpTests(unittest.TestCase):
         self.assertFalse(result.grounded)
         self.assertEqual(result.retrieval_total, 0)
         self.assertEqual(result.sources, [])
-        self.assertIn("9 countries", result.answer)
-        self.assertIn(
-            "choose up to 6 countries",
+        self.assertEqual(
             result.answer,
+            "The chatbot can compare a maximum of 6 countries. "
+            "Please limit the scope of your comparison.",
         )
         self.assertNotIn(
             "max_sources",

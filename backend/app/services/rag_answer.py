@@ -507,6 +507,10 @@ class LegalActionEvidenceSpec:
     subject_text: str | None = None
     search_concepts: list[SearchConceptLike] | None = None
     evidence_mode: str | None = None
+    # Standalone action question for retrieval. The combined user request
+    # remains unchanged for generation and conversation context.
+    retrieval_question: str | None = None
+    allow_cross_topic_fallback: bool = False
 
 
 def _normalize_country_codes(
@@ -4170,6 +4174,69 @@ class _PreparedGeneration:
     insufficient_evidence_answer_parts: list[str]
 
 
+def _cross_topic_candidate_is_supported(
+    hit: LegalSearchHit,
+    *,
+    country_code: str,
+    subject_text: str,
+    search_concepts: Sequence[SearchConceptLike],
+    evidence_mode: str,
+) -> bool:
+    """Conservative eligibility for cross-section retrieval evidence.
+
+    This is candidate selection, not proof that a legal conclusion is
+    universally applicable. Normal answer validation still applies.
+    """
+    if hit.country_code.strip().upper() != country_code:
+        return False
+
+    if (hit.subsection or "").strip().casefold() == "contact":
+        return False
+
+    if not (hit.legal_topic or "").strip():
+        return False
+
+    if not search_concepts:
+        return False
+
+    # Require a distinctive, multiword subject. Ambiguous short
+    # subjects cannot justify crossing a hard topic boundary.
+    stop_words = {
+        "the", "and", "for", "with", "from", "under", "into",
+        "about", "that", "this", "which", "what", "when", "how",
+        "are", "can", "does", "law", "legal",
+    }
+    subject_tokens = {
+        token for token in re.findall(
+            r"[a-z0-9]+", subject_text.casefold()
+        )
+        if len(token) > 2 and token not in stop_words
+    }
+
+    if len(subject_tokens) < 3:
+        return False
+
+    hit_tokens = set(re.findall(
+        r"[a-z0-9]+",
+        ((hit.subsection or "") + " " + hit.content).casefold(),
+    ))
+
+    required_overlap = math.ceil(len(subject_tokens) * 0.65)
+    if len(subject_tokens & hit_tokens) < required_overlap:
+        return False
+
+    # No weak subject-overlap fallback here: require direct concept
+    # evidence, or a complete within-chunk relation.
+    return evaluate_evidence_status(
+        [hit],
+        list(search_concepts),
+        evidence_mode,
+        subject_text=subject_text,
+        expected_country_codes=frozenset({country_code}),
+        expected_legal_topics=frozenset(),
+    ) == "direct"
+
+
 def _prepare_grounded_generation(
     request: LegalChatRequest,
     search_function: SearchFunction,
@@ -4269,6 +4336,12 @@ def _prepare_grounded_generation(
                 "legal_topics": (
                     spec.legal_topics or request.legal_topics
                 ),
+                "question": (
+                    spec.retrieval_question.strip()
+                    if spec.retrieval_question
+                    and spec.retrieval_question.strip()
+                    else request.question
+                ),
             }
         )
 
@@ -4303,6 +4376,90 @@ def _prepare_grounded_generation(
             ) from error
 
         retrieval_total += spec_retrieval_total
+
+        # Phase 2: optional, country-bound cross-topic recovery.
+        # This runs only for an implicitly resolved single-country
+        # action whose original topic did not provide direct evidence.
+        if (
+            spec.allow_cross_topic_fallback
+            and spec.evidence_mode in ("direct_topic", "relation_required")
+            and spec.subject_text
+            and spec.search_concepts
+            and spec_request.legal_topics
+            and not spec_request.subsections
+            and len(_normalize_country_codes(spec.country_codes)) == 1
+        ):
+            code = _normalize_country_codes(spec.country_codes)[0]
+            initial_context_hits = _allocate_country_context_budgets(
+                hits=spec_retrieved_hits,
+                maximum_characters=max_context_characters,
+                maximum_source_characters=max_source_characters,
+            )
+            initial_status = evaluate_evidence_status(
+                [h for h in initial_context_hits if h.country_code == code],
+                list(spec.search_concepts),
+                spec.evidence_mode,
+                subject_text=spec.subject_text,
+                expected_country_codes=frozenset({code}),
+                expected_legal_topics=frozenset(
+                    _normalize_requested_legal_topics(
+                        spec_request.legal_topics
+                    )
+                ),
+            )
+
+            if initial_status != "direct":
+                fallback_request = spec_request.model_copy(
+                    update={
+                        "legal_topics": [],
+                        "max_sources": min(
+                            MAX_RERANK_POOL_SIZE,
+                            max(12, spec_request.max_sources),
+                        ),
+                    }
+                )
+                try:
+                    fallback_total, fallback_hits = _retrieve_search_hits(
+                        request=fallback_request,
+                        search_function=search_function,
+                        generation_client=generation_client,
+                        rerank_enabled=False,
+                        rerank_pool_multiplier=1,
+                        metrics=metrics,
+                        search_concepts=spec.search_concepts,
+                        broad_overview=False,
+                        evidence_mode=spec.evidence_mode,
+                    )
+                except LegalSearchError:
+                    # An optional search must not cause a new outage.
+                    logger.warning(
+                        "Optional legal cross-topic fallback failed."
+                    )
+                else:
+                    retrieval_total += fallback_total
+                    existing_ids = {
+                        hit.chunk_id for hit in spec_retrieved_hits
+                    }
+
+                    relevant_fallback_hits = [
+                        hit for hit in fallback_hits
+                        if hit.chunk_id not in existing_ids
+                        and _cross_topic_candidate_is_supported(
+                            hit,
+                            country_code=code,
+                            subject_text=spec.subject_text,
+                            search_concepts=spec.search_concepts,
+                            evidence_mode=spec.evidence_mode,
+                        )
+                    ]
+
+                    if relevant_fallback_hits:
+                        # Preserve the original source budget and
+                        # retain existing topic-scoped evidence.
+                        spec_retrieved_hits = _deduplicate_hits(
+                            relevant_fallback_hits[:2]
+                            + spec_retrieved_hits
+                        )[:spec_request.max_sources]
 
         hits_by_spec.append(
             _allocate_country_context_budgets(
