@@ -60,6 +60,12 @@ from app.clients.openai_responses import OpenAIConfigurationError
 from app.clients.openai_responses_stream import get_openai_answer_stream_client
 from app.core.config import get_settings
 from app.models.chat import LegalChatRequest, LegalChatResponse
+from app.services.country_detection import (
+    get_country_demonyms,
+    get_country_name_variants,
+    resolve_country_display_name,
+)
+from app.services.legal_stream_presentation import ProgressiveLegalProse
 from app.routers.chat import (
     _build_comparison_source_budget_response,
     router,
@@ -590,6 +596,7 @@ async def _drain_stream_events(
     metrics_holder: list[Any],
     t0: float,
     deadline_at: float,
+    presentation_holder: list[ProgressiveLegalProse | None] | None = None,
 ) -> AsyncIterator[bytes]:
     """
     Runs ONLY once "generation starting" has already been observed -
@@ -618,6 +625,7 @@ async def _drain_stream_events(
 
     stream_failed = False
     first_fastapi_delta_at: float | None = None
+    live_prose = presentation_holder[0] if presentation_holder else None
 
     try:
         while True:
@@ -670,23 +678,36 @@ async def _drain_stream_events(
             assert isinstance(item, StreamAnswerEvent)
 
             if item.type is StreamAnswerEventType.ANSWER_DELTA:
-                sent_text_holder[0] += item.delta_text or ""
-                if first_fastapi_delta_at is None:
-                    first_fastapi_delta_at = perf_counter()
-                yield _serialize_ndjson_record(_map_stream_answer_event(item))
+                # Only presentation changes: canonical source tokens still
+                # pass unchanged through RAG validation and repair.
+                delta = item.delta_text or ""
+                if live_prose is not None:
+                    delta = live_prose.feed(delta)
+                if delta:
+                    sent_text_holder[0] += delta
+                    if first_fastapi_delta_at is None:
+                        first_fastapi_delta_at = perf_counter()
+                    yield _serialize_ndjson_record(_delta_record(delta))
                 continue
 
             if item.type is StreamAnswerEventType.REPLACEMENT:
-                sent_text_holder[0] = item.replacement_text or ""
+                replacement = item.replacement_text or ""
+                if live_prose is not None:
+                    replacement = live_prose.replace(replacement)
+                sent_text_holder[0] = replacement
                 if first_fastapi_delta_at is None:
                     first_fastapi_delta_at = perf_counter()
-                yield _serialize_ndjson_record(_map_stream_answer_event(item))
+                yield _serialize_ndjson_record(_replacement_record(replacement))
                 continue
 
             if item.type in (
                 StreamAnswerEventType.VALIDATING,
                 StreamAnswerEventType.DISCARD,
             ):
+                if item.type is StreamAnswerEventType.DISCARD:
+                    if live_prose is not None:
+                        live_prose.reset()
+                    sent_text_holder[0] = ""
                 yield _serialize_ndjson_record(_map_stream_answer_event(item))
                 continue
 
@@ -900,6 +921,15 @@ async def _drain_stream_events(
         _deregister_active_stream(request_id)
         return
 
+    # Flush remaining display-only chunks. Normal streamed paragraphs
+    # are append-only; the existing final replacement is retained only
+    # when actual validation/postprocessing changes the legal answer.
+    if live_prose is not None:
+        tail = live_prose.finish()
+        if tail:
+            sent_text_holder[0] += tail
+            yield _serialize_ndjson_record(_delta_record(tail))
+
     # _execute_resolved_plan can append text AFTER the streamed RAG
     # answer (an unavailable-countries note, or an ungrounded-answer
     # contact fallback) - if what the client already has doesn't match
@@ -1034,6 +1064,7 @@ async def legal_chat_stream(
     loop = asyncio.get_running_loop()
     event_queue: asyncio.Queue = asyncio.Queue()
     metrics_holder: list[Any] = [None]
+    presentation_holder: list[ProgressiveLegalProse | None] = [None]
 
     # GATE S9-LITE: the concurrent.futures.Future bridging into
     # _consume()'s own Task on this loop - see _cancel_bridge_work's
@@ -1080,6 +1111,51 @@ async def legal_chat_stream(
         # repair_triggered/repair_success reuse /chat's own existing
         # definition of "repair succeeded" rather than a second one.
         metrics_holder[0] = metrics
+
+        # The action evidence specs are resolved by the normal chat
+        # orchestrator before generation. They provide a trustworthy
+        # country/topic layout without a second LLM call. When absent,
+        # preserve the historic wire format (e.g. direct test bridges).
+        if action_specs:
+            codes = list(dict.fromkeys([
+                *(
+                    code.strip().upper()
+                    for spec in action_specs
+                    for code in spec.country_codes
+                    if isinstance(code, str) and code.strip()
+                ),
+                *(
+                    code.strip().upper()
+                    for code in request.country_codes
+                    if isinstance(code, str) and code.strip()
+                ),
+            ]))
+            topics = set(
+                topic
+                for spec in action_specs
+                for topic in (spec.legal_topics or [])
+                if isinstance(topic, str)
+            )
+            labels: dict[str, str] = {}
+            for code in codes:
+                country = resolve_country_display_name(code)
+                demonyms = get_country_demonyms(code)
+                law_name = (
+                    'UK' if code == 'GB'
+                    else 'US' if code == 'US'
+                    else (demonyms[0] if demonyms else country)
+                )
+                law_label = f'Under {law_name} law'
+                for name in (country, *get_country_name_variants(code)):
+                    if name.strip():
+                        labels[name] = law_label
+                labels[law_label + ':'] = law_label
+            if labels:
+                presentation_holder[0] = ProgressiveLegalProse(
+                    law_labels=labels,
+                    show_country_titles=len(codes) > 1,
+                    split_themes=len(codes) == 1 and len(topics) > 1,
+                )
 
         # GATE S9-LITE: _GENERATION_STARTING must still be the FIRST
         # thing scheduled onto event_queue here - loop.call_soon_
@@ -1311,6 +1387,7 @@ async def legal_chat_stream(
             metrics_holder=metrics_holder,
             t0=t0,
             deadline_at=deadline_at,
+            presentation_holder=presentation_holder,
         ),
         media_type=NDJSON_MEDIA_TYPE,
         headers=_streaming_response_headers(request_id),

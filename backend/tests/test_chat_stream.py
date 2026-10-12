@@ -2374,7 +2374,27 @@ class ComparisonRouteTests(unittest.TestCase):
         self.assertNotIn("discard", types)
 
         deltas = "".join(r["text"] for r, t in zip(records, types) if t == "delta")
-        self.assertEqual(answer, deltas)
+        from app.services.country_detection import get_country_demonyms
+
+        sections = answer.split("\n\n")
+        self.assertEqual(len(codes), len(sections))
+
+        expected_parts = []
+        for index, (code, section) in enumerate(zip(codes, sections), 1):
+            title = section.split("\n", 1)[0]
+            demonyms = get_country_demonyms(code)
+            law_name = (
+                "UK" if code == "GB"
+                else "US" if code == "US"
+                else demonyms[0] if demonyms else title
+            )
+            expected_parts.append(
+                f"{title}\nUnder {law_name} law, supported by [{index}]."
+            )
+
+        self.assertEqual("\n\n".join(expected_parts), deltas)
+        self.assertNotIn("replacement", types)
+        self.assertNotIn("\n- ", deltas)
 
         metadata = records[-2]
         self.assertTrue(metadata["grounded"])

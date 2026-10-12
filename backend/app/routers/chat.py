@@ -64,6 +64,7 @@ from app.services.country_detection import (
     is_country_only_followup,
     resolve_country_availability,
     get_country_demonyms,
+    get_country_name_variants,
     resolve_country_display_name,
 )
 from app.services.legal_catalog import (
@@ -3597,7 +3598,12 @@ def _execute_resolved_plan(
                         else demonyms[0] if demonyms else country_name
                     )
                     prefix = f"Under {law_name} law"
-                    law_labels[country_name] = prefix
+                    for variant in (
+                        country_name,
+                        *get_country_name_variants(code),
+                    ):
+                        if variant.strip():
+                            law_labels[variant] = prefix
                     law_labels[prefix + ":"] = prefix
                 formatted_legal_answer = (
                     present_validated_legal_answer_as_prose(
