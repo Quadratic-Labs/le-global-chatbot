@@ -2262,6 +2262,9 @@ def _present_single_country_evidence(
 def _advance_legal_question_counts(
     previous_state: ConversationState | None,
     executed: list[tuple[RequestUnderstandingAction, list[str]]],
+    *,
+    question: str = "",
+    explicit_legal_topics: list[str] | None = None,
 ) -> tuple[list[LegalQuestionCount], set[str]]:
     """Deterministic manager rule: add contact from question 2 per pair.
 
@@ -2287,9 +2290,42 @@ def _advance_legal_question_counts(
         if action.type != "legal_information" or len(available_codes) != 1:
             continue
         code = available_codes[0].upper()
-        # A question can legitimately resolve to multiple canonical themes.
-        # Count each distinct resolved pair once for this user turn.
-        for topic in dict.fromkeys(action.legal_topics):
+        # Conversation counters must reflect the topic of the CURRENT
+        # user question, not a possibly inaccurate topic predicted by
+        # RequestUnderstanding. Do NOT alter the RAG retrieval topics.
+        # Client-supplied explicit topics remain authoritative.
+        counter_topics = list(action.legal_topics)
+        if explicit_legal_topics:
+            counter_topics = list(explicit_legal_topics)
+        elif question:
+            # When understanding splits a turn into multiple actions,
+            # prefer the resolved per-action question if it yields a
+            # recognizable topic. Otherwise use the original question.
+            action_question = (action.resolved_question or "").strip()
+            # For one action, the original user message is more
+            # authoritative than a model-rewritten question.
+            detected = (
+                detect_legal_topics(question)
+                if len(executed) == 1 else []
+            )
+            if not detected and action_question:
+                detected = detect_legal_topics(action_question)
+            if not detected:
+                detected = detect_legal_topics(question)
+            # "notice period" deliberately maps to both Employment
+            # Contracts and Termination. That taxonomy overlap is not
+            # evidence that the user asked two independent topics;
+            # preserve the validated understanding for this case.
+            ambiguous_notice = {
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            }.issubset(set(detected))
+            if detected and not ambiguous_notice:
+                counter_topics = detected
+
+        # A question can legitimately concern multiple independent themes.
+        # Each distinct country/topic pair advances at most once per turn.
+        for topic in dict.fromkeys(counter_topics):
             if topic not in CANONICAL_LEGAL_TOPICS:
                 continue
             pair = (code, topic)
@@ -2575,7 +2611,10 @@ def _execute_resolved_plan(
         # guesses from historical user text or LLM answer wording.
         legal_question_counts, repeated_contact_codes = (
             _advance_legal_question_counts(
-                request.conversation_state, executed
+                request.conversation_state,
+                executed,
+                question=request.question,
+                explicit_legal_topics=list(request.legal_topics),
             )
         )
 
