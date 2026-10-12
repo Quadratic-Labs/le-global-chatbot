@@ -140,6 +140,27 @@ class LocationScopeHotfixTests(unittest.TestCase):
             ["TN"],
         )
 
+    def test_hungary_has_manager_exact_message(self):
+        self.assertEqual(
+            _unavailable_countries_answer(["HU"]),
+            "Unfortunately the information you requested for "
+            "Hungary is not available at this time, please let "
+            "me know if you want me to list the countries that the "
+            "information is available for without Hungary.",
+        )
+
+    def test_multiple_unavailable_countries_keep_existing_wording(self):
+        answer = _unavailable_countries_answer(["HU", "TN"])
+        self.assertIn("Hungary", answer)
+        self.assertIn("Tunisia", answer)
+        self.assertEqual(
+            "Unfortunately the information you requested for the following "
+            "countries: Hungary and Tunisia, is not available at this time. "
+            "Please let me know if you want me to list the countries "
+            "that the information is available for, excluding those countries.",
+            answer,
+        )
+
     def test_tunisia_wording_is_unsupported_not_missing_contact(
         self,
     ):
@@ -147,17 +168,12 @@ class LocationScopeHotfixTests(unittest.TestCase):
             ["TN"]
         )
 
-        self.assertIn(
-            "Tunisia",
+        self.assertEqual(
             answer,
-        )
-        self.assertIn(
-            "not currently covered",
-            answer,
-        )
-        self.assertIn(
-            "cannot provide employment-law information",
-            answer,
+            "Unfortunately the information you requested for "
+            "Tunisia is not available at this time, please let "
+            "me know if you want me to list the countries that the "
+            "information is available for without Tunisia.",
         )
         self.assertNotIn(
             "could not find a validated",
@@ -179,7 +195,7 @@ class LocationScopeHotfixTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "not currently covered",
+            "Unfortunately the information you requested for Tunisia",
             answer,
         )
         self.assertNotIn(

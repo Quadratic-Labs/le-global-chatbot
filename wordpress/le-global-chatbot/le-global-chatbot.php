@@ -424,7 +424,7 @@ final class LE_Global_Chatbot_Plugin
                 <span
                     class="le-global-chatbot-floating__launcher-label"
                 >
-                    L&amp;E Compare!
+                    L&amp;E Global Assistant
                 </span>
             </button>
         <?php endif; ?>
@@ -505,7 +505,7 @@ final class LE_Global_Chatbot_Plugin
                         aria-label="Start a new conversation"
                         data-new-conversation
                     >
-                        New conversation
+                        Refresh conversation
                     </button>
 
                     <?php if ($is_floating) : ?>

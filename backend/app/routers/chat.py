@@ -31,6 +31,7 @@ from app.models.chat import (
 )
 from app.models.conversation_state import ConversationPendingClarification
 from app.models.conversation_state import ConversationState
+from app.models.conversation_state import LegalQuestionCount
 from app.services.assistant_help import (
     build_assistant_help_answer,
     detect_assistant_help_intent,
@@ -62,6 +63,7 @@ from app.services.country_detection import (
     CountryDetectionError,
     is_country_only_followup,
     resolve_country_availability,
+    get_country_demonyms,
     resolve_country_display_name,
 )
 from app.services.legal_catalog import (
@@ -84,6 +86,9 @@ from app.services.legal_topic_detection import (
     detect_document_legal_topics,
     detect_legal_topics,
     resolve_legal_scope,
+)
+from app.services.legal_answer_presentation import (
+    present_validated_legal_answer_as_prose,
 )
 from app.services.rag_answer import (
     sanitize_user_facing_legal_answer,
@@ -496,20 +501,20 @@ def _unavailable_countries_answer(
         country = display_names[0]
 
         return (
-            f"{country} is not currently covered by the validated "
-            "L&E Global documents available in this chatbot. "
-            "I therefore cannot provide employment-law information "
-            f"or a validated L&E Global contact for {country}."
+            "Unfortunately the information you requested for "
+            f"{country} is not available at this time, please let "
+            "me know if you want me to list the countries that the "
+            "information is available for without "
+            f"{country}."
         )
 
     countries = _format_country_list(display_names)
 
     return (
-        "The following countries are not currently covered by the "
-        "validated L&E Global documents available in this chatbot: "
-        f"{countries}. I therefore cannot provide employment-law "
-        "information or validated L&E Global contacts for those "
-        "countries."
+        "Unfortunately the information you requested for the following countries: "
+        f"{countries}, is not available at this time. "
+        "Please let me know if you want me to list the countries "
+        "that the information is available for, excluding those countries."
     )
 
 
@@ -1069,6 +1074,35 @@ def _build_deterministic_hints(
     return hints, current_country_scope, current_legal_scope
 
 
+
+
+def _contact_card_user_message(
+    *,
+    cards: list,
+    country_codes: list[str],
+) -> str:
+    """Contact card introductory text, never contact details.
+
+    This must depend on the actual serialized contact cards, not on
+    a retrieved Contact source: a source can lack validated sidecar
+    data and therefore produce zero cards in the public response.
+    """
+    if cards:
+        return (
+            "For case-specific guidance, you can use "
+            "the L&E Global contacts below:"
+        )
+
+    names = [
+        resolve_country_display_name(code)
+        for code in dict.fromkeys(country_codes)
+    ]
+    if names:
+        return (
+            "Contact details for " + ", ".join(names)
+            + " are not currently available through this assistant."
+        )
+    return "Contact details are not currently available through this assistant."
 
 
 def _build_contact_section(
@@ -2521,7 +2555,15 @@ def _resolve_conservative_fallback(
 
         return LegalChatResponse(
             question=request.question.strip(),
-            answer=contact_answer,
+            answer=_contact_card_user_message(
+                cards=contacts,
+                # An unindexed or unsupported country may exist only
+                # in unavailable_codes. Keep its name in the response.
+                country_codes=[
+                    *current_country_scope.available_codes,
+                    *current_country_scope.unavailable_codes,
+                ],
+            ),
             grounded=bool(sources),
             model=None,
             retrieval_total=retrieval_total,
@@ -2670,6 +2712,324 @@ def _aggregate_action_legal_topics(
     return aggregated
 
 
+
+def _format_single_country_legal_answer(
+    answer: str,
+    country_code: str,
+) -> str:
+    """
+    Format a validated single-country answer for display.
+
+    Preserve legal claims, citations and all subsequent lines.
+    Do not change the internal RAG validation structure.
+    """
+    if not answer:
+        return answer
+
+    lines = answer.splitlines(keepends=True)
+
+    if not lines:
+        return answer
+
+    first_line = lines[0].strip()
+
+    normalized_heading = (
+        first_line.lstrip("#").strip().strip("*").strip()
+    )
+
+    country_name = resolve_country_display_name(
+        country_code
+    )
+
+    if normalized_heading.casefold() != country_name.casefold():
+        return answer
+
+    demonyms = get_country_demonyms(country_code)
+
+    preferred_names = {
+        "GB": "UK",
+        "US": "US",
+    }
+
+    law_name = (
+        preferred_names.get(country_code.upper())
+        or (demonyms[0] if demonyms else country_name)
+    )
+
+    newline = (
+        "\r\n" if lines[0].endswith("\r\n")
+        else "\n" if lines[0].endswith("\n")
+        else ""
+    )
+
+    lines[0] = f"Under {law_name} law:" + newline
+
+    return "".join(lines)
+
+
+
+def _explicit_independent_question_facets(question: str) -> list[str]:
+    """Extract explicitly separate questions, not merely a list with 'and'.
+
+    This is only a DISPLAY safeguard for an already grounded RAG answer.
+    Ambiguous compound questions retain conservative suppression; no
+    inferred facet is used as a legal source or to relax RAG validation.
+    """
+    if not question.strip():
+        return []
+
+    parts = re.split(
+        r"(?:\?|[,;]\s*|\s+and\s+)"
+        r"(?=(?:what\s+(?:is|are|does|do|happens)|"
+        r"how\s+(?:many|much|long|does|do|is|are)|"
+        r"which\s+|when\s+|whether\s+)\b)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    parts = [part.strip(" ,;?\n") for part in parts if part.strip(" ,;?\n")]
+    if len(parts) > 1 and not re.search(
+        r"\b(?:what|how|which|when|whether)\b", parts[0], re.IGNORECASE
+    ):
+        # A leading location clause ("In France, ...") belongs to
+        # the first requested question, not its own legal facet.
+        parts[1] = parts[0] + ", " + parts[1]
+        parts.pop(0)
+    if len(parts) < 2 or len(parts) > 3:
+        return []
+    return parts
+
+
+def _distinctive_legal_question_words(value: str) -> set[str]:
+    """Lexical presentation hints only; never a legal-evidence test."""
+    generic_words = {
+        "what", "which", "when", "where", "whether", "how", "many",
+        "much", "long", "does", "have", "has", "under", "with", "from",
+        "this", "that", "there", "they", "their", "these", "those",
+        "about", "could", "would", "should", "must", "will", "your",
+        "country", "legal",
+        "rules", "rule", "requirements", "requirement", "statutory",
+        "exact", "normal", "period", "days", "employees", "employee",
+        "employer", "employers", "work", "working", "apply", "applies",
+        "which", "where", "than", "more", "less", "entitled",
+        "given", "give", "their", "whatsoever", "confirmed",
+        "reliably", "cannot", "confirm", "information", "available",
+    }
+    return {
+        word for word in re.findall(r"[a-z]{4,}", value.casefold())
+        if word not in generic_words
+    }
+
+
+def _present_single_country_evidence(
+    answer: str,
+    country_code: str,
+    original_question: str = "",
+) -> str:
+    """Present validated bullets without losing another explicit question.
+
+    Uncertain points are never shown as legal conclusions. By default,
+    every subsequent bullet remains suppressed (the established safe
+    behavior), because nearby procedural statements are not substitutes
+    for the requested rule. Exception: when the user's own message has
+    independent explicit questions, a subsequent CITED bullet can be
+    retained only if it concerns a different, unblocked question. This
+    never creates legal content, changes retrieval or bypasses grounding.
+    """
+    from app.services.rag_answer import _UNCERTAIN_LEGAL_ANSWER_PATTERN
+
+    if not answer:
+        return answer
+    lines = answer.splitlines()
+    if not lines:
+        return answer
+    country_name = resolve_country_display_name(country_code)
+    heading = lines[0].strip().lstrip("#").strip("* ")
+    if heading.casefold() != country_name.casefold():
+        return answer
+
+    groups: list[list[str]] = []
+    for line in lines[1:]:
+        if line.startswith("- "):
+            groups.append([line])
+        elif groups and (not line.strip() or line[:1].isspace()):
+            groups[-1].append(line)
+        elif line.strip():
+            # Unexpected structure: leave it for existing validators.
+            return answer
+    if not groups:
+        return answer
+
+    uncertainty_flags = [
+        bool(_UNCERTAIN_LEGAL_ANSWER_PATTERN.search("\n".join(group)))
+        for group in groups
+    ]
+    if not any(uncertainty_flags):
+        return answer
+
+    facets = _explicit_independent_question_facets(original_question)
+    facet_words = [_distinctive_legal_question_words(q) for q in facets]
+    # Jurisdiction words in the user question are not legal subjects.
+    jurisdiction_words = _distinctive_legal_question_words(country_name)
+    jurisdiction_words.update(
+        word for demonym in get_country_demonyms(country_code)
+        for word in _distinctive_legal_question_words(demonym)
+    )
+    for words in facet_words:
+        words.difference_update(jurisdiction_words)
+    # Distinctive words must uniquely identify an explicit question;
+    # generic overlapping words cannot justify keeping adjacent rules.
+    if not all(facet_words):
+        facet_words = []
+    else:
+        for index, words in enumerate(facet_words):
+            other_words = set().union(*(
+                other for i, other in enumerate(facet_words) if i != index
+            ))
+            words.difference_update(other_words)
+        if not all(facet_words):
+            facet_words = []
+
+    blocked_facets: set[int] = set()
+    kept: list[list[str]] = []
+    seen_uncertainty = False
+    for group, is_uncertain in zip(groups, uncertainty_flags):
+        group_text = "\n".join(group)
+        matches = {
+            index for index, words in enumerate(facet_words)
+            if words & _distinctive_legal_question_words(group_text)
+        }
+        if is_uncertain:
+            seen_uncertainty = True
+            # If the doubtful statement cannot be assigned to a
+            # specific requested question, subsequent evidence is
+            # ambiguous and we must remain conservative.
+            if not matches:
+                blocked_facets.update(range(len(facet_words)))
+            else:
+                blocked_facets.update(matches)
+            continue
+        if not seen_uncertainty:
+            kept.append(group)
+            continue
+        # A later bullet is not automatically reliable simply because
+        # it contains a legal citation. It must match exactly one
+        # different, explicitly requested facet, not a blocked one.
+        if (
+            facet_words
+            and len(matches) == 1
+            and not (matches & blocked_facets)
+            and re.search(r"\[\d+(?:,\s*\d+)*\]", group_text)
+        ):
+            kept.append(group)
+
+    referral = (
+        "The available documents do not establish the specific legal "
+        "requirement requested. Please "
+        f"contact the L&E Global member firm in {country_name} "
+        "for further guidance."
+    )
+    if not kept:
+        return referral
+    kept_lines = [line for group in kept for line in group]
+    while kept_lines and not kept_lines[-1].strip():
+        kept_lines.pop()
+    return "\n".join([lines[0], *kept_lines, "- " + referral])
+
+
+def _advance_legal_question_counts(
+    previous_state: ConversationState | None,
+    executed: list[tuple[RequestUnderstandingAction, list[str]]],
+    *,
+    question: str = "",
+    explicit_legal_topics: list[str] | None = None,
+) -> tuple[list[LegalQuestionCount], set[str]]:
+    """Deterministic manager rule: add contact from question 2 per pair.
+
+    The client keeps the bounded counts in conversation_state; the model
+    neither chooses the threshold nor supplies contacts. Only a resolved
+    single-country legal_information action with one canonical topic counts.
+    Comparisons, explicit contact requests and non-legal turns do not count.
+    Distinct pairs survive intervening questions about other topics/countries.
+    """
+
+    counts = {
+        (entry.country_code, entry.legal_topic): entry.count
+        for entry in (
+            previous_state.legal_question_counts
+            if previous_state is not None
+            else []
+        )
+    }
+    repeated_country_codes: set[str] = set()
+    seen_this_turn: set[tuple[str, str]] = set()
+
+    for action, available_codes in executed:
+        if action.type != "legal_information" or len(available_codes) != 1:
+            continue
+        code = available_codes[0].upper()
+        # Conversation counters must reflect the topic of the CURRENT
+        # user question, not a possibly inaccurate topic predicted by
+        # RequestUnderstanding. Do NOT alter the RAG retrieval topics.
+        # Client-supplied explicit topics remain authoritative.
+        counter_topics = list(action.legal_topics)
+        if explicit_legal_topics:
+            counter_topics = list(explicit_legal_topics)
+        elif question:
+            # When understanding splits a turn into multiple actions,
+            # prefer the resolved per-action question if it yields a
+            # recognizable topic. Otherwise use the original question.
+            action_question = (action.resolved_question or "").strip()
+            # For one action, the original user message is more
+            # authoritative than a model-rewritten question.
+            detected = (
+                detect_legal_topics(question)
+                if len(executed) == 1 else []
+            )
+            if not detected and action_question:
+                detected = detect_legal_topics(action_question)
+            if not detected:
+                detected = detect_legal_topics(question)
+            # "notice period" deliberately maps to both Employment
+            # Contracts and Termination. That taxonomy overlap is not
+            # evidence that the user asked two independent topics;
+            # preserve the validated understanding for this case.
+            ambiguous_notice = {
+                "Employment Contracts",
+                "Termination of Employment Contracts",
+            }.issubset(set(detected))
+            if detected and not ambiguous_notice:
+                counter_topics = detected
+
+        # A question can legitimately concern multiple independent themes.
+        # Each distinct country/topic pair advances at most once per turn.
+        for topic in dict.fromkeys(counter_topics):
+            if topic not in CANONICAL_LEGAL_TOPICS:
+                continue
+            pair = (code, topic)
+            if pair in seen_this_turn:
+                continue
+            seen_this_turn.add(pair)
+            count = min(2, counts.pop(pair, 0) + 1)
+            counts[pair] = count
+            if count == 2:
+                repeated_country_codes.add(code)
+
+    # Bound the JSON sent back to WordPress. Evict the oldest pair first,
+    # never any current pair, and do not grow unbounded with a long session.
+    latest = list(counts.items())[-24:]
+    return (
+        [
+            LegalQuestionCount(
+                country_code=code,
+                legal_topic=topic,
+                count=count,
+            )
+            for (code, topic), count in latest
+        ],
+        repeated_country_codes,
+    )
+
+
 def _execute_resolved_plan(
     request: LegalChatRequest,
     result: RequestUnderstandingResult,
@@ -2708,6 +3068,8 @@ def _execute_resolved_plan(
     """
 
     contact_actions = result.actions_of_type("contact")
+    contact_required_country_codes: set[str] = set()
+
     legal_type_actions = [
         action
         for action in result.actions
@@ -2724,6 +3086,12 @@ def _execute_resolved_plan(
     grounded = False
     model_used: str | None = None
     retrieval_total = 0
+    legal_question_counts = list(
+        request.conversation_state.legal_question_counts
+        if request.conversation_state is not None
+        else []
+    )
+    repeated_contact_codes: set[str] = set()
 
     if legal_type_actions:
         merged_available_codes: list[str] = []
@@ -2984,8 +3352,58 @@ def _execute_resolved_plan(
                         evidence_mode=(
                             action.resolved_evidence_mode()
                         ),
+                        allow_cross_topic_fallback=(
+                            action.type == "legal_information"
+                            and not request.legal_topics
+                            and not action.document_legal_topics
+                        ),
+                        retrieval_question=(
+                            action.resolved_question
+                            if action.resolved_question
+                            else None
+                        ),
                     )
                 )
+
+        # Count the ACTUALLY resolved country and canonical topic, not
+        # guesses from historical user text or LLM answer wording.
+        legal_question_counts, repeated_contact_codes = (
+            _advance_legal_question_counts(
+                request.conversation_state,
+                executed,
+                question=request.question,
+                explicit_legal_topics=list(request.legal_topics),
+            )
+        )
+
+        # Manager rule: the legal comparison itself is capped at six
+        # countries. max_sources is a citation budget, NOT a country
+        # limit; increasing it must never bypass the product rule.
+        # Resolve the full union of jurisdictions before any retrieval,
+        # so 7+ countries receive the SAME friendly response from the
+        # stable resolver, REST API and NDJSON stream.
+        comparison_scope = set(merged_available_codes)
+        comparison_scope.update(merged_unavailable_codes)
+        if len(comparison_scope) > 6:
+            metrics.outcome = "comparison_country_limit"
+            metrics.request_actions = result.action_types
+            metrics.resolved_action_countries = resolved_action_countries
+            metrics.resolved_action_topics = resolved_action_topics
+            metrics.resolved_country_codes = sorted(comparison_scope)
+            metrics.model = None
+            metrics.selected_sources = 0
+            metrics.retrieval_total = 0
+            return _build_comparison_source_budget_response(
+                request=request,
+                error=InvalidLegalChatRequestError(
+                    "A comparison may include no more than 6 countries.",
+                    code="comparison_source_budget",
+                    details={
+                        "country_count": len(comparison_scope),
+                        "max_sources": request.max_sources,
+                    },
+                ),
+            )
 
         # Explicit legal_topics on the original request are a binding
         # retrieval constraint - they override whatever the model
@@ -3131,9 +3549,80 @@ def _execute_resolved_plan(
                     )
                 )
 
-            answer_parts.append(legal_answer_text)
+            # User-facing formatting after RAG validation.
+            # Comparisons and unavailable-country responses
+            # retain their existing presentation.
+            if (
+                len(merged_available_codes) == 1
+                and not merged_unavailable_codes
+                and legal_response.grounded
+            ):
+                formatted_legal_answer = (
+                    _format_single_country_legal_answer(
+                        answer=_present_single_country_evidence(
+                            answer=legal_answer_text,
+                            country_code=merged_available_codes[0],
+                            original_question=request.question,
+                        ),
+                        country_code=merged_available_codes[0],
+                    )
+                )
+            elif (
+                len(merged_available_codes) == 1
+                and not merged_unavailable_codes
+                and not legal_response.grounded
+            ):
+                country_name = resolve_country_display_name(
+                    merged_available_codes[0]
+                )
+                formatted_legal_answer = (
+                    "For guidance on this legal question, "
+                    "please contact the L&E Global member firm "
+                    f"in {country_name}."
+                )
+            else:
+                formatted_legal_answer = legal_answer_text
+
+            # Convert *only the final validated display* into prose.
+            # Keep internal RAG bullets for evidence/citation validation,
+            # uncertainty filtering and streaming repair.
+            if legal_response.grounded and not merged_unavailable_codes:
+                law_labels: dict[str, str] = {}
+                for code in merged_available_codes:
+                    country_name = resolve_country_display_name(code)
+                    demonyms = get_country_demonyms(code)
+                    law_name = (
+                        "UK" if code.upper() == "GB"
+                        else "US" if code.upper() == "US"
+                        else demonyms[0] if demonyms else country_name
+                    )
+                    prefix = f"Under {law_name} law"
+                    law_labels[country_name] = prefix
+                    law_labels[prefix + ":"] = prefix
+                formatted_legal_answer = (
+                    present_validated_legal_answer_as_prose(
+                        formatted_legal_answer,
+                        law_labels=law_labels,
+                        split_themes=(
+                            len(merged_available_codes) == 1
+                            and len(set(merged_legal_topics)) > 1
+                        ),
+                    )
+                )
+
+            answer_parts.append(formatted_legal_answer)
             sources.extend(legal_response.sources)
             grounded = legal_response.grounded
+            contact_required_country_codes.update(
+                legal_response.contact_required_country_codes
+            )
+            contact_required_country_codes.update(
+                repeated_contact_codes
+            )
+            if not legal_response.grounded:
+                contact_required_country_codes.update(
+                    merged_available_codes
+                )
             model_used = legal_response.model
             retrieval_total += legal_response.retrieval_total
 
@@ -3145,18 +3634,35 @@ def _execute_resolved_plan(
             # If the user already explicitly requested a contact,
             # leave that action to the normal contact loop below so
             # the same contact is never rendered twice.
-            if (
-                not legal_response.grounded
-                and not contact_actions
-                and merged_available_codes
-            ):
+            explicit_contact_codes = {
+                code.upper()
+                for action in contact_actions
+                for code in (action.country_codes or [])
+            }
+
+            required_contact_codes = [
+                code
+                for code in merged_available_codes
+                if (
+                    not legal_response.grounded
+                    or code.upper() in repeated_contact_codes
+                    or code.upper() in {
+                        value.upper()
+                        for value in
+                        legal_response.contact_required_country_codes
+                    }
+                )
+                and code.upper() not in explicit_contact_codes
+            ]
+
+            if required_contact_codes and not contact_actions:
                 (
                     fallback_contact_answer,
                     fallback_contact_sources,
                     fallback_contact_retrieval_total,
                     fallback_contact_took_ms,
                 ) = _build_contact_section(
-                    country_codes=merged_available_codes,
+                    country_codes=required_contact_codes,
                     unavailable_country_codes=[],
                     citation_offset=max(
                         (source.citation for source in sources),
@@ -3169,34 +3675,25 @@ def _execute_resolved_plan(
                     fallback_contact_retrieval_total
                 )
 
-                if fallback_contact_sources:
-                    # The structured `contacts` field below is the
-                    # single source of contact-card detail (name,
-                    # firm, email, phone) - never re-serialize it into
-                    # the answer text too, or the visitor sees every
-                    # contact twice (once as text, once as its card).
-                    answer_parts.append(
-                        "For case-specific guidance, you can use "
-                        "the L&E Global contacts below:"
-                    )
-                    grounded = True
-                elif fallback_contact_answer:
-                    # Never promise a contact "below" when the
-                    # country currently has no validated contact.
-                    answer_parts.append(fallback_contact_answer)
-
-                contacts.extend(
-                    build_legal_chat_contacts(
-                        source_directory=(
-                            _optional_contact_source_directory()
-                        ),
-                        requested_country_codes=(
-                            merged_available_codes
-                        ),
-                        unavailable_country_codes=[],
-                        sources=fallback_contact_sources,
+                fallback_contact_cards = build_legal_chat_contacts(
+                    source_directory=(
+                        _optional_contact_source_directory()
+                    ),
+                    requested_country_codes=required_contact_codes,
+                    unavailable_country_codes=[],
+                    sources=fallback_contact_sources,
+                )
+                contacts.extend(fallback_contact_cards)
+                # A retrieved Contact chunk does not guarantee that
+                # a validated structured contact card exists.
+                answer_parts.append(
+                    _contact_card_user_message(
+                        cards=fallback_contact_cards,
+                        country_codes=required_contact_codes,
                     )
                 )
+                if fallback_contact_cards:
+                    grounded = True
 
                 sources.extend(fallback_contact_sources)
 
@@ -3275,23 +3772,34 @@ def _execute_resolved_plan(
         metrics.opensearch_ms += took_ms
         retrieval_total += contact_retrieval_total
 
-        if contact_answer:
-            answer_parts.append(contact_answer)
-
-        contacts.extend(
-            build_legal_chat_contacts(
-                source_directory=(
-                    _optional_contact_source_directory()
-                ),
-                requested_country_codes=(
-                    action_scope.available_codes
-                ),
-                unavailable_country_codes=(
-                    action_scope.unavailable_codes
-                ),
-                sources=contact_sources,
-            )
+        explicit_contact_cards = build_legal_chat_contacts(
+            source_directory=(
+                _optional_contact_source_directory()
+            ),
+            requested_country_codes=(
+                action_scope.available_codes
+            ),
+            unavailable_country_codes=(
+                action_scope.unavailable_codes
+            ),
+            sources=contact_sources,
         )
+        contacts.extend(explicit_contact_cards)
+        # Never append `contact_answer`: it contains raw phone,
+        # address and email lines and duplicates public contact cards.
+        if action_scope.available_codes:
+            answer_parts.append(
+                _contact_card_user_message(
+                    cards=explicit_contact_cards,
+                    country_codes=action_scope.available_codes,
+                )
+            )
+        if action_scope.unavailable_codes:
+            answer_parts.append(
+                _unavailable_countries_answer(
+                    action_scope.unavailable_codes
+                )
+            )
 
         sources.extend(contact_sources)
 
@@ -3335,6 +3843,16 @@ def _execute_resolved_plan(
         next_conversation_state = build_next_conversation_state(
             executed=executed
         )
+        if next_conversation_state is not None:
+            next_conversation_state = ConversationState.model_validate(
+                {
+                    **next_conversation_state.model_dump(),
+                    "legal_question_counts": [
+                        entry.model_dump()
+                        for entry in legal_question_counts
+                    ],
+                }
+            )
     except Exception:
         # Constructing the next conversation_state must never cost
         # the user their already-resolved answer - degrade to
@@ -3345,16 +3863,40 @@ def _execute_resolved_plan(
         next_conversation_state is not None
     )
 
+    assembled_answer = "\n\n".join(
+        part for part in answer_parts if part
+    )
+
+    legal_country_codes = list(dict.fromkeys(
+        code
+        for entry in resolved_action_countries
+        if entry.get("type") in (
+            "legal_information",
+            "comparison",
+        )
+        for code in entry.get("country_codes", [])
+        if isinstance(code, str)
+    ))
+
+    # Final presentation only; RAG grounding validation
+    # still uses the original canonical country headings.
+    if len(legal_country_codes) == 1:
+        assembled_answer = _format_single_country_legal_answer(
+            answer=assembled_answer,
+            country_code=legal_country_codes[0],
+        )
+
     return LegalChatResponse(
         question=request.question.strip(),
-        answer="\n\n".join(
-            part for part in answer_parts if part
-        ),
+        answer=assembled_answer,
         grounded=grounded,
         model=model_used,
         retrieval_total=retrieval_total,
         sources=sources,
         contacts=contacts,
+        contact_required_country_codes=sorted(
+            contact_required_country_codes
+        ),
         conversation_state=next_conversation_state,
     )
 
@@ -4713,37 +5255,11 @@ def _build_comparison_source_budget_response(
     FriendlyInvalidRequestHttpTests) protects this extraction.
     """
 
-    country_count = error.details.get("country_count")
-
-    if (
-        not isinstance(country_count, int)
-        or country_count <= 0
-    ):
-        country_count = request.max_sources + 1
-
-    source_word = (
-        "source"
-        if request.max_sources == 1
-        else "sources"
-    )
-    country_word = (
-        "country"
-        if request.max_sources == 1
-        else "countries"
-    )
-
     return LegalChatResponse(
         question=request.question.strip(),
         answer=(
-            f"This comparison includes "
-            f"{country_count} countries, but the "
-            f"current response can cite up to "
-            f"{request.max_sources} {source_word}. "
-            "To keep at least one source for each "
-            f"country, please choose up to "
-            f"{request.max_sources} {country_word} "
-            "or split the comparison into smaller "
-            "groups."
+            "The chatbot can compare a maximum of 6 countries. "
+            "Please limit the scope of your comparison."
         ),
         grounded=False,
         model=None,

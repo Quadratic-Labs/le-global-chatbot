@@ -301,6 +301,32 @@ class ConversationPendingClarification(BaseModel):
         return self
 
 
+class LegalQuestionCount(BaseModel):
+    """Bounded session counter for a validated country + legal topic pair.
+
+    Pure routing metadata: never legal evidence and never contact data.
+    Saturates at two because the UI needs only the manager's threshold.
+    """
+
+    country_code: str
+    legal_topic: str
+    count: Literal[1, 2]
+
+    class Config:
+        extra = "forbid"
+
+    @model_validator(mode="after")
+    def _validate_pair(self) -> "LegalQuestionCount":
+        try:
+            code = normalize_country_code(self.country_code)
+        except UnknownCountryCodeError as error:
+            raise ValueError("Unknown legal question country") from error
+        if self.legal_topic not in CANONICAL_LEGAL_TOPICS:
+            raise ValueError("Unknown legal question topic")
+        self.country_code = code
+        return self
+
+
 class ConversationState(BaseModel):
     """
     The routing-relevant residue of the last successful turn.
@@ -321,6 +347,12 @@ class ConversationState(BaseModel):
 
     ordered_country_codes: list[str] = Field(
         default_factory=list
+    )
+
+    # Last 24 distinct country/topic pairs in this browser conversation.
+    # New conversations send no previous state and start with zero counts.
+    legal_question_counts: list[LegalQuestionCount] = Field(
+        default_factory=list, max_length=24
     )
 
     pending_clarification: (
@@ -347,6 +379,13 @@ class ConversationState(BaseModel):
                 )
 
             seen_scopes.add(scope)
+
+        counted_pairs = [
+            (entry.country_code, entry.legal_topic)
+            for entry in self.legal_question_counts
+        ]
+        if len(set(counted_pairs)) != len(counted_pairs):
+            raise ValueError("Duplicate legal question country/topic pair")
 
         action_count = len(self.actions)
 
