@@ -1008,3 +1008,157 @@ html body .le-global-chatbot-floating.le-global-chatbot-floating--open
 }
 
 /* === L&E GLOBAL CLIENT THEME PROTECTION END === */
+
+
+/* === L&E GLOBAL DESKTOP UI OPTIMIZATION START === */
+
+@media (min-width: 769px) {
+
+    /* Larger chatbot window */
+    .le-global-chatbot.le-global-chatbot--floating {
+    width: min(600px, calc(100vw - 48px));
+    max-width: calc(100vw - 48px);
+    height: min(550px, calc(100vh - 120px));
+    max-height: calc(100vh - 120px);
+    }
+
+    /* Compact header */
+    .le-global-chatbot--floating
+    .le-global-chatbot__panel-header {
+        padding: 10px 14px;
+    }
+
+    /* More space for conversation content */
+    .le-global-chatbot--floating
+    .le-global-chatbot__conversation {
+        padding: 12px 14px;
+    }
+
+    /* Optimized answer typography */
+    .le-global-chatbot--floating
+    .le-global-chatbot__message {
+        font-size: 15px;
+        line-height: 1.5;
+        padding: 10px 12px;
+    }
+
+    .le-global-chatbot--floating
+    .le-global-chatbot__answer {
+        line-height: 1.5;
+    }
+
+    /* Reduce unnecessary paragraph spacing */
+    .le-global-chatbot--floating
+    .le-global-chatbot__message p {
+        line-height: 1.5;
+        margin-bottom: 0.5rem;
+    }
+
+    .le-global-chatbot--floating
+    .le-global-chatbot__message p:last-child {
+        margin-bottom: 0;
+    }
+
+    /* Compact input area */
+    .le-global-chatbot--floating
+    .le-global-chatbot__composer {
+        padding: 10px 14px;
+    }
+
+    .le-global-chatbot--floating
+    textarea.le-global-chatbot__question {
+        font-size: 15px;
+        line-height: 1.45;
+    }
+}
+
+/* === L&E GLOBAL DESKTOP UI OPTIMIZATION END === */
+
+/* === L&E GLOBAL MOBILE UI OPTIMIZATION START === */
+
+@media (max-width: 768px) {
+
+    /* Full screen mobile chatbot */
+    .le-global-chatbot.le-global-chatbot--floating {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        max-width: none;
+        height: 100vh;
+        height: 100dvh;
+        max-height: none;
+        min-height: 0;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
+        overflow: hidden;
+    }
+
+    /* Hide floating launcher while chat is open */
+    .le-global-chatbot-floating--open
+    > .le-global-chatbot-floating__launcher {
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    /* Compact mobile header */
+    .le-global-chatbot--floating
+    .le-global-chatbot__panel-header {
+        padding: calc(10px + env(safe-area-inset-top)) 12px 10px;
+        gap: 8px;
+    }
+
+    /* Scrollable conversation */
+    .le-global-chatbot--floating
+    .le-global-chatbot__conversation {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 10px 12px;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+    }
+
+    /* Comfortable and compact message text */
+    .le-global-chatbot--floating
+    .le-global-chatbot__message {
+        font-size: 15px;
+        line-height: 1.5;
+        padding: 10px 12px;
+    }
+
+    .le-global-chatbot--floating
+    .le-global-chatbot__message p {
+        line-height: 1.5;
+        margin-bottom: 7px;
+    }
+
+    .le-global-chatbot--floating
+    .le-global-chatbot__message p:last-child {
+        margin-bottom: 0;
+    }
+
+    /* Compact composer with safe-area support */
+    .le-global-chatbot--floating
+    .le-global-chatbot__composer {
+        flex-shrink: 0;
+        padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+    }
+
+    /* Avoid automatic zoom on iOS input focus */
+    .le-global-chatbot--floating
+    textarea.le-global-chatbot__question {
+        font-size: 16px;
+        line-height: 1.45;
+        min-height: 52px;
+        padding: 10px 12px;
+    }
+}
+
+/* === L&E GLOBAL MOBILE UI OPTIMIZATION END === */

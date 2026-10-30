@@ -2453,7 +2453,10 @@ class CountryContactFallbackRegressionTests(unittest.TestCase):
             "For guidance on this legal question, please contact the L&E Global member firm in France.",
             response.answer,
         )
-        self.assertIn("L&E Global contacts below", response.answer)
+        self.assertNotIn("L&E Global contacts below", response.answer)
+        self.assertIsNotNone(response.contact_referral)
+        self.assertIsNone(response.contact_referral.contact_person)
+        self.assertIsNone(response.contact_referral.email)
         self.assertNotIn("Test Firm", response.answer)
         self.assertNotIn("contact@test-firm.example", response.answer)
         self.assertEqual(["FR"], [item.country_code for item in response.contacts])
@@ -3363,9 +3366,12 @@ class ContactIntentTests(unittest.TestCase):
             )
         self.assertEqual([card], response.contacts)
         self.assertEqual(
-            "For case-specific guidance, you can use the L&E Global contacts below:",
+            'There are nuances and exceptions that might impact the answer based on facts not provided so we recommend that you contact the L&E Global member firm.',
             response.answer,
         )
+        self.assertIsNotNone(response.contact_referral)
+        self.assertIsNone(response.contact_referral.contact_person)
+        self.assertIsNone(response.contact_referral.email)
         self.assertNotIn("Test Firm", response.answer)
         self.assertNotIn("contact@test-firm.example", response.answer)
         self.assertTrue(response.grounded)

@@ -274,6 +274,16 @@ class LegalChatContact(BaseModel):
         extra = "forbid"
 
 
+class LegalContactReferral(BaseModel):
+    """A public, non-LLM legal referral; never a contact card."""
+
+    contact_person: str | None = None
+    email: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
 class LegalChatResponse(BaseModel):
     """Grounded legal answer and its cited sources."""
 
@@ -303,6 +313,10 @@ class LegalChatResponse(BaseModel):
     # the out-of-scope explanation - even though no plan was executed.
     # None leaves the client's existing heuristic untouched.
     contact_only: bool | None = None
+
+    # Separate from generated answer and from the contact cards.
+    # The public UI renders the contact name and email in <em> safely.
+    contact_referral: LegalContactReferral | None = None
 
     conversation_state: ConversationState | None = None
 

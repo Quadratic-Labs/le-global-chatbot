@@ -2245,8 +2245,9 @@ class NamedEarlyResponseRouteTests(unittest.TestCase):
         types = [r["type"] for r in records]
         self.assertEqual(["start", "delta", "metadata", "done"], types)
         self.assertEqual(
-            "For case-specific guidance, you can use "
-            "the L&E Global contacts below:",
+            "There are nuances and exceptions that might impact the answer "
+            "based on facts not provided so we recommend that you contact "
+            "the L&E Global member firm.",
             records[1]["text"],
         )
         self.assertNotIn("Test Firm", records[1]["text"])
@@ -3123,9 +3124,10 @@ class StableVsStreamEquivalenceTests(unittest.TestCase):
         self._assert_equivalent(stable, reconstructed)
 
         for response in (stable, reconstructed):
-            self.assertIn(
-                "L&E Global contacts below", response.answer,
+            self.assertNotIn(
+                "L&E Global member firm.", response.answer,
             )
+            self.assertIsNotNone(response.contact_referral)
             self.assertNotIn("Test Firm", response.answer)
             self.assertNotIn(
                 "contact@test-firm.example", response.answer,

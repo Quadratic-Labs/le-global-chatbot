@@ -7,6 +7,12 @@
     // frontend-config limit when available (see loadConfiguration()).
     const DEFAULT_MAX_HISTORY_MESSAGES = 20;
 
+    const CONTACT_REFERRAL_SENTENCE = (
+        "There are nuances and exceptions that might impact the answer "
+        + "based on facts not provided so we recommend that you contact "
+        + "the L&E Global member firm."
+    );
+
     const DISCLAIMER_TEXT = (
         "This information is based on the available L&E "
         + "Global documents and does not constitute legal advice."
@@ -250,6 +256,40 @@
      * is what reduces the remaining entries to a safely alternating,
      * complete-pairs-only list.
      */
+    function normalizeContactReferral(raw) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return null;
+        }
+        const clean = (field) => (
+            typeof raw[field] === "string" && raw[field].trim()
+                ? raw[field].trim()
+                : null
+        );
+        const name = clean("contact_person");
+        const email = clean("email");
+        return {
+            contact_person: name && email ? name : null,
+            email: name && email ? email : null,
+        };
+    }
+
+    // Construct DOM nodes rather than parsing model-provided HTML/Markdown.
+    function buildContactReferralElement(referral) {
+        const paragraph = document.createElement("p");
+        paragraph.className = "le-global-chatbot__contact-referral";
+        paragraph.textContent = CONTACT_REFERRAL_SENTENCE;
+        if (referral && referral.contact_person && referral.email) {
+            paragraph.textContent = CONTACT_REFERRAL_SENTENCE.slice(0, -1)
+                + " lawyer ";
+            const italic = document.createElement("em");
+            italic.textContent = referral.contact_person
+                + " (" + referral.email + ")";
+            paragraph.appendChild(italic);
+            paragraph.appendChild(document.createTextNode("."));
+        }
+        return paragraph;
+    }
+
     function normalizePublicContacts(rawContacts) {
         if (!Array.isArray(rawContacts)) {
             return [];
@@ -438,6 +478,9 @@
                 message.contacts = normalizePublicContacts(
                     entry.contacts
                 );
+                message.contactReferral = normalizeContactReferral(
+                    entry.contactReferral
+                );
 
                 message.hasDisclaimer = Boolean(
                     entry.hasDisclaimer
@@ -611,6 +654,9 @@
                         contacts: normalizePublicContacts(
                             turn.contacts
                         ),
+                        contactReferral: normalizeContactReferral(
+                            turn.contactReferral
+                        ),
                         hasDisclaimer: Boolean(
                             turn.hasDisclaimer
                         ),
@@ -696,6 +742,9 @@
                         : [],
                     contacts: normalizePublicContacts(
                         assistantMessage.contacts
+                    ),
+                    contactReferral: normalizeContactReferral(
+                        assistantMessage.contactReferral
                     ),
                     hasDisclaimer: Boolean(
                         assistantMessage.hasDisclaimer
@@ -1668,6 +1717,9 @@
                     turn.answer = renumbered.answer;
                     turn.sources = renumbered.sources;
                     turn.contacts = normalizePublicContacts(response.contacts);
+                    turn.contactReferral = normalizeContactReferral(
+                        response.contact_referral
+                    );
                     turn.contactOnly = isContactOnlyResponse(
                         response
                     );
@@ -1833,7 +1885,19 @@
                     "Close the employment law assistant"
                 );
 
-                questionInput.focus();
+                // Auto-focus only on desktop.
+                // Prevent automatic keyboard opening on mobile.
+                const isDesktop = (
+                    typeof window.matchMedia !== "function"
+                    || window.matchMedia("(min-width: 769px)").matches
+                );
+
+                if (isDesktop) {
+                    questionInput.focus();
+                } else {
+                    // Focus the close button without opening the keyboard.
+                    closeButton.focus({ preventScroll: true });
+                }
             }
 
             function closePanel() {
@@ -2117,6 +2181,13 @@
             } else {
                 assistantBubble.appendChild(
                     answerElement
+                );
+            }
+
+            const referral = normalizeContactReferral(turn.contactReferral);
+            if (referral || (contactOnly && contacts.length > 0)) {
+                assistantBubble.appendChild(
+                    buildContactReferralElement(referral)
                 );
             }
 
@@ -3006,6 +3077,7 @@
             // exactly as for a non-streamed one, where it survives
             // untouched as part of the raw parsed JSON already.
             contact_only: metadata.contact_only,
+            contact_referral: metadata.contact_referral,
             conversation_state: (
                 metadata.conversation_state !== undefined
                     ? metadata.conversation_state
@@ -3203,6 +3275,8 @@
             cancelActiveStream,
             isContactOnlyResponse,
             isContactOnlyTurn,
+            normalizeContactReferral,
+            buildContactReferralElement,
             autoResizeQuestionInput,
             QUESTION_INPUT_MAX_HEIGHT_PX,
         };

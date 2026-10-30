@@ -28,6 +28,7 @@ from app.models.chat import (
     LegalChatHistoryMessage,
     LegalChatRequest,
     LegalChatResponse,
+    LegalContactReferral,
 )
 from app.models.conversation_state import ConversationPendingClarification
 from app.models.conversation_state import ConversationState
@@ -108,6 +109,14 @@ from app.services.request_understanding import (
     RequestUnderstandingAction,
     RequestUnderstandingResult,
     understand_request,
+)
+
+
+# Client-approved wording: do not ask the LLM to invent or edit it.
+CONTACT_REFERRAL_SENTENCE = (
+    "There are nuances and exceptions that might impact the answer "
+    "based on facts not provided so we recommend that you contact "
+    "the L&E Global member firm."
 )
 
 
@@ -1076,6 +1085,50 @@ def _build_deterministic_hints(
 
 
 
+def _legal_contact_referral(
+    *,
+    country_codes: list[str],
+    legal_sources: list[LegalAnswerSource],
+    displayed_cards: list,
+) -> LegalContactReferral | None:
+    """Create a referral from documented country-specific public records.
+
+    Looking up an inline referral must never itself display a card or
+    trigger extra OpenSearch calls. Contact cards still follow the
+    existing two-question/explicit/fallback logic. If no validated
+    contact is available, omit the personal details rather than guess.
+    """
+    codes = list(dict.fromkeys(
+        code.upper() for code in country_codes if code
+    ))
+    if not codes:
+        return None
+    if len(codes) != 1 or displayed_cards:
+        return LegalContactReferral()
+
+    source_dir = _optional_contact_source_directory()
+    if source_dir is None:
+        return LegalContactReferral()
+
+    people = build_legal_chat_contacts(
+        source_directory=source_dir,
+        requested_country_codes=codes,
+        unavailable_country_codes=[],
+        sources=legal_sources,
+    )
+    for person in people:
+        if (
+            person.country_code.upper() == codes[0]
+            and person.contact_person
+            and person.email
+        ):
+            return LegalContactReferral(
+                contact_person=person.contact_person,
+                email=person.email,
+            )
+    return LegalContactReferral()
+
+
 def _contact_card_user_message(
     *,
     cards: list,
@@ -1088,10 +1141,7 @@ def _contact_card_user_message(
     data and therefore produce zero cards in the public response.
     """
     if cards:
-        return (
-            "For case-specific guidance, you can use "
-            "the L&E Global contacts below:"
-        )
+        return CONTACT_REFERRAL_SENTENCE
 
     names = [
         resolve_country_display_name(code)
@@ -2500,7 +2550,15 @@ def _resolve_conservative_fallback(
             )
             metrics.resolved_legal_topics = resolved_document_topics
 
-            return response
+            return response.model_copy(
+            update={
+                "contact_referral": _legal_contact_referral(
+                    country_codes=current_country_scope.available_codes,
+                    legal_sources=response.sources,
+                    displayed_cards=response.contacts,
+                )
+            }
+        )
 
     if (
         hints.strong_contact_signal
@@ -2569,6 +2627,9 @@ def _resolve_conservative_fallback(
             retrieval_total=retrieval_total,
             sources=sources,
             contacts=contacts,
+            contact_referral=(
+                LegalContactReferral() if contacts else None
+            ),
         )
 
     if (
@@ -2637,7 +2698,15 @@ def _resolve_conservative_fallback(
             current_legal_scope.legal_topics
         )
 
-        return response
+        return response.model_copy(
+            update={
+                "contact_referral": _legal_contact_referral(
+                    country_codes=current_country_scope.available_codes,
+                    legal_sources=response.sources,
+                    displayed_cards=response.contacts,
+                )
+            }
+        )
 
     metrics.clarification_reason = "ambiguous_request"
     metrics.outcome = "clarification_ambiguous_request"
@@ -3863,6 +3932,14 @@ def _execute_resolved_plan(
         next_conversation_state is not None
     )
 
+    # A contact intro can occur in more than one action. Display the
+    # new recommendation once in the UI instead of repeating it in
+    # answer text. Keep genuine contact-unavailable messages intact.
+    if legal_type_actions and contacts:
+        answer_parts = [
+            part for part in answer_parts
+            if part != CONTACT_REFERRAL_SENTENCE
+        ]
     assembled_answer = "\n\n".join(
         part for part in answer_parts if part
     )
@@ -3886,6 +3963,18 @@ def _execute_resolved_plan(
             country_code=legal_country_codes[0],
         )
 
+    referral_country_codes = legal_country_codes
+    if not legal_type_actions and contacts:
+        referral_country_codes = list(dict.fromkeys(
+            contact.country_code for contact in contacts
+        ))
+
+    contact_referral = _legal_contact_referral(
+        country_codes=referral_country_codes,
+        legal_sources=sources,
+        displayed_cards=contacts,
+    )
+
     return LegalChatResponse(
         question=request.question.strip(),
         answer=assembled_answer,
@@ -3894,6 +3983,7 @@ def _execute_resolved_plan(
         retrieval_total=retrieval_total,
         sources=sources,
         contacts=contacts,
+        contact_referral=contact_referral,
         contact_required_country_codes=sorted(
             contact_required_country_codes
         ),

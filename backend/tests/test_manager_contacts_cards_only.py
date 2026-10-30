@@ -12,8 +12,7 @@ class ManagerContactCardsOnlyTests(unittest.TestCase):
             cards=[object()], country_codes=["IT"]
         )
         self.assertEqual(
-            "For case-specific guidance, you can use "
-            "the L&E Global contacts below:",
+            'There are nuances and exceptions that might impact the answer based on facts not provided so we recommend that you contact the L&E Global member firm.',
             answer,
         )
         self.assertNotIn("Member firm:", answer)

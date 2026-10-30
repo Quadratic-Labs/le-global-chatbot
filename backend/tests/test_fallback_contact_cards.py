@@ -245,7 +245,10 @@ class MissingEvidenceContactCardTests(unittest.TestCase):
         self.assertEqual(1, len(generation_calls))
         self.assertTrue(response.grounded)
         self.assertTrue(response.answer.startswith(legal_answer))
-        self.assertIn("L&E Global contacts below", response.answer)
+        self.assertNotIn("L&E Global contacts below", response.answer)
+        self.assertIsNotNone(response.contact_referral)
+        self.assertIsNone(response.contact_referral.contact_person)
+        self.assertIsNone(response.contact_referral.email)
         self.assertNotIn(contact_answer, response.answer)
         self.assertNotIn("Caroline Scherrmann", response.answer)
         self.assertNotIn("Robert Hill", response.answer)
@@ -293,10 +296,14 @@ class MissingEvidenceContactCardTests(unittest.TestCase):
 
         self.assertTrue(response.grounded)
         self.assertEqual(
-            "For case-specific guidance, you can use "
-            "the L&E Global contacts below:",
+            "There are nuances and exceptions that might impact the answer "
+            "based on facts not provided so we recommend that you contact "
+            "the L&E Global member firm.",
             response.answer,
         )
+        self.assertIsNotNone(response.contact_referral)
+        self.assertIsNone(response.contact_referral.contact_person)
+        self.assertIsNone(response.contact_referral.email)
         self.assertNotIn("Robert Hill", response.answer)
         self.assertEqual([source], response.sources)
         self.assertEqual(
